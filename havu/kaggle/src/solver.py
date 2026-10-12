@@ -61,6 +61,7 @@ MTP = envf("ARC_MTP", 0)                            # speculative tokens (0 = of
 TIER = os.environ.get("ARC_TIER", "xhigh")
 TEMPERATURE = envf("ARC_TEMPERATURE", 1.0)
 GPU_UTIL = envf("ARC_GPU_UTIL", 0.95)
+TP = int(envf("ARC_TP", 4))                          # tensor parallel size; main() sets it from the GPUs present
 SERVER = os.environ.get("ARC_SERVER", "vllm")        # vllm (user's vllm-0.23.0 cu130 source) | sglang (ours)
 AGENT = os.environ.get("ARC_AGENT", "tools")         # tools (E012 agent_qwen) | plain (v1 no-tool prompt)
 TOOLS_CAP = envf("ARC_TOOLS_CAP", 48000)             # E012: hard cap per attempt (min with the adaptive share)
@@ -303,6 +304,36 @@ def sglang_jit_env(env):
     return jit
 
 
+def gpu_inventory():
+    """[(name, memory MiB, compute capability)] of the GPUs actually present (nvidia-smi)."""
+    _, out = sh("nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader,nounits", timeout=60)
+    gpus = []
+    for ln in out.splitlines():
+        parts = [x.strip() for x in ln.split(",")]
+        if len(parts) == 3:
+            try:
+                gpus.append((parts[0], int(float(parts[1])), float(parts[2])))
+            except ValueError:
+                pass
+    return gpus
+
+
+def choose_tp(gpus, weights_gb=29.0, reserve_gb=6.0):
+    """Tensor-parallel size for Qwen3.8-27B-FP8 on the GPUs present, or 0 if they cannot run it.
+
+    Kaggle once gave a `machine_shape: NvidiaL4` session 2x T4 (E014). FP8 needs SM89+; TP must divide the 4 KV
+    heads; each GPU needs its weight shard plus `reserve_gb` for activations, graphs, KV and Mamba state.
+    ARC_TP overrides (0 = auto)."""
+    forced = int(envf("ARC_TP", 0))
+    if forced:
+        return forced
+    good = [g for g in gpus if g[2] >= 8.9]
+    for tp in (4, 2, 1):
+        if len(good) >= tp and min(g[1] for g in good[:tp]) / 1024 >= weights_gb / tp + reserve_gb:
+            return tp
+    return 0
+
+
 def install_server():
     wd = wheel_dir()
     t = time.time()
@@ -387,23 +418,39 @@ def launch_server(mdir):
                TRANSFORMERS_OFFLINE="1", OMP_NUM_THREADS="1")
     if SERVER == "sglang":
         cmd = [sys.executable, "-m", "sglang.launch_server", "--model-path", mdir, "--served-model-name", SERVED,
-               "--host", "127.0.0.1", "--port", str(PORT), "--tp-size", "4", "--kv-cache-dtype", "fp8_e4m3",
+               "--host", "127.0.0.1", "--port", str(PORT), "--tp-size", str(TP), "--kv-cache-dtype", "fp8_e4m3",
                "--context-length", str(MAX_MODEL_LEN), "--mem-fraction-static", os.environ.get("ARC_SGL_MEM", "0.85"),
                "--max-running-requests", str(MAX_SEQS), "--trust-remote-code",
-               "--attention-backend", os.environ.get("ARC_SGL_ATTN", "triton"), "--log-level", "info"]
+               "--attention-backend", os.environ.get("ARC_SGL_ATTN", "triton"), "--log-level", "info",
+               "--enable-cache-report"]
+        # Radix (prefix) cache is mandatory for the tool agent (every turn re-sends the whole transcript); the
+        # hybrid model's Mamba state slots bound the running batch: max_running = slots / slots-per-request
+        # (5 with extra_buffer + overlap; 3 with extra_buffer_lazy + SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1).
         if os.environ.get("ARC_RADIX", "1") != "1":
             cmd.append("--disable-radix-cache")
+        if os.environ.get("ARC_SGL_MAMBA_SLOTS"):
+            cmd += ["--max-mamba-cache-size", os.environ["ARC_SGL_MAMBA_SLOTS"]]
+        if os.environ.get("ARC_SGL_MAMBA_STRATEGY"):
+            cmd += ["--mamba-radix-cache-strategy", os.environ["ARC_SGL_MAMBA_STRATEGY"]]
+        if os.environ.get("ARC_SGL_SKIP_LOCK", "0") == "1":
+            env["SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK"] = "1"
+        if envf("ARC_SGL_HICACHE", 0) > 0:  # host-memory KV offload (hierarchical cache), ratio = host / device
+            cmd += ["--enable-hierarchical-cache", "--hicache-ratio", os.environ["ARC_SGL_HICACHE"],
+                    "--hicache-write-policy", os.environ.get("ARC_SGL_HICACHE_POLICY", "write_through")]
+        cuda_toolkit_env(env)
+        sglang_jit_env(env)
     else:
         attn = "TRITON_ATTN"  # FlashInfer fp8-KV kernels need SM90+; L4 is SM89
         cmd = [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--model", mdir,
                "--served-model-name", SERVED, "--host", "127.0.0.1", "--port", str(PORT),
-               "--tensor-parallel-size", "4", "--gpu-memory-utilization", str(GPU_UTIL),
+               "--tensor-parallel-size", str(TP), "--gpu-memory-utilization", str(GPU_UTIL),
                "--max-model-len", str(MAX_MODEL_LEN), "--max-num-seqs", str(MAX_SEQS),
                "--kv-cache-dtype", "fp8", "--attention-backend", attn, "--enable-prefix-caching",
                "--trust-remote-code", "--no-async-scheduling"]
         if MTP > 0:
             cmd += ["--speculative-config", json.dumps({"method": "mtp", "num_speculative_tokens": MTP})]
         env.update(VLLM_FORCE_ATTN_BACKEND=attn, VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="1")
+    cmd += json.loads(os.environ.get("ARC_SERVER_EXTRA", "[]"))  # extra server flags (bench / experiments)
     log("server cmd:", " ".join(cmd))
     path = os.path.join(LOG_DIR, f"{SERVER}_server.log")
     fh = open(path, "a")
@@ -459,14 +506,85 @@ def server_capacity(path):
     """(kv_tokens, max_running) from the server log."""
     txt = open(path, errors="ignore").read()
     if SERVER == "sglang":
-        kv = re.findall(r"max_total_num_tokens\W{1,3}(\d+)", txt)
-        mr = re.findall(r"max_running_requests\W{1,3}(\d+)", txt)
-        out = (int(kv[-1]) if kv else None, int(mr[-1]) if mr else None)
+        kv, mr = None, None
+        try:  # runtime values (after the Mamba cap); the log is the fallback
+            import urllib.request
+            with urllib.request.urlopen(BASE + "/get_server_info", timeout=20) as r:
+                st = json.loads(r.read())["internal_states"][0]
+            kv = st.get("memory_usage", {}).get("token_capacity")
+            mr = st.get("effective_max_running_requests_per_dp")
+        except Exception as exc:
+            log("get_server_info failed:", exc)
+        kvl = re.findall(r"KV Cache is allocated\. dtype: \S+ #tokens: (\d+)", txt)
+        mrl = re.findall(r"max_running_requests is capped to (\d+)", txt)
+        out = (kv or (int(kvl[-1]) if kvl else None), mr or (int(mrl[-1]) if mrl else None))
     else:
         m = re.findall(r"GPU KV cache size: ([\d,]+) tokens", txt)
         out = (int(m[-1].replace(",", "")) if m else None, None)
     log("server capacity (kv tokens, max running):", out)
     return out
+
+
+_VLLM_METRICS = {"vllm:prefix_cache_queries_total": "pc_queries", "vllm:prefix_cache_hits_total": "pc_hits",
+                 "vllm:num_preemptions_total": "preemptions", "vllm:kv_cache_usage_perc": "kv_usage",
+                 "vllm:num_requests_running": "running", "vllm:num_requests_waiting": "waiting",
+                 "vllm:prompt_tokens_total": "prompt_tokens", "vllm:generation_tokens_total": "gen_tokens"}
+
+
+def server_stats(timeout=5.0):
+    """Cache / load counters from the server (None if unavailable). Cumulative counters are summed over engines.
+
+    vLLM: /metrics (prefix-cache queries/hits in tokens, preemptions, KV usage fraction, running/waiting).
+    SGLang: /v1/loads (running/waiting, token_usage, cumulative uncached prefill tokens, retracted queue)."""
+    import urllib.request
+    try:
+        if SERVER == "sglang":
+            with urllib.request.urlopen(BASE + "/v1/loads", timeout=timeout) as r:
+                ld = json.loads(r.read())["loads"]
+            return {"running": sum(x.get("num_running_reqs", 0) for x in ld),
+                    "waiting": sum(x.get("num_waiting_reqs", 0) for x in ld),
+                    "kv_usage": max(x.get("token_usage", 0.0) for x in ld),
+                    "kv_used_tokens": sum(x.get("num_used_tokens", 0) for x in ld),
+                    "uncached_prefill": sum(x.get("total_prefill_uncached_tokens", 0) for x in ld),
+                    "retracted": sum((x.get("queues") or {}).get("retracted", 0) for x in ld)}
+        with urllib.request.urlopen(BASE + "/metrics", timeout=timeout) as r:
+            txt = r.read().decode(errors="ignore")
+        out = {}
+        for line in txt.splitlines():
+            if line.startswith("#"):
+                continue
+            name = line.split("{", 1)[0].split(" ", 1)[0]
+            if name in _VLLM_METRICS:
+                try:
+                    v = float(line.rsplit(" ", 1)[1])
+                except ValueError:
+                    continue
+                k = _VLLM_METRICS[name]
+                out[k] = max(out.get(k, 0.0), v) if k == "kv_usage" else out.get(k, 0.0) + v
+        return out or None
+    except Exception:
+        return None
+
+
+def cache_line(cur, prev):
+    """One progress-line fragment: prefix-cache hit rate over the window, KV usage, preemptions/retractions."""
+    if not cur:
+        return "server stats n/a"
+    prev = prev or {}
+    if SERVER == "sglang":
+        new = cur["uncached_prefill"] - prev.get("uncached_prefill", 0)
+        sent = cur.get("_client_prompt", 0) - prev.get("_client_prompt", 0)
+        hit = f"{100 * (1 - new / sent):.1f}%" if sent > 0 else "n/a"
+        return (f"cache hit {hit} (uncached prefill {new} of {sent}), running {cur['running']}, "
+                f"waiting {cur['waiting']}, "
+                f"KV usage {100 * cur['kv_usage']:.1f}%, retracted queue {cur['retracted']}")
+    dq = cur.get("pc_queries", 0) - prev.get("pc_queries", 0)
+    dh = cur.get("pc_hits", 0) - prev.get("pc_hits", 0)
+    hit = f"{100 * dh / dq:.1f}%" if dq > 0 else "n/a"
+    return (f"cache hit {hit} (of {dq:.0f} prompt tokens), running {cur.get('running', 0):.0f}, "
+            f"waiting {cur.get('waiting', 0):.0f}, KV usage {100 * cur.get('kv_usage', 0):.1f}%, "
+            f"preemptions {cur.get('preemptions', 0) - prev.get('preemptions', 0):.0f} "
+            f"(total {cur.get('preemptions', 0):.0f})")
 
 
 # ---------------------------------------------------------------- client
@@ -475,6 +593,8 @@ class Client:
     def __init__(self):
         import httpx
         self.last_prompt_tokens = None
+        self.prompt_tokens = 0  # summed over finished requests (final usage), for the cache hit rate
+        self.cached_tokens = 0  # usage.prompt_tokens_details.cached_tokens when the server reports it
         self.http = httpx.AsyncClient(base_url=BASE, timeout=httpx.Timeout(connect=30.0, read=900.0, write=120.0, pool=None),
                                       limits=httpx.Limits(max_connections=512, max_keepalive_connections=512))
 
@@ -505,6 +625,7 @@ class Client:
         if stop:
             body["stop"] = stop
         text, ntok, finish = parts["text"], 0, None
+        last_usage = None
         async with self.http.stream("POST", "/v1/completions", json=body) as r:
             if r.status_code != 200:
                 raise RuntimeError(f"HTTP {r.status_code}: {(await r.aread())[:300]!r}")
@@ -524,6 +645,8 @@ class Client:
                     got_text = got_text or bool(c.get("text"))
                     if c.get("finish_reason"):
                         finish = c["finish_reason"]
+                if u:
+                    last_usage = u
                 if u and u.get("completion_tokens") is not None:
                     self.last_prompt_tokens = u.get("prompt_tokens") or self.last_prompt_tokens
                     if info is not None and u.get("prompt_tokens"):
@@ -537,6 +660,9 @@ class Client:
                 if time.time() > deadline:
                     finish = "deadline"
                     break
+        if last_usage and last_usage.get("prompt_tokens"):
+            self.prompt_tokens += last_usage["prompt_tokens"]
+            self.cached_tokens += (last_usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
         return "".join(text), ntok, finish or "stop"
 
 
@@ -570,6 +696,7 @@ class Scheduler:
         self.launch_margin = 120  # no new attempts in the last 2 min before forcing
         self.retries = {}
         self.server_down = lambda: False  # set by main(): True while the vLLM server is dead or restarting
+        self.cache_stats = []  # periodic server cache/load counters (summary)
 
     def on_tokens(self, n):
         self.tokens += n
@@ -779,14 +906,22 @@ class Scheduler:
 
     async def monitor(self):
         last_t, last_k = time.time(), 0
+        prev = None
         while True:
             await asyncio.sleep(120)
             now = time.time()
             r = (self.tokens - last_k) / (now - last_t)
             last_t, last_k = now, self.tokens
+            cur = await asyncio.to_thread(server_stats)
+            if cur is not None:
+                cur["_client_prompt"] = getattr(self.client, "prompt_tokens", 0)
             log(f"progress: {len(self.records)} attempts done, in flight {len(self.inflight)}, pending1 "
                 f"{len(self.pending1)}, pending2 {len(self.pending2)}, tokens {self.tokens}, window {r:.0f} tok/s, "
-                f"rate est {self.rate():.0f} tok/s, avg {self.tokens / max(1, now - self.gen_start):.0f} tok/s")
+                f"rate est {self.rate():.0f} tok/s, avg {self.tokens / max(1, now - self.gen_start):.0f} tok/s | "
+                + cache_line(cur, prev))
+            if cur is not None:
+                self.cache_stats.append({"t": round(now - T0), **cur})
+                prev = cur
 
     async def run(self, jobs1):
         self.pending1 = list(jobs1)
@@ -986,6 +1121,16 @@ def main():
         open(slog, "a").close()
         log(f"external server {BASE} (model {SERVED}); skipping install and launch")
     else:
+        global TP
+        gpus = gpu_inventory()
+        TP = choose_tp(gpus)
+        PHASES["gpus"] = [f"{n} {m}MiB sm{c}" for n, m, c in gpus]
+        log(f"GPUs present: {gpus}; tensor parallel {TP}")
+        if TP == 0:
+            log("NO USABLE GPUS for Qwen3.8-27B-FP8 (need SM89+ and enough memory): keeping the fallback submission")
+            return
+        if TP != 4:
+            log(f"WARNING: running with TP={TP} instead of 4; KV capacity and concurrency shrink accordingly")
         mdir = model_dir()
         log("model dir:", mdir)
         install_server()
@@ -1064,6 +1209,8 @@ def main():
                    "answered": sum(r["answered"] for r in recs), "errors": sum("error" in r for r in recs),
                    "stream_errors": sum(r.get("stream_errors") or 0 for r in recs),
                    "server_preemption_lines": sum("preempt" in ln.lower() for ln in open(slog, errors="ignore")),
+                   "cache_stats": sch.cache_stats[-1] if sch.cache_stats else None,
+                   "cache_hit_overall": cache_line(sch.cache_stats[-1], None) if sch.cache_stats else None,
                    "kv_usage_max_pct": max([float(x) for x in re.findall(r"KV cache usage: ([\d.]+)%",
                                                                           open(slog, errors="ignore").read())] or [0]),
                    "tool_calls": sum(r.get("tool_calls") or 0 for r in recs),

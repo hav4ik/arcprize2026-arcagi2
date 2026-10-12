@@ -15,6 +15,7 @@ Experiment notes: `experiments/E013_kaggle_submission/README.md`.
 | `runs/` | Downloaded outputs of Kaggle runs (bench results, logs). |
 | `src/bench_sglang.py` | Offline SGLang throughput test (radix cache on vs off); notebook `nb_sglang_bench/` (`build_notebook.py --variant sglang_bench`). |
 | `wheel_sources/` | Wheel-source builder notebooks (see below). |
+| `src/replay_bench.py` | E014 agentic replay benchmark (concurrency sweep, prefix-cache hit rate, preemptions); notebook `nb_replay_<server>/` (`build_notebook.py --variant replay --env '{"ARC_SERVER": ..., "ARC_REPLAY_PLAN": ...}'`), dataset `chankhavu/arc2-agentic-replay` (`datasets/agentic_replay/build.py`). Test: `tests/fake_replay_test.py`. |
 
 ## Wheel sources (our own; user direction 2026-10-11: no third-party wheelhouses)
 
@@ -24,7 +25,7 @@ Builder notebooks run on CPU with internet and download wheels into their output
 | Source notebook | Contents | Builder |
 |---|---|---|
 | `chankhavu/vllm-0-23-0-py312-cu128` (user's) | vLLM 0.23.0, torch 2.11.0+cu128, flashinfer 0.6.12 (+ jit-cache cu128) | copy in `wheel_sources/vllm-0-23-0-py312-cu128.ipynb` |
-| `chankhavu/sglang-0-5-20-py312-cu130` | SGLang 0.5.20 + 208 wheels (6.66 GB): sglang-kernel 0.4.7, torch 2.13.0 (CUDA 13.0 libs), flashinfer 0.6.18 + cubin + jit-cache cu130, triton 3.7.1, transformers 5.12.1; cuda-tile 1.6.0rc5 built from its sdist. `requirements.lock`, `SHA256SUMS`, `manifest.json`, offline dry-run resolve verified in the builder. | `wheel_sources/build_sglang_source.py` |
+| `chankhavu/sglang-0-5-20-py312-cu130` (v3, E014) | v3 = same 208 wheels (SHA256 identical to v1) + `sglang_jit_cache/sm89` + `toolchain_check.json` (nvcc JIT for sm_89 verified on CPU). SGLang 0.5.20 + 208 wheels (6.66 GB): sglang-kernel 0.4.7, torch 2.13.0 (CUDA 13.0 libs), flashinfer 0.6.18 + cubin + jit-cache cu130, triton 3.7.1, transformers 5.12.1; cuda-tile 1.6.0rc5 built from its sdist. `requirements.lock`, `SHA256SUMS`, `manifest.json`, offline dry-run resolve verified in the builder. | `wheel_sources/build_sglang_source.py` |
 
 Both use the Python 3.12 image `gcr.io/kaggle-images/python@sha256:e5452ce6...` (the user's vLLM source image).
 The host driver (580.x) supports CUDA 13.0, which SGLang 0.5.20's torch 2.13 needs.
@@ -104,8 +105,12 @@ Kernel sessions cannot be cancelled through the API (403); stop them in the web 
   ARC_WORK=... ARC_INPUT=...`.
 - Submit (needs the user's OK; uses a daily slot):
   `.venv/bin/kaggle competitions submit arc-prize-2026-arc-agi-2 -k chankhavu/arc2-qwen38-tools-submit -v 2 -f submission.json -m "..."`
-- SGLang 0.5.20 (own source) does not start on Kaggle yet: sglang-kernel JIT needs nvcc (`/usr/local/cuda/bin/nvcc`
-  missing). Next fix: CUDA 13 nvcc wheel in the source + CUDA_HOME/PATH, TORCH_CUDA_ARCH_LIST=8.9.
+- SGLang 0.5.20 (own source) did not start on Kaggle: sglang-kernel JIT needs nvcc (`/usr/local/cuda/bin/nvcc`
+  missing). Fixed in E014 without new wheels: `solver.cuda_toolkit_env()` points CUDA_HOME at a `/tmp/cuda13` shim
+  over the pip CUDA 13 toolkit already in the source (verified on CPU: the failing kernel compiles for sm_89).
+  GPU replay runs pending (sessions pushed during the competition rerun got 2x T4; see E014).
+- Solver: TP from the GPUs present (`choose_tp`, `ARC_TP`), cache hit rate / KV usage / preemptions in the progress
+  lines (vLLM `/metrics`, SGLang `/v1/loads`).
 
 ## Submission watcher (`monitor_submissions.py`)
 

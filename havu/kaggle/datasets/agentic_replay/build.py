@@ -50,7 +50,7 @@ def segment(text, n_turns):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokenizer", required=True)
-    ap.add_argument("--out", default=os.path.join(HERE, "agentic_replay.json.gz"))
+    ap.add_argument("--out", default=os.path.join(HERE, "upload/agentic_replay.json.gz"))
     a = ap.parse_args()
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(a.tokenizer)
@@ -93,7 +93,7 @@ def main():
              "steady_state_ctx_mean": ss_ctx,
              "prefill_per_gen": (sum(x["final_ctx"] for x in out) - sum(gen)) / sum(gen),
              "bytes_gz": os.path.getsize(a.out)}
-    json.dump(stats, open(os.path.join(HERE, "stats.json"), "w"), indent=1)
+    json.dump(stats, open(os.path.join(HERE, "upload/stats.json"), "w"), indent=1)
     print(json.dumps(stats, indent=1))
 
 

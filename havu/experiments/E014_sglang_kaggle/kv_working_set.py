@@ -14,7 +14,7 @@ import sys
 import numpy as np
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-data = json.load(gzip.open(os.path.join(ROOT, "kaggle/datasets/agentic_replay/agentic_replay.json.gz"), "rt"))
+data = json.load(gzip.open(os.path.join(ROOT, "kaggle/datasets/agentic_replay/upload/agentic_replay.json.gz"), "rt"))
 starts, lens = [], []
 for x in data:
     for t in x["turns"]:
