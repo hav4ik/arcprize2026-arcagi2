@@ -252,6 +252,57 @@ def driver_env():
         os.environ["LD_PRELOAD"] = real + "/libcuda.so"
 
 
+def cuda_toolkit_env(env=None, shim=None):
+    """CUDA 13 toolkit from the pip wheels for JIT builds (SGLang's sglang-kernel JIT, FlashInfer, tvm-ffi).
+
+    The image has no /usr/local/cuda/bin/nvcc; our SGLang wheel source installs nvidia-cuda-nvcc/crt/nvvm/cccl/runtime
+    into site-packages/nvidia/cu13. JIT builders expect $CUDA_HOME/{bin/nvcc,include,nvvm} and link with
+    `-L$CUDA_HOME/lib64 -lcudart`, while the wheels ship lib/ with only libcudart.so.13, so a shim directory of
+    symlinks gives the expected layout. Updates `env` (default os.environ); returns the shim path or None."""
+    env = os.environ if env is None else env
+    shim = shim or os.environ.get("ARC_CUDA_SHIM", "/tmp/cuda13")
+    import site
+    roots = list(dict.fromkeys(site.getsitepackages() + glob.glob("/usr/local/lib/python3*/dist-packages")
+                               + glob.glob("/usr/lib/python3/dist-packages")))
+    cu = next((os.path.join(r, "nvidia/cu13") for r in roots if os.path.exists(os.path.join(r, "nvidia/cu13/bin/nvcc"))),
+              None)
+    if cu is None:
+        log("cuda toolkit: no nvidia/cu13/bin/nvcc in", roots)
+        return None
+    os.makedirs(os.path.join(shim, "lib64"), exist_ok=True)
+    for d in ("bin", "include", "nvvm", "lib", "share"):
+        src, dst = os.path.join(cu, d), os.path.join(shim, d)
+        if os.path.exists(src) and not os.path.lexists(dst):
+            os.symlink(src, dst)
+    for f in os.listdir(os.path.join(cu, "lib")):
+        dst = os.path.join(shim, "lib64", f)
+        if not os.path.lexists(dst):
+            os.symlink(os.path.join(cu, "lib", f), dst)
+    for name in ("cudart", "nvrtc"):
+        real = sorted(glob.glob(os.path.join(cu, "lib", f"lib{name}.so.*")))
+        dst = os.path.join(shim, "lib64", f"lib{name}.so")
+        if real and not os.path.lexists(dst):
+            os.symlink(real[0], dst)
+    env.update(CUDA_HOME=shim, CUDA_PATH=shim, CUDA_ROOT=shim,
+               PATH=os.path.join(shim, "bin") + ":" + env.get("PATH", ""),
+               LD_LIBRARY_PATH=(env.get("LD_LIBRARY_PATH", "") + ":" + os.path.join(shim, "lib64")).lstrip(":"),
+               TORCH_CUDA_ARCH_LIST=os.environ.get("ARC_CUDA_ARCH", "8.9"))
+    return shim
+
+
+def sglang_jit_env(env):
+    """SGLang JIT kernel cache: a writable dir, seeded from a pre-built cache attached as input if there is one."""
+    import shutil
+    jit = os.environ.get("ARC_SGL_JIT_DIR", "/tmp/sglang_jit")
+    seed = find_one(f"{INPUT}/**/sglang_jit_cache/sm89") if os.path.isdir(INPUT) else None
+    if seed and not os.path.exists(os.path.join(jit, "sm89")):
+        shutil.copytree(seed, os.path.join(jit, "sm89"), symlinks=True)
+        log("sglang JIT cache seeded from", seed)
+    os.makedirs(jit, exist_ok=True)
+    env["SGLANG_JIT_CACHE_DIR"] = jit
+    return jit
+
+
 def install_server():
     wd = wheel_dir()
     t = time.time()
@@ -283,6 +334,10 @@ def install_server():
     code, out = sh(f"{sys.executable} -c 'import torch, {mod}; print(torch.__version__, torch.version.cuda, "
                    f"torch.cuda.is_available(), torch.cuda.device_count(), {mod}.__version__)'", timeout=600)
     log("torch/server:", out.strip().splitlines()[-1] if out.strip() else out)
+    if SERVER == "sglang":
+        shim = cuda_toolkit_env()
+        code, out = sh(f"{shim}/bin/nvcc --version | tail -2", timeout=120) if shim else (1, "no shim")
+        log(f"cuda toolkit shim {shim}: nvcc rc={code} {out.strip().splitlines()[-1:] if out.strip() else ''}")
     if SERVER == "vllm":
         _, ldd = sh(f"ldd $({sys.executable} -c 'import glob, os, vllm; "
                     f"print(glob.glob(os.path.dirname(vllm.__file__) + \"/_C*.so\")[0])') | grep -i 'not found'",
