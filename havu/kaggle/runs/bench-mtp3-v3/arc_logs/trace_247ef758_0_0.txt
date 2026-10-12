@@ -1,0 +1,350 @@
+We need solve ARC-like transformation. Need final output only likely JSON grid? Let's analyze deeply.
+
+We have three training examples. Need infer pattern.
+
+Inputs are grids with some structure: a frame? There are boundary rows/cols? There are "separators" columns/rows with constant values? There are inner shapes? Output modifies interior by propagating patterns based on boundary row/col values and marker objects? Let's parse.
+
+Example 0:
+Input 12 rows x 18 cols.
+Rows:
+0: [0,4,0,2,3,3,6,3,3,4,7,3,3,3,3,3,3,3]
+1: [4,4,4,2,3,0,0,0,0,0,0,0,0,0,0,0,0,3]
+2: [0,4,0,2,3,0,...,3]
+3: [0,0,0,2,3,0...,3]
+4: [0,0,0,2,4,0...,4]
+5: [0,0,0,2,3,0...,3]
+6: [0,0,0,2,7,0...,7]
+7: [0,0,0,2,3,0...,3]
+8: [7,7,7,2,3,0...,3]
+9: [7,7,7,2,6,0...,6]
+10:[7,7,7,2,3,0...,3]
+11:[0,0,0,2,3,3,6,3,3,4,7,3,3,3,3,3,3,3]
+
+Output:
+0: [0,0,0,2,3,3,6,3,3,4,7,3,3,3,3,3,3,3]
+1: [0,0,0,2,3,0,0,0,0,0,0,0,0,0,0,0,0,3]
+2: [0,0,0,2,3,0,0,0,0,0,0,0,0,0,0,0,0,3]
+3: [0,0,0,2,3,0,0,0,4,0,0,0,0,0,0,0,0,3]
+4: [0,0,0,2,4,0,0,0,4,4,4,0,0,0,0,0,0,4]
+5: [0,0,0,2,3,0,0,0,0,4,7,7,0,0,0,0,0,3]
+6: [0,0,0,2,7,0,0,0,0,7,7,7,0,0,0,0,0,7]
+7: [0,0,0,2,3,0,0,0,0,7,7,7,0,0,0,0,0,3]
+8: [0,0,0,2,3,0,0,0,0,0,0,0,0,0,0,0,0,3]
+9: [0,0,0,2,6,0,0,0,0,0,0,0,0,0,0,0,0,6]
+10:[0,0,0,2,3,0,0,0,0,0,0,0,0,0,0,0,0,3]
+11:[0,0,0,2,3,3,6,3,3,4,7,3,3,3,3,3,3,3]
+
+Compare: There is left 3x? pattern (cols 0-2) and top row (row 0 cols 5-10?) and bottom row same. Output replaces left pattern? Let's map:
+Input has special columns: col3 all 2, col4 values, col17 values. Top row has pattern at cols 0-2: 0,4,0? Actually row0 cols0-2 0,4,0, col3 2, col4 3, cols5-10 3,6,3,3,4,7? row0 top: [0,4,0,2,3,3,6,3,3,4,7,3,3,3,3,3,3,3]
+Bottom row row11: [0,0,0,2,3,3,6,3,3,4,7,3,3,3,3,3,3,3]
+Output top row cols0-2 become 0,0,0 (erase input pattern). Left cols0-2 rows1-10 become 0, except row8-10? Actually output all 0 in cols0-2. Input left has row1 4,4,4; row2 0,4,0; rows8-10 7,7,7. Removed.
+
+Output introduces a 3x3-ish shape at center columns 8-10 rows3-7: values:
+row3: col8=4
+row4: col8=4,col9=4,col10=4
+row5: col9=4,col10=7? Wait row5 output: [.. 0,0,0, 0,4,7,7? positions? Let's index:
+Row5 output: [0,0,0,2,3,0,0,0,0,4,7,7,0,0,0,0,0,3]
+cols: 0 0,1 0,2 0,3 2,4 3,5 0,6 0,7 0,8 0,9 4,10 7,11 7? Wait length 18: positions:
+0 0
+1 0
+2 0
+3 2
+4 3
+5 0
+6 0
+7 0
+8 0
+9 4
+10 7
+11 7
+12 0...
+But row6: [0,0,0,2,7,0,0,0,0,7,7,7,0,0,0,0,0,7]
+cols9=7,10=7,11=7
+row7: [0,0,0,2,3,0,0,0,0,7,7,7,0,0,0,0,0,3]
+cols9=7,10=7,11=7
+So shape positions:
+(3,8)=4
+(4,8)=4,(4,9)=4,(4,10)=4
+(5,9)=4,(5,10)=7,(5,11)=7
+(6,9)=7,(6,10)=7,(6,11)=7
+(7,9)=7,(7,10)=7,(7,11)=7
+This resembles combining two shapes: a T? from top row pattern at col4? Wait input row0 has at cols5-10: 3,6,3,3,4,7? Maybe patterns: a horizontal line of length 6? Output draws a shape derived from left patterns and top pattern? Let's inspect other examples.
+
+Example 1:
+Input 10x15:
+row0: [0,5,0,0,3,4,4,7,4,5,4,7,4,4,4]
+row1: [5,0,5,0,3,4,0,0,0,0,0,0,0,0,4]
+row2: [0,5,0,0,3,7,0,0,0,0,0,0,0,0,7]
+row3: [8,0,0,0,3,4,0,0,0,0,0,0,0,0,4]
+row4: [0,8,0,0,3,4,0,0,0,0,0,0,0,0,4]
+row5: [0,0,8,0,3,5,0,0,0,0,0,0,0,0,5]
+row6: [0,7,0,0,3,4,0,0,0,0,0,0,0,0,4]
+row7: [7,7,7,0,3,7,0,0,0,0,0,0,0,0,7]
+row8: [0,7,0,0,3,4,0,0,0,0,0,0,0,0,4]
+row9: [0,0,0,0,3,4,4,7,4,5,4,7,4,4,4]
+
+Output:
+row0: [0,0,0,0,3,4,4,7,4,5,4,7,4,4,4]
+row1: [0,0,0,0,3,4,0,7,0,0,0,7,0,0,4]
+row2: [0,0,0,0,3,7,7,7,7,0,7,7,7,0,7]
+row3: [8,0,0,0,3,4,0,7,0,0,0,7,0,0,4]
+row4: [0,8,0,0,3,4,0,0,0,5,0,0,0,0,4]
+row5: [0,0,8,0,3,5,0,0,5,0,5,0,0,0,5]
+row6: [0,0,0,0,3,4,0,7,0,5,0,7,0,0,4]
+row7: [0,0,0,0,3,7,7,7,7,0,7,7,7,0,7]
+row8: [0,0,0,0,3,4,0,7,0,0,0,7,0,0,4]
+row9: same top/bottom? [0,0,0,0,3,4,4,7,4,5,4,7,4,4,4]
+
+Observations: There is central vertical separator col4 all 3? Yes col4 all 3. Maybe top and bottom rows define a pattern row at cols5-14 (interior right region). Left region cols0-3 has objects (diagonal 8s, 7 shape, 5 shape?). Output removes some left objects (5 and 7 at rows1-2,6-8? but keeps diagonal 8s? Actually output row3 8, row4 0 8, row5 0 0 8 remain. It removes 5/7 patterns in left region except? It adds patterns in right region based on? Let's identify.
+
+Input left region (cols0-3) has:
+row1: [5,0,5]
+row2: [0,5,0] (vertical? 5s at (1,0),(1,2),(2,1))
+row3: [8,0,0]
+row4: [0,8,0]
+row5: [0,0,8]
+row6: [0,7,0]
+row7: [7,7,7]
+row8: [0,7,0]
+These are three 3x3 shapes? For 5: positions (1,0),(1,2),(2,1) incomplete? For 7: plus shape? Actually row7 7,7,7; row6/8 0,7,0: plus/T? For 8: diagonal.
+Output left region: only diagonal 8s kept: rows3-5 (8,0,0 /0,8,0/0,0,8). The 5 and 7 patterns removed from left (rows1,2,6,7,8) set to 0, but 5? row? It doesn't keep them.
+In right region (cols5-14) output adds shapes:
+- At rows1-2 and 6-8? Let's see output right:
+Rows 0/9 top/bottom pattern remain: row0: [4,4,7,4,5,4,7,4,4,4] cols5-14. Row9 same.
+Row1: col7=7, col11=7
+Row2: col6-8=7, col10=7,col11? row2 output: [3,7,7,7,7,0,7,7,7,0,7] for cols5-14: positions 5 7,6 7,7 7,8 7,9 0,10 7,11 7,12 7,13 0,14 7. Hmm.
+Row3: col7=7,col11=7
+Row4: col9=5
+Row5: col8=5,col10=5
+Row6: col7=7,col9=5,col11=7
+Row7: same as row2
+Row8: same as row1
+Also row? There are 7s pattern at rows1-3,6-8 centered? It looks like two copies of 7 shape? Let's parse.
+
+Could be transformation: There is an input with a "frame" (outer rows/cols) and a divider. Some "source patterns" placed on one side of divider. Need copy them to other side according to top/bottom/line? Maybe each row's left non-zero pattern (a sprite) is projected horizontally to positions indicated by top row? Let's find general.
+
+Example 2:
+Input 10x14:
+row0: [0,3,0,1,2,2,2,3,2,2,2,6,2,2]
+row1: [3,3,3,1,2,0,0,0,0,0,0,0,0,2]
+row2: [0,3,0,1,2,0,0,0,0,0,0,0,0,2]
+row3: [0,0,0,1,3,0,0,0,0,0,0,0,0,3]
+row4: [0,6,0,1,2,0,0,0,0,0,0,0,0,2]
+row5: [6,0,6,1,2,0,0,0,0,0,0,0,0,2]
+row6: [0,6,0,1,6,0,0,0,0,0,0,0,0,6]
+row7: [0,0,0,1,2,0,0,0,0,0,0,0,0,2]
+row8: [7,7,7,1,2,0,0,0,0,0,0,0,0,2]
+row9: [0,0,0,1,2,2,2,3,2,2,2,6,2,2]
+Output:
+row0: [0,0,0,1,2,2,2,3,2,2,2,6,2,2]
+row1: [0,0,0,1,2,0,0,0,0,0,0,0,0,2]
+row2: [0,0,0,1,2,0,0,3,0,0,0,0,0,2]
+row3: [0,0,0,1,3,0,3,3,3,0,0,0,0,3]
+row4: [0,0,0,1,2,0,0,3,0,0,0,0,0,2]
+row5: [0,0,0,1,2,0,0,0,0,0,0,6,0,2]
+row6: [0,0,0,1,6,0,0,0,0,0,6,0,6,6]
+row7: [0,0,0,1,2,0,0,0,0,0,0,6,0,2]
+row8: [7,7,7,1,2,0,0,0,0,0,0,0,0,2]
+row9: same
+
+Input left region cols0-2 (since col3 separator 1) has patterns:
+row1: 3,3,3
+row2: 0,3,0
+row3: 0,0,0? row3 [0,0,0] but col4=3
+row4: 0,6,0
+row5: 6,0,6
+row6: 0,6,0
+row7: 0,0,0
+row8: 7,7,7
+Also top row has 3 at col1? row0 [0,3,0]
+Bottom row row9 [0,0,0]?
+Output left: row8 7,7,7 remains. Other left patterns (3 and 6) removed. In right region output adds:
+- 3 shape at rows2-4 cols6-8? row2 col7=3; row3 cols6-8=3,3,3; row4 col7=3. This is a plus/T? Actually 3 shape input left at rows1-2? row1 3,3,3; row2 0,3,0. Output shape at rows2-4 with horizontal line at row3 (cols6-8) and vertical at col7 rows2-4? Wait positions:
+row2 col7=3
+row3 col6,7,8=3
+row4 col7=3
+This is a plus sign (center row3 col7? plus with horizontal length 3 and vertical length 3). Input left 3 pattern was top horizontal line + center below? row1 333, row2 030: a T shape. Output T? Actually output is plus? Let's compare: Input 3 sprite: row1 [3,3,3]; row2 [0,3,0] (down T). Output at right: row2 [0,3,0]? row2 col7=3, row3 [3,3,3], row4 [0,3,0]. That's an X? No it's a plus rotated? It is a vertical line with horizontal middle: plus sign. Not same as input T? Maybe input 3 object includes row0 col1? Input row0 col1=3, so full sprite maybe rows0-2: row0 [0,3,0], row1 [3,3,3], row2 [0,3,0] (plus). Yes top boundary row0 left region had 3 at col1. So left object is plus of 3 (rows0-2). Output removed it from left but placed a plus of 3 in right at rows2-4? Center? Similarly 6 object input: rows4-6 maybe row4 060, row5 606, row6 060 (diamond?) Actually 6 pattern: row4 col1=6, row5 col0&2=6, row6 col1=6: an X/diamond. Output in right: row5 col11=6; row6 col10=6,col12=6,col13=6? row7 col11=6. Let's parse output 6 positions:
+row5: [.. col11=6]
+row6: [col10=6, col12=6, col13=6? row6: [0,0,0,1,6,0,0,0,0,0,6,0,6,6] indices: 0 0,1 0,2 0,3 1,4 6,5 0,6 0,7 0,8 0,9 0,10 6,11 0,12 6,13 6. Yes col10=6, col12=6, col13=6]
+row7: col11=6.
+That's a diamond? Positions relative: row5 (above) col11; row6 (middle) col10, col12, col13; row7 (below) col11. Middle has three cells (left, center? col12, right col13). Input 6 was row4 col1, row5 col0&2, row6 col1: diamond with middle left/right, no center? Output diamond shifted and maybe plus one? Let's see: input 6 diamond: coordinates (0,1), (1,0),(1,2), (2,1). Output: (0,1) at row5 col11; (1,0),(1,2),(1,3)? at row6 col10,col12,col13? That's not exact, maybe center? There are 4 sixes? Output row6 has 3 sixes plus row5/7 = 5? Actually 5 sixes. Input 6 has 4. Maybe one is from col4=6? Input row6 col4=6 (the row's "label"?) Let's include col4? col4 values are not separator; in Example2 col4 has values: row0 2,row1 2,row2 2,row3 3,row4 2,row5 2,row6 6,row7 2,row8 2,row9 2. This is a "row label" column just right of separator? In Example0 col4 values: 3,3,3,3,4,3,7,3,3,6,3,3. Example1 col5? Wait.
+
+Maybe structure: grid has a vertical separator column with constant value (2 in ex0, 3 in ex1, 1 in ex2). To its right is a "label" column (col4 in ex0, col5 in ex1? Actually ex1 separator col4 value 3; label col5 values: 4,4,7,4,4,5,4,7,4,4). To left of separator is a 3-wide area with shapes? To right beyond label is a big area? Output draws patterns in big area based on shapes and labels? Let's examine.
+
+In each example there is a rectangular frame/border? Top and bottom rows have a horizontal sequence (pattern) that may serve as template. There are also "left-side" objects (3x3) in a 3-column band just left of separator. There is a "center column" adjacent to separator (col4/5) with row labels (colors). There is a rightmost column with values matching row labels? In ex0: rightmost col17 values: 3,3,3,3,4,3,7,3,3,6,3,3, same as col4? Row0 top row? Let's check: col4 values (excluding top/bottom): row1 3,row2 3,row3 3,row4 4,row5 3,row6 7,row7 3,row8 3,row9 6,row10 3. Rightmost col17: row1 3,row2 3,row3 3,row4 4,row5 3,row6 7,row7 3,row8 3,row9 6,row10 3. Yes identical. Top/bottom row0/11 maybe full pattern with left 3 columns and rightmost? Ex0 top row col17=3, bottom=3.
+
+In ex1: separator col4 all 3. Label col5 values: row0 4,row1 4,row2 7,row3 4,row4 4,row5 5,row6 4,row7 7,row8 4,row9 4. Rightmost col14 values: row0 4,row1 4,row2 7,row3 4,row4 4,row5 5,row6 4,row7 7,row8 4,row9 4. Yes identical. Top/bottom rows have pattern across right region.
+
+In ex2: separator col3 all 1. Label col4 values: row0 2,row1 2,row2 2,row3 3,row4 2,row5 2,row6 6,row7 2,row8 2,row9 2. Rightmost col13 values same? row0 2, row1 2,row2 2,row3 3,row4 2,row5 2,row6 6,row7 2,row8 2,row9 2. Yes.
+
+So there is a vertical line at column s (value constant maybe background?), a label column s+1, and a right border column same as label. The top and bottom rows have a pattern in the right region (columns s+1 to rightmost maybe) that is constant across rows? Output: top/bottom rows become? In ex0 output top row left 3 cols zeroed, right pattern same. Bottom row same? Bottom row left zero, right pattern same. In ex1 top/bottom same, left zero. In ex2 top row left zero, bottom same. So top/bottom frame pattern is preserved but left area zeroed except some? Row8 in ex2 left remains 7,7,7! Why? In ex0/1 left 7 pattern removed except ex2 row8? Actually ex2 input row8 left [7,7,7], output unchanged. In ex0 input rows8-10 left 7,7,7/7,7,7? Output rows8-10 left zero. In ex1 input rows6-8 left 7 plus, output left zero (but row? output row7 all 0 left). So ex2 row8 remains. Why? Maybe because it is a "source" object that is not to be removed if its corresponding row label? Wait ex2 row8 label col4=2, rightmost=2, top/bottom? 7 pattern remains. In ex0 rows8-10 label col4 rows8=3,row9=6,row10=3; 7 pattern at rows8-10 left. Output removed. In ex1 7 pattern rows6-8 label col5 rows6=4,row7=7,row8=4; removed. In ex2 7 pattern at row8 only horizontal, not full 3-row? label row8=2. It remains maybe because it corresponds to a row in top/bottom? Let's understand transformation.
+
+Alternative view: The input has a set of "glyphs" on the left side and a "template" on top/bottom. Output uses the template to place "reflections" or "intersections" inside. Maybe left glyphs are "keys" that when matched with row/column labels produce marks. Let's inspect all.
+
+We need produce for test input. Let's formalize.
+
+Grids seem composed of:
+- A border/frame? Top and bottom rows contain a pattern in right region (between label column and right border) maybe the "answer template". In ex0 top row: [3,3,6,3,3,4,7,3,3,3,3,3,3,3,3] after label? Let's define after separator col3, label col4, inner cols5-16? Right border col17. Top row inner values (cols5-16): 3,3,6,3,3,4,7,3,3,3,3,3? Wait length 18, cols: 0-2 left, 3 sep, 4 label, 5-16 inner (12 cols), 17 right border. Top row: col4=3, col5=3,6=6,7=3,8=3,9=4,10=7,11-16=3. Right border col17=3. Output top row same. Bottom row same except left zero? row11: col0-2 0, col4=3, col5=3,6=6,7=3,8=3,9=4,10=7,11-16=3, col17=3.
+
+There may be a "background" color (3) in right region; other colored cells in top pattern: at col6=6, col9=4, col10=7? These may indicate positions to place corresponding left objects? In output ex0, right region added colored cells: 4,7 at positions related to top pattern? Let's map.
+
+Output ex0 right inner (cols5-16) rows1-10:
+row1 all 0
+row2 all 0
+row3: col8=4? Wait col8 is inner (since cols5-16). top row had 4 at col9 and 7 at col10, 6 at col6. Output 4 at row3 col8, row4 col8-10, row5 col9=4. 7 at row5 col10-11,row6 col9-11,row7 col9-11. So 4 shape placed around top 4 at col9? 7 shape placed around top 7 at col10? The top pattern cells act as anchors? Let's see.
+
+Input ex0 left objects:
+- 4 object? top row left has [0,4,0] at row0 col1; row1 [4,4,4]; row2 [0,4,0]? Actually input row0 col1=4, row1 col0-2=4,4,4, row2 col1=4. That's a plus shape of 4 at rows0-2 cols0-2 (center (1,1)). Output removed from left. In right output, 4 cells: positions:
+row3 col8=4
+row4 col8,9,10=4
+row5 col9=4
+plus? This is a T? Actually plus missing bottom? Let's list with top row anchor: top pattern 4 at col9? row0 col9=4. If we place 4 object (plus shape from left: row0 col1=4, row1 0-2=4, row2 col1=4) with its top cell aligned to top row? Input 4 object is plus with top, middle horizontal, below center. In output right 4: row3 center? row4 horizontal, row5 below. It lacks top? It has row3 col8, row4 col8-10, row5 col9. If aligned to top row col9? Suppose object shape coordinates relative to top cell (row0 col1): top (0,1), middle row1 (1,0),(1,1),(1,2), bottom (2,1). If place top at row3 col8? Then middle row4 col8,9,10; bottom row5 col9. Yes exactly. Top at row3 col8, not top border. So placed lower inside, at row3. Why row3? Maybe because of left object's vertical position? Input 4 object at left rows0-2; output at rows3-5. Maybe shift down by 3? Because removed top border? Hmm.
+
+- 7 object in input ex0 left rows8-10: row8 7,7,7; row9? wait row9 left [7,7,7]? input row9: [7,7,7,2,6,...] yes row9 [7,7,7]; row10 [7,7,7]? Actually input rows8,9,10 all 7,7,7? Let's check ex0 input row8: [7,7,7,...]; row9: [7,7,7,2,6,...]; row10: [7,7,7,2,3,...]. So a 3x3 block of 7? Output left zero. Output right 7 positions: row5 col10,11; row6 col9,10,11; row7 col9,10,11. That's not 3x3; it's maybe a 7 object shape from top row? Wait input top row has 7 at col10. The top row pattern maybe includes 7 as a cell, and the object to draw is derived from top row pattern around that cell? Hmm.
+
+- 6 object in input ex0: row0 col6=6 top, row9 col4=6 label? Actually left 6? There is no left 6 object except top row col6 and label row9 col4=6/rightmost=6. Output has no 6 in inner? Wait output ex0 no 6 in inner except top row col6=6 and row9 label? It has no 6 drawn in central right except top row and row9 label. So 6 maybe no shape because no left object? But top row has 6 at col6; maybe if no corresponding left shape, leave empty? But top row cell 6 remains.
+
+Example1:
+Left objects:
+- 5 object? Input row0 col1=5? top row left [0,5,0]; row1 [5,0,5]; row2 [0,5,0]. That's X/diamond? Coordinates: top center, middle left+right, bottom center. This is an X (diamond) without center. Output in right: 5 cells at row4 col9=5; row5 col8,10=5; row6 col9=5. That's same diamond shape, centered at row5 col9? Top at row4 col9, middle row5 col8/10, bottom row6 col9. Yes exactly. Input 5 object placed top row at left (rows0-2), output placed at rows4-6, col? Top row anchor? Top row pattern has 5 at col9? row0 col9=5. The output 5 diamond top cell at row4 col9, aligned vertically with top 5 col9. So top cell same column as top pattern 5, shifted down 4 rows.
+
+- 7 object input left: rows6 [0,7,0], row7 [7,7,7], row8 [0,7,0] plus? Also top row left? row? top row has no 7 at left? row0 col1=5. There's a 7 plus shape at left rows6-8. Output right 7 positions: row1-3 and row6-8? Let's identify shape: Output 7 cells form two plus-like shapes? Rows1: col7,11; row2: col6-8 and col10-12 plus col14? row3: col7,11; row6: col7,11; row7: col6-8,col10-12,col14; row8: col7,11. This looks like two copies? Maybe input 7 shape plus (center with cross) placed at multiple positions? Input 7 shape is plus sign: row6 [0,7,0], row7 [7,7,7], row8 [0,7,0]. Output right contains two plus signs? One centered at row2 col7? Coordinates: center row2? plus would have row1 col7, row2 col6,7,8, row3 col7. Yes that's a plus sign centered at (2,7). Another centered at (2,11)? row1 col11, row2 col10,11,12, row3 col11. And another? row7 plus centered at (7,7): row6 col7,row7 col6,7,8,row8 col7. Another at (7,11): row6 col11,row7 col10,11,12,row8 col11. Also there is 7 at row2 col14 and row7 col14, not part? Actually row2 col14=7, row7 col14=7 maybe right border? Rightmost col14 values in rows2/7 are 7 (label) and remain? Input rightmost col14 had 7 at row2,row7; output keeps them (border). Row2 output col14=7 is border not shape? Let's check row2 output: [0,0,0,0,3,7,7,7,7,0,7,7,7,0,7]; col14=7 yes border. Row7 col14=7 border. So 7 shapes are plus signs centered at columns 7 and 11? Why two? Top row pattern has 7 at col7 and col11? row0: cols5-14: 4,4,7,4,5,4,7,4,4,4. So top pattern has 7 at col7 and col11. Yes! For each top row colored cell (non-background? background 4? maybe), place the corresponding left object? Top row has 5 at col9 -> place 5 diamond at rows4-6 centered col9. Top row has 7 at col7 and col11 -> place 7 plus at rows1-3 and 6-8? Why both vertical positions? There are two 7 positions? Top row pattern has 7 at col7 and 11, but output has 7 plus shapes at both columns 7 and 11, and at two vertical positions: rows1-3 and 6-8. That's four plus shapes, not just two. Wait each top 7 appears maybe as anchor for a shape whose vertical position determined by left object's row? Input left 7 object at rows6-8. Why output at rows1-3 and 6-8? Maybe because 7 object occurs in left at two vertical positions? Let's re-examine input ex1 left: 7 cells at row6 col1=7, row7 col0-2=7, row8 col1=7 (plus). Only one. Output 7 shapes at rows1-3 and 6-8. Where did upper shape rows1-3 come from? Maybe from top row pattern itself? Top row left? no. Or maybe the object is not left shape but "difference" between input left and top/bottom? Let's see.
+
+In ex1 output, for top row 5 at col9: 5 shape only at rows4-6 (one). For top row 7 at col7/11: 7 shapes at rows1-3 AND rows6-8. Why two? Could be because there are two 7 occurrences in the "label column" or border? Label col5 has 7 at row2 and row7. Right border also row2,row7. Those rows correspond to vertical centers? Let's map.
+
+Example1 label column (col5) values:
+row0 4 (top)
+row1 4
+row2 7
+row3 4
+row4 4
+row5 5
+row6 4
+row7 7
+row8 4
+row9 4 (bottom)
+Non-background labels: row2=7, row5=5, row7=7. Output shapes vertical centers maybe at label rows? 5 shape centered at row5 col9 (label row5=5). 7 plus shapes centered at row2 and row7? Yes! Centers: plus at rows1-3 center row2; plus at rows6-8 center row7. At columns top pattern positions for color 7 (col7, col11). So rule: For each row r where label column value c != background, take the shape of color c from the left area (or maybe from top row left), and stamp it in the right area at all columns where top row (or bottom?) has color c? Or maybe stamp shape centered at row r, with horizontal position at each top/bottom cell of same color? Let's test with ex0.
+
+Ex0 label col4 values: background? Most 3, exceptions row4=4, row6=7, row9=6. Non-background: row4=4, row6=7, row9=6. Output shapes:
+- color 4: shape? centered at row4? It has cells row3 col8, row4 col8-10, row5 col9. Center row4, yes. Horizontal columns? Top row pattern has 4 at col9. Shape centered at col9? If shape is T? Input 4 object plus? For color 4 left object: coordinates (0,1),(1,0),(1,1),(1,2),(2,1) center row1 col1. If centered at (row4,col9), cells: (3,9),(4,8),(4,9),(4,10),(5,9). But output has (3,8),(4,8,9,10),(5,9). That's centered at col8? Let's check top row 4 at col9? Row0: index: 0 0,1 4,2 0,3 2,4 3,5 3,6 6,7 3,8 3,9 4,10 7,11 3... yes top 4 at col9. Output 4 shape: top cell at row3 col8, middle row4 col8-10, bottom row5 col9. Center would be row4 col9? middle horizontal 8-10 center col9, top cell should be col9, bottom col9. But output top cell at col8, not col9. Did I mis-index? Let's re-evaluate output row3: [0, 0, 0, 2, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 3]. Indices: 0:0,1:0,2:0,3:2,4:3,5:0,6:0,7:0,8:4,9:0,10:0. Yes top cell col8. Row4: [0,0,0,2,4,0,0,0,4,4,4,0,...] col8,9,10. Row5: col9=4. So shape's top is shifted left relative to middle? Input left 4 object: row0 [0,4,0] col1; row1 [4,4,4] cols0-2; row2 [0,4,0] col1. That's symmetric. Why output asym? Wait output 4 shape maybe not full plus; it's a different shape due to overlap with 7? Maybe 7 overwrote top center? At (3,9) would be 4 but maybe 7 shape? 7 shape has no row3. Or maybe top row 4 anchor is at col8 not col9? Check input top row maybe col8=4? row0: [0, 4, 0, 2, 3, 3, 6, 3, 3, 4, 7, 3, 3, 3, 3, 3, 3, 3]. Let's count carefully: The string: 0 (idx0), 4 (1), 0 (2), 2 (3), 3 (4), 3 (5), 6 (6), 3 (7), 3 (8), 4 (9), 7 (10), 3 (11), 3 (12), 3 (13), 3 (14), 3 (15), 3 (16), 3 (17). Yes 4 at idx9, 7 at idx10. But output 4 shape top at idx8. Could the shape be left 4 object but with center at (row4,col9) and top cell overwritten by something? no.
+
+Maybe I misread output row4? It says [0, 0, 0, 2, 4, 0, 0, 0, 4, 4, 4, 0, 0, 0, 0, 0, 0, 4]. Index 4 label=4, then 5 0,6 0,7 0,8 4,9 4,10 4,11 0. Yes.
+
+Could the output 4 shape be not the left 4 object but top row left pattern? Input top row left (cols0-2) had 4 at col1 only, plus row1? Actually left 4 object spans rows0-2: row0 col1=4; row1 4,4,4; row2 col1=4. It is symmetric. Output 4 shape missing top center but has top left? Wait output has row3 col8, row4 8-10, row5 9. This is like input 4 object shifted such that its middle row aligns with label row4, but top row of object is at row3 col8 (left), bottom row at row5 col9. It is not symmetric; maybe because row3 col9 is occupied by background? No, background would be 0 in interior; can be overwritten. Could there be a collision with something that removed (3,9)? What could overwrite with 0? No output only non-zero where drawn. Maybe shape is not plus but a "7-segment" glyph? Let's compare with top row pattern: Maybe the pattern in top row (cols5-10) [3,6,3,3,4,7] represents a sequence of segments? The left objects are "digit" shapes? 4 and 7? The output draws digital digits? Hmm.
+
+Let's look at ex0 output 7 shape: row5 col10,11; row6 col9,10,11; row7 col9,10,11. Input left 7 object? There are 7s at rows8-10 all [7,7,7] (3x3 block) not a symmetric shape. Output 7 shape is 3 rows: row5 has two cells at col10-11, row6/7 three cells col9-11. That's a 2x3 plus missing top-left? Actually coordinates: (5,10),(5,11),(6,9),(6,10),(6,11),(7,9),(7,10),(7,11). It looks like a 3x3 block missing (5,9), maybe also missing? This may be derived from label row6=7? If shape is 3x3 block of 7 with top row partially missing due to overlap? Top row block would rows5-7 cols9-11 (if centered row6 col10). That would be all 9 cells. Output missing (5,9). Why? Maybe because it collides with 4 shape? (5,9) is 4, not 7. Yes row5 col9 is 4 from 4 shape, overwrites 7? If both shapes overlap, priority? 4 shape includes (5,9); 7 block includes (5,9). Output has 4. So 7 block missing where 4 overlaps. That suggests 7 object is 3x3 block (from left rows8-10 all 7). Center at row6? If center label row6, block rows5-7, columns? Top row 7 at col10 maybe center col10 -> cols9-11. Then (5,9) conflict with 4 bottom at (5,9), 4 wins. Good. What about 4 shape? It might be 3x3? If 4 object is not plus? Let's infer from input left 4: rows0-2? row0 0,4,0; row1 4,4,4; row2 0,4,0. That's plus (5 cells). If centered row4 col9, full plus cells (3,9),(4,8),(4,9),(4,10),(5,9). Output has (3,8) instead of (3,9). Is there another interpretation: maybe 4 object is not plus but "arrow" from top row? Input 4 left includes top row col1=4 but maybe that's part of top frame, not object? The object in left area could be rows1-2 only? row1 4,4,4; row2 0,4,0 (T shape). Then output 4 shape: row3? If T shape (horizontal top, center below) placed? Let's test: T shape coordinates relative top row: row0 (0,0),(0,1),(0,2), row1 (1,1). If centered at label row4? Place top row at row3? Then cells row3 col8-10, row4 col9. Output has row3 only col8; row4 8-10. Not.
+
+If object is row0 col1 + row1 444 (an up-arrow?), coordinates (-1,0),(0,-1),(0,0),(0,1). Placed center row4? Then row3 col9, row4 8-10. Output row3 col8 not.
+
+Could it be shape derived from "input top row left" but not all 4? Let's compare ex2 3 shape to left input. Ex2 input 3 object: row0 col1=3, row1 3,3,3, row2 0,3,0 (plus). Output 3 shape: row2 col7=3, row3 col6-8=3, row4 col7=3. If center label row3=3, full plus centered at (3,7) would be row2 col7, row3 col6-8, row4 col7. That matches exactly. Top row 3 at col7? Top row pattern has 3 at col7? row0: [0,3,0,1,2,2,2,3,2,2,2,6,2,2], col7=3 yes. So 3 shape matches full plus centered at label row3 and top column7. Good.
+
+Ex2 6 shape: label row6=6. Top row pattern has 6 at col11. Input left 6 object? rows4-6? row4 col1=6,row5 col0&2=6,row6 col1=6 (diamond). If centered at label row6? Let's define object coordinates. Input 6 diamond: top center (row4,col1), middle left/right (row5,col0,2), bottom center (row6,col1). Center is (row5,col1) (middle row). If stamp centered at label row6 and top column11, center row6, col11. Expected cells: row5 col11 (top), row6 col10 and col12 (middle), row7 col11 (bottom). Output has those plus row6 col13? Wait output row6 has col10=6, col12=6, col13=6. Extra at col13. Why? Right border? col13 is border, value row6=6. Ah! Rightmost border col13 has value 6 at row6 (label). That's preserved. It is not part of shape? The shape expected row6 col12; border col13 also 6. So output 6 shape is correct diamond, plus border col13. Great. So ex2 fits rule: For each label row with non-background color c, stamp the left sprite of color c (3x3 shape as it appears on left?) centered at that row, at each column in top frame where c appears? For 3: top frame c at col7, one shape centered row3 col7. For 6: top frame c at col11, one shape centered row6 col11. Border remains. Left row8 7 shape remains? Top frame has no 7? Actually top row pattern background 2, non-background 3 and 6 only. There is no 7 in top frame. But left has 7 shape at row8 (horizontal line). Since no top frame anchor, maybe it remains? Why in ex0/1 other left shapes without anchors removed? Ex0 top frame has 4 and 7 and 6? It has 4,7,6. Left has 4 shape (top row?), 7 block, but no 6 shape. 6 label row9 but no left 6? Output no 6 shape. 7 top frame anchor yes. 4 top frame anchor yes. Left shapes with anchors removed; 7 has anchor and removed. But ex2 7 no anchor remains. In ex0, maybe there is a 7 shape in left that is anchored, removed. In ex1, 7 anchored (top frame 7), removed. 5 anchored (top frame 5), removed. So left shapes with color present in top frame get erased and re-stamped right; left shapes with color absent in top frame remain unchanged? Ex2 7 absent -> remains. What about ex0 left 7 is a 3x3 block; top frame has 7. removed. Ex1 left 7 plus; top frame has 7. removed. Ex1 left 5 diamond; top frame has 5. removed. Ex0 left 4 plus; top frame has 4. removed. Ex2 left 3 plus; top frame has 3. removed. Ex2 left 6 diamond; top frame has 6. removed. Good.
+
+What about left shapes that are at top border rows? In ex0 4 object includes top row col1; top frame left part? It is erased. In ex1 5 object includes top row col1; erased. In ex2 3 object includes top row col1; erased.
+
+Now vertical position: centered at label row (the row in label column where value equals color c). Ex1 5 label row5, shape center row5; yes. 7 label rows2 and7, shapes centers row2 and7. Ex0 4 label row4, shape center row4? But full plus expected center (4,9); output seemed top at col8. Maybe maybe label row4, top frame 4 at col9, but shape is not plus? Let's re-examine ex0 4 shape if left sprite maybe is not symmetric. Input left 4 object: let's extract full color 4 cells in left area (cols0-2) input ex0:
+row0: col1=4
+row1: col0=4,col1=4,col2=4
+row2: col1=4
+No other 4 in left (row4 label 4 but not left). That's plus shape symmetric. If centered at row4, col? top row anchor col? If shape center is (1,1), top frame 4 at col9 -> center col9. Expected (3,9),(4,8-10),(5,9). Output (3,8) instead. Did I misassign top frame 4 column? Maybe top frame 4 at col8? Let's re-count top row ex0 after separator. Maybe separator column not col3? Input row0: [0, 4, 0, 2, 3, 3, 6, 3, 3, 4, 7, 3, 3, 3, 3, 3, 3, 3]. It has 2 at col3? Yes constant col3 2? Rows: row1 [4,4,4,2,...]; row2 [0,4,0,2]; row8 [7,7,7,2]. So separator col3 value 2. Then col4 label? row0 col4=3, row1 col4=3, row4 col4=4. So top row pattern begins at col4? But label column itself might be part of top frame, not separated? In ex1 separator col4=3, label col5 values. In ex0 top row has col4=3 (background), col5=3, col6=6, col7=3, col8=3, col9=4, col10=7, ... The top pattern's non-background colors are at col6=6, col9=4, col10=7. But could the "column anchor" be the label column value? Wait for ex2 top row: separator col3=1, label col4=2 (background), col5=2, col6=2, col7=3, col8=2, col9=2, col10=2, col11=6, col12=2, border col13=2. Non-background at col7 and 11. Shapes centered at those columns. So anchor columns are top row positions of color c excluding label? The label col4 background 2; not anchor.
+
+For ex0 if top 4 at col9, output center col? Maybe shape is centered at col8 because top 4 actually at col8 if label column is col5? Let's identify separator maybe col4? Wait in ex0 row1 [4,4,4,2,3,0,...] The constant column with 2 is col3. There is no other constant? Top row col3=2, yes. So left area cols0-2. label col4. Top pattern maybe includes label column? If anchor for 4 is col8? Where is 4 in top row if considering only inner cols5-16? At index 9. But maybe due to 0-index confusion? Let's write top row with indices:
+0 0
+1 4
+2 0
+3 2
+4 3
+5 3
+6 6
+7 3
+8 3
+9 4
+10 7
+11 3
+12 3
+13 3
+14 3
+15 3
+16 3
+17 3
+Yes.
+
+Output 4 shape indices:
+row3: 8=4
+row4: 8=4,9=4,10=4
+row5: 9=4
+This shape's center of horizontal is col9, vertical center row4. Top cell should be at center col9 for plus, but it's at col8. Is there a possibility that output row3 actually [.. 0,4,0?]? The given output row3: `[0, 0, 0, 2, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 3]` only one 4 at index 8. Could be typo? But assume data correct.
+
+Maybe left 4 sprite is not plus but shifted: row0 col1=4, row1 4,4,4, row2 col? Wait input row2: [0,4,0,2,3,...] yes col1. Symmetric.
+
+Maybe centering uses top frame cell as the *top-left* or *some reference* of sprite, not center. Let's derive from ex2 and ex1 to see.
+
+Ex1 5 sprite input left:
+row0: col1=5
+row1: col0=5,col2=5 (no center)
+row2: col1=5
+Coordinates relative top-left 3x3 (rows0-2, cols0-2): (0,1),(1,0),(1,2),(2,1). This is X/diamond. It is symmetric, no center. If anchor top frame 5 at col9 and label row5. Output 5 positions:
+row4 col9=5
+row5 col8=5,col10=5
+row6 col9=5
+If sprite placed with its top cell (0,1) at row4 col9, then center row5 col9? Expected: top row4 col9, middle row5 col8/10, bottom row6 col9. That matches. The label row5 is the *middle row* of sprite (since sprite height 3, center row = 1). So anchor top row? The top frame anchor column corresponds to sprite column 1 (center), but vertical placement uses label row as center row, not top. Equivalently sprite's center row aligns to label row, and center column aligns to top anchor. For symmetric diamond, top cell at center col.
+
+Ex2 3 sprite plus: coordinates (0,1),(1,0),(1,1),(1,2),(2,1). Center row=1, center col=1. Output center row3, center col7. Top cell row2 col7, middle row3 6-8, bottom row4 col7. matches.
+
+Ex2 6 sprite diamond: coords (0,1),(1,0),(1,2),(2,1) center row1, col1. Output center row6, col11: row5 col11, row6 10/12, row7 11. matches (plus border). Good.
+
+Ex1 7 sprite plus: coords (0,1),(1,0),(1,1),(1,2),(2,1). Top frame anchors at col7 and col11. Label rows with 7: row2 and row7. For each combination row2 x col7, row2 x col11, row7 x col7, row7 x col11, stamp plus centered. Output exactly four plus shapes (except border 7 at col14? not part). Yes.
+
+Ex0 7 sprite? Input left 7 cells: rows8-10 cols0-2 all 7? Let's verify input ex0 rows8,9,10 left:
+row8 [7,7,7,2,...]
+row9 [7,7,7,2,6,...]
+row10 [7,7,7,2,3,...]
+Yes 3x3 block. Coordinates all 9. Center row9, center col1? If label row with 7 is row6. Top frame 7 anchor col10. If center row aligns to label row6 and center col aligns to anchor col10, 3x3 block rows5-7 cols9-11. Output has that except (5,9) overwritten by 4? Yes. So rule works.
+
+Ex0 4 sprite? Coordinates plus centered (1,1). Label row4, top anchor col9. Should output plus centered row4 col9: (3,9),(4,8,9,10),(5,9). But output has (3,8),(4,8,9,10),(5,9). Why top cell col8 not col9? Could it be because top anchor for 4 is col8? Maybe top row has 4 at col8 if we treat top row pattern differently? Let's look at top row ex0: Maybe the top row after separator is not row0 but row11? Bottom row: [0,0,0,2,3,3,6,3,3,4,7,3,3,3,3,3,3,3]. Same. 4 at col9. Hmm.
+
+Could the 4 sprite be not plus but a shape with top-left? Let's examine input left 4 in ex0 maybe row0 col1=4 is not part of sprite because top row is frame and should be excluded? If sprite is rows1-2: row1 4,4,4; row2 0,4,0 (T shape). Center row? Height 2? If placed with horizontal row at label row4? Maybe row4 8-10, row5 9; and top? no. If sprite row1 444, row2 040, with anchor top frame 4 at col9? Maybe align horizontal row to row above label? Let's see output: horizontal row at label row4, bottom at row5. It lacks top row. If using only rows1-2 (T) and aligning horizontal row to label row4, center col9, we get row4 8-10, row5 9. That matches output except extra row3 col8. Where does row3 col8 come from? Could be top row of a full plus but shifted due to something? Wait if full plus, row3 col9. If T only, no row3. Output has row3 col8, not col9. Could row3 col8 be part of 4 sprite if sprite is asymmetric: input top row left maybe [0,4,0], but the 4 at row0 col1 might be considered col0 relative to object? Let's extract sprite coordinates from input not assuming 3x3 bounding box. Color 4 left cells: (0,1),(1,0),(1,1),(1,2),(2,1). If we choose a reference point not center, e.g., top-right? Output could match with reference at label row/anchor.
+
+Let's solve mapping from input sprite coordinates to output positions for ex0 4. We know label row r=4, anchor col a maybe 9 or 8? Output coords: (3,8),(4,8),(4,9),(4,10),(5,9). Input coords: (0,1),(1,0),(1,1),(1,2),(2,1). Find a translation (dr, dc) such that input+ (dr,dc) = output? If dr=3, then rows: 0->3,1->4,2->5 matches. Columns: input col1->8 => dc=7; input col0->8? (1,0)-> (4,8) dc=8. Not uniform. So not simple translation. If anchor col a=8, maybe input col1 maps to 8, input col0 maps to8? no.
+
+Maybe output 4 shape is union of two things: plus centered at (4,9) but top cell (3,9) changed to (3,8) due to overlapping with something? What could move it? Maybe background color 3? No.
+
+Let's check ex0 output row3 col9 is 0, row3 col8 is 4. Is there any input at row3 col8? row3 all 0. Could be a diagonal from 6? No 6 top at col6, label row9=6; no 6 shape. Could be a 4 "shadow" from border? Hmm.
+
+Maybe I mis-copied output row3: It might be [0,0,0,2,3,0,0,0,0,4,0,0,0,0,0,0,0,3]? Let's re-read user text:
+Example 0 OUTPUT:
+
+[[0, 0, 0, 2, 3, 3, 6, 3, 3, 4, 7, 3, 3, 3, 3, 3, 3, 3], [0, 0, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3], [0, 0, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3], [0, 0, 0, 2, 3, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 3], [0, 0, 0, 2, 4, 0, 0, 0, 4, 4, 4, 0, 0, 0, 0, 0, 0, 4], [0, 0, 0, 2, 3, 0, 0, 0, 0, 4, 7, 7, 0, 0, 0, 0, 0, 3], [0, 0, 0, 2, 7, 0, 0, 0, 0, 7, 7, 7, 0, 0, 0, 0, 0, 7], [0, 0, 0, 2, 3, 0, 0, 0, 0, 7, 7, 7, 0, 0, 0, 0, 0, 3], [0, 0, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3], [0, 0, 0, 2, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6], [0, 0, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3], [0, 0, 0, 2, 3, 3, 6, 3, 3, 4, 7, 3, 3, 3, 3, 3, 3, 3]]
+
+Yes row3 col8. Could be a typo in problem? But likely not; maybe pattern more nuanced.
+
+Let's check if output 4 shape could be a *reflection* of left 4 sprite horizontally depending on something. Input plus symmetric, reflection no change. But output missing top center, extra top left. Maybe it's not a 4 sprite; maybe it's a "4" digit drawn in a 3x3 grid? The color 4 shape might represent digit 4, not plus. Input left has a 3x3 representation of digit 4? Let's view:
+row0: 0 4 0
+row1: 4 4 4
+row2: 0 4 0
+That's not a standard 4; maybe a plus. Color 7 shape 3x3 block maybe digit? Hmm.
+
+Maybe the left area contains *multiple* overlapping objects, and the sprite for a color is the set of cells of that color in the left area *excluding border/label*, but if a color appears in top frame, we take its bounding box and stamp? For 4, left 4 cells plus. For output, maybe stamp the *complement*? No.
+
+Let's examine other possible pattern: It might be a "nonogram"/"sliding block" where left side patterns are moved to positions determined by top and label columns, but with a rule based on the row's left pattern and top row: For each row in label column with color c, copy the entire top row pattern? Let's see.
+
+Alternative: The left 3xN patterns and top/bottom patterns are "masks". Output is the result of taking the *intersection* of rows and columns from left patterns? For each non-background color c, the left side gives a vertical mask (rows where c appears in left 3 cols) and the top row gives a horizontal mask (columns where c appears in top row
+
+I have to give my final answer now.
+</think>
+
+[[0, 0, 0, 0, 3, 9, 9, 1, 9, 9, 3, 9, 9, 9, 4, 6, 9, 9, 8, 9],
+ [0, 0, 0, 0, 3, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9],
+ [0, 0, 0, 0, 3, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9],
+ [0, 0, 0, 0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1],
+ [4, 0, 0, 0, 3, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9],
+ [0, 4, 0, 0, 3, 9, 0, 0, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9],
+ [0, 0, 4, 0, 3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+ [0, 0, 0, 0, 3, 4, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 4],
+ [6, 6, 6, 0, 3, 4, 0, 0, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 4],
+ [6, 6, 6, 0, 3, 6, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 6],
+ [6, 0, 6, 0, 3, 9, 0, 0, 0, 6, 0, 6, 0, 0, 0, 0, 0, 0, 0, 9],
+ [0, 0, 0, 0, 3, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9],
+ [0, 0, 0, 7, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+ [0, 0, 0, 7, 3, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9],
+ [0, 0, 0, 7, 3, 9, 8, 1, 9, 9, 3, 9, 9, 9, 4, 6, 9, 9, 9, 9]]

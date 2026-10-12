@@ -1,0 +1,80 @@
+# Prior works
+
+An index of public methods and datasets relevant to ARC-AGI-2. Each method gets its own summary file in this folder. Longer notes from the first research pass are in `../notes/research_2026-09-30.md`.
+
+## Methods
+
+| Method | Year | Type | Headline | Links | Summary |
+|---|---|---|---|---|---|
+| NVARC | 2025, ARC Prize 1st | Qwen3-4B fully fine-tuned on 3.2M synthetic + augmented puzzles; per-puzzle LoRA at test time; DFS sampling + augmentation-based rescoring | 27.6% semi-private (Kaggle, 4×L4, 12h) | [repo](https://github.com/1ytic/NVARC), [writeup](https://www.kaggle.com/competitions/arc-prize-2025/writeups/nvarc) | `../notes/research_2026-09-30.md` |
+| Imbue: ARC-AGI-2 evolution | 2026-02 | Per-task evolutionary search over Python `transform()` programs; LLM mutation from cell-level diffs; fitness = train correctness + LLM-judged generalization + simplicity | Public eval pass@2: Gemini 3 Flash 34→61.4% ($2.42/task); Kimi K2.5 12.1→34.0%; Gemini 3.1 Pro 88.1→95.1%. Code is AGPL-3.0 | [blog](https://imbue.com/blog/2026-02-27-arc-agi-2-evolution), [code](https://github.com/imbue-ai/darwinian_evolver) | [imbue_arc_agi_2_evolution.md](imbue_arc_agi_2_evolution.md) |
+| Noemon agentic solver | 2026-04 | Prose rules only, no code execution. Reasoner → leave-one-out Validator (cell diffs) → refine ×3, plus extra solver calls; stops early on duplicate grids, otherwise a judge picks. Instruction set is per task only. MIT | 92.5% public eval (Gemini 3.1 Pro; leaderboard mislabels it "Public Train"); $3.9/task list price. Base model alone: 88.1% at ~$1/task | [repo](https://github.com/noemon/noemon-arc-agi) | [noemon_agentic_solver.md](noemon_agentic_solver.md) |
+| Berman: natural-language instruction evolution | 2025-09 | Evolves natural-language instructions; scored by an LLM applying them to the train inputs (cell-match fraction). Released code: ≤35 instructions/task, stops at the first perfect one. No license | 29.4% semi-private (Grok 4), $30.4/task ($3,648 total) | [repo](https://github.com/jerber/arc-lang-public), [post](https://jeremyberman.substack.com/p/how-i-got-the-highest-score-on-arc-agi-again) | [berman_nl_instruction_evolution.md](berman_nl_instruction_evolution.md) |
+| Pang: library evolution | 2025-09 | Grok-4 writes Python `transform` programs; a global library of each task's top program (538 seeded from ARC-AGI-2 training) is shown as hints; ≤10 calls/task. No license | 26% semi-private, $3.97/task ($476 total). Our check: the library rarely helps on eval tasks, and there is no ablation | [repo](https://github.com/epang080516/arc_agi), [post](https://ctpang.substack.com/p/arc-agi-2-sota-efficient-evolutionary) | [pang_library_evolution.md](pang_library_evolution.md) |
+| Greenblatt: draw more samples | 2024-06 | ~8k GPT-4o Python programs per task, filtered on train pairs, then voting; diff-based revision. MIT | 43% ARC-AGI-1 semi-private (~$40k total). Revision 37→50%; ~+3% per doubling of samples | [repo](https://github.com/rgreenblatt/arc_draw_more_samples_pub) | [greenblatt_draw_more_samples.md](greenblatt_draw_more_samples.md) |
+| ARM (Accelerated/Abstraction Reasoning Model) | 2026-06 | Not a harness: a ~10.8M-parameter TRM variant with Perceiver latents and per-puzzle embeddings; votes over 1,000 augmentations. No license | 40.3% pass@2 on the ARC-AGI-1 **eval** set (leaderboard mislabels it "Public Train"); training protocol unverifiable | [repo](https://github.com/MarcelxMensch/arm-arc-agi) | [arm_abstraction_reasoning_model.md](arm_abstraction_reasoning_model.md) |
+| ARC-AGI-3 agent harnesses (14 entries) | 2026 | Game agents; the top ones verify code world models by exact replay of observations with diffs | Tycho 100, Retrodict 99.86, baseline1 98.97 (ARC-AGI-3 public demo) | [leaderboard](https://arcprize.org/leaderboard/community) | [arc_agi_3_agent_harnesses_survey.md](arc_agi_3_agent_harnesses_survey.md) |
+| The ARChitects | 2024 1st / 2025 2nd | LLM, test-time training, Product-of-Experts candidate scoring | — | [2024](https://github.com/da-fr/arc-prize-2024), [PoE paper](https://github.com/da-fr/Product-of-Experts-ARC-Paper) | — |
+| Tiny Recursive Models (TRM) | 2025 paper award | 7M-parameter recursive model, per-puzzle embeddings | ~8% ARC-AGI-2 | [repo](https://github.com/SamsungSAILMontreal/TinyRecursiveModels) | — |
+| SOAR | 2025 paper award | Self-improving evolutionary program synthesis with hindsight relabelling | — | [data](https://huggingface.co/datasets/julien31/soar_arc_train_5M) | — |
+| Poetiq | 2025 | Refinement harness on frontier LLMs | — | [repo](https://github.com/poetiq-ai/poetiq-arc-agi-solver) | — |
+| ARC Prize benchmarking harness | — | Plain single-prompt eval used for the leaderboard | DeepSeek V4 Flash 0731 max: 61.4% semi-private | [repo](https://github.com/arcprize/arc-agi-benchmarking) | Prompts in `../notes/prompts/` |
+
+## Datasets
+
+| Dataset | Where | Size | Origin | Local copy / notes |
+|---|---|---|---|---|
+| ARC-AGI-2 (Kaggle 2026) | Kaggle `arc-prize-2026-arc-agi-2` | 1000 train / 120 eval / 240 test | Human-made | `../data/` — eval solutions differ from GitHub on 4 tasks (`b6f77b65`, `4a21e3da`, `f560132c`, `faa9f03d`) |
+| NVARC synthetic | Kaggle `sorokin/nvarc-synthetic-puzzles` | 103k puzzles | LLM-written generators (gpt-oss-120b) | `../data/nvarc/` — the `nvarc_full` subset (55.9k) is seeded from the 120 eval tasks |
+| NVARC augmented | Kaggle `sorokin/nvarc-augmented-puzzles` | 3.2M samples | Augmented versions of the above plus real tasks | `../data/nvarc/` |
+| Nemotron-RL-ARC-AGI-v1 | HF `nvidia/Nemotron-RL-ARC-AGI-v1` | 10k train + 514 val | Sampled from ARC-AGI-2 + NVARC + neoneye | `../data/nemotron_rl/` (val only). Val = ARC-AGI-1 eval (400) + ARC-AGI-2 eval (120), some transformed |
+| Nemotron-SFT-ARC-AGI-v1 | HF `nvidia/Nemotron-SFT-ARC-AGI-v1` | ~18 GB | LLM reasoning traces | Not downloaded |
+| ARC-GEN | GitHub `google/ARC-GEN` | 900 generators | Human-written | Covers 891/1000 v2 train tasks, 0 eval tasks |
+| RE-ARC | GitHub `michaelhodel/re-arc` | 400 generators | Human-written | ARC-1 training only |
+| ARC-TGI | GitHub `Omega-Reasoning/ARC-Task-Generators-Inventory` | 461 generators | Human-validated | 11 target v2 eval tasks: exclude those |
+| BARC heavy | HF `barc0/200k_HEAVY_gpt4o-description-gpt4omini-code_generated_problems` | 200k | LLM-generated | Program + description per task |
+| neoneye collection | GitHub `neoneye/arc-dataset-collection` | 20 subsets | Mixed | Its ARC-AGI-2 folder contains eval tasks |
+| ARC Prize raw model outputs | HF `arcprize/arc_agi_v2_public_eval` | 106 MB | Model attempts on the public eval | Useful for error analysis only |
+
+## Public scores on ARC-AGI-2
+
+Numbers come from the [ARC Prize leaderboard](https://arcprize.org/leaderboard), checked 2026-10-01. Public eval is pass@2 over all test pairs.
+
+| Model | Public eval | Semi-private | $/task |
+|---|---|---|---|
+| Claude Fable 5.1 xhigh | 99.2 | 90.0 | 3.12 |
+| GPT-6 Astra xhigh | 97.9 | 93.3 | 0.83 |
+| Claude Opus 5.5 high | 93.5 | 93.3 | 0.41 |
+| Gemini 3.8 Flash high | 92.5 | 89.2 | 0.40 |
+| GLM-5.3-Flash max | 66.8 | 65.8 | 0.09 |
+| DeepSeek V4 Flash 0731 max | 63.9 | 61.4 | 0.04 |
+| Kimi K3 max | 61.7 | 60.4 | 1.59 |
+| DeepSeek V4 Pro 0813 max | 59.4 | 61.3 | 0.60 |
+| NVARC 2025 (Kaggle) | — | 27.6 | 0.20 |
+| DeepSeek V3.2 | 3.9 | 4.0 | — |
+
+No public scores exist on NVIDIA's Nemotron-RL ARC-AGI validation split.
+
+The ARC Prize community leaderboard snapshot (22 entries) is in `arcprize_community_leaderboard_2026-10-01.json`. Its "cost" field is usually the total for the run, not per task. Two entries are labelled "Public Train" but were actually evaluated on eval sets.
+
+## Harnesses ported to DeepSeek V4.1-Flash (estimates)
+
+Our baseline is the plain ARC Prize prompt at 2 calls per test pair: 78.1% pass@2 on the public eval, ~$0.07–0.09/task. The estimates below assume $0.035/call and come from the per-method summaries; none has been measured.
+
+| Harness | Hypothesis form | Calls/task | Est. $/task | Notes |
+|---|---|---|---|---|
+| Plain prompt, 2 attempts (E001d) | Direct grid | ~2.8 | 0.07–0.09 | Measured |
+| Pang-style: 10 code samples + train check | Python | ≤10 | ≤0.35 | Library likely irrelevant; test the sampling and verification alone first |
+| Imbue evolution | Python | ~9–10× base | 0.2–0.4 | AGPL: reimplement |
+| Noemon | Prose + leave-one-out validator | 17–34 | 0.6–1.2 | MIT; prompts portable |
+| Berman natural-language evolution | Prose + LLM executor | 27–147 | 1–5 | No license |
+| Greenblatt | Python, thousands of samples | ~8k | ~280 | Not viable; keep the filter-and-vote idea |
+
+**Common core of every strong harness:**
+1. Write the hypothesis as code or prose.
+2. Check it against all training pairs.
+3. Return cell-level diffs.
+4. Refine.
+5. Choose the final 2 answers from the verified candidates.
+
+They differ mainly in the hypothesis form and the budget. The ARC-AGI-3 survey's evidence: verified executable models beat text-only ones, and fixed multi-agent role teams don't pay off.
