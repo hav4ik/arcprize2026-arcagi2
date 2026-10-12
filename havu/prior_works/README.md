@@ -14,6 +14,10 @@ An index of public methods and datasets relevant to ARC-AGI-2. Each method gets 
 | Greenblatt: draw more samples | 2024-06 | ~8k GPT-4o Python programs per task, filtered on train pairs, then voting; diff-based revision. MIT | 43% ARC-AGI-1 semi-private (~$40k total). Revision 37→50%; ~+3% per doubling of samples | [repo](https://github.com/rgreenblatt/arc_draw_more_samples_pub) | [greenblatt_draw_more_samples.md](greenblatt_draw_more_samples.md) |
 | ARM (Accelerated/Abstraction Reasoning Model) | 2026-06 | Not a harness: a ~10.8M-parameter TRM variant with Perceiver latents and per-puzzle embeddings; votes over 1,000 augmentations. No license | 40.3% pass@2 on the ARC-AGI-1 **eval** set (leaderboard mislabels it "Public Train"); training protocol unverifiable | [repo](https://github.com/MarcelxMensch/arm-arc-agi) | [arm_abstraction_reasoning_model.md](arm_abstraction_reasoning_model.md) |
 | ARC-AGI-3 agent harnesses (14 entries) | 2026 | Game agents; the top ones verify code world models by exact replay of observations with diffs | Tycho 100, Retrodict 99.86, baseline1 98.97 (ARC-AGI-3 public demo) | [leaderboard](https://arcprize.org/leaderboard/community) | [arc_agi_3_agent_harnesses_survey.md](arc_agi_3_agent_harnesses_survey.md) |
+| Hodel ARC-DSL + RE-ARC | 2023–24 | Functional Python DSL (160 primitives) with solvers for the 400 ARC-1 training tasks; RE-ARC = 400 generators verified by DSL solvers | ARC-1 only. Our check: the solvers fit 0/120 ARC-AGI-2 eval tasks | [dsl](https://github.com/michaelhodel/arc-dsl), [re-arc](https://github.com/michaelhodel/re-arc) | [hodel_arc_dsl_re_arc.md](hodel_arc_dsl_re_arc.md) |
+| icecuber DSL search | 2020 Kaggle 1st | Brute-force search, depth ≤4, over 142 C++ grid transforms | 20.6% ARC-1 private; **1.6% ARC-AGI-2 semi-private** | [repo](https://github.com/top-quarks/ARC-solution) | [icecuber_dsl_search.md](icecuber_dsl_search.md) |
+| BARC (Li, Ellis et al.) | 2024 | Python seeds plus a helper library ("library, not DSL"), remixed into 200k–400k problems; induction + transduction ensemble | 56.75% ARC-1 public eval (61.9% with Akyürek TTT) | [paper](https://arxiv.org/abs/2411.02272), [repo](https://github.com/xu3kev/BARC) | [barc_induction_transduction.md](barc_induction_transduction.md) |
+| DSL systems on ARC-AGI-2 (3 papers) | 2026 | DSL hints for Grok-4; LLM + GA over a 41-op DSL; ARCANA | 24.4% public (hints); 10% on 60 tasks (GA); ARCANA's 32.5% unverified | see file | [dsl_systems_arc_agi_2.md](dsl_systems_arc_agi_2.md) |
 | The ARChitects | 2024 1st / 2025 2nd | LLM, test-time training, Product-of-Experts candidate scoring | — | [2024](https://github.com/da-fr/arc-prize-2024), [PoE paper](https://github.com/da-fr/Product-of-Experts-ARC-Paper) | — |
 | Tiny Recursive Models (TRM) | 2025 paper award | 7M-parameter recursive model, per-puzzle embeddings | ~8% ARC-AGI-2 | [repo](https://github.com/SamsungSAILMontreal/TinyRecursiveModels) | — |
 | SOAR | 2025 paper award | Self-improving evolutionary program synthesis with hindsight relabelling | — | [data](https://huggingface.co/datasets/julien31/soar_arc_train_5M) | — |
@@ -30,7 +34,7 @@ An index of public methods and datasets relevant to ARC-AGI-2. Each method gets 
 | Nemotron-RL-ARC-AGI-v1 | HF `nvidia/Nemotron-RL-ARC-AGI-v1` | 10k train + 514 val | Sampled from ARC-AGI-2 + NVARC + neoneye | `../data/nemotron_rl/` (val only). Val = ARC-AGI-1 eval (400) + ARC-AGI-2 eval (120), some transformed |
 | Nemotron-SFT-ARC-AGI-v1 | HF `nvidia/Nemotron-SFT-ARC-AGI-v1` | ~18 GB | LLM reasoning traces | Not downloaded |
 | ARC-GEN | GitHub `google/ARC-GEN` | 900 generators | Human-written | Covers 891/1000 v2 train tasks, 0 eval tasks |
-| RE-ARC | GitHub `michaelhodel/re-arc` | 400 generators | Human-written | ARC-1 training only |
+| RE-ARC | GitHub `michaelhodel/re-arc` | 400 generators | Human-written (Hodel DSL; verified by DSL solvers) | ARC-1 training only (391/400 in v2 train, 0 in eval). See `hodel_arc_dsl_re_arc.md` |
 | ARC-TGI | GitHub `Omega-Reasoning/ARC-Task-Generators-Inventory` | 461 generators | Human-validated | 11 target v2 eval tasks: exclude those |
 | BARC heavy | HF `barc0/200k_HEAVY_gpt4o-description-gpt4omini-code_generated_problems` | 200k | LLM-generated | Program + description per task |
 | neoneye collection | GitHub `neoneye/arc-dataset-collection` | 20 subsets | Mixed | Its ARC-AGI-2 folder contains eval tasks |
@@ -78,3 +82,9 @@ Our baseline is the plain ARC Prize prompt at 2 calls per test pair: 78.1% pass@
 5. Choose the final 2 answers from the verified candidates.
 
 They differ mainly in the hypothesis form and the budget. The ARC-AGI-3 survey's evidence: verified executable models beat text-only ones, and fixed multi-agent role teams don't pay off.
+
+## DSLs (E015)
+The survey is `../experiments/E015_dsl_analysis/survey.md`.
+- **At inference:** DSL search and DSL-output systems score ≤10% on ARC-AGI-2, apart from unverified claims.
+- **Where DSLs pay off:** data generation, with Python generators plus a helper library as in BARC, NVARC and ARC-GEN, and possibly an optional helper library in the sandbox.
+- **Recommendation:** keep Python as the hypothesis language.

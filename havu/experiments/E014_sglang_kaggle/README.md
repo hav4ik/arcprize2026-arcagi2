@@ -114,7 +114,24 @@ valid 240-task fallback).
 Kaggle GPU quota at the start of E014: 4.61 h used of 30 h (resets 2026-10-17).
 
 ## Results
-Pending.
+- Toolchain: fixed and verified on CPU (wheel source v3). No GPU measurement yet: every GPU session pushed during
+  the competition rerun came up on 2x T4 and was aborted by the pre-check (~5 GPU-min used in total).
+- Offline working-set estimate: see Setup 3. vLLM's 1.40M reported KV covers concurrency 35 at the mean (80 %)
+  and roughly at p99.9; SGLang's default radix sizing (772k KV, 29 running) only covers ~24 agents. To run 35 on
+  SGLang, Mamba slots must drop to ~3 per request (`extra_buffer_lazy` + `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1`,
+  `--max-mamba-cache-size 108`, ~1.0M KV expected), which the replay will test first (fallbacks: skip-lock only
+  with 144 slots, then defaults).
 
 ## Conclusions
-Pending.
+Pending GPU runs. Expected from the analysis: host offload (hicache) mostly helps when the device pool overflows;
+the tool agents spend ~99 % of their time generating (tool calls take ~1 s against 50-100 s of decoding per turn),
+so the live working set must fit on the device anyway and hicache is at best a cheap safety net against
+retraction re-prefill at the top concurrency level.
+
+## Next (commands)
+1. When rerun 57088016 is no longer PENDING (`kaggle/monitor_submissions.py --once`):
+   `P=$(python3 experiments/E014_sglang_kaggle/plans.py)`, build `--variant replay` with `["sgl"]`, then
+   `.venv/bin/kaggle kernels push -p kaggle/nb_replay_sglang -t 3780` (planned 51 GPU-min).
+2. Then the vLLM replay: build with `["vllm"]`, `kernels push -p kaggle/nb_replay_vllm -t 2520` (planned 34 min).
+3. `kaggle kernels output chankhavu/arc2-e014-replay-<server> -p kaggle/runs/e014-replay-<server>-vN`, then
+   `.venv/bin/python experiments/E014_sglang_kaggle/report.py kaggle/runs/e014-replay-*-vN`.

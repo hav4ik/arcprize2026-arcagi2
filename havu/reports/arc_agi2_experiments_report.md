@@ -1,154 +1,157 @@
 # ARC-AGI-2 Experiment Report
 
-2026-10-12 · data snapshot 2026-10-12 01:01 UTC · regenerate with `.venv/bin/python reports/build_report.py`
+2026-10-12 · data snapshot 2026-10-12 03:08 UTC · regenerate with `.venv/bin/python reports/build_report.py`
 
 This report collects every model and harness experiment we have run on ARC-AGI-2 so far. Models: DeepSeek V4.1-Flash and V4-Pro (DeepSeek API); Qwen3.8-27B and Qwen3.6-35B-A3B (NVFP4 checkpoints on self-hosted SGLang, plus OpenRouter probes); Nemotron 3.5 Lightning and Nemotron 3 Super 120B (OpenRouter). Harnesses: a no-tool single call with the ARC Prize prompt; a generation API harness for Qwen that continues the raw completion through mid-thought EOS and forces a final answer at the budget; Python tool use in grid mode (answer as a grid, later handed over with `submit_answer`) and code mode (`submit_solution`, checked on the train pairs); and token-budget variants of the tool harness (hard caps, budget notes, soft targets, thinking-off turns). Every number below is recomputed from `evals/results/*.jsonl` and `kaggle/runs/` by `reports/build_report.py`.
 
 ## Scoring convention
 
-- **ARC Prize scoring, task-weighted.** Each task scores the fraction of its test pairs solved; the score is the mean over the 120 tasks.
+- **Primary metric: Kaggle score (pair-weighted).** The ARC Prize 2026 ARC-AGI-2 competition page on Kaggle allows 2 attempts per test input; a test output scores 1 if either attempt matches exactly, else 0, and "The final score is the average across all task test outputs". So the Kaggle score = solved test outputs / all test outputs (167 on the public eval set), and a task with 2–3 test inputs counts 2–3 times. All headline numbers, best-value shading, sorting, charts and paired Δs use this metric because it is what the competition scores.
+- **Secondary metric: ARC Prize task-weighted.** The ARC Prize benchmarking harness (`arc-agi-benchmarking`, `scoring.py`) scores each task as the fraction of its test pairs solved and averages over the 120 tasks. ARC Prize's published leaderboard numbers use this convention, so it is shown in smaller muted columns and quoted in parentheses where we compare with ARC Prize's numbers. The two differ only through the 45 tasks with more than one test input; for Table 1 runs the gap is at most 1.6 pp, and Kaggle is the lower of the two in 29 of 37 pass@1/pass@2 values (Appendix).
 - **Full set** = the official ARC-AGI-2 public evaluation set from github.com/arcprize/ARC-AGI-2 (120 tasks / 167 test pairs). This is the public evaluation set, not the hidden Kaggle test set (240 tasks / 259 pairs) and not ARC Prize's semi-private set.
-- **pass@1** = mean over attempts (samples) of the single-attempt score. **pass@2** = a pair counts if either of 2 attempts is correct; with more than 2 attempts it is the mean over all attempt pairs (attempts 0+1 shown as a0+a1).
+- **pass@1** = mean over attempts (samples) of the single-attempt score, ± sd over samples. **pass@2** = a test output counts if either of 2 attempts is correct (the Kaggle rule); with more than 2 samples it is the mean over all attempt pairs (attempts 0+1 shown as a0+a1). **Paired Δ** = run minus reference on the same test outputs (Kaggle pass@1, pp), 95% CI from a cluster bootstrap that resamples tasks (all test outputs of a task move together; 10,000 resamples).
 - **Completeness rule (Table 1).** A run is complete when every counted sample has a record for all 167 pairs. Attempts lost to an API error are scored wrong; a sample with more than 1 such attempt counts as incomplete and the run goes to Table 2.
 - **Tokens/attempt** = output (completion) tokens summed over all turns of an attempt, over attempts that returned. **Cost**: rec. = recorded per-call cost (`est_cost_usd` at off-peak list price incl. input, or OpenRouter's `cost_usd`); est. = output tokens × list price ($0.60/M Flash, $1.98/M Pro); rental = vast.ai box time from the README (footnoted).
-- **Other sets.** pilot-26 = the first 15 tasks in sorted id order (26 pairs); dev-56 = E009's stratified dev set (`experiments/E009_tool_token_efficiency/dev_pairs.txt`); E004a-20 = E004's hard-biased 20-pair subset. Partial runs are scored on their covered pairs only (a task's score is over its covered pairs; only covered tasks are averaged).
+- **Other sets.** pilot-26 = the first 15 tasks in sorted id order (26 pairs); dev-56 = E009's stratified dev set (`experiments/E009_tool_token_efficiency/dev_pairs.txt`); E004a-20 = E004's hard-biased 20-pair subset. Partial runs are scored on their covered pairs only (Kaggle: mean over covered test outputs; task-weighted: a task's score is over its covered pairs and only covered tasks are averaged).
 
 ## Table 1 — complete runs on the full public evaluation set (23 runs)
 
-Runs covering all 167 pairs for every counted sample, grouped by model family and sorted by pass@2 (runs without pass@2 last). **Bold** = best value in the column (highest score, fewest tokens). Scores in %; Δ in notes = paired pass@1 difference in pp, 95% bootstrap CI over tasks.
+Runs covering all 167 test outputs for every counted sample. Scores in %. **Kaggle pass@1 / pass@2** (pair-weighted, the competition metric) are primary; *ARC Prize task-weighted* columns (italic) are secondary. Grouped by model family and sorted by Kaggle pass@2 (runs without pass@2 last). **Bold** = best value in the column (highest Kaggle score, fewest tokens). Δ in notes = paired Kaggle pass@1 difference in pp, 95% cluster-bootstrap CI (tasks resampled).
 
-| Experiment ID | LLM model | Harness | Description | Samples | pass@1 | pass@2 | Tok mean | Tok median | Tok p90 | Correct tok median | Cost | Notes |
-|---|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|---|
-| `E009/E011 sub96n` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2sub prompt, low effort, 96k hard cap, budget notes from 50% used; … [^t1d-1] | 2 × 167/167 | **68.3 ± 2.2**<br><sub>69.9 / 66.8</sub> | **78.5** | 45.7k | 39.0k | 90.9k | 29.4k | $5.06/sample (rec.) | [^t1-1] |
-| `E004 grid-high` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2 prompt, high effort, 120k total / 64k per turn / 24k forced final, … [^t1d-2] | 2 × 167/167 | 68.3 ± 1.7<br><sub>67.1 / 69.4</sub> | 78.2 | 55.2k | 48.5k | 106.7k | 34.9k | $6.15/sample (rec.) | [^t1-2] |
-| `E009 sub80s40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2sub prompt, low effort, 80k hard cap, budget note on every tool output, … [^t1d-3] | 3 × 167/167 | 67.8 ± 2.9<br><sub>67.8 / 70.7 / 64.9</sub> | 77.5<br><sub>a0+a1 77.4; 3 pairs</sub> | 40.7k | 37.6k | 74.3k | 25.4k | $4.50/sample (rec.) | [^t1-3] |
-| `E011 sub80s40h` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | sub80s40 at high effort | 2 × 167/167 | 66.0 ± 2.4<br><sub>64.3 / 67.6</sub> | 77.5 | 47.1k | 48.0k | 80.0k | 31.3k | $5.18/sample (rec.) | [^t1-4] |
-| `E011 sub80s40v` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | sub80s40 + --verify-submit (train check before accepting submit_answer), lean2sub prompt | 2 × 167/167 | 66.5 ± 1.3<br><sub>67.4 / 65.6</sub> | 77.2 | 41.9k | 37.6k | 78.0k | 26.8k | $4.62/sample (rec.) | [^t1-5] |
-| `E011 subv80s40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | sub80s40 + --verify-submit + lean2subv prompt (submit exactly solve(test_input)) | 2 × 167/167 | 65.7 ± 4.1<br><sub>62.8 / 68.6</sub> | 76.5 | 41.4k | 37.4k | 75.7k | 26.7k | $4.58/sample (rec.) | [^t1-6] |
-| `E010 s20x60` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2sub prompt, low effort, 60k hard cap, 20k soft target with strong wording; … [^t1d-7] | 2 × 167/167 (1 API-error attempt scored wrong) | 62.4 ± 1.7<br><sub>63.6 / 61.3</sub> | 76.5 | **32.9k** | **30.4k** | 57.4k | 24.1k | $3.58/sample (rec.) | [^t1-7] |
-| `E004-GL` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2 prompt, low effort, 120k total / 64k per turn / 24k forced final, harness … [^t1d-8] | 4 × 167/167 | 66.0 ± 3.1<br><sub>66.7 / 70.0 / 64.4 / 62.8</sub> | 76.4<br><sub>a0+a1 77.5; 6 pairs</sub> | 49.5k | 41.4k | 103.9k | 28.7k | $5.59/sample (rec.) | [^t1-8] |
-| `E010 s25x80` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2sub prompt, low effort, 80k hard cap, 25k soft target with strong wording; … [^t1d-9] | 2 × 167/167 | 64.7 ± 3.8<br><sub>61.9 / 67.4</sub> | 75.3 | 35.9k | 34.1k | 63.9k | 25.3k | $3.94/sample (rec.) | [^t1-9] |
-| `E001d` | DeepSeek V4.1-Flash (DeepSeek API) | no tools | ARC Prize prompt verbatim, max effort, max_tokens 200k, one call per attempt | 3 × 167/167 | 59.9 ± 5.5<br><sub>65.1 / 60.3 / 54.2</sub> | 74.6<br><sub>a0+a1 79.3; 3 pairs</sub> | 55.7k | 49.2k | 103.2k | 36.9k | $5.58/sample (est.) | [^t1-10] |
-| `E009 sub96s40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2sub prompt, low effort, 96k hard cap, notes on every output, 40k soft … [^t1d-11] | 1 × 167/167 | 67.8 | — | 42.1k | 38.2k | 79.4k | 27.3k | $4.68/sample (rec.) | [^t1-11] |
-| `E004 grid-max` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2 prompt, max effort, 120k total / 64k per turn / 24k forced final, harness … [^t1d-12] | 1 × 167/167 | 65.3 | — | 65.0k | 60.8k | 120.0k | 41.9k | $7.22/sample (rec.) | [^t1-12] |
-| `E004 cap100` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2 prompt, low effort, 100k total / 64k per turn / 24k forced final | 1 × 167/167 | 61.9 | — | 45.5k | 37.0k | 91.1k | 26.1k | $5.09/sample (rec.) | [^t1-13] |
-| `E004 code-high` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | submit_solution checked on train pairs, lean2, high effort, 120k total / 64k … [^t1d-14] | 1 × 167/167 | 61.9 | — | 58.9k | 50.9k | 113.2k | 34.4k | $6.66/sample (rec.) | [^t1-14] |
-| `E004 code-max` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | submit_solution checked on train pairs, lean2, max effort, 120k total / 64k per … [^t1d-15] | 1 × 167/167 | 60.7 | — | 65.2k | 56.9k | 120.0k | 41.1k | $7.16/sample (rec.) | [^t1-15] |
-| `E009 sub64a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2sub prompt, low effort, 64k hard cap, notes on every output, warn at 75%; … [^t1d-16] | 1 × 167/167 | 58.2 | — | 38.7k | 40.7k | 64.0k | 24.4k | $4.27/sample (rec.) | [^t1-16] |
-| `E004 plain-low` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | plain ARC Prize prompt (no lean2 suffix), low effort, 120k total / 64k per turn … [^t1d-17] | 1 × 167/167 | 51.2 | — | 61.0k | 51.2k | 120.0k | 37.5k | $6.61/sample (rec.) | [^t1-17] |
-| `E004 plain-max` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | plain ARC Prize prompt, max effort, 120k total / 64k per turn / 24k forced … [^t1d-18] | 1 × 167/167 | 47.6 | — | 86.2k | 97.5k | 120.0k | 58.6k | $9.06/sample (rec.) | [^t1-18] |
-| `E008 Qwen xhigh-240k` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | gen API | ARC Prize prompt, tier xhigh, temp 1.0 / top_p 0.95 / top_k 20 (official), 240k … [^t1d-19] | 2 × 167/167 | 36.4 ± 0.8<br><sub>35.8 / 36.9</sub> | 48.2 | 73.6k | 67.5k | 120.2k | 44.9k | ≈$27 rental [^rent-xhigh] | [^t1-19] |
-| `E012 Qwen tools full` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | E009 sub80s40 port: lean2sub prompt + submit_answer, tier medium, 48k hard cap, … [^t1d-20] | 2 × 167/167 | 25.8 ± 2.4<br><sub>27.5 / 24.2</sub> | 34.6 | 35.6k | 40.0k | **48.0k** | **23.1k** | box time [^rent-e012] | [^t1-20] |
-| `E008 Qwen medium-48k` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | gen API | ARC Prize prompt, tier medium, temp 0.6 / top_p 0.95 / top_k 20, 48k budget in … [^t1d-21] | 2 × 167/167 | 9.7 ± 0.1<br><sub>9.7 / 9.6</sub> | 13.3 | 39.1k | 44.8k | 50.6k | 23.8k | ≈$10 rental [^rent-medium] | [^t1-21] |
-| `E008 Qwen3.6-35B` | Qwen3.6-35B-A3B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000 Server) | gen API | ARC Prize prompt, no tier (thinking on), temp 1.0 / top_p 0.95 / top_k 20, … [^t1d-22] | 2 × 167/167 | 6.2 ± 0.0<br><sub>6.2 / 6.2</sub> | 7.5 | 53.0k | 56.6k | 81.4k | 37.2k | ≈$19 rental [^rent-36] | [^t1-22] |
-| `E008 Nemotron Lightning` | Nemotron 3.5 Lightning bf16, OpenRouter (CoreWeave) | no tools | ARC Prize prompt, high effort, max_tokens 200k, one call | 1 × 167/167 | 0.0 | — | 68.0k | 64.9k | 85.6k | — | $2.35/sample (rec.) | [^t1-23] |
+| Experiment ID | LLM model | Harness | Description | Samples | Kaggle pass@1 | Kaggle pass@2 | *ARC Prize pass@1 (task-wt.)* | *ARC Prize pass@2 (task-wt.)* | Tok mean | Tok median | Tok p90 | Correct tok median | Cost | Notes |
+|---|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|
+| `E009/E011 sub96n` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2sub prompt, low effort, 96k hard cap, budget notes from 50% used; … [^t1d-1] | 2 × 167/167 | **67.7 ± 3.4**<br><sub>70.1 / 65.3</sub> | **79.0** | *68.3 ± 2.2*<br><sub>69.9 / 66.8</sub> | *78.5* | 45.7k | 39.0k | 90.9k | 29.4k | $5.06/sample (rec.) | [^t1-1] |
+| `E004 grid-high` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2 prompt, high effort, 120k total / 64k per turn / 24k forced final, … [^t1d-2] | 2 × 167/167 | **67.7 ± 0.8**<br><sub>67.1 / 68.3</sub> | 77.8 | *68.3 ± 1.7*<br><sub>67.1 / 69.4</sub> | *78.2* | 55.2k | 48.5k | 106.7k | 34.9k | $6.15/sample (rec.) | [^t1-2] |
+| `E011 sub80s40v` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | sub80s40 + --verify-submit (train check before accepting submit_answer), lean2sub prompt | 2 × 167/167 | 65.9 ± 0.8<br><sub>66.5 / 65.3</sub> | 77.8 | *66.5 ± 1.3*<br><sub>67.4 / 65.6</sub> | *77.2* | 41.9k | 37.6k | 78.0k | 26.8k | $4.62/sample (rec.) | [^t1-3] |
+| `E011 sub80s40h` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | sub80s40 at high effort | 2 × 167/167 | 65.0 ± 1.3<br><sub>64.1 / 65.9</sub> | 77.2 | *66.0 ± 2.4*<br><sub>64.3 / 67.6</sub> | *77.5* | 47.1k | 48.0k | 80.0k | 31.3k | $5.18/sample (rec.) | [^t1-4] |
+| `E009 sub80s40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2sub prompt, low effort, 80k hard cap, budget note on every tool output, … [^t1d-5] | 3 × 167/167 | 66.5 ± 3.0<br><sub>66.5 / 69.5 / 63.5</sub> | 76.4<br><sub>a0+a1 76.0; 3 attempt pairs</sub> | *67.8 ± 2.9*<br><sub>67.8 / 70.7 / 64.9</sub> | *77.5*<br><sub>a0+a1 77.4; 3 attempt pairs</sub> | 40.7k | 37.6k | 74.3k | 25.4k | $4.50/sample (rec.) | [^t1-5] |
+| `E004-GL` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2 prompt, low effort, 120k total / 64k per turn / 24k forced final, harness … [^t1d-6] | 4 × 167/167 | 64.5 ± 2.6<br><sub>63.5 / 68.3 / 64.1 / 62.3</sub> | 75.6<br><sub>a0+a1 76.0; 6 attempt pairs</sub> | *66.0 ± 3.1*<br><sub>66.7 / 70.0 / 64.4 / 62.8</sub> | *76.4*<br><sub>a0+a1 77.5; 6 attempt pairs</sub> | 49.5k | 41.4k | 103.9k | 28.7k | $5.59/sample (rec.) | [^t1-6] |
+| `E010 s25x80` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2sub prompt, low effort, 80k hard cap, 25k soft target with strong wording; … [^t1d-7] | 2 × 167/167 | 65.3 ± 2.5<br><sub>63.5 / 67.1</sub> | 75.4 | *64.7 ± 3.8*<br><sub>61.9 / 67.4</sub> | *75.3* | 35.9k | 34.1k | 63.9k | 25.3k | $3.94/sample (rec.) | [^t1-7] |
+| `E011 subv80s40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | sub80s40 + --verify-submit + lean2subv prompt (submit exactly solve(test_input)) | 2 × 167/167 | 64.1 ± 3.4<br><sub>61.7 / 66.5</sub> | 75.4 | *65.7 ± 4.1*<br><sub>62.8 / 68.6</sub> | *76.5* | 41.4k | 37.4k | 75.7k | 26.7k | $4.58/sample (rec.) | [^t1-8] |
+| `E010 s20x60` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2sub prompt, low effort, 60k hard cap, 20k soft target with strong wording; … [^t1d-9] | 2 × 167/167 (1 API-error attempt scored wrong) | 61.4 ± 2.1<br><sub>62.9 / 59.9</sub> | 75.4 | *62.4 ± 1.7*<br><sub>63.6 / 61.3</sub> | *76.5* | **32.9k** | **30.4k** | 57.4k | 24.1k | $3.58/sample (rec.) | [^t1-9] |
+| `E001d` | DeepSeek V4.1-Flash (DeepSeek API) | no tools | ARC Prize prompt verbatim, max effort, max_tokens 200k, one call per attempt | 3 × 167/167 | 58.3 ± 6.1<br><sub>63.5 / 59.9 / 51.5</sub> | 73.3<br><sub>a0+a1 78.4; 3 attempt pairs</sub> | *59.9 ± 5.5*<br><sub>65.1 / 60.3 / 54.2</sub> | *74.6*<br><sub>a0+a1 79.3; 3 attempt pairs</sub> | 55.7k | 49.2k | 103.2k | 36.9k | $5.58/sample (est.) | [^t1-10] |
+| `E009 sub96s40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2sub prompt, low effort, 96k hard cap, notes on every output, 40k soft … [^t1d-11] | 1 × 167/167 | 66.5 | — | *67.8* | — | 42.1k | 38.2k | 79.4k | 27.3k | $4.68/sample (rec.) | [^t1-11] |
+| `E004 grid-max` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2 prompt, max effort, 120k total / 64k per turn / 24k forced final, harness … [^t1d-12] | 1 × 167/167 | 64.1 | — | *65.3* | — | 65.0k | 60.8k | 120.0k | 41.9k | $7.22/sample (rec.) | [^t1-12] |
+| `E004 cap100` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2 prompt, low effort, 100k total / 64k per turn / 24k forced final | 1 × 167/167 | 62.3 | — | *61.9* | — | 45.5k | 37.0k | 91.1k | 26.1k | $5.09/sample (rec.) | [^t1-13] |
+| `E004 code-high` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | submit_solution checked on train pairs, lean2, high effort, 120k total / 64k … [^t1d-14] | 1 × 167/167 | 61.1 | — | *61.9* | — | 58.9k | 50.9k | 113.2k | 34.4k | $6.66/sample (rec.) | [^t1-14] |
+| `E004 code-max` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | submit_solution checked on train pairs, lean2, max effort, 120k total / 64k per … [^t1d-15] | 1 × 167/167 | 59.9 | — | *60.7* | — | 65.2k | 56.9k | 120.0k | 41.1k | $7.16/sample (rec.) | [^t1-15] |
+| `E009 sub64a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | lean2sub prompt, low effort, 64k hard cap, notes on every output, warn at 75%; … [^t1d-16] | 1 × 167/167 | 57.5 | — | *58.2* | — | 38.7k | 40.7k | 64.0k | 24.4k | $4.27/sample (rec.) | [^t1-16] |
+| `E004 plain-low` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | plain ARC Prize prompt (no lean2 suffix), low effort, 120k total / 64k per turn … [^t1d-17] | 1 × 167/167 | 51.5 | — | *51.2* | — | 61.0k | 51.2k | 120.0k | 37.5k | $6.61/sample (rec.) | [^t1-17] |
+| `E004 plain-max` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | plain ARC Prize prompt, max effort, 120k total / 64k per turn / 24k forced … [^t1d-18] | 1 × 167/167 | 47.3 | — | *47.6* | — | 86.2k | 97.5k | 120.0k | 58.6k | $9.06/sample (rec.) | [^t1-18] |
+| `E008 Qwen xhigh-240k` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | no tools (raw gen API) | ARC Prize prompt, tier xhigh, temp 1.0 / top_p 0.95 / top_k 20 (official), 240k … [^t1d-19] | 2 × 167/167 | 35.9 ± 1.7<br><sub>34.7 / 37.1</sub> | 47.9 | *36.4 ± 0.8*<br><sub>35.8 / 36.9</sub> | *48.2* | 73.6k | 67.5k | 120.2k | 44.9k | ≈$27 rental [^rent-xhigh] | [^t1-19] |
+| `E012 Qwen tools full` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | E009 sub80s40 port: lean2sub prompt + submit_answer, tier medium, 48k hard cap, … [^t1d-20] | 2 × 167/167 | 24.6 ± 1.7<br><sub>25.7 / 23.4</sub> | 33.5 | *25.8 ± 2.4*<br><sub>27.5 / 24.2</sub> | *34.6* | 35.6k | 40.0k | **48.0k** | **23.1k** | box time [^rent-e012] | [^t1-20] |
+| `E008 Qwen medium-48k` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | no tools (raw gen API) | ARC Prize prompt, tier medium, temp 0.6 / top_p 0.95 / top_k 20, 48k budget in … [^t1d-21] | 2 × 167/167 | 9.6 ± 0.8<br><sub>10.2 / 9.0</sub> | 13.8 | *9.7 ± 0.1*<br><sub>9.7 / 9.6</sub> | *13.3* | 39.1k | 44.8k | 50.6k | 23.8k | ≈$10 rental [^rent-medium] | [^t1-21] |
+| `E008 Qwen3.6-35B` | Qwen3.6-35B-A3B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000 Server) | no tools (raw gen API) | ARC Prize prompt, no tier (thinking on), temp 1.0 / top_p 0.95 / top_k 20, … [^t1d-22] | 2 × 167/167 | 6.0 ± 0.0<br><sub>6.0 / 6.0</sub> | 7.2 | *6.2 ± 0.0*<br><sub>6.2 / 6.2</sub> | *7.5* | 53.0k | 56.6k | 81.4k | 37.2k | ≈$19 rental [^rent-36] | [^t1-22] |
+| `E008 Nemotron Lightning` | Nemotron 3.5 Lightning bf16, OpenRouter (CoreWeave) | no tools | ARC Prize prompt, high effort, max_tokens 200k, one call | 1 × 167/167 | 0.0 | — | *0.0* | — | 68.0k | 64.9k | 85.6k | — | $2.35/sample (rec.) | [^t1-23] |
 
 ## Table 2 — smaller sets, probes and partial runs (58 runs)
 
-‡ = NVIDIA validation subset (different task set). Paired diff = run minus reference on the pairs the run covers (pass@1, pp, 95% CI); references: E004-GL for DeepSeek tools, E001d for DeepSeek no-tool, Qwen xhigh-240k (same attempt indices; also capped at the run's hard cap, simulated) for Qwen.
+‡ = NVIDIA validation subset (different task set). Kaggle pass@1 / pass@2 = mean over covered test outputs (primary); *task-weighted* columns are secondary. Paired diff = run minus reference on the test outputs the run covers (Kaggle pass@1, pp, 95% cluster-bootstrap CI over tasks); references: E004-GL for DeepSeek tools, E001d for DeepSeek no-tool, Qwen xhigh-240k (same attempt indices; also capped at the run's hard cap, simulated) for Qwen.
 
-| Experiment ID | Model | Harness | Set | Samples / coverage | pass@1 | pass@2 | Tok mean / median | Paired diff vs reference | Status / notes |
-|---|---|---|---|---|--:|--:|--:|---|---|
-| `E008 Qwen OpenRouter pilot` | Qwen3.8-27B bf16, OpenRouter (DeepInfra) | no tools | pilot-26 (26 pairs) | 1 × 26/26 | 20.0 | — | 35.2k / 36.2k | vs E008 Qwen xhigh-240k: −20.0 [−40.0, −1.7] (20.0 vs 40.0, 26 pairs) | done [^t2-1] |
-| `E008 Nemotron Super pilot` | Nemotron 3 Super 120B-A12B fp8, OpenRouter (DekaLLM) | no tools | pilot-26 (26 pairs) | 5 attempts, 5 pairs / 4 tasks; 21 errors | 0.0 | — | 49.2k / 47.7k | — | provider errors [^t2-2] |
-| `E008 Qwen xhigh pilot` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | gen API | pilot-26 (26 pairs) | 2 × 26/26 | 40.0 (36.7 / 43.3) | 46.7 | 68.5k / 63.2k | — | merged [^t2-3] |
-| `E012 pilot medium-48k s24` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | pilot-26 (26 pairs) | 17/52 attempts | 66.7 | 66.7<br><sub>6 pairs with 2 attempts</sub> | 16.6k / 16.8k | vs E008 Qwen xhigh-240k: −4.2 [−37.5, +25.0] (66.7 vs 70.8, 11 pairs) [^t2p-4] | stopped [^t2-4] |
-| `E012 pilot xhigh-48k s24` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | pilot-26 (26 pairs) | 12/52 attempts | 75.0 | 100.0<br><sub>4 pairs with 2 attempts</sub> | 16.9k / 16.4k | vs E008 Qwen xhigh-240k: +5.0 [+0.0, +15.0] (75.0 vs 70.0, 8 pairs) [^t2p-5] | stopped. tier xhigh, 48k hard / 24k soft; sources: submit 12 |
-| `E012 pilot xhigh-48k s24v` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | pilot-26 (26 pairs) | 2/52 attempts | 100.0 | 100.0<br><sub>1 pairs with 2 attempts</sub> | 4.0k / 4.0k | vs E008 Qwen xhigh-240k: +0.0 [+0.0, +0.0] (100.0 vs 100.0, 1 pairs) [^t2p-6] | stopped [^t2-6] |
-| `E012 pilot xhigh-80k s40` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | pilot-26 (26 pairs) | 11/52 attempts | 80.0 | 100.0<br><sub>3 pairs with 2 attempts</sub> | 20.1k / 24.1k | vs E008 Qwen xhigh-240k: +10.0 [−30.0, +60.0] (80.0 vs 70.0, 8 pairs) [^t2p-7] | stopped. tier xhigh, 80k hard / 40k soft; sources: submit 11 |
-| `E012 dev medium-48k s24` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | dev-56 (56 pairs) | 112/112 attempts | 20.4 (22.4 / 18.4) | 27.6 | 36.1k / 40.9k | vs E008 Qwen xhigh-240k: −18.2 [−31.5, −5.1] (20.4 vs 38.6, 56 pairs) [^t2p-8] | done [^t2-8] |
-| `E012 dev medium-48k s24strong` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | dev-56 (56 pairs) | 90/112 attempts | 29.6 | 36.7<br><sub>34 pairs with 2 attempts</sub> | 34.4k / 38.3k | vs E008 Qwen xhigh-240k: −9.7 [−22.4, +3.6] (29.6 vs 39.3, 56 pairs) [^t2p-9] | stopped [^t2-9] |
-| `E012 dev medium-28k s14` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | dev-56 (56 pairs) | 22/112 attempts | 21.1 | — | 24.0k / 27.6k | vs E008 Qwen xhigh-240k: −13.2 [−39.5, +13.2] (21.1 vs 34.2, 22 pairs) [^t2p-10] | stopped [^t2-10] |
-| `E012 dev xhigh-48k s24` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | dev-56 (56 pairs) | 38/112 attempts | 22.7 | — | 40.8k / 48.0k | vs E008 Qwen xhigh-240k: −6.1 [−24.2, +12.1] (22.7 vs 28.8, 38 pairs) [^t2p-11] | stopped [^t2-11] |
-| `E009 dev sub96` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 73.1 | — | 48.5k / 41.2k | vs E004-GL: +7.2 [−2.3, +16.2] (73.1 vs 65.9, 56 pairs) | done [^t2-12] |
-| `E009 dev sub96n` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 74.1 | — | 45.8k / 38.2k | vs E004-GL: +8.2 [−0.2, +16.7] (74.1 vs 65.9, 56 pairs) | done [^t2-13] |
-| `E009 dev brief96n` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 66.0 | — | 46.2k / 36.1k | vs E004-GL: +0.1 [−7.4, +7.1] (66.0 vs 65.9, 56 pairs) | done [^t2-14] |
-| `E009 dev brief80n` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 65.0 | — | 44.1k / 40.5k | vs E004-GL: −0.9 [−13.2, +11.0] (65.0 vs 65.9, 56 pairs) | done [^t2-15] |
-| `E009 dev brief80a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 72.8 | — | 41.6k / 38.4k | vs E004-GL: +6.9 [−0.8, +14.5] (72.8 vs 65.9, 56 pairs) | done [^t2-16] |
-| `E009 dev brief72a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 65.0 | — | 40.4k / 34.3k | vs E004-GL: −0.9 [−9.9, +6.9] (65.0 vs 65.9, 56 pairs) | done [^t2-17] |
-| `E009 dev brief64a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 58.8 | — | 40.8k / 45.4k | vs E004-GL: −7.1 [−16.7, +1.6] (58.8 vs 65.9, 56 pairs) | done [^t2-18] |
-| `E009 dev sub80a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 68.7 | — | 40.1k / 32.2k | vs E004-GL: +2.8 [−5.9, +11.2] (68.7 vs 65.9, 56 pairs) | done [^t2-19] |
-| `E009 dev sub72a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 66.3 | — | 40.3k / 37.4k | vs E004-GL: +0.4 [−8.7, +9.1] (66.3 vs 65.9, 56 pairs) | done [^t2-20] |
-| `E009 dev sub64a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 73.1 | — | 37.2k / 36.2k | vs E004-GL: +7.2 [−2.7, +17.2] (73.1 vs 65.9, 56 pairs) | done [^t2-21] |
-| `E009 dev sub80s40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 71.1 | — | 38.8k / 31.0k | vs E004-GL: +5.2 [−4.5, +14.1] (71.1 vs 65.9, 56 pairs) | done [^t2-22] |
-| `E009 dev sub72s32` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 75.2 | — | 39.1k / 37.8k | vs E004-GL: +9.3 [+1.9, +17.1] (75.2 vs 65.9, 56 pairs) | done [^t2-23] |
-| `E009 dev sub64s32` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 65.6 | — | 38.0k / 35.2k | vs E004-GL: −0.3 [−12.8, +11.7] (65.6 vs 65.9, 56 pairs) | done. 64k, 32k soft target; rec. $1.39; sources: submit 49, none 7 |
-| `E010 dev nt0s20x60` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 25/56 attempts | 27.3 | — | 18.5k / 20.2k | vs E004-GL: −45.5 [−65.3, −23.9] (27.3 vs 72.7, 25 pairs) | stopped [^t2-25] |
-| `E010 dev nt1s40x80` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 20/56 attempts; 3 errors | 36.1 | — | 23.3k / 24.1k | vs E004-GL: −36.8 [−56.9, −17.4] (36.1 vs 72.9, 20 pairs) | stopped [^t2-26] |
-| `E010 dev nt3s20x60` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 23/56 attempts; 4 errors | 40.5 | — | 19.9k / 19.1k | vs E004-GL: −28.0 [−47.6, −9.5] (40.5 vs 68.5, 23 pairs) | stopped [^t2-27] |
-| `E010 dev s10x40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 51/56 attempts; 5 errors | 50.7 | — | 26.3k / 24.5k | vs E004-GL: −16.9 [−29.2, −5.2] (50.7 vs 67.6, 51 pairs) | done [^t2-28] |
-| `E010 dev s15x45` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 54/56 attempts; 2 errors | 48.0 | — | 31.0k / 31.9k | vs E004-GL: −17.4 [−30.4, −4.4] (48.0 vs 65.4, 54 pairs) | done [^t2-29] |
-| `E010 dev s20x40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 54/56 attempts; 2 errors | 55.0 | — | 26.9k / 24.8k | vs E004-GL: −11.6 [−21.5, −2.4] (55.0 vs 66.6, 54 pairs) | done [^t2-30] |
-| `E010 dev s20x60` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 51/56 attempts; 5 errors | 60.9 | — | 32.7k / 29.9k | vs E004-GL: −6.5 [−19.3, +5.7] (60.9 vs 67.4, 51 pairs) | done [^t2-31] |
-| `E010 dev s25x80` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 53/56 attempts; 3 errors | 67.0 | — | 35.9k / 29.4k | vs E004-GL: +3.4 [−4.7, +10.9] (67.0 vs 63.7, 53 pairs) | done [^t2-32] |
-| `E004a grid plain max v1` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | E004a-20 (20 pairs) | 1 × 20/20 | 66.7 | — | 103.9k / 90.8k | vs E004-GL: +0.0 [−29.2, +28.3] (66.7 vs 66.7, 20 pairs) | done. plain prompt, max, 200k total / 8k final, harness v1; rec. $1.32 |
-| `E004a code plain max v1` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | E004a-20 (20 pairs) | 1 × 20/20 | 60.0 | — | 97.2k / 86.3k | vs E004-GL: −6.7 [−26.7, +10.0] (60.0 vs 66.7, 20 pairs) | done. plain prompt, max, harness v1 (buggy train check); rec. $1.25 |
-| `E004a code plain max v2` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | E004a-20 (20 pairs) | 1 × 20/20 | 60.0 | — | 104.4k / 94.3k | vs E004-GL: −6.7 [−23.3, +7.5] (60.0 vs 66.7, 20 pairs) | done. plain prompt, max, harness v2; rec. $1.29 |
-| `E004a grid lean max` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | E004a-20 (20 pairs) | 1 × 20/20 | 76.7 | — | 74.0k / 36.2k | vs E004-GL: +10.0 [−1.7, +25.8] (76.7 vs 66.7, 20 pairs) | done. lean prompt, max, harness v2; rec. $0.95 |
-| `E004a code lean max` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | E004a-20 (20 pairs) | 1 × 20/20 | 73.3 | — | 91.0k / 74.1k | vs E004-GL: +6.7 [−6.7, +22.5] (73.3 vs 66.7, 20 pairs) | done. lean prompt, max, harness v2; rec. $1.19 |
-| `E004a grid lean high` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | E004a-20 (20 pairs) | 1 × 20/20 | 66.7 | — | 57.2k / 30.1k | vs E004-GL: +0.0 [−24.2, +23.3] (66.7 vs 66.7, 20 pairs) | done. lean prompt, high, harness v2; rec. $0.78 |
-| `E004a code lean high` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | E004a-20 (20 pairs) | 1 × 20/20 | 56.7 | — | 75.7k / 51.2k | vs E004-GL: −10.0 [−25.8, +1.7] (56.7 vs 66.7, 20 pairs) | done. lean prompt, high, harness v2; rec. $0.99 |
-| `E004 stateless v0` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | 2 easy tasks | 2 × 2/2 | 100.0 (100.0 / 100.0) | 100.0 | 61.6k / 60.4k | vs E004-GL: +12.5 [+0.0, +25.0] (100.0 vs 87.5, 2 pairs) | superseded [^t2-40] |
-| `E004 code smoke` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | smoke | 1 × 1/1 | 100.0 | — | 18.6k / 18.6k | vs E004-GL: +0.0 [+0.0, +0.0] (100.0 vs 100.0, 1 pairs) | probe. harness v1 smoke test; rec. $0.01 |
-| `E003 Flash max` | DeepSeek V4.1-Flash (DeepSeek API) | no tools | E003-4 (4 tasks) | 2 × 4/4 | 62.5 (50.0 / 75.0) | 75.0 | 57.4k / 57.3k | vs E001d: +20.8 [+0.0, +41.7] (62.5 vs 41.7, 4 pairs) | done. ARC Prize prompt, max effort; trace study; est. $0.28 |
-| `E003 Pro max` | DeepSeek V4-Pro (DeepSeek API) | no tools | E003-4 (4 tasks) | 2 × 4/4 | 50.0 (50.0 / 50.0) | 50.0 | 67.4k / 68.3k | vs E001d: +8.3 [+0.0, +25.0] (50.0 vs 41.7, 4 pairs) | done. ARC Prize prompt, max effort; trace study; est. $1.07 |
-| `E005 Flash high` | DeepSeek V4.1-Flash (DeepSeek API) | no tools | full-167 (partial) | 2/167 attempts | 50.0 | — | 8.0k / 8.0k | vs E001d: −50.0 [−100.0, +0.0] (50.0 vs 100.0, 2 pairs) | paused [^t2-44] |
-| `E005 Flash low` | DeepSeek V4.1-Flash (DeepSeek API) | no tools | full-167 (partial) | 7/167 attempts | 85.7 | — | 10.1k / 10.8k | vs E001d: +0.0 [−38.1, +33.3] (85.7 vs 85.7, 7 pairs) | paused [^t2-45] |
-| `E009 sub64a 2nd sample` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | full-167 (partial) | 61/167 attempts | 65.9 | — | 39.2k / 43.6k | vs E004-GL: −5.5 [−18.0, +7.0] (65.9 vs 71.3, 61 pairs) | stopped [^t2-46] |
-| `E010 s20x40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | full-167 (167 pairs) | 159 attempts, 159 pairs / 115 tasks; 8 errors | 47.8 | — | 29.3k / 34.2k | vs E004-GL: −17.8 [−25.3, −10.4] (47.8 vs 65.7, 159 pairs) | done (8 API errors) [^t2-47] |
-| `E008 Qwen Reka diag` | Qwen3.8-27B fp8, OpenRouter (Reka) | no tools | probe | 1 × 5/5 | 0.0 | — | 4.3k / 5.0k | — | probe. high effort; provider fixes thinking at ~2k tokens; rec. $0.04 |
-| `E008 Qwen Reka budget` | Qwen3.8-27B fp8, OpenRouter (Reka) | no tools | probe | 1 × 1/1 | 0.0 | — | 2.9k / 2.9k | — | probe. reasoning.max_tokens 150k (ignored by provider); rec. $0.00 |
-| `E008 Qwen Alibaba diag` | Qwen3.8-27B, OpenRouter (Alibaba) | no tools | probe | 1 × 5/5 | 0.0 | — | 20.7k / 19.1k | — | probe. reasoning.max_tokens 100k (provider fixes ~16k); rec. $0.28 |
-| `E008 Nemotron Lightning smoke` | Nemotron 3.5 Lightning bf16, OpenRouter (CoreWeave) | no tools | smoke | 1 × 2/2 | 0.0 | — | 67.1k / 67.1k | — | probe. router smoke test; rec. $0.03 |
-| `E008 Qwen medium smoke` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | gen API | smoke | 1 × 2/2 | 0.0 | — | 38.6k / 38.6k | — | probe. generation-API harness smoke test |
-| `E012 xhigh-80k smoke` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | smoke | 1 × 4/4 | 100.0 | — | 15.3k / 11.6k | — | probe [^t2-53] |
-| `E001a` | DeepSeek V4.1-Flash (DeepSeek API) | no tools | NVIDIA val subset ‡ (120 problems) | 2 × 120/120 | 52.9 (52.5 / 53.3) | 60.8 | 81.3k / 77.5k | — (different task set) | done [^t2-54] |
-| `E001b` | DeepSeek V4.1-Flash (DeepSeek API) | no tools | NVIDIA val subset ‡ (120 problems) | 2 × 120/120 | 40.8 (45.0 / 36.7) | 56.7 | 72.0k / 74.7k | — (different task set) | done [^t2-55] |
-| `E001c` | DeepSeek V4-Pro (DeepSeek API) | no tools | NVIDIA val subset ‡ (120 problems) | 1 × 120/120 | 40.0 | — | 74.7k / 75.9k | — (different task set) | done [^t2-56] |
-| `Kaggle v2 tools (commit run)` | Qwen3.8-27B FP8, vLLM 0.23 on Kaggle 4×L4 | tools-grid | Kaggle local test (4 tasks / 5 pairs) | 1 × 5/5 | 2.00/4 tasks | — | 5.0k / 6.9k | — | done (deadline-forced ~6 min after server ready) [^t2-57] |
-| `Kaggle plain v1 (commit run)` | Qwen3.8-27B FP8, vLLM 0.23 on Kaggle 4×L4 | no tools | Kaggle local test (4 tasks / 5 pairs) | 1 × 5/5 | 1.00/4 tasks | — | 7.6k / 7.3k | — | done (deadline-forced ~6 min after server ready) [^t2-58] |
+| Experiment ID | Model | Harness | Set | Samples / coverage | Kaggle pass@1 | Kaggle pass@2 | *ARC Prize pass@1 (task-wt.)* | *ARC Prize pass@2 (task-wt.)* | Tok mean / median | Paired diff vs reference | Status / notes |
+|---|---|---|---|---|--:|--:|--:|--:|--:|---|---|
+| `E008 Qwen OpenRouter pilot` | Qwen3.8-27B bf16, OpenRouter (DeepInfra) | no tools | pilot-26 (26 pairs) | 1 × 26/26 | 23.1 | — | *20.0* | — | 35.2k / 36.2k | vs E008 Qwen xhigh-240k: −19.2 [−38.6, +0.0] (23.1 vs 42.3, 26 pairs) | done [^t2-1] |
+| `E008 Nemotron Super pilot` | Nemotron 3 Super 120B-A12B fp8, OpenRouter (DekaLLM) | no tools | pilot-26 (26 pairs) | 5 attempts, 5 pairs / 4 tasks; 21 errors | 0.0 | — | *0.0* | — | 49.2k / 47.7k | — | provider errors [^t2-2] |
+| `E008 Qwen xhigh pilot` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | no tools (raw gen API) | pilot-26 (26 pairs) | 2 × 26/26 | 42.3 (38.5 / 46.2) | 50.0 | *40.0 (36.7 / 43.3)* | *46.7* | 68.5k / 63.2k | — | merged [^t2-3] |
+| `E012 pilot medium-48k s24` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | pilot-26 (26 pairs) | 17/52 attempts | 72.7 | 66.7<br><sub>6 pairs with 2 attempts</sub> | *66.7* | *66.7* | 16.6k / 16.8k | vs E008 Qwen xhigh-240k: −4.5 [−38.5, +25.0] (72.7 vs 77.3, 11 pairs) [^t2p-4] | stopped [^t2-4] |
+| `E012 pilot xhigh-48k s24` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | pilot-26 (26 pairs) | 12/52 attempts | 81.2 | 100.0<br><sub>4 pairs with 2 attempts</sub> | *75.0* | *100.0* | 16.9k / 16.4k | vs E008 Qwen xhigh-240k: +6.2 [+0.0, +18.8] (81.2 vs 75.0, 8 pairs) [^t2p-5] | stopped. tier xhigh, 48k hard / 24k soft; sources: submit 12 |
+| `E012 pilot xhigh-48k s24v` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | pilot-26 (26 pairs) | 2/52 attempts | 100.0 | 100.0<br><sub>1 pairs with 2 attempts</sub> | *100.0* | *100.0* | 4.0k / 4.0k | vs E008 Qwen xhigh-240k: +0.0 [+0.0, +0.0] (100.0 vs 100.0, 1 pairs) [^t2p-6] | stopped [^t2-6] |
+| `E012 pilot xhigh-80k s40` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | pilot-26 (26 pairs) | 11/52 attempts | 75.0 | 100.0<br><sub>3 pairs with 2 attempts</sub> | *80.0* | *100.0* | 20.1k / 24.1k | vs E008 Qwen xhigh-240k: +0.0 [−30.0, +42.9] (75.0 vs 75.0, 8 pairs) [^t2p-7] | stopped. tier xhigh, 80k hard / 40k soft; sources: submit 11 |
+| `E012 dev medium-48k s24` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | dev-56 (56 pairs) | 112/112 attempts | 19.6 (21.4 / 17.9) | 26.8 | *20.4 (22.4 / 18.4)* | *27.6* | 36.1k / 40.9k | vs E008 Qwen xhigh-240k: −17.0 [−29.1, −5.4] (19.6 vs 36.6, 56 pairs) [^t2p-8] | done [^t2-8] |
+| `E012 dev medium-48k s24strong` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | dev-56 (56 pairs) | 90/112 attempts | 28.6 | 38.2<br><sub>34 pairs with 2 attempts</sub> | *29.6* | *36.7* | 34.4k / 38.3k | vs E008 Qwen xhigh-240k: −8.0 [−20.0, +3.7] (28.6 vs 36.6, 56 pairs) [^t2p-9] | stopped [^t2-9] |
+| `E012 dev medium-28k s14` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | dev-56 (56 pairs) | 22/112 attempts | 18.2 | — | *21.1* | — | 24.0k / 27.6k | vs E008 Qwen xhigh-240k: −13.6 [−36.4, +9.5] (18.2 vs 31.8, 22 pairs) [^t2p-10] | stopped [^t2-10] |
+| `E012 dev xhigh-48k s24` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | dev-56 (56 pairs) | 38/112 attempts | 21.1 | — | *22.7* | — | 40.8k / 48.0k | vs E008 Qwen xhigh-240k: −5.3 [−21.6, +11.4] (21.1 vs 26.3, 38 pairs) [^t2p-11] | stopped [^t2-11] |
+| `E009 dev sub96` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 71.4 | — | *73.1* | — | 48.5k / 41.2k | vs E004-GL: +7.6 [−2.7, +16.9] (71.4 vs 63.8, 56 pairs) | done [^t2-12] |
+| `E009 dev sub96n` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 73.2 | — | *74.1* | — | 45.8k / 38.2k | vs E004-GL: +9.4 [+1.0, +17.4] (73.2 vs 63.8, 56 pairs) | done [^t2-13] |
+| `E009 dev brief96n` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 64.3 | — | *66.0* | — | 46.2k / 36.1k | vs E004-GL: +0.4 [−6.6, +6.8] (64.3 vs 63.8, 56 pairs) | done [^t2-14] |
+| `E009 dev brief80n` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 64.3 | — | *65.0* | — | 44.1k / 40.5k | vs E004-GL: +0.4 [−11.0, +11.2] (64.3 vs 63.8, 56 pairs) | done [^t2-15] |
+| `E009 dev brief80a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 71.4 | — | *72.8* | — | 41.6k / 38.4k | vs E004-GL: +7.6 [−2.5, +17.4] (71.4 vs 63.8, 56 pairs) | done [^t2-16] |
+| `E009 dev brief72a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 64.3 | — | *65.0* | — | 40.4k / 34.3k | vs E004-GL: +0.4 [−8.0, +7.9] (64.3 vs 63.8, 56 pairs) | done [^t2-17] |
+| `E009 dev brief64a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 58.9 | — | *58.8* | — | 40.8k / 45.4k | vs E004-GL: −4.9 [−14.2, +3.2] (58.9 vs 63.8, 56 pairs) | done [^t2-18] |
+| `E009 dev sub80a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 66.1 | — | *68.7* | — | 40.1k / 32.2k | vs E004-GL: +2.2 [−7.8, +12.3] (66.1 vs 63.8, 56 pairs) | done [^t2-19] |
+| `E009 dev sub72a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 66.1 | — | *66.3* | — | 40.3k / 37.4k | vs E004-GL: +2.2 [−8.5, +14.1] (66.1 vs 63.8, 56 pairs) | done [^t2-20] |
+| `E009 dev sub64a` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 71.4 | — | *73.1* | — | 37.2k / 36.2k | vs E004-GL: +7.6 [−1.8, +16.7] (71.4 vs 63.8, 56 pairs) | done [^t2-21] |
+| `E009 dev sub80s40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 69.6 | — | *71.1* | — | 38.8k / 31.0k | vs E004-GL: +5.8 [−4.1, +14.8] (69.6 vs 63.8, 56 pairs) | done [^t2-22] |
+| `E009 dev sub72s32` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 73.2 | — | *75.2* | — | 39.1k / 37.8k | vs E004-GL: +9.4 [+2.5, +16.7] (73.2 vs 63.8, 56 pairs) | done [^t2-23] |
+| `E009 dev sub64s32` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 56/56 attempts | 64.3 | — | *65.6* | — | 38.0k / 35.2k | vs E004-GL: +0.4 [−13.2, +12.9] (64.3 vs 63.8, 56 pairs) | done. 64k, 32k soft target; rec. $1.39; sources: submit 49, none 7 |
+| `E010 dev nt0s20x60` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 25/56 attempts | 28.0 | — | *27.3* | — | 18.5k / 20.2k | vs E004-GL: −45.0 [−63.9, −25.0] (28.0 vs 73.0, 25 pairs) | stopped [^t2-25] |
+| `E010 dev nt1s40x80` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 20/56 attempts; 3 errors | 40.0 | — | *36.1* | — | 23.3k / 24.1k | vs E004-GL: −33.8 [−53.9, −15.8] (40.0 vs 73.8, 20 pairs) | stopped [^t2-26] |
+| `E010 dev nt3s20x60` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 23/56 attempts; 4 errors | 43.5 | — | *40.5* | — | 19.9k / 19.1k | vs E004-GL: −26.1 [−46.6, −6.8] (43.5 vs 69.6, 23 pairs) | stopped [^t2-27] |
+| `E010 dev s10x40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 51/56 attempts; 5 errors | 51.0 | — | *50.7* | — | 26.3k / 24.5k | vs E004-GL: −13.7 [−26.0, −2.7] (51.0 vs 64.7, 51 pairs) | done [^t2-28] |
+| `E010 dev s15x45` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 54/56 attempts; 2 errors | 50.0 | — | *48.0* | — | 31.0k / 31.9k | vs E004-GL: −13.4 [−28.4, +2.2] (50.0 vs 63.4, 54 pairs) | done [^t2-29] |
+| `E010 dev s20x40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 54/56 attempts; 2 errors | 53.7 | — | *55.0* | — | 26.9k / 24.8k | vs E004-GL: −10.6 [−21.0, −0.9] (53.7 vs 64.4, 54 pairs) | done [^t2-30] |
+| `E010 dev s20x60` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 51/56 attempts; 5 errors | 60.8 | — | *60.9* | — | 32.7k / 29.9k | vs E004-GL: −4.9 [−17.2, +6.5] (60.8 vs 65.7, 51 pairs) | done [^t2-31] |
+| `E010 dev s25x80` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | dev-56 (56 pairs) | 53/56 attempts; 3 errors | 66.0 | — | *67.0* | — | 35.9k / 29.4k | vs E004-GL: +4.2 [−3.4, +11.3] (66.0 vs 61.8, 53 pairs) | done [^t2-32] |
+| `E004a grid plain max v1` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | E004a-20 (20 pairs) | 1 × 20/20 | 65.0 | — | *66.7* | — | 103.9k / 90.8k | vs E004-GL: −2.5 [−28.7, +22.4] (65.0 vs 67.5, 20 pairs) | done. plain prompt, max, 200k total / 8k final, harness v1; rec. $1.32 |
+| `E004a code plain max v1` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | E004a-20 (20 pairs) | 1 × 20/20 | 60.0 | — | *60.0* | — | 97.2k / 86.3k | vs E004-GL: −7.5 [−29.5, +10.3] (60.0 vs 67.5, 20 pairs) | done. plain prompt, max, harness v1 (buggy train check); rec. $1.25 |
+| `E004a code plain max v2` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | E004a-20 (20 pairs) | 1 × 20/20 | 60.0 | — | *60.0* | — | 104.4k / 94.3k | vs E004-GL: −7.5 [−22.4, +5.3] (60.0 vs 67.5, 20 pairs) | done. plain prompt, max, harness v2; rec. $1.29 |
+| `E004a grid lean max` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | E004a-20 (20 pairs) | 1 × 20/20 | 75.0 | — | *76.7* | — | 74.0k / 36.2k | vs E004-GL: +7.5 [−3.0, +21.4] (75.0 vs 67.5, 20 pairs) | done. lean prompt, max, harness v2; rec. $0.95 |
+| `E004a code lean max` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | E004a-20 (20 pairs) | 1 × 20/20 | 75.0 | — | *73.3* | — | 91.0k / 74.1k | vs E004-GL: +7.5 [−3.8, +20.2] (75.0 vs 67.5, 20 pairs) | done. lean prompt, max, harness v2; rec. $1.19 |
+| `E004a grid lean high` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | E004a-20 (20 pairs) | 1 × 20/20 | 70.0 | — | *66.7* | — | 57.2k / 30.1k | vs E004-GL: +2.5 [−17.1, +20.2] (70.0 vs 67.5, 20 pairs) | done. lean prompt, high, harness v2; rec. $0.78 |
+| `E004a code lean high` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | E004a-20 (20 pairs) | 1 × 20/20 | 60.0 | — | *56.7* | — | 75.7k / 51.2k | vs E004-GL: −7.5 [−21.6, +2.6] (60.0 vs 67.5, 20 pairs) | done. lean prompt, high, harness v2; rec. $0.99 |
+| `E004 stateless v0` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | 2 easy tasks | 2 × 2/2 | 100.0 (100.0 / 100.0) | 100.0 | *100.0 (100.0 / 100.0)* | *100.0* | 61.6k / 60.4k | vs E004-GL: +12.5 [+0.0, +25.0] (100.0 vs 87.5, 2 pairs) | superseded [^t2-40] |
+| `E004 code smoke` | DeepSeek V4.1-Flash (DeepSeek API) | tools-code | smoke | 1 × 1/1 | 100.0 | — | *100.0* | — | 18.6k / 18.6k | vs E004-GL: +0.0 [+0.0, +0.0] (100.0 vs 100.0, 1 pairs) | probe. harness v1 smoke test; rec. $0.01 |
+| `E003 Flash max` | DeepSeek V4.1-Flash (DeepSeek API) | no tools | E003-4 (4 tasks) | 2 × 4/4 | 62.5 (50.0 / 75.0) | 75.0 | *62.5 (50.0 / 75.0)* | *75.0* | 57.4k / 57.3k | vs E001d: +20.8 [+0.0, +41.7] (62.5 vs 41.7, 4 pairs) | done. ARC Prize prompt, max effort; trace study; est. $0.28 |
+| `E003 Pro max` | DeepSeek V4-Pro (DeepSeek API) | no tools | E003-4 (4 tasks) | 2 × 4/4 | 50.0 (50.0 / 50.0) | 50.0 | *50.0 (50.0 / 50.0)* | *50.0* | 67.4k / 68.3k | vs E001d: +8.3 [+0.0, +25.0] (50.0 vs 41.7, 4 pairs) | done. ARC Prize prompt, max effort; trace study; est. $1.07 |
+| `E005 Flash high` | DeepSeek V4.1-Flash (DeepSeek API) | no tools | full-167 (partial) | 2/167 attempts | 50.0 | — | *50.0* | — | 8.0k / 8.0k | vs E001d: −50.0 [−100.0, +0.0] (50.0 vs 100.0, 2 pairs) | paused [^t2-44] |
+| `E005 Flash low` | DeepSeek V4.1-Flash (DeepSeek API) | no tools | full-167 (partial) | 7/167 attempts | 85.7 | — | *85.7* | — | 10.1k / 10.8k | vs E001d: +0.0 [−38.1, +33.3] (85.7 vs 85.7, 7 pairs) | paused [^t2-45] |
+| `E009 sub64a 2nd sample` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | full-167 (partial) | 61/167 attempts | 63.9 | — | *65.9* | — | 39.2k / 43.6k | vs E004-GL: −5.7 [−16.9, +5.3] (63.9 vs 69.7, 61 pairs) | stopped [^t2-46] |
+| `E010 s20x40` | DeepSeek V4.1-Flash (DeepSeek API) | tools-grid | full-167 (167 pairs) | 159 attempts, 159 pairs / 115 tasks; 8 errors | 47.8 | — | *47.8* | — | 29.3k / 34.2k | vs E004-GL: −17.0 [−24.1, −10.0] (47.8 vs 64.8, 159 pairs) | done (8 API errors) [^t2-47] |
+| `E008 Qwen Reka diag` | Qwen3.8-27B fp8, OpenRouter (Reka) | no tools | probe | 1 × 5/5 | 0.0 | — | *0.0* | — | 4.3k / 5.0k | — | probe. high effort; provider fixes thinking at ~2k tokens; rec. $0.04 |
+| `E008 Qwen Reka budget` | Qwen3.8-27B fp8, OpenRouter (Reka) | no tools | probe | 1 × 1/1 | 0.0 | — | *0.0* | — | 2.9k / 2.9k | — | probe. reasoning.max_tokens 150k (ignored by provider); rec. $0.00 |
+| `E008 Qwen Alibaba diag` | Qwen3.8-27B, OpenRouter (Alibaba) | no tools | probe | 1 × 5/5 | 0.0 | — | *0.0* | — | 20.7k / 19.1k | — | probe. reasoning.max_tokens 100k (provider fixes ~16k); rec. $0.28 |
+| `E008 Nemotron Lightning smoke` | Nemotron 3.5 Lightning bf16, OpenRouter (CoreWeave) | no tools | smoke | 1 × 2/2 | 0.0 | — | *0.0* | — | 67.1k / 67.1k | — | probe. router smoke test; rec. $0.03 |
+| `E008 Qwen medium smoke` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | no tools (raw gen API) | smoke | 1 × 2/2 | 0.0 | — | *0.0* | — | 38.6k / 38.6k | — | probe. generation-API harness smoke test |
+| `E012 xhigh-80k smoke` | Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000) | tools-grid | smoke | 1 × 4/4 | 100.0 | — | *100.0* | — | 15.3k / 11.6k | — | probe [^t2-53] |
+| `E001a` | DeepSeek V4.1-Flash (DeepSeek API) | no tools | NVIDIA val subset ‡ (120 problems) | 2 × 120/120 | 52.9 (52.5 / 53.3) | 60.8 | *52.9* | *60.8* | 81.3k / 77.5k | — (different task set) | done [^t2-54] |
+| `E001b` | DeepSeek V4.1-Flash (DeepSeek API) | no tools | NVIDIA val subset ‡ (120 problems) | 2 × 120/120 | 40.8 (45.0 / 36.7) | 56.7 | *40.8* | *56.7* | 72.0k / 74.7k | — (different task set) | done [^t2-55] |
+| `E001c` | DeepSeek V4-Pro (DeepSeek API) | no tools | NVIDIA val subset ‡ (120 problems) | 1 × 120/120 | 40.0 | — | *40.0* | — | 74.7k / 75.9k | — (different task set) | done [^t2-56] |
+| `Kaggle v2 tools (commit run)` | Qwen3.8-27B FP8, vLLM 0.23 on Kaggle 4×L4 | tools-grid | Kaggle local test (4 tasks / 5 pairs) | 1 × 5/5 | 40.0 (2/5 outputs) | — | *50.0 (2.00/4 tasks)* | — | 5.0k / 6.9k | — | done (deadline-forced ~6 min after server ready) [^t2-57] |
+| `Kaggle plain v1 (commit run)` | Qwen3.8-27B FP8, vLLM 0.23 on Kaggle 4×L4 | no tools | Kaggle local test (4 tasks / 5 pairs) | 1 × 5/5 | 20.0 (1/5 outputs) | — | *25.0 (1.00/4 tasks)* | — | 7.6k / 7.3k | — | done (deadline-forced ~6 min after server ready) [^t2-58] |
 
 ## Key findings
 
-- **Tools + lean2 prompt beat no tools for Flash; tools alone do not.** E004-GL (grid mode, lean2 prompt, low effort) scores pass@1 66.0% over 4 samples against 59.9% for no-tool E001d (3 samples), paired +6.1 pp [+0.0, +12.1], at 49.5k vs 55.7k tokens/attempt. With the plain ARC Prize prompt the same tool harness drops to 51.2% (low) and 47.6% (max, 86.2k tokens): the model reasons by hand, calls the tool rarely and runs out of budget. pass@2 is 76.4% vs 74.6% (mean over attempt pairs).
-- **The `submit_answer` hand-off is what makes the harness both cheaper and more accurate.** In E004-GL, 116/668 attempts end without a parsable grid and burn 34% of all output tokens. With `submit_answer(expr)` the grid is read from the Python session instead of being retyped; in sub80s40 93% of answers arrive that way. sub80s40 reaches 67.8% pass@1 / 77.5% pass@2 at 40.7k tokens (paired vs E004-GL +1.8 pp [−2.6, +6.0]); sub96n reaches 68.3% / 78.5% at 45.7k.
-- **Budget notes and soft targets beat hard caps; hard caps cut the long tail.** A 64k hard cap (sub64a) scores 58.2% (−7.8 pp [−14.4, −1.4]); on the 56 long-tail pairs (E004-GL's correct rollouts average >40k tokens) it solves 44.6% against 71.4% for E004-GL and 66.1% for sub96n. A 40k cap (s20x40, 1 incomplete sample) falls to 47.8%. A soft target with a looser cap keeps the tail reachable: s20x60 matches E004-GL on pass@2 (76.5% vs 76.4%) at 32.9k tokens (−34%). Thinking-off turns (E010 nt*) save tokens but lose 28–45 pp on dev.
-- **The 56-pair dev set overstated gains (about ×3 for the configs that held up).** Paired vs E004-GL, dev → full set: sub80s40 +5.2 → +1.8, sub96n +8.2 → +2.4, sub64a +7.2 → −7.8, s20x60 −6.5 → −3.5, s25x80 +3.4 → −1.3, s20x40 −11.6 → −17.8 pp. The 4 configs that beat E004-GL on dev averaged +6.0 pp there and −1.2 pp on the full set; sub64a flipped sign. Dev pairs under-represent the long tail of slow but solvable pairs, and picking the best of many single-sample dev runs inflates the winner. Only full-set samples are used for decisions.
-- **Qwen3.8-27B needs its official settings; medium tier / temp 0.6 / 48k breaks it.** Official settings (tier xhigh, temp 1.0, 240k budget) give pass@1 36.4% / pass@2 48.2% at 73.6k tokens/attempt. Medium tier, temp 0.6 and a 48k budget give 9.7% / 13.3%: 43% of attempts emit EOS mid-thought (continued by the harness) and 53% are forced to answer. Under the official settings mid-thought EOS falls to 0% and forced answers to 0.9%. ARC Prize reports 42.4% semi-private for this model [^arcprize].
-- **Tools roughly double Qwen's accuracy at equal tokens.** E012 (sub80s40 port, tier medium, 48k hard / 24k soft; 334 of 334 attempts done) scores pass@1 25.8% at 35.6k tokens/attempt. The no-tool xhigh run on the same attempts scores 21.2% when capped at 48k and 12.1% when capped at 36k (simulated: correct and finished within the cap), and 36.4% uncapped at 240k (73.6k tokens). Paired vs the 36k cap: +13.8 pp [+7.1, +20.8]. On dev-56 the same config scores 20.4% at 36.1k.
-- **Qwen3.6-35B-A3B and Nemotron are far behind.** Qwen3.6-35B-A3B: pass@1 6.2%, pass@2 7.5% at 53.0k tokens, a clean run with every attempt closing its thinking on its own. Nemotron 3.5 Lightning: 0.0% (0/167) at 68.0k tokens. Nemotron 3 Super 120B is inconclusive (provider stream failures on most pilot attempts).
+Scores are Kaggle (pair-weighted) unless marked task-weighted; task-weighted values appear only where a finding is compared with ARC Prize's published numbers.
+
+- **Tools + lean2 prompt beat no tools for Flash; tools alone do not.** E004-GL (grid mode, lean2 prompt, low effort) scores pass@1 64.5% over 4 samples against 58.3% for no-tool E001d (3 samples), paired +6.2 pp [+0.2, +12.5], at 49.5k vs 55.7k tokens/attempt. With the plain ARC Prize prompt the same tool harness drops to 51.5% (low) and 47.3% (max, 86.2k tokens): the model reasons by hand, calls the tool rarely and runs out of budget. pass@2 is 75.6% vs 73.3% (mean over attempt pairs). All scores in these findings are Kaggle (pair-weighted) scores.
+- **The `submit_answer` hand-off is what makes the harness both cheaper and more accurate.** In E004-GL, 116/668 attempts end without a parsable grid and burn 34% of all output tokens. With `submit_answer(expr)` the grid is read from the Python session instead of being retyped; in sub80s40 93% of answers arrive that way. sub80s40 reaches 66.5% pass@1 / 76.4% pass@2 at 40.7k tokens (paired vs E004-GL +1.9 pp [−2.1, +5.9]); sub96n reaches 67.7% / 79.0% at 45.7k.
+- **Budget notes and soft targets beat hard caps; hard caps cut the long tail.** A 64k hard cap (sub64a) scores 57.5% (−7.0 pp [−13.3, −0.9]); on the 56 long-tail pairs (E004-GL's correct rollouts average >40k tokens) it solves 44.6% against 71.4% for E004-GL and 66.1% for sub96n. A 40k cap (s20x40, 1 incomplete sample) falls to 47.8%. A soft target with a looser cap keeps the tail reachable: s20x60 matches E004-GL on pass@2 (75.4% vs 75.6%) at 32.9k tokens (−34%). Thinking-off turns (E010 nt*) save tokens but lose 26–45 pp on dev.
+- **The 56-pair dev set overstated gains (about ×4 for the configs that held up).** Paired vs E004-GL, dev → full set: sub80s40 +5.8 → +1.9, sub96n +9.4 → +3.1, sub64a +7.6 → −7.0, s20x60 −4.9 → −3.1, s25x80 +4.2 → +0.7, s20x40 −10.6 → −17.0 pp. The 4 configs that beat E004-GL on dev averaged +6.8 pp there and −0.3 pp on the full set; sub64a flipped sign. Dev pairs under-represent the long tail of slow but solvable pairs, and picking the best of many single-sample dev runs inflates the winner. Only full-set samples are used for decisions.
+- **Qwen3.8-27B needs its official settings; medium tier / temp 0.6 / 48k breaks it.** Official settings (tier xhigh, temp 1.0, 240k budget) give pass@1 35.9% / pass@2 47.9% at 73.6k tokens/attempt. Medium tier, temp 0.6 and a 48k budget give 9.6% / 13.8%: 43% of attempts emit EOS mid-thought (continued by the harness) and 53% are forced to answer. Under the official settings mid-thought EOS falls to 0% and forced answers to 0.9%. ARC Prize reports 42.4% semi-private for this model [^arcprize] (task-weighted; our public task-weighted pass@2 is 48.2%).
+- **Tools roughly double Qwen's accuracy at equal tokens.** E012 (sub80s40 port, tier medium, 48k hard / 24k soft; 334 of 334 attempts done) scores pass@1 24.6% at 35.6k tokens/attempt. The no-tool xhigh run on the same attempts scores 20.4% when capped at 48k and 10.8% when capped at 36k (simulated: correct and finished within the cap), and 35.9% uncapped at 240k (73.6k tokens). Paired vs the 36k cap: +13.8 pp [+7.6, +20.2]. On dev-56 the same config scores 19.6% at 36.1k.
+- **Qwen3.6-35B-A3B and Nemotron are far behind.** Qwen3.6-35B-A3B: pass@1 6.0%, pass@2 7.2% at 53.0k tokens, a clean run with every attempt closing its thinking on its own. Nemotron 3.5 Lightning: 0.0% (0/167) at 68.0k tokens. Nemotron 3 Super 120B is inconclusive (provider stream failures on most pilot attempts).
 - **Nemotron failure pattern (40 traces read).** No trace finds the correct rule; every answer is an admitted guess or give-up (copy the test input, constant fill). It invents time pressure ("given the time…") although the prompt sets no limit and quits at 50–95k of 200k tokens; it misreads grid sizes in about 30/40 traces and never re-checks; its written grids drop cells or whole rows (the source of the jagged answers); and it tries dozens of one-example ideas without checking any rule on all training pairs [^nemo].
 - **Format audit: the parser loses nothing.** Re-parsing 450 Qwen attempts finds 0 incorrect attempts that contain the correct grid anywhere, in the answer or in the thinking; `\boxed` is never used [^audit]. The one real output loss is dropping a row while typing a large grid: about 1–2% of attempts (1 for Qwen3.6, 4 exact + 2 near for Qwen3.8). Recomputed here: attempts without any parsable grid are Qwen xhigh-240k 0/334, Qwen medium-48k 11/334, Qwen3.6-35B 1/334; the recomputed correct flag matches the stored flag on all 8589 public-eval records (0 mismatches).
 
 ## Tokens vs accuracy
 
-Points plotted in the HTML report (Fig. 1–2): every Table 1 run; x = mean output tokens per attempt, y = pass@1 (and pass@2 where ≥2 samples).
+Points plotted in the HTML report (Fig. 1–2): every Table 1 run; x = mean output tokens per attempt, y = Kaggle score (pair-weighted): Kaggle pass@1, and Kaggle pass@2 where ≥2 samples.
 
-| Run | Family | Tokens / attempt | pass@1 | pass@2 | Samples |
+| Run | Family | Tokens / attempt | Kaggle pass@1 | Kaggle pass@2 | Samples |
 |---|---|--:|--:|--:|--:|
-| `E010 s20x60` | DeepSeek | 32.9k | 62.4 | 76.5 | 2 |
-| `E012 Qwen tools full` | Qwen | 35.6k | 25.8 | 34.6 | 2 |
-| `E010 s25x80` | DeepSeek | 35.9k | 64.7 | 75.3 | 2 |
-| `E009 sub64a` | DeepSeek | 38.7k | 58.2 | — | 1 |
-| `E008 Qwen medium-48k` | Qwen | 39.1k | 9.7 | 13.3 | 2 |
-| `E009 sub80s40` | DeepSeek | 40.7k | 67.8 | 77.5 | 3 |
-| `E011 subv80s40` | DeepSeek | 41.4k | 65.7 | 76.5 | 2 |
-| `E011 sub80s40v` | DeepSeek | 41.9k | 66.5 | 77.2 | 2 |
-| `E009 sub96s40` | DeepSeek | 42.1k | 67.8 | — | 1 |
-| `E004 cap100` | DeepSeek | 45.5k | 61.9 | — | 1 |
-| `E009/E011 sub96n` | DeepSeek | 45.7k | 68.3 | 78.5 | 2 |
-| `E011 sub80s40h` | DeepSeek | 47.1k | 66.0 | 77.5 | 2 |
-| `E004-GL` | DeepSeek | 49.5k | 66.0 | 76.4 | 4 |
-| `E008 Qwen3.6-35B` | Qwen | 53.0k | 6.2 | 7.5 | 2 |
-| `E004 grid-high` | DeepSeek | 55.2k | 68.3 | 78.2 | 2 |
-| `E001d` | DeepSeek | 55.7k | 59.9 | 74.6 | 3 |
-| `E004 code-high` | DeepSeek | 58.9k | 61.9 | — | 1 |
-| `E004 plain-low` | DeepSeek | 61.0k | 51.2 | — | 1 |
-| `E004 grid-max` | DeepSeek | 65.0k | 65.3 | — | 1 |
-| `E004 code-max` | DeepSeek | 65.2k | 60.7 | — | 1 |
+| `E010 s20x60` | DeepSeek | 32.9k | 61.4 | 75.4 | 2 |
+| `E012 Qwen tools full` | Qwen | 35.6k | 24.6 | 33.5 | 2 |
+| `E010 s25x80` | DeepSeek | 35.9k | 65.3 | 75.4 | 2 |
+| `E009 sub64a` | DeepSeek | 38.7k | 57.5 | — | 1 |
+| `E008 Qwen medium-48k` | Qwen | 39.1k | 9.6 | 13.8 | 2 |
+| `E009 sub80s40` | DeepSeek | 40.7k | 66.5 | 76.4 | 3 |
+| `E011 subv80s40` | DeepSeek | 41.4k | 64.1 | 75.4 | 2 |
+| `E011 sub80s40v` | DeepSeek | 41.9k | 65.9 | 77.8 | 2 |
+| `E009 sub96s40` | DeepSeek | 42.1k | 66.5 | — | 1 |
+| `E004 cap100` | DeepSeek | 45.5k | 62.3 | — | 1 |
+| `E009/E011 sub96n` | DeepSeek | 45.7k | 67.7 | 79.0 | 2 |
+| `E011 sub80s40h` | DeepSeek | 47.1k | 65.0 | 77.2 | 2 |
+| `E004-GL` | DeepSeek | 49.5k | 64.5 | 75.6 | 4 |
+| `E008 Qwen3.6-35B` | Qwen | 53.0k | 6.0 | 7.2 | 2 |
+| `E004 grid-high` | DeepSeek | 55.2k | 67.7 | 77.8 | 2 |
+| `E001d` | DeepSeek | 55.7k | 58.3 | 73.3 | 3 |
+| `E004 code-high` | DeepSeek | 58.9k | 61.1 | — | 1 |
+| `E004 plain-low` | DeepSeek | 61.0k | 51.5 | — | 1 |
+| `E004 grid-max` | DeepSeek | 65.0k | 64.1 | — | 1 |
+| `E004 code-max` | DeepSeek | 65.2k | 59.9 | — | 1 |
 | `E008 Nemotron Lightning` | Nemotron | 68.0k | 0.0 | — | 1 |
-| `E008 Qwen xhigh-240k` | Qwen | 73.6k | 36.4 | 48.2 | 2 |
-| `E004 plain-max` | DeepSeek | 86.2k | 47.6 | — | 1 |
+| `E008 Qwen xhigh-240k` | Qwen | 73.6k | 35.9 | 47.9 | 2 |
+| `E004 plain-max` | DeepSeek | 86.2k | 47.3 | — | 1 |
 
 ## Kaggle feasibility
 
@@ -163,34 +166,34 @@ Target: Kaggle rerun on 4×L4 (24 GB, SM89), 12 h, no internet, 240 tasks / 259 
 | decode MTP=0 (measured) | 195 | 7.6M | 29.5k | 14.7k |
 | E2E scheduler avg MTP=3 (README) [^kag-e2e] | 295 | 11.5M | 44.5k | 22.2k |
 
-No-tool Qwen3.8 xhigh at simulated caps (correct and finished within the cap):
+No-tool Qwen3.8 xhigh at simulated caps (correct and finished within the cap); Kaggle score primary, task-weighted secondary:
 
-| Cap | Finished within cap | pass@1 | pass@2 |
-|--:|--:|--:|--:|
-| 28k | 8% | 6.9 | 10.8 |
-| 36k | 14% | 12.1 | 16.7 |
-| 48k | 30% | 21.2 | 29.0 |
-| 64k | 48% | 28.5 | 36.9 |
-| 96k | 74% | 34.5 | 46.1 |
-| 128k | 93% | 35.8 | 47.4 |
-| 240k budget (uncapped) | 99% | 36.4 | 48.2 |
+| Cap | Finished within cap | Kaggle pass@1 | Kaggle pass@2 | *Task-wt. pass@1* | *Task-wt. pass@2* |
+|--:|--:|--:|--:|--:|--:|
+| 28k | 8% | 6.6 | 9.6 | *6.9* | *10.8* |
+| 36k | 14% | 10.8 | 14.4 | *12.1* | *16.7* |
+| 48k | 30% | 20.4 | 28.1 | *21.2* | *29.0* |
+| 64k | 48% | 27.5 | 35.9 | *28.5* | *36.9* |
+| 96k | 74% | 33.8 | 45.5 | *34.5* | *46.1* |
+| 128k | 93% | 35.3 | 47.3 | *35.8* | *47.4* |
+| 240k budget (uncapped) | 99% | 35.9 | 47.9 | *36.4* | *48.2* |
 
 - **Why tools for Kaggle.** At ~30–37k tokens per pair, no-tool Qwen sits on the steep part of its cap curve (table above), while the E012 tool agent gets twice the no-tool accuracy at the same spend: about two-thirds of its attempts finish under the 48k cap, and every correct answer is handed over by `submit_answer`.
 - **Submitted config:** Qwen3.8-27B-FP8 + python tools (qwen-tools-3), vLLM 0.23 — submission 57088016, submitted 2026-10-11 23:51 UTC, status PENDING at 2026-10-12 00:04 UTC. Config (kaggle/README.md, v2): E012 tool agent (`agent_qwen.solve`, qwen-tools-3), tier medium, 24k soft target, hard cap min(48k, adaptive per-pair share), budget notes on every tool output, temp 1.0 / top_p 0.95 / top_k 20, LocalExecutor, vLLM 0.23 from our own wheel source, force answers at 11h00m, hard stop 11h30m, emergency writer 11h42m, notebook guard 11h45m (all from the first cell).
 - **Prefix-caching rule** (AGENTS.md): tool use re-sends the whole growing transcript each turn, so prefix caching (vLLM `--enable-prefix-caching` / SGLang radix cache) is mandatory; never benchmark, tune or submit a tool config with it off, size concurrency by cache health (hit rate, evictions, preemptions) and not only KV capacity, and log those metrics during real runs. On vLLM 0.19 prefix caching put the hybrid model in Mamba `align` mode and cut KV to ~304k tokens; vLLM 0.23 reports 1.40M.
-- The commit runs only validate the pipeline: the local test is deadline-forced about 6 minutes after the server is up, so its 2/4 (tools) and 1/4 (plain) task scores say nothing about accuracy (Table 2).
+- The commit runs only validate the pipeline: the local test is deadline-forced about 6 minutes after the server is up, so its scores of 2/5 (tools) and 1/5 (plain) solved test outputs (2.00/4 tasks and 1.00/4 tasks task-weighted) say nothing about accuracy (Table 2).
 
 ## Caveats
 
-- **Public vs semi-private.** All full-set numbers are on the public evaluation set. ARC Prize reports V4 Flash 0731 at 63.9% public / 61.4% semi-private and Qwen3.8-27B at 42.4% semi-private [^arcprize]; our public pass@2 for Qwen3.8 xhigh is 48.2%.
-- **Contamination signs for Flash.** The public set predates V4.1; Flash's no-tool pass@2 here is well above ARC Prize's public number for V4 Flash 0731, and in E004 traces Flash listed real ARC-AGI-2 eval task ids while trying to recall answers [^contam]. Absolute Flash scores may be inflated; comparisons within one model are not affected.
-- **Sample noise is ±3–5 pp.** E004-GL's 4 samples span 62.8–70.0 (sd 3.1); E001d's span 54.2–65.1. Most paired CIs vs E004-GL include zero; only the losses (sub64a, s20x40, plain prompt) are clearly significant.
-- **Single samples.** Rows with 1 sample (grid-max, cap100, code mode, plain prompt, sub96s40, sub64a, Nemotron) have no pass@2 and carry the full ±3–5 pp noise. pilot-26 and dev-56 numbers are noisier still (one task moves the pilot by 6.7 pp).
+- **Public vs semi-private.** All full-set numbers are on the public evaluation set. ARC Prize reports V4 Flash 0731 at 63.9% public / 61.4% semi-private and Qwen3.8-27B at 42.4% semi-private [^arcprize], all task-weighted; our public pass@2 for Qwen3.8 xhigh is 47.9% Kaggle (48.2% task-weighted).
+- **Contamination signs for Flash.** The public set predates V4.1; Flash's no-tool pass@2 here (73.3% Kaggle, 74.6% task-weighted) is well above ARC Prize's public 63.9% (task-weighted) for V4 Flash 0731, and in E004 traces Flash listed real ARC-AGI-2 eval task ids while trying to recall answers [^contam]. Absolute Flash scores may be inflated; comparisons within one model are not affected.
+- **Sample noise is a few pp.** E004-GL's 4 samples span 62.3–68.3 (sd 2.6); E001d's span 51.5–63.5 (sd 6.1); across multi-sample DeepSeek runs the per-sample sd is 0.8–6.1 pp. Most paired CIs vs E004-GL include zero; only the losses (sub64a, s20x40, plain prompt) are clearly significant.
+- **Single samples.** Rows with 1 sample (grid-max, cap100, code mode, plain prompt, sub96s40, sub64a, Nemotron) have no pass@2 and carry the full sample noise. pilot-26 and dev-56 numbers are noisier still (one test output moves the pilot by 3.8 pp on the Kaggle metric; one task by 6.7 pp task-weighted).
 - **Budgets differ by harness.** No-tool DeepSeek runs use one 200k call; E004 tool runs a 120k total budget; E009–E011 80–96k; Qwen gen runs 48k or 240k; E012 48k. Compare tokens/attempt, not caps.
 
 ## Appendix — cross-check against READMEs and the registry
 
-96 README / registry numbers were compared with the recomputed values; 4 differ by more than 0.5 pt (scores) or more than 1k and 2% (tokens).
+96 README / registry numbers were compared with the recomputed values; 4 differ by more than 0.5 pt (scores) or more than 1k and 2% (tokens). The cross-check compares task-weighted values, because the READMEs and the registry quote ARC Prize's task-weighted convention.
 
 | Run | Metric | README | Recomputed | Diff | Source | Explanation |
 |---|---|--:|--:|--:|---|---|
@@ -198,6 +201,10 @@ No-tool Qwen3.8 xhigh at simulated caps (correct and finished within the cap):
 | `E001d` | pass2_a01 | 78.1 | 79.3 | +1.2 | experiments.tsv E001d headline (pre-retry) | predates the 2026-10-03 retry |
 | `E012 Qwen tools full` | pass1 | 26.4 | 25.8 | -0.6 | experiments.tsv E012 (interim snapshot) | interim snapshot of a running job |
 | `E012 Qwen tools full` | tok_mean | 32.8k | 35.6k | +2.8k | experiments.tsv E012 (interim snapshot) | interim snapshot of a running job |
+
+### Kaggle minus task-weighted, per Table 1 run
+
+Kaggle pass@2 − task-weighted pass@2 (pp): E009/E011 sub96n +0.6; E004 grid-high −0.4; E011 sub80s40v +0.6; E011 sub80s40h −0.3; E009 sub80s40 −1.1; E004-GL −0.8; E010 s25x80 +0.2; E011 subv80s40 −1.1; E010 s20x60 −1.1; E001d −1.4; E009 sub96s40 n/a (1 sample; pass@1 −1.3); E004 grid-max n/a (1 sample; pass@1 −1.2); E004 cap100 n/a (1 sample; pass@1 +0.3); E004 code-high n/a (1 sample; pass@1 −0.9); E004 code-max n/a (1 sample; pass@1 −0.8); E009 sub64a n/a (1 sample; pass@1 −0.7); E004 plain-low n/a (1 sample; pass@1 +0.2); E004 plain-max n/a (1 sample; pass@1 −0.3); E008 Qwen xhigh-240k −0.3; E012 Qwen tools full −1.1; E008 Qwen medium-48k +0.4; E008 Qwen3.6-35B −0.3; E008 Nemotron Lightning n/a (1 sample; pass@1 +0.0). Range −1.4 to +0.6 pp, mean −0.4 pp.
 
 Input audit: 78 result files read; recomputed correctness matches the stored flag on 8589/8589 public-eval records. Eval processes running at build time: none.
 
@@ -210,63 +217,63 @@ Input audit: 78 result files read; recomputed correctness matches the stored fla
 [^audit]: From experiments/E008_openrouter_models/qwen_format_audit.md (450 Qwen attempts read and re-parsed); not recomputed here.
 [^kag-e2e]: 295 tok/s average over 16 min in the end-to-end scheduler (MTP=3, contexts 2–20k) is from experiments/E013_kaggle_submission/README.md; the bench JSON stores only the decode benchmark.
 [^contam]: From experiments/E004_tool_use/README.md (safety trace review): Flash listed real ARC-AGI-2 eval task ids while trying to recall answers.
-[^t1-1]: Sample 0 from E009, sample 1 from E011 (same file). E011's pick for best accuracy. · Δ pass@1 vs E004-GL: +2.4 [−2.2, +6.9] pp · long-tail pairs solved: 66.1% · answer sources: submit 306, none 25, session 3 (of 334)
+[^t1-1]: Sample 0 from E009, sample 1 from E011 (same file). E011's pick for best accuracy. · Δ Kaggle pass@1 vs E004-GL: +3.1 [−1.4, +7.6] pp · long-tail pairs solved: 66.1% · answer sources: submit 306, none 25, session 3 (of 334)
 [^t1d-1]: lean2sub prompt, low effort, 96k hard cap, budget notes from 50% used; submit_answer tool, session-answer fallback (no forced final), lenient parse, 64k per turn
-[^t1-2]: Δ pass@1 vs E004-GL: +2.3 [−2.8, +7.3] pp · long-tail pairs solved: 68.8% · 76/334 attempts without a parsable grid
+[^t1-2]: Δ Kaggle pass@1 vs E004-GL: +3.1 [−1.5, +7.7] pp · long-tail pairs solved: 68.8% · 76/334 attempts without a parsable grid
 [^t1d-2]: lean2 prompt, high effort, 120k total / 64k per turn / 24k forced final, harness persistent-v3
-[^t1-3]: Δ pass@1 vs E004-GL: +1.8 [−2.6, +6.0] pp · long-tail pairs solved: 63.1% · answer sources: submit 468, none 30, session 3 (of 501)
-[^t1d-3]: lean2sub prompt, low effort, 80k hard cap, budget note on every tool output, 40k soft target; submit_answer tool, session-answer fallback (no forced final), lenient parse, 64k per turn
-[^t1-4]: Δ pass@1 vs E004-GL: +0.0 [−4.4, +4.5] pp · long-tail pairs solved: 61.6% · answer sources: submit 273, none 55, session 6 (of 334)
-[^t1-5]: Δ pass@1 vs E004-GL: +0.5 [−4.2, +5.1] pp · long-tail pairs solved: 67.9% · answer sources: submit 306, none 25, session 3 (of 334)
-[^t1-6]: Δ pass@1 vs E004-GL: −0.3 [−4.7, +4.2] pp · long-tail pairs solved: 59.8% · answer sources: submit 308, none 22, session 4 (of 334)
-[^t1-7]: E011's pick for ≲35k tokens/attempt. · Δ pass@1 vs E004-GL: −3.5 [−8.4, +1.4] pp · long-tail pairs solved: 57.1% · answer sources: submit 307, none 24, session 2 (of 333)
-[^t1d-7]: lean2sub prompt, low effort, 60k hard cap, 20k soft target with strong wording; submit_answer tool, session-answer fallback (no forced final), lenient parse, 64k per turn
-[^t1-8]: Candidate from E004; the baseline for E009–E011. · Δ pass@1 vs E001d: +6.1 [+0.0, +12.1] pp · long-tail pairs solved: 71.4% · 116/668 attempts without a parsable grid
-[^t1d-8]: lean2 prompt, low effort, 120k total / 64k per turn / 24k forced final, harness persistent-v3
-[^t1-9]: Δ pass@1 vs E004-GL: −1.3 [−6.6, +3.7] pp · long-tail pairs solved: 56.2% · answer sources: submit 325, none 9 (of 334)
-[^t1d-9]: lean2sub prompt, low effort, 80k hard cap, 25k soft target with strong wording; submit_answer tool, session-answer fallback (no forced final), lenient parse, 64k per turn
+[^t1-3]: Δ Kaggle pass@1 vs E004-GL: +1.3 [−3.5, +6.1] pp · long-tail pairs solved: 67.9% · answer sources: submit 306, none 25, session 3 (of 334)
+[^t1-4]: Δ Kaggle pass@1 vs E004-GL: +0.4 [−4.1, +5.0] pp · long-tail pairs solved: 61.6% · answer sources: submit 273, none 55, session 6 (of 334)
+[^t1-5]: Δ Kaggle pass@1 vs E004-GL: +1.9 [−2.1, +5.9] pp · long-tail pairs solved: 63.1% · answer sources: submit 468, none 30, session 3 (of 501)
+[^t1d-5]: lean2sub prompt, low effort, 80k hard cap, budget note on every tool output, 40k soft target; submit_answer tool, session-answer fallback (no forced final), lenient parse, 64k per turn
+[^t1-6]: Candidate from E004; the baseline for E009–E011. · Δ Kaggle pass@1 vs E001d: +6.2 [+0.2, +12.5] pp · long-tail pairs solved: 71.4% · 116/668 attempts without a parsable grid
+[^t1d-6]: lean2 prompt, low effort, 120k total / 64k per turn / 24k forced final, harness persistent-v3
+[^t1-7]: Δ Kaggle pass@1 vs E004-GL: +0.7 [−4.1, +5.5] pp · long-tail pairs solved: 56.2% · answer sources: submit 325, none 9 (of 334)
+[^t1d-7]: lean2sub prompt, low effort, 80k hard cap, 25k soft target with strong wording; submit_answer tool, session-answer fallback (no forced final), lenient parse, 64k per turn
+[^t1-8]: Δ Kaggle pass@1 vs E004-GL: −0.4 [−4.7, +3.8] pp · long-tail pairs solved: 59.8% · answer sources: submit 308, none 22, session 4 (of 334)
+[^t1-9]: E011's pick for ≲35k tokens/attempt. · Δ Kaggle pass@1 vs E004-GL: −3.1 [−7.8, +1.5] pp · long-tail pairs solved: 57.1% · answer sources: submit 307, none 24, session 2 (of 333)
+[^t1d-9]: lean2sub prompt, low effort, 60k hard cap, 20k soft target with strong wording; submit_answer tool, session-answer fallback (no forced final), lenient parse, 64k per turn
 [^t1-10]: 17 connection-error attempts were retried on 2026-10-03, so all 501 records are complete; ARC Prize parser.
-[^t1-11]: Δ pass@1 vs E004-GL: +1.8 [−4.9, +8.3] pp · long-tail pairs solved: 67.9% · answer sources: submit 162, none 4, session 1 (of 167)
+[^t1-11]: Δ Kaggle pass@1 vs E004-GL: +1.9 [−4.2, +7.8] pp · long-tail pairs solved: 67.9% · answer sources: submit 162, none 4, session 1 (of 167)
 [^t1d-11]: lean2sub prompt, low effort, 96k hard cap, notes on every output, 40k soft target; submit_answer tool, session-answer fallback (no forced final), lenient parse, 64k per turn
-[^t1-12]: Δ pass@1 vs E004-GL: −0.7 [−6.7, +5.0] pp · long-tail pairs solved: 55.4% · 52/167 attempts without a parsable grid
+[^t1-12]: Δ Kaggle pass@1 vs E004-GL: −0.4 [−6.5, +5.2] pp · long-tail pairs solved: 55.4% · 52/167 attempts without a parsable grid
 [^t1d-12]: lean2 prompt, max effort, 120k total / 64k per turn / 24k forced final, harness persistent-v3
-[^t1-13]: Δ pass@1 vs E004-GL: −4.0 [−10.5, +2.1] pp · long-tail pairs solved: 57.1% · 36/167 attempts without a parsable grid
-[^t1-14]: Δ pass@1 vs E004-GL: −4.0 [−10.3, +2.1] pp · long-tail pairs solved: 60.7% · 43/167 attempts without a parsable grid
+[^t1-13]: Δ Kaggle pass@1 vs E004-GL: −2.2 [−8.0, +3.1] pp · long-tail pairs solved: 57.1% · 36/167 attempts without a parsable grid
+[^t1-14]: Δ Kaggle pass@1 vs E004-GL: −3.4 [−9.1, +2.2] pp · long-tail pairs solved: 60.7% · 43/167 attempts without a parsable grid
 [^t1d-14]: submit_solution checked on train pairs, lean2, high effort, 120k total / 64k per turn / 24k forced final, harness persistent-v3
-[^t1-15]: Δ pass@1 vs E004-GL: −5.3 [−11.3, +0.3] pp · long-tail pairs solved: 48.2% · 56/167 attempts without a parsable grid
+[^t1-15]: Δ Kaggle pass@1 vs E004-GL: −4.6 [−10.5, +0.9] pp · long-tail pairs solved: 48.2% · 56/167 attempts without a parsable grid
 [^t1d-15]: submit_solution checked on train pairs, lean2, max effort, 120k total / 64k per turn / 24k forced final, harness persistent-v3
-[^t1-16]: Sample 0 only; the stopped 2nd sample (61 pairs) is in Table 2. · Δ pass@1 vs E004-GL: −7.8 [−14.4, −1.4] pp · long-tail pairs solved: 44.6% · answer sources: submit 133, none 33, session 1 (of 167)
+[^t1-16]: Sample 0 only; the stopped 2nd sample (61 pairs) is in Table 2. · Δ Kaggle pass@1 vs E004-GL: −7.0 [−13.3, −0.9] pp · long-tail pairs solved: 44.6% · answer sources: submit 133, none 33, session 1 (of 167)
 [^t1d-16]: lean2sub prompt, low effort, 64k hard cap, notes on every output, warn at 75%; submit_answer tool, session-answer fallback (no forced final), lenient parse, 64k per turn
-[^t1-17]: Prompt ablation. · Δ pass@1 vs E004-GL: −14.7 [−21.9, −7.6] pp · long-tail pairs solved: 50.0% · 37/167 attempts without a parsable grid
+[^t1-17]: Prompt ablation. · Δ Kaggle pass@1 vs E004-GL: −13.0 [−19.4, −6.7] pp · long-tail pairs solved: 50.0% · 37/167 attempts without a parsable grid
 [^t1d-17]: plain ARC Prize prompt (no lean2 suffix), low effort, 120k total / 64k per turn / 24k forced final, harness persistent-v3
-[^t1-18]: Prompt ablation. · Δ pass@1 vs E004-GL: −18.3 [−26.2, −10.8] pp · long-tail pairs solved: 30.4% · 75/167 attempts without a parsable grid
+[^t1-18]: Prompt ablation. · Δ Kaggle pass@1 vs E004-GL: −17.2 [−25.0, −9.7] pp · long-tail pairs solved: 30.4% · 75/167 attempts without a parsable grid
 [^t1d-18]: plain ARC Prize prompt, max effort, 120k total / 64k per turn / 24k forced final, harness persistent-v3
 [^t1-19]: First 52 records are the pilot run (copied in).
 [^t1d-19]: ARC Prize prompt, tier xhigh, temp 1.0 / top_p 0.95 / top_k 20 (official), 240k budget in 32k chunks, mid-thought EOS continued, 4k forced final
-[^t1-20]: Merged: dev-pair attempts and 81 attempt-0 records from qwen_tools_medium_48k_dev_s24 (harness qwen-tools-2), the rest from qwen_tools_medium_48k_full_v3 (qwen-tools-3, adds a salvage answer source). · Δ pass@1 vs E008 Qwen xhigh-240k: −10.6 [−18.0, −3.0] pp · Δ pass@1 vs E008 Qwen xhigh-240k capped 48k: +4.7 [−2.3, +11.8] pp · answer sources: submit 222, forced 64, none 46 (of 334)
+[^t1-20]: Merged: dev-pair attempts and 81 attempt-0 records from qwen_tools_medium_48k_dev_s24 (harness qwen-tools-2), the rest from qwen_tools_medium_48k_full_v3 (qwen-tools-3, adds a salvage answer source). · Δ Kaggle pass@1 vs E008 Qwen xhigh-240k: −11.4 [−18.3, −4.3] pp · Δ Kaggle pass@1 vs E008 Qwen xhigh-240k capped 48k: +4.2 [−1.9, +10.5] pp · answer sources: submit 222, forced 64, none 46 (of 334)
 [^t1d-20]: E009 sub80s40 port: lean2sub prompt + submit_answer, tier medium, 48k hard cap, 24k soft target, notes on every output, temp 1.0 / top_p 0.95 / top_k 20, forced 256-token submit at the cap
-[^t1-21]: Δ pass@1 vs E008 Qwen xhigh-240k: −26.7 [−33.3, −20.3] pp · 11/334 attempts without a parsable grid
+[^t1-21]: Δ Kaggle pass@1 vs E008 Qwen xhigh-240k: −26.3 [−32.6, −20.1] pp · 11/334 attempts without a parsable grid
 [^t1d-21]: ARC Prize prompt, tier medium, temp 0.6 / top_p 0.95 / top_k 20, 48k budget in 16k chunks, EOS continuation, 4k forced final
-[^t1-22]: Δ pass@1 vs E008 Qwen xhigh-240k: −30.1 [−36.7, −23.7] pp · 1/334 attempts without a parsable grid
+[^t1-22]: Δ Kaggle pass@1 vs E008 Qwen xhigh-240k: −29.9 [−36.3, −23.8] pp · 1/334 attempts without a parsable grid
 [^t1d-22]: ARC Prize prompt, no tier (thinking on), temp 1.0 / top_p 0.95 / top_k 20, presence penalty 1.5, 240k budget in 32k chunks
 [^t1-23]: 1 sample; pass@2 skipped as not worth the cost. Every attempt ends with an admitted guess (Manual reading of 40 traces (experiments/E008_openrouter_models/nemotron_traces/notes_{A,B,C,D}.md), not recomputed.). · 4/167 attempts without a parsable grid
 [^t2-1]: done. ARC Prize prompt, high effort, 200k; 14/26 attempts ended with empty content (mid-thought stop).; rec. $1.75
 [^t2-2]: provider errors. ARC Prize prompt, high effort, temp 1.0 / top_p 0.95, 200k; Inconclusive: provider-side stream failures on 15–30 min streams; the completed attempts are all wrong.; rec. $0.11
 [^t2-3]: merged. same settings as E008 Qwen xhigh-240k; These 52 records were copied into the full run.
 [^t2-4]: stopped. tier medium, 48k hard / 24k soft, qwen-tools-2 (early); sources: submit 16, none 1
-[^t2p-4]: vs E008 Qwen xhigh-240k: −4.2 [−37.5, +25.0] (66.7 vs 70.8, 11 pairs); vs E008 Qwen xhigh-240k capped 48k (sim.): +16.7 [+0.0, +33.3] (66.7 vs 50.0, 11 pairs)
-[^t2p-5]: vs E008 Qwen xhigh-240k: +5.0 [+0.0, +15.0] (75.0 vs 70.0, 8 pairs); vs E008 Qwen xhigh-240k capped 48k (sim.): +5.0 [+0.0, +15.0] (75.0 vs 70.0, 8 pairs)
+[^t2p-4]: vs E008 Qwen xhigh-240k: −4.5 [−38.5, +25.0] (72.7 vs 77.3, 11 pairs); vs E008 Qwen xhigh-240k capped 48k (sim.): +18.2 [+0.0, +40.0] (72.7 vs 54.5, 11 pairs)
+[^t2p-5]: vs E008 Qwen xhigh-240k: +6.2 [+0.0, +18.8] (81.2 vs 75.0, 8 pairs); vs E008 Qwen xhigh-240k capped 48k (sim.): +6.2 [+0.0, +18.8] (81.2 vs 75.0, 8 pairs)
 [^t2-6]: stopped. tier xhigh, 48k hard / 24k soft, --verify-submit; sources: submit 2
 [^t2p-6]: vs E008 Qwen xhigh-240k: +0.0 [+0.0, +0.0] (100.0 vs 100.0, 1 pairs); vs E008 Qwen xhigh-240k capped 48k (sim.): +0.0 [+0.0, +0.0] (100.0 vs 100.0, 1 pairs)
-[^t2p-7]: vs E008 Qwen xhigh-240k: +10.0 [−30.0, +60.0] (80.0 vs 70.0, 8 pairs); vs E008 Qwen xhigh-240k capped 80k (sim.): +10.0 [−30.0, +60.0] (80.0 vs 70.0, 8 pairs)
+[^t2p-7]: vs E008 Qwen xhigh-240k: +0.0 [−30.0, +42.9] (75.0 vs 75.0, 8 pairs); vs E008 Qwen xhigh-240k capped 80k (sim.): +0.0 [−30.0, +42.9] (75.0 vs 75.0, 8 pairs)
 [^t2-8]: done. tier medium, 48k hard / 24k soft, notes on every output (the Kaggle v2 config); sources: submit 72, forced 28, none 12
-[^t2p-8]: vs E008 Qwen xhigh-240k: −18.2 [−31.5, −5.1] (20.4 vs 38.6, 56 pairs); vs E008 Qwen xhigh-240k capped 48k (sim.): +1.7 [−8.7, +12.6] (20.4 vs 18.7, 56 pairs)
+[^t2p-8]: vs E008 Qwen xhigh-240k: −17.0 [−29.1, −5.4] (19.6 vs 36.6, 56 pairs); vs E008 Qwen xhigh-240k capped 48k (sim.): +0.9 [−8.6, +10.9] (19.6 vs 18.8, 56 pairs)
 [^t2-9]: stopped. as dev medium-48k s24 + strong soft-target wording; sources: submit 61, forced 16, none 13
-[^t2p-9]: vs E008 Qwen xhigh-240k: −9.7 [−22.4, +3.6] (29.6 vs 39.3, 56 pairs); vs E008 Qwen xhigh-240k capped 48k (sim.): +10.2 [−1.0, +21.9] (29.6 vs 19.4, 56 pairs)
+[^t2p-9]: vs E008 Qwen xhigh-240k: −8.0 [−20.0, +3.7] (28.6 vs 36.6, 56 pairs); vs E008 Qwen xhigh-240k capped 48k (sim.): +9.8 [+0.0, +20.3] (28.6 vs 18.8, 56 pairs)
 [^t2-10]: stopped. tier medium, 28k hard / 14k soft; sources: submit 11, forced 7, none 3, session 1
-[^t2p-10]: vs E008 Qwen xhigh-240k: −13.2 [−39.5, +13.2] (21.1 vs 34.2, 22 pairs); vs E008 Qwen xhigh-240k capped 28k (sim.): +10.5 [−10.5, +31.6] (21.1 vs 10.5, 22 pairs)
+[^t2p-10]: vs E008 Qwen xhigh-240k: −13.6 [−36.4, +9.5] (18.2 vs 31.8, 22 pairs); vs E008 Qwen xhigh-240k capped 28k (sim.): +9.1 [−8.7, +28.6] (18.2 vs 9.1, 22 pairs)
 [^t2-11]: stopped. tier xhigh, 48k hard / 24k soft; sources: submit 14, none 12, forced 12
-[^t2p-11]: vs E008 Qwen xhigh-240k: −6.1 [−24.2, +12.1] (22.7 vs 28.8, 38 pairs); vs E008 Qwen xhigh-240k capped 48k (sim.): +6.1 [−9.1, +24.2] (22.7 vs 16.7, 38 pairs)
+[^t2p-11]: vs E008 Qwen xhigh-240k: −5.3 [−21.6, +11.4] (21.1 vs 26.3, 38 pairs); vs E008 Qwen xhigh-240k capped 48k (sim.): +5.3 [−8.6, +20.5] (21.1 vs 15.8, 38 pairs)
 [^t2-12]: done. 96k hard cap, no notes; rec. $1.81; sources: submit 47, none 7, session 2
 [^t2-13]: done. 96k hard cap, notes from 50% used; rec. $1.70; sources: submit 52, none 4
 [^t2-14]: done. brevity prompt, 96k, notes from 50%; rec. $1.71; sources: submit 52, none 4
@@ -293,8 +300,8 @@ Input audit: 78 result files read; recomputed correctness matches the stored fla
 [^t2-46]: stopped. as E009 sub64a; Stopped early because it was clearly losing to E004-GL.; rec. $1.58; sources: submit 49, none 8, session 4
 [^t2-47]: done (8 API errors). 40k hard / 20k soft, strong wording; 8 attempts lost to API connection errors and not retried, so it fails the completeness rule.; rec. $3.04; sources: submit 111, none 44, session 4
 [^t2-53]: probe. tool-harness smoke test, xhigh, 80k / 40k soft; sources: submit 4
-[^t2-54]: done. NVIDIA transductive prompt, max effort, 200k. Score uses the stored flag against NVIDIA's expected_output; est. cost $11.70; 3 unparsed.
-[^t2-55]: done. NVIDIA transductive prompt, high effort, 200k. Score uses the stored flag against NVIDIA's expected_output; est. cost $10.36; 2 unparsed.
-[^t2-56]: done. NVIDIA transductive prompt, max effort, 200k. Score uses the stored flag against NVIDIA's expected_output; est. cost $17.75; 1 unparsed.
+[^t2-54]: done. NVIDIA transductive prompt, max effort, 200k. One test input per problem, so Kaggle and task-weighted scores coincide. Score uses the stored flag against NVIDIA's expected_output; est. cost $11.70; 3 unparsed.
+[^t2-55]: done. NVIDIA transductive prompt, high effort, 200k. One test input per problem, so Kaggle and task-weighted scores coincide. Score uses the stored flag against NVIDIA's expected_output; est. cost $10.36; 2 unparsed.
+[^t2-56]: done. NVIDIA transductive prompt, max effort, 200k. One test input per problem, so Kaggle and task-weighted scores coincide. Score uses the stored flag against NVIDIA's expected_output; est. cost $17.75; 1 unparsed.
 [^t2-57]: done (deadline-forced ~6 min after server ready). 21 tool calls, 2 tool errors, 0 parse failures, peak KV 4.5%; source kaggle/runs/v2-v2/summary_local.json
 [^t2-58]: done (deadline-forced ~6 min after server ready). 0 tool calls, 0 tool errors, 0 parse failures, peak KV 5.8%; source kaggle/runs/plain-v1/summary_local.json
