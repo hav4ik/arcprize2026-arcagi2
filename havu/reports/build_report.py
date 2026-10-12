@@ -262,6 +262,15 @@ def evaluate(spec):
         res["cost_total"] = sum(r.get(field) or 0 for r in good)
         res["cost_file_total"] = sum(r.get(field) or 0 for r in allrecs)
         res["cost_kind"] = "rec"
+        if field == "est_cost_usd" and any("est_cost_peak_usd" in r for r in good):
+            # --auto-peak-price runs: est_cost_usd already bills peak turns at 2x; est_cost_peak_usd is that (doubled) peak part
+            by_att = defaultdict(lambda: [0.0, 0.0])
+            for (_, _, a), r in lat.items():
+                if not r["_err"]:
+                    by_att[a][0] += r.get(field) or 0
+                    by_att[a][1] += r.get("est_cost_peak_usd") or 0
+            res["cost_by_attempt"] = {a: {"rec": v[0], "peak_part": v[1], "offpeak_equiv": v[0] - v[1] / 2} for a, v in sorted(by_att.items())}
+            res["cost_offpeak_equiv"] = sum(v["offpeak_equiv"] for v in res["cost_by_attempt"].values())
     elif c[0] == "text":
         res["cost_kind"] = "text"
         res["cost_text"] = c[1]
@@ -269,6 +278,8 @@ def evaluate(spec):
         res["cost_kind"] = "none"
     if "cost_total" in res:
         res["cost_per_sample"] = res["cost_total"] / n_samples if n_samples else None
+        if "cost_offpeak_equiv" in res and n_samples:
+            res["cost_per_sample_offpeak"] = res["cost_offpeak_equiv"] / n_samples
     res["_lat"] = lat
     res["_universe"] = universe
     return res
@@ -325,6 +336,127 @@ def paired(run, ref, match_attempts=False, cap=None):
             "tw_run": tw(run_r), "tw_ref_score": tw(ref_r), "tw_diff": st.mean(tdiff.values()), "tw_lo": tlo, "tw_hi": thi}
 
 
+def ranked_answers(recs, k=2):
+    """Same rule as evals/train_check.py ranked_answers (the harness's Kaggle answer order): attempts ranked by
+    train_pass (True first), then attempt order; the top-k distinct non-empty predictions."""
+    order = sorted((r for r in recs if r.get("pred") is not None), key=lambda r: (r.get("train_pass") is not True, r["_att"]))
+    out = []
+    for r in order:
+        if r["pred"] not in [o["pred"] for o in out]:
+            out.append(r)
+        if len(out) == k:
+            break
+    return out
+
+
+def policy3(spec):
+    """pass@2 with the conditional 3rd attempt (E017 --extra-attempt-if-no-train-pass): per pair, the harness's top-2 ranked
+    answers over attempts 0, 1 and (when it fired) 2, against the plain a0+a1 pass@2 on the same file."""
+    lat, _ = merged(spec["files"])
+    idx = index_lat(lat)
+    pol, base = {}, {}
+    for t, p in FULL:
+        recs = [dict(r, _att=a) for a, r in idx.get((t, p), {}).items() if not r["_err"]]
+        pol[(t, p)] = any(r["_ok"] for r in ranked_answers(recs))
+        base[(t, p)] = any(r["_ok"] for r in recs if r["_att"] in (0, 1))
+    extra = [r for (t, p, a), r in lat.items() if a == 2 and not r["_err"]]
+    tasks = defaultdict(list)
+    for k in pol:
+        tasks[k[0]].append(pol[k] - base[k])
+    lo, hi = bootstrap_cluster({t: (sum(v), len(v)) for t, v in tasks.items()})
+    base_tok = sum(r["_tok"] for (t, p, a), r in lat.items() if a in (0, 1) and not r["_err"])
+    ex_tok = sum(r["_tok"] for r in extra)
+    return {"fired": len(extra), "fired_pairs": len({(r["task_id"], r["pair"]) for r in extra}),
+            "extra_correct": sum(r["_ok"] for r in extra), "extra_train_pass": sum(r.get("train_pass") is True for r in extra),
+            "extra_train_pass_correct": sum(r.get("train_pass") is True and r["_ok"] for r in extra),
+            "extra_no_answer": sum(r.get("pred") is None for r in extra),
+            "extra_tok_mean": st.mean(r["_tok"] for r in extra) if extra else None, "extra_tok_total": ex_tok,
+            "extra_cost": sum(r.get("est_cost_usd") or 0 for r in extra),
+            "extra_cost_peak_part": sum(r.get("est_cost_peak_usd") or 0 for r in extra),
+            "tok_per_pair_base": base_tok / len(FULL), "tok_per_pair_policy": (base_tok + ex_tok) / len(FULL),
+            "rescued": sum(pol[k] and not base[k] for k in pol), "lost": sum(base[k] and not pol[k] for k in pol),
+            "k_pass2_base": pw(base), "k_pass2_policy": pw(pol), "pass2_base": tw(base), "pass2_policy": tw(pol),
+            "diff": pw(pol) - pw(base), "lo": lo, "hi": hi}
+
+
+def train_check_stats(lat):
+    """Live train-check verifier quality over the given attempts: P(correct | train_pass), P(correct | train_fail).
+    Attempts without an answer (train_pass None) are left out of both conditionals, as in the E017 README."""
+    good = [r for r in lat.values() if not r["_err"] and "train_pass" in r]
+    ps = [r for r in good if r.get("train_pass") is True]
+    fs = [r for r in good if r.get("train_pass") is False]
+    return {"n": len(good), "pass": len(ps), "pass_correct": sum(r["_ok"] for r in ps), "fail": len(fs),
+            "fail_correct": sum(r["_ok"] for r in fs), "no_answer": sum(r.get("pred") is None for r in good),
+            "p_pass": sum(r["_ok"] for r in ps) / len(ps) if ps else None, "p_fail": sum(r["_ok"] for r in fs) / len(fs) if fs else None,
+            "recall": sum(r["_ok"] for r in ps) / max(1, sum(r["_ok"] for r in good))}
+
+
+E016_DIR = ROOT / "experiments/E016_cutoff_continuation"
+E016_ARMS = [("toolnote", "E016 toolnote (thinking off)", "drop the truncated reasoning-only turn, append a \"time is up, call submit_answer now\" "
+              "note to the last tool result; thinking off, 2,048-token cap, one extra turn if it runs code instead"),
+             ("usermsg", "E016 usermsg (thinking off)", "keep the trace as sent and append the same text as a user message; thinking off, 2,048-token cap"),
+             ("toolnote_think", "E016 toolnote (thinking on)", "toolnote messages with thinking on (low effort), 8,192-token cap")]
+
+
+def e016_rows(s2060):
+    """Table 2 rows for E016's continuation arms, recomputed from results/continuations.jsonl; scored with the official
+    exact-match flag stored per row, and substituted into E010 s20x60 to show the effect on its full-set scores."""
+    path = E016_DIR / "results/continuations.jsonl"
+    rows = [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
+    best = {}
+    for r in rows:
+        if "error" not in r:
+            best[(r["task_id"], int(r["pair"]), int(r["attempt"]), r["variant"])] = r
+    base = {k[:3]: r for k, r in best.items() if k[3] == "baseline"}
+    out, summ = [], {}
+    lat = s2060["_lat"]
+    for var, rid, desc in E016_ARMS:
+        rs = [r for k, r in best.items() if k[3] == var]
+        n = len(rs)
+        ans = sum(r.get("pred") is not None for r in rs)
+        corr = [r for r in rs if r.get("correct")]
+        src = Counter(r.get("source") or "none" for r in rs)
+        toks = [r["usage"]["completion"] for r in rs]
+        cost = sum(r.get("cost_usd") or 0 for r in rs)
+        inp = sum(r["usage"]["prompt"] for r in rs)
+        hit = sum(r["usage"].get("cache_hit", 0) for r in rs)
+        # verify the official flag on the stored prediction
+        mism = sum(bool(r.get("correct")) != (r.get("pred") is not None and r["pred"] == TASKS[r["task_id"]]["test"][int(r["pair"])]["output"])
+                   for r in rs)
+        # substitute rescued answers into s20x60 (attempts 0 and 1)
+        sub = {k: r["_ok"] for k, r in lat.items() if not r["_err"]}
+        for r in rs:
+            sub[(r["task_id"], int(r["pair"]), int(r["attempt"]))] = bool(r.get("correct")) or sub.get((r["task_id"], int(r["pair"]), int(r["attempt"])), False)
+        k1 = st.mean(pw({(t, p): sub.get((t, p, a), False) for t, p in FULL}) for a in (0, 1))
+        k2 = pw({(t, p): sub.get((t, p, 0), False) or sub.get((t, p, 1), False) for t, p in FULL})
+        per_pair = defaultdict(list)
+        for r in rs:
+            per_pair[(r["task_id"], int(r["pair"]))].append(bool(r.get("correct")))
+        tw1 = tw({k: st.mean(v) for k, v in per_pair.items()})
+        summ[var] = {"n": n, "answered": ans, "correct": len(corr), "cost": cost, "out_tok": sum(toks), "in_tok": inp, "cache_hit": hit,
+                     "sources": dict(src), "s2060_k_pass1": k1, "s2060_k_pass2": k2, "flag_mismatch": mism,
+                     "rescued": [f"{r['task_id']}.{r['pair']}#{r['attempt']}" for r in corr]}
+        status = (f"done. {desc}. Answered {ans}/{n} (" + ", ".join(f"{k} {v}" for k, v in src.most_common()) + f"), correct {len(corr)}"
+                  + (f" ({', '.join(summ[var]['rescued'])})" if corr else "") + f"; rec. ${cost:.3f} for {n} calls (off-peak); input "
+                  f"{inp / 1000:.0f}k tokens ({hit / 1000:.0f}k cache hit), output {sum(toks) / 1000:.1f}k")
+        if var == "toolnote":
+            nb = len(base)
+            status += (f". Zero-cost probe on the replayed sessions: `answer` set in {sum(bool(b.get('answer_present')) for b in base.values())}/{nb}, "
+                       f"a function fitting every train pair in {sum(bool(b.get('functions_fitting_all_train')) for b in base.values())}, "
+                       f"correct {sum(bool(b.get('any_function_correct')) for b in base.values())}. With thinking off DeepSeek drops earlier "
+                       "reasoning_content from the prompt, so the turn sees only code and tool outputs [^e016]")
+        out.append({
+            "id": rid, "fam": DS, "model": FLASH, "harness": "tools-grid (continuation)", "set": f"s20x60 cut-off attempts ({n})",
+            "coverage": f"1 × {n}/{n} attempts", "k_pass1": f"{f1(len(corr) / n)} ({len(corr)}/{n})", "k_pass2": "—",
+            "pass1": f1(tw1), "pass2": "—", "tok": f"{fk(st.mean(toks))} / {fk(st.median(toks))}",
+            "paired": (f"E010 s20x60 with these answers substituted: Kaggle pass@1 {f1(s2060['k_pass1'])} → {f1(k1)}, "
+                       f"pass@2 {f1(s2060['k_pass2'])} → {f1(k2)}"),
+            "status": status,
+            "raw": {"k_pass1": len(corr) / n, "k_pass2": None, "pass1": tw1, "pass2": None, "tok_mean": st.mean(toks)}})
+    summ["total_cost_all_rows"] = sum(r.get("cost_usd") or 0 for r in rows)
+    return out, summ
+
+
 # ----------------------------------------------------------------------------------------------- run specs
 DS = "DeepSeek"
 QW = "Qwen"
@@ -336,6 +468,7 @@ QWEN36 = "Qwen3.6-35B-A3B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000 Ser
 TOOLS_V3 = "120k total / 64k per turn / 24k forced final, harness persistent-v3"
 SUB = "submit_answer tool, session-answer fallback (no forced final), lenient parse, 64k per turn"
 GEN = "no tools (raw gen API)"
+E017_H = "low effort, sub80s40 budgets (80k hard / 40k soft, notes on every output, `submit_answer`), harness persistent-v5"
 
 
 def tool_file(prompt, effort, tag, mode="grid"):
@@ -389,6 +522,20 @@ T1_SPECS = [
          desc="sub80s40 + --verify-submit + lean2subv prompt (submit exactly solve(test_input))", cost=REC_EST, ref="E004-GL"),
     dict(id="E011 sub80s40h", fam=DS, model=FLASH, harness="tools-grid", set="full", files=[tool_file("lean2sub", "high", "e011_full_sub80s40h")],
          desc="sub80s40 at high effort", cost=REC_EST, ref="E004-GL"),
+    dict(id="E017 V1 summary", fam=DS, model=FLASH, harness="tools-grid", set="full", files=[tool_file("lean2sub", "low", "e017_full_v1sum")],
+         desc=f"sub80s40 + `--task-summary` (P1: host-computed perception pack in the first message: sizes, colours, object tables, "
+              f"in→out object matching, \"outside train range\" line for the test input); `--train-check`; {E017_H}",
+         cost=REC_EST, ref="E004-GL", ref_extra=["E009 sub80s40"], e017=True),
+    dict(id="E017 V2 lean2roles", fam=DS, model=FLASH, harness="tools-grid", set="full", files=[tool_file("lean2roles", "low", "e017_full_v2roles")],
+         desc=f"sub80s40 with the lean2roles prompt (P2: ROLES note before solve(), no \"noise\" labels without code evidence, "
+              f"test-vs-train difference audit after train passes); `--train-check`; {E017_H}",
+         cost=REC_EST, ref="E004-GL", ref_extra=["E009 sub80s40"], e017=True),
+    dict(id="E017 V3 all", fam=DS, model=FLASH, harness="tools-grid", set="full", files=[tool_file("lean2roles", "low", "e017_full_v3all")],
+         attempts=[0, 1], expected_attempts=2,
+         desc=f"P1+P2+P3: lean2roles + `--task-summary` + `--helpers` (objects, crop, d8, panels, `check(solve)` in the session); "
+              f"`--train-check`; conditional 3rd attempt when neither attempt passes the train check; {E017_H}",
+         cost=REC_EST, ref="E004-GL", ref_extra=["E009 sub80s40"], e017=True, policy3=True,
+         note="pass@1 / pass@2 use attempts 0–1 only; the conditional 3rd attempts (attempt index 2) are reported separately."),
     dict(id="E008 Qwen xhigh-240k", fam=QW, model=QWEN_NV, harness=GEN, set="full", files=["qwen_nvfp4_gen_xhigh_240k_t1.jsonl"],
          desc="ARC Prize prompt, tier xhigh, temp 1.0 / top_p 0.95 / top_k 20 (official), 240k budget in 32k chunks, mid-thought EOS continued, 4k forced final",
          cost=("text", "≈$27 rental [^rent-xhigh]"),
@@ -542,6 +689,10 @@ NVIDIA_SPECS = [
 
 E004_SUBSET = None  # filled from the E004a pilot files
 
+# ARC Prize's official DeepSeek V4.1 Flash results (arcprize.org/results/deepseek-v4-1-flash), quoted; see footnote "arcprize"
+ARCPRIZE_V41 = {"max": 72.9, "high": 67.5, "low": 60.6, "none": 1.3, "arc1_max": 94.5, "public_max_tasks": 91, "agree_lo": 82, "agree_hi": 87}
+QWEN_SEMI = 42.4
+
 
 def nvidia_eval(spec):
     lat, _ = load(spec["file"])
@@ -621,11 +772,17 @@ def build():
             if spec.get("ref_cap"):
                 d = paired(res, results[ref], match_attempts=spec.get("ref_match", False), cap=spec["ref_cap"])
                 out.append(d)
+        for r2 in spec.get("ref_extra", []):
+            out.append(paired(res, results[r2]))
         return [d for d in out if d]
 
     for spec in all_specs:
         res = results[spec["id"]]
         res["paired"] = paired_for(spec, res)
+        if spec.get("e017"):
+            res["train_check"] = train_check_stats(res["_lat"])
+        if spec.get("policy3"):
+            res["policy3"] = policy3(spec)
         if spec["fam"] == DS and spec["harness"].startswith("tools") and spec["set"] == "full":
             res["longtail_acc"] = longtail_acc(res)
         tags = spec.get("running_tags") or spec.get("tags") or []
@@ -642,7 +799,8 @@ def build():
         t1_rows.append(t1_row(spec, res))
     t1_rows.sort(key=lambda r: (fam_order[r["fam"]], -(r["raw"]["k_pass2"] if r["raw"]["k_pass2"] is not None else -1),
                                 -(r["raw"]["k_pass1"] or 0)))
-    mark_best(t1_rows, {"k_pass1": max, "k_pass2": max, "tok_mean": min, "tok_median": min, "tok_p90": min, "ctok_median": min})
+    mark_best(t1_rows, {"k_pass1": max, "k_pass2": max, "tok_mean": min, "tok_median": min, "tok_p90": min, "ctok_median": min},
+              band={"k_pass1": NOISE_BAND, "k_pass2": NOISE_BAND})
 
     # ------------------------------------------------------------------ Table 2
     for spec in T1_SPECS:  # incomplete Table-1 candidates go to Table 2
@@ -651,6 +809,8 @@ def build():
             t2_rows.append(t2_row(spec, res, inprogress=True))
     for spec in T2_SPECS:
         t2_rows.append(t2_row(spec, results[spec["id"]]))
+    e16_rows, e16 = e016_rows(results["E010 s20x60"])
+    t2_rows += e16_rows
     for spec in NVIDIA_SPECS:
         r = nv[spec["id"]]
         t2_rows.append({
@@ -668,7 +828,7 @@ def build():
         t2_rows.append(k)
 
     # ------------------------------------------------------------------ derived findings
-    F = findings(results, specs, nv, longtail, kag)
+    F = findings(results, specs, nv, longtail, kag, e16)
     chart = [{"id": r["id"], "fam": r["fam"], "tok_mean": r["raw"]["tok_mean"], "k_pass1": r["raw"]["k_pass1"], "k_pass2": r["raw"]["k_pass2"],
               "pass1": r["raw"]["pass1"], "pass2": r["raw"]["pass2"], "samples": r["raw"]["samples"]} for r in t1_rows]
     metric_gap = [{"id": r["id"], "samples": r["raw"]["samples"],
@@ -691,14 +851,41 @@ def build():
                                 "paired[].diff/lo/hi/run/ref_score are Kaggle (cluster bootstrap over tasks); paired[].tw_* are task-weighted.",
                  "running_tags": sorted(RUNNING), "audit": AUDIT, "longtail_pairs": len(longtail),
                  "sets": {"full": len(FULL), "pilot": len(PILOT), "dev": len(DEV), "e004": len(E004_SUBSET)}},
-        "table1": t1_rows, "table2": t2_rows, "chart": chart, "metric_gap": metric_gap, "findings": F["findings"], "kaggle": kag, "caveats": F["caveats"],
+        "table1": t1_rows, "table2": t2_rows, "chart": chart, "metric_gap": metric_gap, "findings": F["findings"], "kaggle": kag, "caveats": F["caveats"], "arcprize_cmp": F["arcprize_cmp"], "e016": e16,
         "footnotes": FOOTNOTES, "crosscheck": crosscheck(results, nv), "scope": SCOPE, "scoring": scoring,
         "runs": {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in results.items()}, "nvidia_runs": nv,
     }
+    data["pareto"] = pareto(chart, results)
     v2, pl1 = kag.get("v2-v2", {}), kag.get("plain-v1", {})
     data["kaggle_text"] = dict(KAGGLE_TEXT, local=KAGGLE_TEXT["local"].format(
         v2=v2.get("k_score_txt", "?"), pl=pl1.get("k_score_txt", "?"), v2t=v2.get("score", "?"), plt=pl1.get("score", "?")))
     return data
+
+
+def pareto_front(pts):
+    front, best2 = [], -1.0
+    for p_ in sorted((p_ for p_ in pts if p_["k_pass2"] is not None), key=lambda p_: p_["tok_mean"]):
+        if p_["k_pass2"] > best2:
+            front.append(p_)
+            best2 = p_["k_pass2"]
+    return front
+
+
+def pareto(chart, results):
+    """Kaggle pass@2 Pareto front over the multi-sample Table 1 runs, and how E017 changed it."""
+    front = pareto_front(chart)
+    before = pareto_front([p for p in chart if not p["id"].startswith("E017")])
+    ids, bids = [p["id"] for p in front], [p["id"] for p in before]
+    txt = ("Kaggle pass@2 Pareto front over all multi-sample runs (fewer tokens per attempt, higher pass@2): "
+           + " → ".join(f"{p['id']} ({fk(p['tok_mean'])}, {f1(p['k_pass2'])}%)" for p in front) + ".")
+    added, dropped = [i for i in ids if i not in bids], [i for i in bids if i not in ids]
+    if added:
+        txt += (f" {' and '.join(added)} joined the front" + (f", displacing {' and '.join(dropped)}" if dropped else "") + ".")
+    pp = results.get("E017 V3 all", {}).get("policy3")
+    if pp:
+        txt += (f" Not plotted: with its conditional 3rd attempt E017 V3 reaches {f1(pp['k_pass2_policy'])}% Kaggle pass@2 at "
+                f"{fk(pp['tok_per_pair_policy'])} tokens per pair ({fk(pp['tok_per_pair_base'])} without), a per-pair rather than per-attempt cost.")
+    return {"front": ids, "front_before_e017": bids, "text": txt}
 
 
 def coverage_text(res):
@@ -728,7 +915,17 @@ def t1_row(spec, res):
     ns = res["samples"]
     p1, p1_sub, p2, p2_sub = score_cells(res, "k_")
     tp1, tp1_sub, tp2, tp2_sub = score_cells(res, "")
-    if res["cost_kind"] in ("est", "rec"):
+    cost_sub, cost_raw = None, res.get("cost_per_sample")
+    cba = res.get("cost_by_attempt") or {}
+    if cba and any(v["peak_part"] > 0 for v in cba.values()):
+        def when(v):
+            return "peak 2×" if v["peak_part"] >= v["rec"] - 1e-9 else ("off-peak" if v["peak_part"] == 0 else "partly peak")
+        cost = " / ".join(f"{money(v['rec'])} ({when(v)})" for v in cba.values())
+        cost_raw = res["cost_per_sample_offpeak"]
+        cost_sub = ("rec. per sample" if len(cba) > 1 else "rec.") + f"; {money(cost_raw)}/sample off-peak equiv."
+        if res.get("policy3"):
+            cost_sub += f"; +{money(res['policy3']['extra_cost'])} for 3rd attempts"
+    elif res["cost_kind"] in ("est", "rec"):
         cost = f"{money(res['cost_per_sample'])}/sample ({'est.' if res['cost_kind'] == 'est' else 'rec.'})"
     elif res["cost_kind"] == "text":
         cost = res["cost_text"]
@@ -749,25 +946,50 @@ def t1_row(spec, res):
     unp = res["unparsed"]
     if unp and not res.get("sources"):
         notes.append(f"{unp}/{res['n_good']} attempts without a parsable grid")
+    tc = res.get("train_check")
+    if tc:
+        notes.append(f"live train check: {tc['pass']}/{tc['n']} attempts pass train; P(correct | train pass) {tc['p_pass']:.0%} "
+                     f"({tc['pass_correct']}/{tc['pass']}), P(correct | train fail) {tc['p_fail']:.0%} ({tc['fail_correct']}/{tc['fail']}); "
+                     f"{tc['no_answer']} without an answer")
+    pp = res.get("policy3")
+    if pp:
+        p2_sub = f"with cond. 3rd attempt: {f1(pp['k_pass2_policy'])}"
+        tp2_sub = f"with 3rd attempt: {f1(pp['pass2_policy'])}"
+        notes.append(f"Conditional 3rd attempt (attempt index 2, only when neither attempt 0 nor 1 passed the train check): fired on "
+                     f"{pp['fired_pairs']}/{len(FULL)} pairs; {pp['extra_correct']} correct, {pp['extra_train_pass']} passed train "
+                     f"({pp['extra_train_pass_correct']} of those correct), {pp['extra_no_answer']} without an answer; mean "
+                     f"{fk(pp['extra_tok_mean'])} tokens, +{fk(pp['extra_tok_total'] / len(FULL))} tokens/pair "
+                     f"({fk(pp['tok_per_pair_base'])} → {fk(pp['tok_per_pair_policy'])}, "
+                     f"{sg((pp['tok_per_pair_policy'] / pp['tok_per_pair_base'] - 1) * 100, 0)}%), rec. {money(pp['extra_cost'])}{' off-peak' if not pp['extra_cost_peak_part'] else ' (partly peak)'}. "
+                     f"Answers ranked as the harness does (train pass first, then attempt order, top-2 distinct): Kaggle pass@2 "
+                     f"{f1(pp['k_pass2_base'])} → {f1(pp['k_pass2_policy'])} ({sg(pp['diff'] * 100)} pp [{sg(pp['lo'] * 100)}, "
+                     f"{sg(pp['hi'] * 100)}]; {pp['rescued']} pairs rescued, {pp['lost']} lost); task-weighted {f1(pp['pass2_base'])} → "
+                     f"{f1(pp['pass2_policy'])}")
     return {"id": spec["id"], "fam": spec["fam"], "model": spec["model"], "harness": spec["harness"], "desc": spec["desc"],
             "samples": coverage_text(res), "k_pass1": p1, "k_pass1_sub": p1_sub, "k_pass2": p2, "k_pass2_sub": p2_sub,
             "pass1": tp1, "pass1_sub": tp1_sub, "pass2": tp2, "pass2_sub": tp2_sub,
             "tok_mean": fk(res["tok_mean"]), "tok_median": fk(res["tok_median"]), "tok_p90": fk(res["tok_p90"]),
-            "ctok_median": fk(res["ctok_median"]), "cost": cost, "notes": notes,
+            "ctok_median": fk(res["ctok_median"]), "cost": cost, "cost_sub": cost_sub, "notes": notes,
             "raw": {"k_pass1": res["k_pass1"], "k_pass2": res.get("k_pass2"), "pass1": res["pass1"], "pass2": res.get("pass2"),
                     "tok_mean": res["tok_mean"], "tok_median": res["tok_median"],
                     "tok_p90": res["tok_p90"], "ctok_median": res["ctok_median"], "samples": ns,
-                    "cost_per_sample": res.get("cost_per_sample")}, "best": {}}
+                    "cost_per_sample": cost_raw, "k_pass2_policy": pp["k_pass2_policy"] if pp else None}, "best": {}}
 
 
-def mark_best(rows, rules):
+# Scores within this many points (fraction) of a column's best are treated as tied with it (sample noise is ~2-3 pp).
+NOISE_BAND = 0.03
+
+
+def mark_best(rows, rules, band=None):
+    band = band or {}
     for col, fn in rules.items():
         vals = [r["raw"][col] for r in rows if r["raw"].get(col) is not None]
         if not vals:
             continue
         b = fn(vals)
         for r in rows:
-            r["best"][col] = r["raw"].get(col) == b
+            v = r["raw"].get(col)
+            r["best"][col] = v is not None and (v >= b - band[col] - 1e-9 if col in band else v == b)
 
 
 def t2_row(spec, res, inprogress=False):
@@ -889,7 +1111,9 @@ SCOPE = ("This report collects every model and harness experiment we have run on
          "Lightning and Nemotron 3 Super 120B (OpenRouter). Harnesses: a no-tool single call with the ARC Prize prompt; a generation API "
          "harness for Qwen that continues the raw completion through mid-thought EOS and forces a final answer at the budget; Python tool "
          "use in grid mode (answer as a grid, later handed over with `submit_answer`) and code mode (`submit_solution`, checked on the "
-         "train pairs); and token-budget variants of the tool harness (hard caps, budget notes, soft targets, thinking-off turns). "
+         "train pairs); token-budget variants of the tool harness (hard caps, budget notes, soft targets, thinking-off turns); E017's "
+         "additions to it (a host-computed task summary, a roles prompt, session helpers, a live train check and a conditional 3rd attempt); "
+         "and E016's \"time is up\" continuation of cut-off attempts. "
          "Every number below is recomputed from `evals/results/*.jsonl` and `kaggle/runs/` by `reports/build_report.py`.")
 
 SCORING = [
@@ -926,13 +1150,23 @@ FOOTNOTES = {
     "rent-e012": "Self-hosted on vast.ai instance 55443640 ($5.89/h, E012 README); box time per run is not itemised. API cost $0.",
     "nemo": "Manual reading of 40 traces (experiments/E008_openrouter_models/nemotron_traces/notes_{A,B,C,D}.md), not recomputed.",
     "kag-e2e": "295 tok/s average over 16 min in the end-to-end scheduler (MTP=3, contexts 2–20k) is from experiments/E013_kaggle_submission/README.md; the bench JSON stores only the decode benchmark.",
-    "arcprize": "ARC Prize's published scores (V4 Flash 0731: 63.9% public / 61.4% semi-private; Qwen3.8-27B: 42.4% semi-private) are quoted from the E001 and E008 READMEs.",
+    "arcprize": ("ARC Prize's official DeepSeek V4.1 Flash results, https://arcprize.org/results/deepseek-v4-1-flash: verified semi-private ARC-AGI-2 "
+                 "Max 72.9%, High 67.5%, Low 60.6%, None 1.3% (ARC-AGI-1 Max 94.5%); their per-task public-eval table at Max marks 91/120 tasks "
+                 "solved. The per-task agreement with E001d (82–87% depending on the attempt pair) was computed against that table, which is not "
+                 "stored in the repo, so it is quoted, not recomputed here. Qwen3.8-27B's 42.4% semi-private is quoted from the E008 README. The "
+                 "older V4 Flash 0731 numbers in the E001 README (63.9% public / 61.4% semi-private) are for a different model version."),
+    "e017fa": ("From experiments/E017_reasoning_efficiency/failure_analysis.md (phase 1B: offline replay of 835 sub80s40/sub96n attempts and 48 "
+               "traces annotated by a single reader each; token shares are reader estimates) and the E017 README; not recomputed here."),
+    "e017ps": ("From experiments/E017_reasoning_efficiency/policy_sim.md (phase 1A: 160 sub80s40 + s20x60 attempts on a stratified sample of 32 "
+               "pairs, train-check labels by replay, population-weighted) and failure_analysis.md section 5; not recomputed here."),
+    "e016": ("From experiments/E016_cutoff_continuation/README.md: for 142ca369.1#0 the thinking-off continuation had a 12.5k-token prompt "
+             "against 45.7k for the original last turn; not recomputed here."),
     "audit": "From experiments/E008_openrouter_models/qwen_format_audit.md (450 Qwen attempts read and re-parsed); not recomputed here.",
     "contam": "From experiments/E004_tool_use/README.md (safety trace review): Flash listed real ARC-AGI-2 eval task ids while trying to recall answers.",
 }
 
 
-def findings(R, specs, nv, longtail, kag):
+def findings(R, specs, nv, longtail, kag, e16=None):
     g = lambda k: R[k]
     gl, e1 = g("E004-GL"), g("E001d")
     d_gl = next(d for d in gl["paired"] if d["ref"] == "E001d")
@@ -1016,6 +1250,51 @@ def findings(R, specs, nv, longtail, kag):
               f"s20x60 matches E004-GL on pass@2 ({f1(s2060['k_pass2'])}% vs {f1(gl['k_pass2'])}%) at {fk(s2060['tok_mean'])} tokens "
               f"({sg((s2060['tok_mean'] / gl['tok_mean'] - 1) * 100, 0)}%). Thinking-off turns (E010 nt*) save tokens but lose "
               f"{-max(nt_d):.0f}–{-min(nt_d):.0f} pp on dev."))
+    v1, v2, v3 = g("E017 V1 summary"), g("E017 V2 lean2roles"), g("E017 V3 all")
+    if all(x["complete"] for x in (v1, v2, v3)):
+        def d_ref(res, ref):
+            return next(d for d in res["paired"] if d["ref"] == ref and not d["cap"])
+        def tokd(res):
+            return sg((res["tok_mean"] / s80["tok_mean"] - 1) * 100, 0) + "%"
+        pp, tc3, tc1, tc2 = v3["policy3"], v3["train_check"], v1["train_check"], v2["train_check"]
+        F.append(("E017: a computed perception pack, a roles prompt and session helpers (V3) reach the top tier at fewer tokens; no accuracy change is significant.", [
+            f"V3 (all three, harness persistent-v5) scores Kaggle pass@1 {f1(v3['k_pass1'])}% ({' / '.join(f1(x) for x in v3['k_pass1_each'])}) over "
+            f"{v3['samples']} samples against {f1(s80['k_pass1'])}% for sub80s40 (paired {ci(d_ref(v3, 'E009 sub80s40'))}) at "
+            f"{fk(v3['tok_mean'])} tokens/attempt ({tokd(v3)}); pass@2 {f1(v3['k_pass2'])}% vs {f1(s80['k_pass2'])}%. Single samples: "
+            f"V1 (summary only) {f1(v1['k_pass1'])}% at {fk(v1['tok_mean'])} ({tokd(v1)}, shorter correct rollouts: median "
+            f"{fk(v1['ctok_median'])} vs {fk(s80['ctok_median'])}); V2 (lean2roles only) {f1(v2['k_pass1'])}% at {fk(v2['tok_mean'])} ({tokd(v2)}). "
+            f"One sample swings by several pp (sub80s40's own samples span {f1(min(s80['k_pass1_each']))}–{f1(max(s80['k_pass1_each']))}%), "
+            "so these are 'no harm, slightly fewer tokens' results.",
+            f"Conditional 3rd attempt (only when neither of 2 attempts passes the train check): fired on {pp['fired_pairs']} of {len(FULL)} pairs "
+            f"and lifts V3's Kaggle pass@2 from {f1(pp['k_pass2_base'])}% to {f1(pp['k_pass2_policy'])}% "
+            f"({sg(pp['diff'] * 100)} pp [{sg(pp['lo'] * 100)}, {sg(pp['hi'] * 100)}], {pp['rescued']} pairs rescued) for "
+            f"{sg((pp['tok_per_pair_policy'] / pp['tok_per_pair_base'] - 1) * 100, 0)}% tokens per pair and {money(pp['extra_cost'])}; "
+            f"task-weighted {f1(pp['pass2_base'])}% → {f1(pp['pass2_policy'])}%. Phase 1 had simulated +2.0 pp [+1.0, +3.2] for +23% tokens [^e017ps].",
+            f"The live train check (re-running the answer cell on the training inputs; no model tokens) is a good ranker but a poor gate: "
+            f"P(correct | train pass) = {tc3['p_pass']:.0%} ({tc3['pass_correct']}/{tc3['pass']}) on V3's attempts 0–1, {tc1['p_pass']:.0%} for V1, "
+            f"{tc2['p_pass']:.0%} for V2 (phase-1 offline estimate 86% [^e017ps]); P(correct | train fail) = {tc3['p_fail']:.0%} on V3. The "
+            f"{1 - tc3['p_pass']:.0%} of train-passing answers that are wrong mostly miss something the training pairs do not show.",
+        ]))
+        F.append(("E017 phase 1 (offline, $0): Flash spends its tokens on prose hypothesis search, and the test is almost always novel.", [
+            "Token shares from 48 annotated sub80s40/sub96n traces (population-weighted reader estimates): hypothesis search in prose 51%, "
+            "perception (reading or transcribing grids, hand counting) 20%, code writing 11%, everything after the first train pass 4%; readers "
+            "judged about 42% of tokens wasted. Attempts whose longest single turn reaches 30k tokens are 26% correct, against 81% under 10k [^e017fa].",
+            "In 155 of 167 pairs the test input lies outside the training inputs' range on at least one cheap feature (size, colours, component "
+            "count, border contact, object sizes). The largest failure mode is a rule that fits every training pair and is wrong on the test "
+            "(12 of 28 failing traces) [^e017fa].",
+            "Restarting attempts that have no train pass by 20–50k tokens loses 7–12 pp pass@1 in simulation (slow successes and dead ends look "
+            "alike until late), and gating the 2nd attempt on the train check loses 3.8 pp pass@2; only extra attempts where the check fails pay "
+            "off [^e017ps].",
+        ]))
+    if e16:
+        tn, um, tt = e16["toolnote"], e16["usermsg"], e16["toolnote_think"]
+        F.append(("A \"time is up, submit now\" turn does not rescue cut-off attempts (E016).",
+                  f"Of the {tn['n']} E010 s20x60 attempts that hit the 60k cap without an answer, a one-turn thinking-off continuation returns an "
+                  f"answer for {tn['answered']} (tool note) or {um['answered']} (user message) and gets {tn['correct']} and {um['correct']} right; with "
+                  f"thinking on (8k) it answers {tt['answered']} and gets {tt['correct']} right, which moves s20x60's Kaggle pass@1 from "
+                  f"{f1(s2060['k_pass1'])}% to {f1(tt['s2060_k_pass1'])}% and leaves pass@2 at {f1(tt['s2060_k_pass2'])}%. The replayed sessions hold "
+                  f"nothing to submit, so the lever for the long tail is budget, not hand-off. Total recorded spend "
+                  f"${e16['total_cost_all_rows']:.2f}."))
     held = [(n, a, b) for n, a, b in dvf if a > 0 and b > 0]
     if gains:
         ratio = st.mean(a / b for _, a, b in held) if held else None
@@ -1055,25 +1334,58 @@ def findings(R, specs, nv, longtail, kag):
               ", ".join(f"{k.replace('E008 ', '')} {a}/{b}" for k, (a, b) in unp.items()) +
               f"; the recomputed correct flag matches the stored flag on all {AUDIT['records_checked']} public-eval records "
               f"({AUDIT['flag_mismatch']} mismatches)."))
+    # ARC Prize comparison for DeepSeek V4.1 Flash (E001d uses ARC Prize's prompt at max effort, like their Max column)
+    e1lat, e1atts = e1["_lat"], e1["attempt_indices"]
+    solved = {}
+    for a, b in combinations(e1atts, 2):
+        solved[(a, b)] = sum(all(e1lat.get((t, p, a), {}).get("_ok") or e1lat.get((t, p, b), {}).get("_ok") for p in range(len(TASKS[t]["test"])))
+                             for t in TASKS)
+    a01 = solved[(e1atts[0], e1atts[1])]
+    nT = len(TASKS)
+    ap = ARCPRIZE_V41
+    arc_cmp = {
+        "title": "ARC Prize vs our E001d: DeepSeek V4.1 Flash, no tools, ARC Prize prompt",
+        "rows": [
+            ["ARC Prize, verified [^arcprize]", "ARC-AGI-2 semi-private", "Max / High / Low / None effort",
+             " / ".join(f"{v:.1f}" for v in (ap["max"], ap["high"], ap["low"], ap["none"])) + "% (task-weighted)"],
+            ["ARC Prize per-task table [^arcprize]", "ARC-AGI-2 public eval", "Max effort",
+             f"{ap['public_max_tasks']}/{nT} tasks ✓ ({ap['public_max_tasks'] / nT * 100:.1f}%)"],
+            ["Ours, E001d", "ARC-AGI-2 public eval", "max effort, attempts 0+1", f"{a01}/{nT} tasks fully solved ({a01 / nT * 100:.1f}%)"],
+            ["Ours, E001d", "ARC-AGI-2 public eval", f"max effort, mean over {len(solved)} attempt pairs",
+             f"task-weighted pass@2 {f1(e1['pass2'])}%; Kaggle pass@2 {f1(e1['k_pass2'])}%; tasks fully solved "
+             + " / ".join(str(v) for v in solved.values()) + f" of {nT} (" + " / ".join(f"a{a}+a{b}" for a, b in solved) + ")"],
+            ["Per-task agreement [^arcprize]", "public eval, 120 tasks", "E001d attempt pair vs ARC Prize Max ✓",
+             f"{ap['agree_lo']}–{ap['agree_hi']}% of tasks, depending on the attempt pair"],
+        ],
+        "note": (f"Public − semi-private for V4.1 Flash at Max: {ap['public_max_tasks'] / nT * 100:.1f} − {ap['max']:.1f} = "
+                 f"{ap['public_max_tasks'] / nT * 100 - ap['max']:.1f} pp. ARC-AGI-1 semi-private at Max: {ap['arc1_max']:.1f}%."),
+    }
     caveats = [
-        f"**Public vs semi-private.** All full-set numbers are on the public evaluation set. ARC Prize reports V4 Flash 0731 at 63.9% public / "
-        f"61.4% semi-private and Qwen3.8-27B at 42.4% semi-private [^arcprize], all task-weighted; our public pass@2 for Qwen3.8 xhigh is "
-        f"{f1(qx['k_pass2'])}% Kaggle ({f1(qx['pass2'])}% task-weighted).",
-        f"**Contamination signs for Flash.** The public set predates V4.1; Flash's no-tool pass@2 here ({f1(e1['k_pass2'])}% Kaggle, "
-        f"{f1(e1['pass2'])}% task-weighted) is well above ARC Prize's public 63.9% (task-weighted) for V4 Flash 0731, and in E004 traces Flash "
-        "listed real ARC-AGI-2 eval task ids while trying to recall answers [^contam]. Absolute Flash scores may be inflated; comparisons within "
-        "one model are not affected.",
+        f"**Public vs semi-private.** All full-set numbers are on the public evaluation set. ARC Prize's verified semi-private ARC-AGI-2 scores "
+        f"for DeepSeek V4.1 Flash are {ap['max']:.1f}% (Max), {ap['high']:.1f}% (High), {ap['low']:.1f}% (Low) and {ap['none']:.1f}% (None) "
+        f"[^arcprize], task-weighted; their public-eval table at Max marks {ap['public_max_tasks']}/{nT} tasks solved. Our no-tool E001d (same "
+        f"prompt, max effort) fully solves {a01}/{nT} tasks ({a01 / nT * 100:.1f}%) with attempts 0+1 (other attempt pairs: "
+        + " and ".join(str(v) for k, v in solved.items() if k != (e1atts[0], e1atts[1])) +
+        f") and scores {f1(e1['pass2'])}% task-weighted pass@2 averaged over attempt pairs ({f1(e1['k_pass2'])}% Kaggle); per-task agreement "
+        f"with ARC Prize's Max column is {ap['agree_lo']}–{ap['agree_hi']}% depending on the attempt pair. So our Flash numbers sit close to "
+        f"ARC Prize's public ones and should be read against V4.1's {ap['max']:.1f}% semi-private, not against the older V4 Flash 0731 numbers. "
+        f"Qwen3.8-27B: {QWEN_SEMI:.1f}% semi-private "
+        f"[^arcprize]; our public pass@2 for Qwen3.8 xhigh is {f1(qx['k_pass2'])}% Kaggle ({f1(qx['pass2'])}% task-weighted). Table below.",
+        f"**Contamination.** The public set has been out since 2025, and in E004 traces Flash listed real ARC-AGI-2 eval task ids while trying "
+        f"to recall answers [^contam], so some memorisation is possible. But V4.1 Flash's public score at Max is only "
+        f"~{ap['public_max_tasks'] / nT * 100 - ap['max']:.0f} pp above its semi-private score, so any inflation of absolute Flash numbers "
+        "looks small; comparisons within one model are not affected.",
         f"**Sample noise is a few pp.** E004-GL's {gl['samples']} samples span {f1(min(gl['k_pass1_each']))}–{f1(max(gl['k_pass1_each']))} "
         f"(sd {gl['k_pass1_sd'] * 100:.1f}); E001d's span {f1(min(e1['k_pass1_each']))}–{f1(max(e1['k_pass1_each']))} (sd {e1['k_pass1_sd'] * 100:.1f}); "
         f"across multi-sample DeepSeek runs the per-sample sd is {min(ds_sd):.1f}–{max(ds_sd):.1f} pp. Most paired CIs vs E004-GL "
         "include zero; only the losses (sub64a, s20x40, plain prompt) are clearly significant.",
-        f"**Single samples.** Rows with 1 sample (grid-max, cap100, code mode, plain prompt, sub96s40, sub64a, Nemotron) have no pass@2 and "
+        f"**Single samples.** Rows with 1 sample (grid-max, cap100, code mode, plain prompt, sub96s40, sub64a, E017 V1/V2, Nemotron) have no pass@2 and "
         f"carry the full sample noise. pilot-26 and dev-56 numbers are noisier still (one test output moves the pilot by "
         f"{100 / pilot_pairs:.1f} pp on the Kaggle metric; one task by {100 / pilot_tasks:.1f} pp task-weighted).",
         "**Budgets differ by harness.** No-tool DeepSeek runs use one 200k call; E004 tool runs a 120k total budget; E009–E011 80–96k; "
         "Qwen gen runs 48k or 240k; E012 48k. Compare tokens/attempt, not caps.",
     ]
-    return {"findings": [{"title": t, "body": b} for t, b in F], "caveats": caveats}
+    return {"findings": [{"title": t, "body": b} for t, b in F], "caveats": caveats, "arcprize_cmp": arc_cmp}
 
 
 def longtail_rate(res, longtail):
@@ -1128,6 +1440,13 @@ CLAIMS = [
     ("E010 dev nt3s20x60", "pass1", 40.5, "E010 README"), ("E010 dev s10x40", "pass1", 50.7, "E010 README"),
     ("E010 dev s15x45", "pass1", 48.0, "E010 README"), ("E010 dev s20x40", "pass1", 55.0, "E010 README"),
     ("E010 dev s20x60", "pass1", 60.9, "E010 README"), ("E010 dev s25x80", "pass1", 67.0, "E010 README"),
+    ("E017 V1 summary", "pass1", 66.0, "E017 README"), ("E017 V1 summary", "k_pass1", 67.1, "E017 README (pair-weighted)"),
+    ("E017 V1 summary", "tok_mean", 37.1e3, "E017 README"),
+    ("E017 V2 lean2roles", "pass1", 67.8, "E017 README"), ("E017 V2 lean2roles", "k_pass1", 67.1, "E017 README (pair-weighted)"),
+    ("E017 V2 lean2roles", "tok_mean", 42.9e3, "E017 README"),
+    ("E017 V3 all", "pass1", 68.3, "E017 README"), ("E017 V3 all", "pass2", 76.0, "E017 README"),
+    ("E017 V3 all", "k_pass1", 69.2, "E017 README (pair-weighted)"), ("E017 V3 all", "k_pass2", 77.2, "E017 README (pair-weighted)"),
+    ("E017 V3 all", "tok_mean", 39.5e3, "E017 README"),
     ("E001a", "pass1", 52.9, "E001 README"), ("E001a", "pass2", 60.8, "E001 README"), ("E001b", "pass1", 40.8, "E001 README"),
     ("E001b", "pass2", 56.7, "E001 README"), ("E001c", "pass1", 40.0, "E001 README"),
 ]
@@ -1281,6 +1600,7 @@ def gap_line(gaps):
             + (f"Range {sg(min(two))} to {sg(max(two))} pp, mean {sg(st.mean(two))} pp." if two else ""))
 
 FN_RE = re.compile(r"\[\^([a-z0-9-]+)\]")
+_FN_SEEN = Counter()  # footnote reference occurrences per render, so every back-reference id is unique
 
 
 def inline(s, fn_order):
@@ -1293,7 +1613,9 @@ def inline(s, fn_order):
         if k not in fn_order:
             fn_order.append(k)
         n = fn_order.index(k) + 1
-        return f'<sup class="fn"><a href="#fn-{k}" id="fnref-{k}-{n}">{n}</a></sup>'
+        _FN_SEEN[k] += 1
+        c = _FN_SEEN[k]
+        return f'<sup class="fn"><a href="#fn-{k}" id="fnref-{k}-{n}{"" if c == 1 else "-" + str(c)}">{n}</a></sup>'
     return FN_RE.sub(fn, s)
 
 
@@ -1343,6 +1665,7 @@ thead th{position:sticky;top:0;background:var(--surface);z-index:2;border-bottom
 tbody tr:nth-child(even) td{background:var(--zebra)}
 td.num,th.num{text-align:right;white-space:nowrap}
 td.num{font-family:var(--f-mono);font-size:.8rem}
+td.num.cost{white-space:normal;min-width:13ch;max-width:24ch}
 td.id{font-family:var(--f-mono);font-size:.78rem;white-space:nowrap;font-weight:600}
 td.desc{width:34ch;min-width:28ch;max-width:38ch;color:var(--fg2);white-space:normal}
 td.notes{width:40ch;min-width:30ch;max-width:44ch;color:var(--fg2);font-size:.8rem;white-space:normal}
@@ -1367,6 +1690,7 @@ th[aria-sort="ascending"] .arr::after{content:"▲"} th[aria-sort="descending"] 
 th:not([aria-sort]) .arr::after{content:"↕"}
 .findings{display:grid;gap:.9rem;padding:0;list-style:none}
 .findings li{max-width:80ch}
+.findings ul{margin:.3rem 0 0;padding-left:1.1rem;display:grid;gap:.3rem}
 .findings strong.ft{display:block;font-family:var(--f-head);font-size:1.02rem;margin-bottom:.15rem}
 figure{margin:1.2rem 0;max-width:900px}
 figcaption{color:var(--muted);font-size:.86rem;margin-top:.4rem;max-width:80ch}
@@ -1394,6 +1718,7 @@ figcaption{color:var(--muted);font-size:.86rem;margin-top:.4rem;max-width:80ch}
 .kv b{display:block;font-family:var(--f-mono);font-size:1.05rem;font-variant-numeric:tabular-nums}
 .kv small{color:var(--muted)}
 .small-tbl{max-width:900px}
+#arcprize{width:100%} #arcprize td{min-width:12ch}
 .footnotes{font-size:.86rem;color:var(--fg2)}
 .footnotes li{max-width:90ch;margin-bottom:.3rem}
 .flag{color:var(--qw);font-weight:600}
@@ -1456,6 +1781,7 @@ def rawv(x):
 
 def render_html(data, wrapper=True):
     fo = []  # footnote order
+    _FN_SEEN.clear()
     m = data["meta"]
     t1, t2 = data["table1"], data["table2"]
     fam_name = {DS: "DeepSeek", QW: "Qwen", NM: "Nemotron"}
@@ -1475,7 +1801,7 @@ def render_html(data, wrapper=True):
     out.append(f'<p class="tbl-note">Runs that cover all {m["sets"]["full"]} test outputs for every counted sample. Scores in %. '
                '<strong>Kaggle pass@1 / pass@2</strong> (pair-weighted, the competition metric) are primary; the muted ARC Prize columns are the '
                'task-weighted benchmark convention. Grouped by model family, then sorted by Kaggle pass@2 (runs without pass@2 last, by Kaggle '
-               'pass@1). Click a header to sort. Shaded cells mark the best value in a column (highest Kaggle score, fewest tokens). Δ values in '
+               'pass@1). Click a header to sort. Shaded cells mark the top tier of a column: Kaggle scores within 3 pp of the column’s best (treated as tied, since one sample swings by ~2–3 pp) and the fewest tokens. Δ values in '
                'Notes are paired Kaggle pass@1 differences in pp with a 95% cluster-bootstrap CI (tasks resampled).</p>')
     out.append('<div class="tbl-wrap"><table class="sortable" id="table1"><thead><tr>')
     out += [th("Experiment ID"), th("LLM model"), th("Harness"), th("Description"), th("Samples"), th("Kaggle pass@1", True, extra="prim"),
@@ -1501,7 +1827,7 @@ def render_html(data, wrapper=True):
         out.append(td(r["pass2"], "num sec", v=rawv(raw["pass2"]), sub=r["pass2_sub"]))
         for col in ("tok_mean", "tok_median", "tok_p90", "ctok_median"):
             out.append(td(r[col], "num", v=rawv(raw[col]), best=b.get(col)))
-        out.append(td(r["cost"], "num", v=rawv(raw.get("cost_per_sample")), fn_order=fo))
+        out.append(td(r["cost"], "num", v=rawv(raw.get("cost_per_sample")), sub=r.get("cost_sub"), fn_order=fo).replace('<td class="num"', '<td class="num cost"', 1))
         out.append(f'<td class="notes">{"<br>".join(inline(n, fo) for n in r["notes"])}</td>')
         out.append("</tr>")
     out.append("</tbody></table></div>")
@@ -1541,7 +1867,9 @@ def render_html(data, wrapper=True):
     out.append('<h2 id="findings">Key findings</h2><p class="tbl-note">Scores are Kaggle (pair-weighted) unless marked task-weighted; '
                'task-weighted values appear only where a finding is compared with ARC Prize\'s published numbers.</p><ul class="findings">')
     for f in data["findings"]:
-        out.append(f'<li><strong class="ft">{inline(f["title"], fo)}</strong>{inline(f["body"], fo)}</li>')
+        body = f["body"]
+        body = ("<ul>" + "".join(f"<li>{inline(b, fo)}</li>" for b in body) + "</ul>") if isinstance(body, list) else inline(body, fo)
+        out.append(f'<li><strong class="ft">{inline(f["title"], fo)}</strong>{body}</li>')
     out.append("</ul>")
 
     # Chart
@@ -1566,14 +1894,8 @@ def render_html(data, wrapper=True):
     ylo = 5 * int((dmin - 2) / 5)
     svg2 = svg_chart(ds_pts, "DeepSeek V4.1-Flash runs only, enlarged: Kaggle pass@1 and pass@2 vs tokens", (30000, xhi), (ylo, 82), list(range(30000, xhi + 1, 10000)),
                      list(range(ylo, 81, 5)), height=520, fig_id="fig2")
-    front, best2 = [], -1.0
-    for p_ in sorted((p_ for p_ in pts if p_["k_pass2"] is not None), key=lambda p_: p_["tok_mean"]):
-        if p_["k_pass2"] > best2:
-            front.append(p_)
-            best2 = p_["k_pass2"]
-    ftxt = " → ".join(f"{html.escape(p_['id'])} ({fk(p_['tok_mean'])}, {f1(p_['k_pass2'])}%)" for p_ in front)
-    out.append(f'<figure><div class="chart-scroll">{svg2}</div><figcaption>Fig. 2. DeepSeek runs only, y = Kaggle score from {ylo}%. Kaggle pass@2 Pareto front over '
-               f'all multi-sample runs (fewer tokens, higher pass@2): {ftxt}.</figcaption></figure>')
+    out.append(f'<figure><div class="chart-scroll">{svg2}</div><figcaption>Fig. 2. DeepSeek runs only, y = Kaggle score from {ylo}%. '
+               f'{html.escape(data["pareto"]["text"])}</figcaption></figure>')
 
     # Kaggle
     k = data["kaggle"]
@@ -1584,6 +1906,13 @@ def render_html(data, wrapper=True):
     out.append('<h2 id="caveats">Caveats</h2><ul>')
     out += [f"<li>{inline(c, fo)}</li>" for c in data["caveats"]]
     out.append("</ul>")
+    ac = data["arcprize_cmp"]
+    out.append(f'<h3 id="arcprize-cmp">{html.escape(ac["title"])}</h3>')
+    out.append('<div class="tbl-wrap small-tbl"><table id="arcprize"><thead><tr><th scope="col">Source</th><th scope="col">Set</th>'
+               '<th scope="col">Setting</th><th scope="col">Score</th></tr></thead><tbody>')
+    for row in ac["rows"]:
+        out.append("<tr>" + "".join("<td>" + inline(c, fo) + "</td>" for c in row) + "</tr>")
+    out.append(f'</tbody></table></div><p class="tbl-note">{inline(ac["note"], fo)}</p>')
 
     # Appendix
     cc = data["crosscheck"]
@@ -1599,7 +1928,7 @@ def render_html(data, wrapper=True):
                    f'<td class="num">{c["computed"]}</td><td class="num flag">{c["diff"]}</td><td>{html.escape(c["source"])}</td>'
                    f'<td>{html.escape(c["note"] or "unexplained: check the README")}</td></tr>')
     out.append("</tbody></table></div>")
-    out.append(f'<p class="prose">The cross-check compares task-weighted values, because the READMEs and the registry quote ARC Prize\'s '
+    out.append(f'<p class="prose">The cross-check compares task-weighted values (k_* rows: Kaggle pair-weighted, where the source quotes both), because the READMEs and the registry quote ARC Prize\'s '
                'task-weighted convention.</p>')
     out.append(f'<h3 id="metric-gap">Kaggle minus task-weighted, per Table 1 run</h3><p class="prose">{html.escape(gap_line(data["metric_gap"]))}</p>')
     a = m["audit"]
@@ -1704,7 +2033,7 @@ def render_md(data):
     L += ["", f"## Table 1 — complete runs on the full public evaluation set ({len(data['table1'])} runs)", "",
           "Runs covering all 167 test outputs for every counted sample. Scores in %. **Kaggle pass@1 / pass@2** (pair-weighted, the competition "
           "metric) are primary; *ARC Prize task-weighted* columns (italic) are secondary. Grouped by model family and sorted by Kaggle pass@2 "
-          "(runs without pass@2 last). **Bold** = best value in the column (highest Kaggle score, fewest tokens). Δ in notes = paired Kaggle "
+          "(runs without pass@2 last). **Bold** = top tier of the column: Kaggle scores within 3 pp of the best (treated as tied; one sample swings by ~2–3 pp) and the fewest tokens. Δ in notes = paired Kaggle "
           "pass@1 difference in pp, 95% cluster-bootstrap CI (tasks resampled).", "",
           "| Experiment ID | LLM model | Harness | Description | Samples | Kaggle pass@1 | Kaggle pass@2 | *ARC Prize pass@1 (task-wt.)* | *ARC Prize pass@2 (task-wt.)* | Tok mean | Tok median | Tok p90 | Correct tok median | Cost | Notes |",
           "|---|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|"]
@@ -1726,7 +2055,7 @@ def render_md(data):
         L.append("| " + " | ".join(md_cell(x) for x in [
             f"`{r['id']}`", r["model"], r["harness"], md(desc), r["samples"], p1, p2, tp1, tp2, best(r["tok_mean"], b.get("tok_mean")),
             best(r["tok_median"], b.get("tok_median")), best(r["tok_p90"], b.get("tok_p90")), best(r["ctok_median"], b.get("ctok_median")),
-            md(r["cost"]), f"[^{key}]" if r["notes"] else ""]) + " |")
+            md(r["cost"]) + (f"<br><sub>{r['cost_sub']}</sub>" if r.get("cost_sub") else ""), f"[^{key}]" if r["notes"] else ""]) + " |")
     L += ["", f"## Table 2 — smaller sets, probes and partial runs ({len(data['table2'])} runs)", "",
           "‡ = NVIDIA validation subset (different task set). Kaggle pass@1 / pass@2 = mean over covered test outputs (primary); *task-weighted* "
           "columns are secondary. Paired diff = run minus reference on the test outputs the run covers (Kaggle pass@1, pp, 95% cluster-bootstrap CI over tasks); "
@@ -1751,13 +2080,18 @@ def render_md(data):
     L += ["", "## Key findings", "", "Scores are Kaggle (pair-weighted) unless marked task-weighted; task-weighted values appear only where a "
           "finding is compared with ARC Prize's published numbers.", ""]
     for f in data["findings"]:
-        L.append(f"- **{md(f['title']).replace('**', '')}** {md(f['body'])}")
+        if isinstance(f["body"], list):
+            L.append(f"- **{md(f['title']).replace('**', '')}**")
+            L += [f"  - {md(b)}" for b in f["body"]]
+        else:
+            L.append(f"- **{md(f['title']).replace('**', '')}** {md(f['body'])}")
     L += ["", "## Tokens vs accuracy", "",
           "Points plotted in the HTML report (Fig. 1–2): every Table 1 run; x = mean output tokens per attempt, y = Kaggle score "
           "(pair-weighted): Kaggle pass@1, and Kaggle pass@2 where ≥2 samples.", "",
           "| Run | Family | Tokens / attempt | Kaggle pass@1 | Kaggle pass@2 | Samples |", "|---|---|--:|--:|--:|--:|"]
     for p in sorted(data["chart"], key=lambda p: p["tok_mean"]):
         L.append(f"| `{p['id']}` | {p['fam']} | {fk(p['tok_mean'])} | {f1(p['k_pass1'])} | {f1(p['k_pass2'])} | {p['samples']} |")
+    L += ["", data["pareto"]["text"]]
     k = data["kaggle"]
     b3, b0, v2 = k["bench"].get("bench-mtp3-v3", {}), k["bench"].get("bench-mtp0-v3", {}), k.get("v2-v2", {})
     L += ["", "## Kaggle feasibility", "",
@@ -1781,10 +2115,14 @@ def render_md(data):
                  f"status {sub['status']} at {sub['observed_at'][:16].replace('T', ' ')} UTC. {md(kt['submitted'])}")
     L += [f"- {md(kt['prefix'])}", f"- {md(kt['local'])}", "", "## Caveats", ""]
     L += [f"- {md(c)}" for c in data["caveats"]]
+    ac = data["arcprize_cmp"]
+    L += ["", f"### {ac['title']}", "", "| Source | Set | Setting | Score |", "|---|---|---|---|"]
+    L += ["| " + " | ".join(md_cell(md(c)) for c in row) + " |" for row in ac["rows"]]
+    L += ["", md(ac["note"])]
     cc = [c for c in data["crosscheck"] if c["flag"]]
     L += ["", "## Appendix — cross-check against READMEs and the registry", "",
           f"{len(data['crosscheck'])} README / registry numbers were compared with the recomputed values; {len(cc)} differ by more than 0.5 pt "
-          "(scores) or more than 1k and 2% (tokens). The cross-check compares task-weighted values, because the READMEs and the registry "
+          "(scores) or more than 1k and 2% (tokens). The cross-check compares task-weighted values (k_* rows: Kaggle pair-weighted, where the source quotes both), because the READMEs and the registry "
           "quote ARC Prize's task-weighted convention.", "",
           "| Run | Metric | README | Recomputed | Diff | Source | Explanation |", "|---|---|--:|--:|--:|---|---|"]
     for c in cc:
