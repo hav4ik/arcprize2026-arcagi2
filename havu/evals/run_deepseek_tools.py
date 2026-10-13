@@ -11,7 +11,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from uuid import uuid4
 
@@ -20,6 +20,8 @@ from openai import OpenAI
 from run_deepseek_arc2 import api_key
 from run_deepseek_arcprize import TASKS, build_prompt, parse
 from sandbox_client import SandboxSession, check_health, tool_output
+from task_summary import task_summary
+from train_check import ranked_answers, train_check
 
 ROOT = Path(__file__).resolve().parents[1]
 # USD / million tokens: cache hit, cache miss, output (off-peak).
@@ -56,13 +58,58 @@ PROMPT_SUFFIXES["lean2subv"] = PROMPT_SUFFIXES["lean2"] + (
     "harness first runs solve on every training input, then evaluates it on test_input in your session, and that "
     "grid is your answer, so never retype the grid. Keep your current best guess for the test output in a variable "
     "`answer`; if you run out of budget it is submitted automatically.")
-SUBMIT_PROMPTS = {"lean2sub", "lean2brief", "lean2subv"}
+# E017 P2: roles note before solve(), no unproven "noise" labels, test audit after train passes.
+PROMPT_SUFFIXES["lean2roles"] = PROMPT_SUFFIXES["lean2sub"] + (
+    "\n\nBefore writing solve(), write a short ROLES note: what each kind of object or colour does (template, "
+    "marker, key/legend, obstacle, container, background). Do not call anything noise or irrelevant unless code "
+    "shows it is removed or unchanged in every training output. When solve() reproduces every training output, "
+    "print what is different about test_input compared with all training inputs (sizes, colours, objects clipped "
+    "by the border, counts, key entries, shapes not seen) and say in one line how solve handles each difference; "
+    "if your rule ignores some non-background cells of test_input, explain them before submitting. If any "
+    "training pair still fails, or a test difference is unhandled, do not submit: fix the rule.")
+SUBMIT_PROMPTS = {"lean2sub", "lean2brief", "lean2subv", "lean2roles"}
 HARNESS_VERSION = "persistent-v3"  # v3: submissions run on inputs only in a fresh session; host compares
 # v4 (E009) is recorded only when a new option below is active; defaults reproduce v3 exactly.
 HARNESS_VERSION_V4 = "persistent-v4"
 V4_DEFAULTS = {"answer_tool": False, "final_mode": "turn", "budget_notes": 0.0, "budget_warn": 0.8,
                "lenient_parse": False, "budget_soft": 0, "soft_wording": "gentle", "think_turns": -1,
                "verify_submit": False}
+# v5 (E017) is recorded when an E017 option or prompt is active; it adds the keys below to the config.
+HARNESS_VERSION_V5 = "persistent-v5"
+V5_DEFAULTS = {"task_summary": False, "helpers": False, "train_check": False}
+V5_PROMPTS = {"lean2roles"}
+HELPERS_SRC = (Path(__file__).resolve().parent / "arc_helpers.py").read_text()
+HELPERS_DOC = (
+    " Also preloaded, numpy grid helpers (g = list or array; boxes (r0,c0,r1,c1) inclusive): "
+    "objects(g, by='colour'|'nonbg', diag=True, bg=None) -> list of dicts {colour, colours, cells [(r,c)], bbox, "
+    "size, holes, touches_border, shape_key} in reading order (equal shape_key = same shape up to "
+    "rotation/reflection); bbox(mask); crop(g, box); bg_colour(g); d8(g) -> {name: array} for the 8 "
+    "rotations/reflections (id, rot90, rot180, rot270, flipud, fliplr, transpose, antitranspose); match_d8(a, b) "
+    "-> name of the transform mapping a to b, or None; panels(g) -> [{'bbox', 'grid', 'pos'}] sub-grids split by "
+    "full separator lines ([] if none); stamp(g, pattern, at, clip=True, transparent=None) -> copy of g with "
+    "pattern pasted at top-left `at` (may overhang; clipped at the edges); ray(g, start, d, stop=None) -> cells "
+    "from start (exclusive) stepping by d=(dr,dc) until the edge or the first cell where stop(value) (default: "
+    "non-background); show(g) prints one digit string per row; check(fn) runs fn on a copy of every training "
+    "input and prints per pair OK, the shape mismatch, the error, or up to 8 differing cells as (r,c) got/exp, "
+    "then ALL PASS; returns True if all pass.")
+HELPERS_PROMPT = "\n\nUse check(solve) after every change to solve."
+# Weekday peak pricing (2x) on the DeepSeek API, UTC hours [start, end).
+PEAK_HOURS = ((1, 4), (6, 10))
+
+
+def peak_multiplier(now=None):
+    """2 inside a weekday peak window (UTC), else 1."""
+    import datetime
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return 2.0 if now.weekday() < 5 and any(a <= now.hour < b for a, b in PEAK_HOURS) else 1.0
+
+
+def harness_version(args):
+    if any(getattr(args, k, v) != v for k, v in V5_DEFAULTS.items()) or getattr(args, "prompt", "") in V5_PROMPTS:
+        return HARNESS_VERSION_V5
+    if any(getattr(args, k, v) != v for k, v in V4_DEFAULTS.items()):
+        return HARNESS_VERSION_V4
+    return HARNESS_VERSION
 
 
 def tools_for(args):
@@ -71,6 +118,7 @@ def tools_for(args):
         "Preloaded: train (list of {'input': grid, 'output': grid}), test_input (grid), numpy as np. "
         f"scipy is available. No internet or host files. Timeout {args.tool_timeout}s. "
         "Use print() to inspect results. Check transformations on all training pairs."
+        + (HELPERS_DOC if getattr(args, "helpers", False) else "")
     )}
     if getattr(args, "answer_tool", False):
         descriptions["submit_answer"] = (
@@ -364,6 +412,17 @@ def estimated_cost(total, model, multiplier):
                          + total["completion"] * output) / 1e6
 
 
+def add_cost(cost, usage, model, multiplier):
+    """Accumulate one turn's cost at the multiplier in force when its request started (E017 --auto-peak-price)."""
+    t = {"prompt": 0, "cache_hit": 0, "completion": 0}
+    add_usage(t, usage)
+    c = estimated_cost(t, model, multiplier)
+    cost["total"] += c
+    if multiplier > 1:
+        cost["peak"] += c
+        cost["peak_turns"] += 1
+
+
 def budget_note(args, used):
     """E009 --budget-notes: a status line appended to tool output once `used` passes the threshold."""
     if not args.budget_notes or used < args.budget_notes * args.max_total_output:
@@ -388,6 +447,10 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
     prompt = build_prompt(task["train"], test_input) + PROMPT_SUFFIXES[args.prompt]
     if args.mode == "code":
         prompt += "\n\nUse run_python to investigate; submit self-contained transform(grid) code with submit_solution."
+    if getattr(args, "helpers", False):
+        prompt += HELPERS_PROMPT
+    if getattr(args, "task_summary", False):
+        prompt += task_summary(task["train"], test_input)
     messages = [{"role": "user", "content": prompt}]
     total = {"prompt": 0, "cache_hit": 0, "completion": 0}
     n_tools, n_errors, n_turns, finish, stop, pred = 0, 0, 0, None, None, None
@@ -395,9 +458,13 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
     session_final = getattr(args, "final_mode", "turn") == "session"
     source = None  # where the single scored grid came from
     forced, submit_verified = set(), None  # E011 --verify-submit state
+    executed, submit_code, labels = [], None, {}  # E017 --train-check state
+    auto_price = getattr(args, "auto_peak_price", False)
+    cost = {"total": 0.0, "peak": 0.0, "peak_turns": 0}
+    extra = {"prelude_extra": HELPERS_SRC} if getattr(args, "helpers", False) else {}
     try:
         with session_factory(args.sandbox_url, task["train"], test_input,
-                             args.tool_timeout, args.max_tool_output) as session:
+                             args.tool_timeout, args.max_tool_output, **extra) as session:
             for index in range(args.max_turns):
                 remaining = args.max_total_output - total["completion"]
                 if remaining <= 0:
@@ -415,6 +482,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                                          "Finalize now. Return only your best test output as a JSON grid."})
                     cap = min(args.max_tokens, remaining if final else remaining - args.final_tokens)
                 n_turns += 1
+                mult = peak_multiplier() if auto_price else args.price_multiplier
                 try:
                     think = args.think_turns < 0 or index < args.think_turns
                     msg, usage, finish = turn(client, args, messages, cap, final, think)
@@ -422,8 +490,10 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                     messages.append(exc.assistant)
                     if exc.usage:
                         add_usage(total, exc.usage)
+                        add_cost(cost, exc.usage, args.model, mult)
                     finish = exc.finish
                     raise
+                add_cost(cost, usage, args.model, mult)
                 messages.append(msg)
                 add_usage(total, usage)
                 events.append({"turn": n_turns, "usage": usage, "finish_reason": finish,
@@ -461,6 +531,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                         if accepted is not None:
                             output = "[skipped: solution already accepted]"
                         elif name == "run_python":
+                            executed.append((name, code))
                             result = session.execute(code)
                             status = result["process_status"]
                             output = tool_output(result, args.max_tool_output)
@@ -468,6 +539,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                             output, accepted = submit_solution(session, code)
                             status = "completed" if accepted is not None else "rejected"
                         elif name == "submit_answer" and getattr(args, "answer_tool", False):
+                            executed.append((name, code))
                             output, accepted = submit_answer(session, code)
                             if accepted is not None and getattr(args, "verify_submit", False):
                                 check = check_answer_on_train(session, code)
@@ -491,6 +563,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                     events.append({"turn": n_turns, "tool_call_id": call["id"], "status": status})
                 if accepted is not None:
                     pred, content, stop, source = accepted, json.dumps(accepted), "submitted", "submit"
+                    submit_code = code
                     break
                 note = budget_note(args, total["completion"])
                 if note and messages[-1]["role"] == "tool":
@@ -505,14 +578,27 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                 output, grid = submit_answer(session, "answer")
                 events.append({"fallback": "session_answer", "accepted": grid is not None, "output": output[:300]})
                 if grid is not None:
-                    pred, content, source = grid, json.dumps(grid), "session"
+                    pred, content, source, submit_code = grid, json.dumps(grid), "session", "answer"
+            if getattr(args, "train_check", False) and pred is not None:
+                # E017: label the answer program on the training pairs (no model tokens; host compares hashes).
+                try:
+                    labels = train_check(session, executed, pred, submit_code, submit=submit_answer,
+                                         replay_session=lambda grid: session_factory(
+                                             args.sandbox_url, task["train"], grid, args.tool_timeout,
+                                             args.max_tool_output, **extra))
+                except Exception as exc:
+                    labels = {"train_pass": None, "train_frac": None, "train_trace": "check_error",
+                              "train_check_error": f"{type(exc).__name__}: {exc}"[:300]}
     except Exception as exc:
         error, stop = f"{type(exc).__name__}: {exc}"[:1000], "error"
     result = {"content": content, "pred": pred, "tool_calls": n_tools, "tool_errors": n_errors,
               "turns": n_turns, "usage": total, "finish_reason": finish, "stop_reason": stop,
-              "usage_complete": error is None, "est_cost_usd": round(estimated_cost(
-                  total, args.model, args.price_multiplier), 6),
+              "usage_complete": error is None, "est_cost_usd": round(cost["total"], 6),
               "seconds": round(time.monotonic() - t0, 1)}
+    if auto_price:
+        result.update(est_cost_peak_usd=round(cost["peak"], 6), peak_turns=cost["peak_turns"])
+    if getattr(args, "train_check", False):
+        result.update({"train_pass": None, "train_frac": None, "train_trace": "no_answer"} if pred is None else labels)
     if any(getattr(args, k, v) != v for k, v in V4_DEFAULTS.items()):
         result["answer_source"] = source if pred is not None else None
     if getattr(args, "verify_submit", False):
@@ -568,6 +654,14 @@ def summarize(records, tasks, attempts):
                            for p in range(len(task["test"]))) / len(task["test"])
                        for t, task in scored.items()) / len(scored)
         print(f"pass@1 {score(1):.1%}  pass@{attempts} {score(attempts):.1%} ({len(scored)} scored tasks)")
+        if any("train_pass" in r for r in latest.values()) or any(a >= attempts for _, _, a in latest):
+            allrecs = {(r["task_id"], r["pair"], r["attempt"]): r for r in records if r["task_id"] in tasks}
+            def ranked(t, p):
+                recs = [r for (u, q, _), r in allrecs.items() if (u, q) == (t, p) and "error" not in r]
+                return any(r.get("correct") for r in ranked_answers(recs))
+            ranked_score = sum(sum(ranked(t, p) for p in range(len(task["test"]))) / len(task["test"])
+                               for t, task in scored.items()) / len(scored)
+            print(f"train-check ranked pass@2 (all attempts incl. policy extras) {ranked_score:.1%}")
     print(f"{len(latest)} attempts, {sum('error' in r for r in latest.values())} errors, "
           f"{sum(r.get('tool_calls', 0) for r in latest.values())} tool calls; "
           f"estimated recorded cost ${sum(r.get('est_cost_usd', 0) for r in records):.2f}")
@@ -613,6 +707,18 @@ def parser():
     ap.add_argument("--budget-warn", type=float, default=0.8, help="fraction at which the note says to answer now")
     ap.add_argument("--lenient-parse", action="store_true",
                     help="E009: if the ARC Prize parser finds no grid in the final text, take the last valid one")
+    ap.add_argument("--task-summary", action="store_true",
+                    help="E017 P1: append a host-computed perception pack (objects, matching, test novelty) to the prompt")
+    ap.add_argument("--helpers", action="store_true",
+                    help="E017 P3: preload numpy grid helpers (objects, d8, panels, stamp, ray, check) in the session")
+    ap.add_argument("--train-check", action="store_true",
+                    help="E017: after each attempt, re-run its answer program on the training inputs and record "
+                         "train_pass / train_frac (no model tokens)")
+    ap.add_argument("--extra-attempt-if-no-train-pass", action="store_true",
+                    help="E017 policy: with --attempts 2 and --train-check, run attempt 2 for a pair when neither "
+                         "attempt 0 nor 1 passes the train check (not part of the config, so files resume)")
+    ap.add_argument("--auto-peak-price", action="store_true",
+                    help="E017: price each turn at 2x inside weekday peak windows (UTC 01-04, 06-10), else 1x")
     ap.add_argument("--max-balance-stop", type=float, default=20.0,
                     help="stop launching new attempts when the DeepSeek balance falls below this (USD)")
     ap.add_argument("--price-multiplier", type=float, default=2, help="2 assumes peak; 1 off-peak")
@@ -636,6 +742,8 @@ def main():
         ap.error("--limit must be positive")
     if args.prompt in SUBMIT_PROMPTS and not args.answer_tool:
         ap.error(f"--prompt {args.prompt} describes submit_answer; pass --answer-tool")
+    if args.extra_attempt_if_no_train_pass and (args.attempts != 2 or not args.train_check):
+        ap.error("--extra-attempt-if-no-train-pass needs --attempts 2 and --train-check")
     if args.answer_tool and args.mode != "grid":
         ap.error("--answer-tool is for grid mode")
     if args.budget_soft and (not args.budget_notes or not 0 < args.budget_soft < args.max_total_output):
@@ -662,10 +770,10 @@ def main():
     config = {name: getattr(args, name) for name in (
         "model", "effort", "mode", "prompt", "max_tokens", "max_total_output", "final_tokens", "max_turns",
         "tool_timeout", "max_tool_output")}
-    v4 = {k: getattr(args, k) for k, v in V4_DEFAULTS.items() if getattr(args, k) != v}
+    v4 = {k: getattr(args, k) for k, v in {**V4_DEFAULTS, **V5_DEFAULTS}.items() if getattr(args, k) != v}
     if v4:  # only new-option runs carry the extra keys, so v3 configs (and resume of old files) are unchanged
         config.update(v4)
-    config.update(harness_version=HARNESS_VERSION_V4 if v4 else HARNESS_VERSION, challenges=str(args.challenges.resolve()),
+    config.update(harness_version=harness_version(args), challenges=str(args.challenges.resolve()),
                   solutions=str(args.solutions.resolve()) if args.solutions else None)
     try:
         records = read_records(out)
@@ -674,10 +782,22 @@ def main():
     if any(r.get("config") != config for r in records):
         ap.error("Existing results use a different configuration; choose a new --tag or --out")
     latest = {(r["task_id"], r["pair"], r["attempt"]): r for r in records}
+    policy = args.extra_attempt_if_no_train_pass
+
+    def needs_extra(t, p):
+        """E017 policy: attempts 0 and 1 finished (no API error), neither passes train, attempt 2 not done yet."""
+        recs = [latest.get((t, p, a)) for a in (0, 1)]
+        done2 = (t, p, 2) in latest and "error" not in latest[t, p, 2]
+        return (not done2 and all(r is not None and "error" not in r for r in recs)
+                and not any(r.get("train_pass") is True for r in recs))
+
     jobs = [(t, p, a) for t, task in tasks.items() for p in range(len(task["test"]))
             for a in range(args.attempts) if (t, p, a) not in latest or "error" in latest[t, p, a]]
     if pairs is not None:
         jobs = [job for job in jobs if job[:2] in pairs]
+    if policy:
+        jobs += [(t, p, 2) for t, task in tasks.items() for p in range(len(task["test"]))
+                 if (pairs is None or (t, p) in pairs) and needs_extra(t, p)]
     output_cap = len(jobs) * args.max_total_output * PRICES[args.model][2] * args.price_multiplier / 1e6
     expected = len(jobs) * 65000 * PRICES[args.model][2] * args.price_multiplier / 1e6
     print(f"{len(tasks)} tasks, {len(jobs)} remaining attempts, {args.workers} workers -> {out}", flush=True)
@@ -726,7 +846,10 @@ def main():
                 return None
             task = tasks[t]
             rec = {"task_id": t, "pair": p, "attempt": a, "model": args.model, "effort": args.effort,
-                   "mode": args.mode, "config": config, "price_multiplier": args.price_multiplier}
+                   "mode": args.mode, "config": config,
+                   "price_multiplier": "auto" if args.auto_peak_price else args.price_multiplier}
+            if a >= args.attempts:
+                rec["policy_extra"] = True
             trace, result = solve(client, args, task, task["test"][p]["input"])
             if "error" in result:
                 result["error"] = result["error"].replace(key, "[redacted]")
@@ -742,19 +865,33 @@ def main():
             return rec
 
         with ThreadPoolExecutor(args.workers) as executor:
-            futures = [executor.submit(work, *job) for job in jobs]
-            for index, future in enumerate(as_completed(futures), 1):
-                rec = future.result()
-                if rec is None:
-                    continue
-                records.append(rec)
-                status = rec.get("error") or (
-                    f"correct={rec.get('correct', 'unscored')} tools={rec['tool_calls']} "
-                    f"{rec['usage']['completion']} out-tok ${rec['est_cost_usd']:.4f} "
-                    f"{rec['seconds']}s {rec['stop_reason']}"
-                )
-                print(f"[{index}/{len(jobs)}] {rec['task_id']}.{rec['pair']}#{rec['attempt']} {status}", flush=True)
+            futures = {executor.submit(work, *job): job for job in jobs}
+            index, total_jobs = 0, len(jobs)
+            while futures:
+                finished, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    futures.pop(future)
+                    rec = future.result()
+                    if rec is None:
+                        continue
+                    index += 1
+                    records.append(rec)
+                    latest[rec["task_id"], rec["pair"], rec["attempt"]] = rec
+                    if policy and rec["attempt"] in (0, 1) and needs_extra(rec["task_id"], rec["pair"]) \
+                            and (rec["task_id"], rec["pair"], 2) not in {futures[f] for f in futures}:
+                        futures[executor.submit(work, rec["task_id"], rec["pair"], 2)] = (rec["task_id"], rec["pair"], 2)
+                        total_jobs += 1
+                    report(rec, index, total_jobs)
     summarize(records, tasks, args.attempts)
+
+
+def report(rec, index, total_jobs):
+    status = rec.get("error") or (
+        f"correct={rec.get('correct', 'unscored')} tools={rec['tool_calls']} "
+        f"{rec['usage']['completion']} out-tok ${rec['est_cost_usd']:.4f} "
+        f"{rec['seconds']}s {rec['stop_reason']}"
+        + (f" train_pass={rec['train_pass']}" if "train_pass" in rec else ""))
+    print(f"[{index}/{total_jobs}] {rec['task_id']}.{rec['pair']}#{rec['attempt']} {status}", flush=True)
 
 
 if __name__ == "__main__":

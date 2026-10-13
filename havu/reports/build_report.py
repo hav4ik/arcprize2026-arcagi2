@@ -468,6 +468,12 @@ QWEN36 = "Qwen3.6-35B-A3B NVFP4, self-hosted SGLang (vast.ai 4×RTX PRO 6000 Ser
 TOOLS_V3 = "120k total / 64k per turn / 24k forced final, harness persistent-v3"
 SUB = "submit_answer tool, session-answer fallback (no forced final), lenient parse, 64k per turn"
 GEN = "no tools (raw gen API)"
+QWEN_POOL = "Qwen3.8-27B NVFP4, self-hosted SGLang (vast.ai 1×RTX PRO 6000 boxes, 3–5 in a pool)"
+E020_PROG = ("program answers (`submit_program`: a `solve()` checked on every train pair before the test), lean2progroles prompt, "
+             "task summary, helpers, rich failure feedback")
+E020_BASE = "temp 1.0 / top_p 0.95 / top_k 20, budget notes on every output, harness qwen-tools-5"
+# Kaggle rerun budget: ~295 tok/s end-to-end on 4×L4 (E013) × ~11 h usable / 259 test pairs ≈ 44k generated tokens per pair.
+KAGGLE_PAIR_BUDGET = 44000
 E017_H = "low effort, sub80s40 budgets (80k hard / 40k soft, notes on every output, `submit_answer`), harness persistent-v5"
 
 
@@ -552,6 +558,32 @@ T1_SPECS = [
          cost=("text", "box time [^rent-e012]"), ref="E008 Qwen xhigh-240k", ref_match=True, ref_cap=48000,
          note="Merged: dev-pair attempts and 81 attempt-0 records from qwen_tools_medium_48k_dev_s24 (harness qwen-tools-2), the rest from qwen_tools_medium_48k_full_v3 (qwen-tools-3, adds a salvage answer source).",
          running_tags=["full_v3"]),
+    dict(id="E020 K0 (v2 config)", fam=QW, model=QWEN_POOL, harness="tools-grid", set="full", files=["qwen_tools_e020_K0_all.jsonl"],
+         desc=f"the submitted Kaggle v2 config re-run: lean2sub + `submit_answer`, tier medium, 48k hard / 24k soft, {E020_BASE}; train check and alternative answers recorded",
+         cost=("text", "pool time [^rent-e020]"), ref="E012 Qwen tools full", ref_match=True, e017=True,
+         note="Kaggle-budget baseline for K1–K3; reproduces E012 (same config)."),
+    dict(id="E020 K1 think cap", fam=QW, model=QWEN_POOL, harness="tools-grid", set="full", files=["qwen_tools_e020_K1_all.jsonl"],
+         desc=f"K0 + per-turn thinking cap 8192 (+2048 grace) with an 'act now: run code' nudge; {E020_BASE}",
+         cost=("text", "pool time [^rent-e020]"), ref="E020 K0 (v2 config)", e017=True),
+    dict(id="E020 K2 program recipe", fam=QW, model=QWEN_POOL, harness="tools-program", set="full", files=["qwen_tools_e020_K2_all.jsonl"],
+         expected_attempts=2, desc=f"K1 + {E020_PROG}; tier medium, 48k hard / 24k soft; {E020_BASE}",
+         cost=("text", "pool time [^rent-e020]"), ref="E020 K0 (v2 config)", e017=True),
+    dict(id="E020 K2 no think cap", fam=QW, model=QWEN_POOL, harness="tools-program", set="full", files=["qwen_tools_e020_K2nc_all.jsonl"],
+         desc=f"K2 without the per-turn thinking cap; {E020_BASE}",
+         cost=("text", "pool time [^rent-e020]"), ref="E020 K0 (v2 config)", ref_extra=["E020 K2 program recipe"], e017=True),
+    dict(id="E020 K3 xhigh-48k (v4)", fam=QW, model=QWEN_POOL, harness="tools-program", set="full", files=["qwen_tools_e020_K3_all.jsonl"],
+         expected_attempts=2, desc=f"K2 at tier xhigh, still 48k hard / 24k soft; {E020_BASE}. The Kaggle v4 config.",
+         cost=("text", "pool time [^rent-e020]"), ref="E020 K0 (v2 config)", ref_extra=["E020 K2 program recipe"], e017=True,
+         note="Gated 2nd attempt held to a 44k mean per pair (simulated with the real attempt 1 as the retry): Kaggle pass@2 38.3% (task-wt. 39.9%); at a 64k mean 43.1% [^e020]."),
+    dict(id="E020 x96p", fam=QW, model=QWEN_POOL, harness="tools-program", set="full",
+         files=["qwen_tools_e020_x96p_shard0.jsonl", "qwen_tools_e020_x96p_shard1.jsonl"],
+         desc=f"{E020_PROG}; tier xhigh, 96k hard / 48k soft, no thinking cap; {E020_BASE}",
+         cost=("text", "pool time [^rent-e020]"), ref="E008 Qwen xhigh-240k", ref_match=True, e017=True),
+    dict(id="E020 x96pc8", fam=QW, model=QWEN_POOL, harness="tools-program", set="full", attempts=[0],
+         files=["qwen_tools_e020_x96pc8_shard0.jsonl", "qwen_tools_e020_x96pc8_shard1.jsonl"],
+         desc=f"x96p + per-turn thinking cap 8192; {E020_BASE}. Best single-attempt Qwen config.",
+         cost=("text", "pool time [^rent-e020]"), ref="E008 Qwen xhigh-240k", ref_match=True, ref_extra=["E020 x96p"], e017=True,
+         note="Pooled with x96p and 2 no-tool xhigh-240k samples (vote, ties by train-passing programs): Kaggle pass@2 69.5% (task-wt. 70.7%), oracle 71.3%, ~261k tokens/pair [^e020]."),
     dict(id="E008 Nemotron Lightning", fam=NM, model="Nemotron 3.5 Lightning bf16, OpenRouter (CoreWeave)", harness="no tools", set="full",
          files=["openrouter_nvidia-nemotron-3.5-lightning_high.jsonl"],
          desc="ARC Prize prompt, high effort, max_tokens 200k, one call", cost=REC_OR,
@@ -663,6 +695,24 @@ T2_SPECS = [
     dict(id="E010 s20x40", fam=DS, model=FLASH, harness="tools-grid", set="full", files=[tool_file("lean2sub", "low", "e010_full_s20x40")],
          desc="40k hard / 20k soft, strong wording", cost=REC_EST, ref="E004-GL", setlabel="full-167", status="done (8 API errors)",
          note="8 attempts lost to API connection errors and not retried, so it fails the completeness rule."),
+    # E019 (dev-56, gateway pool) and E020 partial full-set arms
+    dict(id="E019 dev A submit_answer", fam=QW, model=QWEN_POOL, harness="tools-grid", set="dev", files=["qwen_tools_baseline_gw_dev56.jsonl"],
+         attempts=[0], desc="qwen-tools-4 baseline (= Kaggle v2 config), tier medium, 48k / 24k", cost=("none",), ref="E008 Qwen xhigh-240k",
+         ref_match=True, ref_cap=48000, setlabel="dev-56", status="done", expected=56, e017=True,
+         note="Partial extra samples (17 + 5 attempts) were stopped to free the pool."),
+    dict(id="E019 dev B program-only", fam=QW, model=QWEN_POOL, harness="tools-program", set="dev", files=["qwen_tools_program_gw_dev56.jsonl"],
+         attempts=[0], desc="as A, but answers only as a program (`submit_program`, train-checked); no typed grids", cost=("none",),
+         ref="E019 dev A submit_answer", setlabel="dev-56", status="done", expected=56, e017=True,
+         note="A tie with A; P(correct | train pass) 41% at medium-48k. Partial extra samples (16 + 7 + 2) stopped."),
+    dict(id="E020 x96pal (partial)", fam=QW, model=QWEN_POOL, harness="tools-program", set="covered", files=["qwen_tools_e020_x96pal_all.jsonl"],
+         desc="x96p + test-audit review turn + hardcoded-constant lint", cost=("none",), ref="E020 x96p", ref_match=True,
+         setlabel="full-167 (partial)", status="stopped", expected=167, note="Boxes destroyed; resumable. The review turn changed the answer once in 91 reviews."),
+    dict(id="E020 x96pex (partial)", fam=QW, model=QWEN_POOL, harness="tools-program", set="covered", files=["qwen_tools_e020_x96pex_all.jsonl"],
+         desc="x96p + one worked example (ARC training task 3aa6fb7a) in the prompt", cost=("none",), ref="E020 x96p", ref_match=True,
+         setlabel="full-167 (partial)", status="stopped", expected=167, note="Too few pairs to judge; resumable."),
+    dict(id="E020 x96pc8 2nd sample (partial)", fam=QW, model=QWEN_POOL, harness="tools-program", set="covered", attempts=[1],
+         files=["qwen_tools_e020_x96pc8_all.jsonl"], desc="as E020 x96pc8, attempt index 1", cost=("none",), ref="E020 x96pc8",
+         setlabel="full-167 (partial)", status="stopped", expected=167, note="Resumable."),
     # provider / harness probes
     dict(id="E008 Qwen Reka diag", fam=QW, model="Qwen3.8-27B fp8, OpenRouter (Reka)", harness="no tools", set="covered",
          files=["openrouter_qwen-qwen3.8-27b_high_reka_diag.jsonl"], desc="high effort; provider fixes thinking at ~2k tokens", cost=REC_OR,
@@ -965,7 +1015,9 @@ def t1_row(spec, res):
                      f"{f1(pp['k_pass2_base'])} → {f1(pp['k_pass2_policy'])} ({sg(pp['diff'] * 100)} pp [{sg(pp['lo'] * 100)}, "
                      f"{sg(pp['hi'] * 100)}]; {pp['rescued']} pairs rescued, {pp['lost']} lost); task-weighted {f1(pp['pass2_base'])} → "
                      f"{f1(pp['pass2_policy'])}")
+    kb_txt, kb_sub, kb_v, kb_cls = kaggle_budget(spec, res)
     return {"id": spec["id"], "fam": spec["fam"], "model": spec["model"], "harness": spec["harness"], "desc": spec["desc"],
+            "kb": kb_txt, "kb_sub": kb_sub, "kb_cls": kb_cls,
             "samples": coverage_text(res), "k_pass1": p1, "k_pass1_sub": p1_sub, "k_pass2": p2, "k_pass2_sub": p2_sub,
             "pass1": tp1, "pass1_sub": tp1_sub, "pass2": tp2, "pass2_sub": tp2_sub,
             "tok_mean": fk(res["tok_mean"]), "tok_median": fk(res["tok_median"]), "tok_p90": fk(res["tok_p90"]),
@@ -973,7 +1025,21 @@ def t1_row(spec, res):
             "raw": {"k_pass1": res["k_pass1"], "k_pass2": res.get("k_pass2"), "pass1": res["pass1"], "pass2": res.get("pass2"),
                     "tok_mean": res["tok_mean"], "tok_median": res["tok_median"],
                     "tok_p90": res["tok_p90"], "ctok_median": res["ctok_median"], "samples": ns,
-                    "cost_per_sample": cost_raw, "k_pass2_policy": pp["k_pass2_policy"] if pp else None}, "best": {}}
+                    "cost_per_sample": cost_raw, "k_pass2_policy": pp["k_pass2_policy"] if pp else None, "kb": kb_v}, "best": {}}
+
+
+def kaggle_budget(spec, res):
+    """Does one attempt per test pair fit the Kaggle rerun (4×L4, 12 h, 259 pairs, ~44k generated tokens per pair)?"""
+    if not spec["model"].startswith("Qwen3.8-27B"):
+        why = "throughput on 4×L4 not measured" if spec["model"].startswith("Qwen") else "not runnable on Kaggle"
+        return "n/a", why, None, "kb-na"
+    t = res["tok_mean"]
+    ratio = t / KAGGLE_PAIR_BUDGET
+    if ratio <= 1.0:
+        extra = (f"; the pass@2 column uses 2 attempts/pair ({fk(2 * t)}, {2 * ratio:.1f}× budget)"
+                 if res.get("k_pass2") is not None else "")
+        return "✓ Kaggle budget", f"1 attempt/pair: {fk(t)} of ~{KAGGLE_PAIR_BUDGET // 1000}k{extra}", ratio, "kb-ok"
+    return f"✗ {ratio:.1f}× budget", f"needs ~{ratio:.1f}× today's Kaggle throughput for 1 attempt/pair", ratio, "kb-over"
 
 
 # Scores within this many points (fraction) of a column's best are treated as tied with it (sample noise is ~2-3 pp).
@@ -1057,7 +1123,8 @@ def kaggle_data():
             out["bench"][name] = {"mtp": b["mtp"], "kv_tokens": b["kv_tokens"], "concurrency": b["concurrency"],
                                   "decode_tok_s": b["decode_long"]["steady_decode_tok_s"], "ctx_mean": b["decode_long"]["ctx_mean"],
                                   "prefill_s": b["decode_long"]["prefill_phase_s"], "e2e": b["e2e"]}
-    for name, label in (("v2-v2", "Kaggle v2 tools (commit run)"), ("plain-v1", "Kaggle plain v1 (commit run)")):
+    for name, label in (("v2-v2", "Kaggle v2 tools (commit run)"), ("plain-v1", "Kaggle plain v1 (commit run)"),
+                        ("v3-v3", "Kaggle v3 tools (commit run)")):
         p = kr / name / "summary_local.json"
         if not p.exists():
             continue
@@ -1162,6 +1229,10 @@ FOOTNOTES = {
     "e016": ("From experiments/E016_cutoff_continuation/README.md: for 142ca369.1#0 the thinking-off continuation had a 12.5k-token prompt "
              "against 45.7k for the original last turn; not recomputed here."),
     "audit": "From experiments/E008_openrouter_models/qwen_format_audit.md (450 Qwen attempts read and re-parsed); not recomputed here.",
+    "rent-e020": ("Self-hosted on 3–5 single-GPU vast.ai RTX PRO 6000 boxes ($1.03–1.28/h each, ~$3.5–5.6/h for the pool) behind an SGLang "
+                  "Model Gateway with per-box slots; ~$65–70 of box time for E019+E020 together (estimate from list prices). Box time per arm is not itemised. API cost $0."),
+    "e020": ("From experiments/E020_qwen_harness_80/README.md (offline policy simulations over the logged samples: gated 2nd attempt with the real "
+             "attempt-1 sample as the retry, cross-mode pooling with votes); not recomputed here."),
     "contam": "From experiments/E004_tool_use/README.md (safety trace review): Flash listed real ARC-AGI-2 eval task ids while trying to recall answers.",
 }
 
@@ -1318,6 +1389,47 @@ def findings(R, specs, nv, longtail, kag, e16=None):
                   f"(simulated: correct and finished within the cap), and {f1(e12_d[0]['ref_score'])}% uncapped at 240k "
                   f"({fk(qx['tok_mean'])} tokens). Paired vs the {cap_eq // 1000}k cap: {ci(d_eq)}. "
                   f"On dev-56 the same config scores {f1(e12dev['k_pass1'])}% at {fk(e12dev['tok_mean'])}."))
+    e20 = ["E020 K0 (v2 config)", "E020 K1 think cap", "E020 K2 program recipe", "E020 K2 no think cap", "E020 K3 xhigh-48k (v4)",
+           "E020 x96p", "E020 x96pc8", "E019 dev A submit_answer", "E019 dev B program-only"]
+    if all(k in R and R[k]["complete"] for k in e20[:7]):
+        k0, k1, k2, k2nc, k3, xp, xc = (g(k) for k in e20[:7])
+        def pd(res, ref):
+            return next((d for d in res["paired"] if d["ref"] == ref and not d["cap"]), None)
+        def tcp(res):
+            tc = res.get("train_check")
+            return f"{tc['p_pass']:.0%}" if tc and tc.get("p_pass") is not None else "n/a"
+        F.append(("E020: at Kaggle's budget, program answers + task summary + helpers lift Qwen3.8-27B by ~10 pp; K3 is the v4 config.", [
+            f"K0 (the submitted v2 config, re-run) scores Kaggle pass@1 {f1(k0['k_pass1'])}% at {fk(k0['tok_mean'])} tokens/attempt. "
+            f"K1 adds an 8k per-turn thinking cap: {f1(k1['k_pass1'])}% ({ci(pd(k1, 'E020 K0 (v2 config)'))}), a tie. "
+            f"Program answers + task summary + helpers + roles prompt + rich feedback without the cap (K2 no think cap): {f1(k2nc['k_pass1'])}% "
+            f"({ci(pd(k2nc, 'E020 K0 (v2 config)'))} vs K0). With the cap (K2, 2 samples): {f1(k2['k_pass1'])}% at {fk(k2['tok_mean'])}.",
+            f"K3 = the K2 recipe at tier xhigh, still within 48k: {f1(k3['k_pass1'])}% mean pass@1 over 2 samples at {fk(k3['tok_mean'])} tokens/attempt "
+            f"({ci(pd(k3, 'E020 K0 (v2 config)'))} vs K0 on matching pairs; {ci(pd(k3, 'E020 K2 program recipe'))} vs K2). "
+            f"P(correct | train pass): K0 {tcp(k0)}, K2 {tcp(k2)}, K3 {tcp(k3)}. All of these fit one attempt per pair within Kaggle's ~44k-token budget.",
+            "Simulated policies at the Kaggle budget [^e020]: a gated 2nd attempt (only for pairs without a train-passing program, held to a 44k mean per pair) "
+            "gives K3 Kaggle pass@2 38.3% (task-weighted 39.9%) and K2 37.1%, against ~28% for the submitted v2/v3 config; at a 64k mean K3 reaches 43.1%. "
+            "The free attempt_2 (other grids of the same attempt) adds +0 to +1.2 pp.",
+        ]))
+        F.append(("E020: given 96k tokens, Qwen3.8-27B's program agent reaches 56% pass@1; pooling with no-tool samples reaches ~70% pass@2.", [
+            f"x96pc8 (K3 recipe at 96k hard / 48k soft, thinking cap 8k): Kaggle pass@1 {f1(xc['k_pass1'])}% (task-weighted {f1(xc['pass1'])}%) at "
+            f"{fk(xc['tok_mean'])} tokens/attempt, {ci(pd(xc, 'E008 Qwen xhigh-240k'))} vs the best no-tool config (xhigh-240k, {fk(g('E008 Qwen xhigh-240k')['tok_mean'])} tokens). "
+            f"Without the cap (x96p): {f1(xp['k_pass1'])}%; the cap is worth {ci(pd(xc, 'E020 x96p'))} at xhigh-96k, unlike at medium-48k. "
+            f"P(correct | train pass) {tcp(xc)} with the cap.",
+            "Pooling x96pc8 + x96p + 2 no-tool xhigh-240k samples and voting (ties broken by train-passing programs) gives Kaggle pass@2 69.5% "
+            "(task-weighted 70.7%) at ~261k tokens/pair; the oracle is 71.3% (74.3% with every logged candidate), so coverage, not selection, "
+            "is the limit [^e020]. The 80% target was not reached.",
+            f"On Kaggle one x96pc8 attempt needs {xc['tok_mean'] / KAGGLE_PAIR_BUDGET:.1f}× today's per-pair budget: throughput (MTP, 2 model copies "
+            "on 4×L4) is the lever that would move the Kaggle score from ~38% towards ~56%.",
+        ]))
+    if all(k in R for k in e20[7:]):
+        ea, eb = g("E019 dev A submit_answer"), g("E019 dev B program-only")
+        dba = next((d for d in eb["paired"] if d["ref"] == "E019 dev A submit_answer" and not d["cap"]), None)
+        ebp = f"{eb['train_check']['p_pass']:.0%}" if eb.get('train_check') else 'about 41%'
+        if dba:
+            F.append(("E019: program-only answers tie with submit_answer at medium-48k, and make every answer train-checkable.",
+                      f"On dev-56 (same gateway pool, 1 attempt each) A (submit_answer) scores Kaggle pass@1 {f1(ea['k_pass1'])}% and B (program-only) "
+                      f"{f1(eb['k_pass1'])}% ({ci(dba)}). At medium-48k a train-passing program is right only {ebp} of the time "
+                      "and 55% of B's attempts hit the cap before writing a solve(); the program recipe pays off once the budget or tier rises (E020)."))
     F.append(("Qwen3.6-35B-A3B and Nemotron are far behind.",
               f"Qwen3.6-35B-A3B: pass@1 {f1(q36['k_pass1'])}%, pass@2 {f1(q36['k_pass2'])}% at {fk(q36['tok_mean'])} tokens, a clean run with "
               f"every attempt closing its thinking on its own. Nemotron 3.5 Lightning: {f1(nemo['k_pass1'])}% ({nemo['n_correct']}/{nemo['n_good']}) at "
@@ -1676,6 +1788,7 @@ thead th:first-child{z-index:3}
 td.id{max-width:24ch;white-space:normal}
 td .sub{display:block;color:var(--muted);font-size:.72rem;margin-top:.1rem}
 td.best{color:var(--best);font-weight:700;background:var(--best-bg)!important}
+td.kb-ok{color:var(--best);font-weight:700}td.kb-over{color:var(--fg2)}td.kb-na{color:var(--fg2)}
 th.prim{color:var(--fg)} td.prim{font-size:.84rem;font-weight:600;color:var(--fg)}
 th.sec{color:var(--muted);font-weight:500;font-size:.74rem} td.sec{color:var(--muted);font-size:.72rem}
 th.sec.first,td.sec.first{border-left:1px solid var(--rule)}
@@ -1801,10 +1914,12 @@ def render_html(data, wrapper=True):
     out.append(f'<p class="tbl-note">Runs that cover all {m["sets"]["full"]} test outputs for every counted sample. Scores in %. '
                '<strong>Kaggle pass@1 / pass@2</strong> (pair-weighted, the competition metric) are primary; the muted ARC Prize columns are the '
                'task-weighted benchmark convention. Grouped by model family, then sorted by Kaggle pass@2 (runs without pass@2 last, by Kaggle '
-               'pass@1). Click a header to sort. Shaded cells mark the top tier of a column: Kaggle scores within 3 pp of the column’s best (treated as tied, since one sample swings by ~2–3 pp) and the fewest tokens. Δ values in '
+               'pass@1). <strong>Kaggle 4×L4 / 12 h</strong>: ✓ when one attempt per test pair fits the Kaggle rerun budget (Qwen3.8-27B only; ~295 tok/s '
+               'measured end-to-end on 4×L4 × ~11 h usable ÷ 259 test pairs ≈ 44k generated tokens per pair); ✗ shows how many times over. '
+               'pass@2 rows with 2 always-on samples cost twice that. Click a header to sort. Shaded cells mark the top tier of a column: Kaggle scores within 3 pp of the column’s best (treated as tied, since one sample swings by ~2–3 pp) and the fewest tokens. Δ values in '
                'Notes are paired Kaggle pass@1 differences in pp with a 95% cluster-bootstrap CI (tasks resampled).</p>')
     out.append('<div class="tbl-wrap"><table class="sortable" id="table1"><thead><tr>')
-    out += [th("Experiment ID"), th("LLM model"), th("Harness"), th("Description"), th("Samples"), th("Kaggle pass@1", True, extra="prim"),
+    out += [th("Experiment ID"), th("LLM model"), th("Harness"), th("Description"), th("Samples"), th("Kaggle 4×L4 / 12 h", True), th("Kaggle pass@1", True, extra="prim"),
             th("Kaggle pass@2", True, extra="prim"), th("ARC Prize pass@1 (task-wt.)", True, extra="sec first"),
             th("ARC Prize pass@2 (task-wt.)", True, extra="sec"),
             th("Tok mean", True), th("Tok median", True), th("Tok p90", True), th("Correct tok median", True), th("Cost", True), th("Notes", sortable=False)]
@@ -1813,7 +1928,7 @@ def render_html(data, wrapper=True):
     for r in t1:
         if r["fam"] != cur:
             cur = r["fam"]
-            out.append(f'<tr class="fam-row"><td colspan="15">{fam_name[cur]}</td></tr>')
+            out.append(f'<tr class="fam-row"><td colspan="16">{fam_name[cur]}</td></tr>')
         raw, b = r["raw"], r["best"]
         out.append("<tr>")
         out.append(f'<td class="id" data-v="{html.escape(r["id"])}"><span class="badge {FAM_CLASS[r["fam"]]}" aria-hidden="true"></span>{html.escape(r["id"])}</td>')
@@ -1821,6 +1936,7 @@ def render_html(data, wrapper=True):
         out.append(td(r["harness"]))
         out.append(td(r["desc"], "desc", fn_order=fo))
         out.append(td(r["samples"], "cov", v=raw["samples"]))
+        out.append(td(r["kb"], "num " + r["kb_cls"], v=rawv(raw.get("kb")), sub=r["kb_sub"]))
         out.append(td(r["k_pass1"], "num prim", v=rawv(raw["k_pass1"]), sub=r["k_pass1_sub"], best=b.get("k_pass1")))
         out.append(td(r["k_pass2"], "num prim", v=rawv(raw["k_pass2"]), sub=r["k_pass2_sub"], best=b.get("k_pass2")))
         out.append(td(r["pass1"], "num sec first", v=rawv(raw["pass1"]), sub=r["pass1_sub"]))
@@ -2033,10 +2149,10 @@ def render_md(data):
     L += ["", f"## Table 1 — complete runs on the full public evaluation set ({len(data['table1'])} runs)", "",
           "Runs covering all 167 test outputs for every counted sample. Scores in %. **Kaggle pass@1 / pass@2** (pair-weighted, the competition "
           "metric) are primary; *ARC Prize task-weighted* columns (italic) are secondary. Grouped by model family and sorted by Kaggle pass@2 "
-          "(runs without pass@2 last). **Bold** = top tier of the column: Kaggle scores within 3 pp of the best (treated as tied; one sample swings by ~2–3 pp) and the fewest tokens. Δ in notes = paired Kaggle "
+          "(runs without pass@2 last). *Kaggle 4×L4 / 12 h*: ✓ = one attempt per test pair fits the Kaggle rerun (~44k generated tokens per pair: ~295 tok/s × ~11 h ÷ 259 pairs; Qwen3.8-27B only). **Bold** = top tier of the column: Kaggle scores within 3 pp of the best (treated as tied; one sample swings by ~2–3 pp) and the fewest tokens. Δ in notes = paired Kaggle "
           "pass@1 difference in pp, 95% cluster-bootstrap CI (tasks resampled).", "",
-          "| Experiment ID | LLM model | Harness | Description | Samples | Kaggle pass@1 | Kaggle pass@2 | *ARC Prize pass@1 (task-wt.)* | *ARC Prize pass@2 (task-wt.)* | Tok mean | Tok median | Tok p90 | Correct tok median | Cost | Notes |",
-          "|---|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|"]
+          "| Experiment ID | LLM model | Harness | Description | Samples | Kaggle 4×L4 / 12 h | Kaggle pass@1 | Kaggle pass@2 | *ARC Prize pass@1 (task-wt.)* | *ARC Prize pass@2 (task-wt.)* | Tok mean | Tok median | Tok p90 | Correct tok median | Cost | Notes |",
+          "|---|---|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|"]
     for i, r in enumerate(data["table1"]):
         b = r["best"]
         p1 = best(r["k_pass1"], b.get("k_pass1")) + (f"<br><sub>{r['k_pass1_sub']}</sub>" if r["k_pass1_sub"] else "")
@@ -2053,7 +2169,7 @@ def render_md(data):
             extra_fn.append((dkey, desc))
             desc = desc[:80].rsplit(" ", 1)[0] + f" … [^{dkey}]"
         L.append("| " + " | ".join(md_cell(x) for x in [
-            f"`{r['id']}`", r["model"], r["harness"], md(desc), r["samples"], p1, p2, tp1, tp2, best(r["tok_mean"], b.get("tok_mean")),
+            f"`{r['id']}`", r["model"], r["harness"], md(desc), r["samples"], (f"**{r['kb']}**" if r["kb_cls"] == "kb-ok" else r["kb"]) + (f"<br><sub>{r['kb_sub']}</sub>" if r.get("kb_sub") else ""), p1, p2, tp1, tp2, best(r["tok_mean"], b.get("tok_mean")),
             best(r["tok_median"], b.get("tok_median")), best(r["tok_p90"], b.get("tok_p90")), best(r["ctok_median"], b.get("ctok_median")),
             md(r["cost"]) + (f"<br><sub>{r['cost_sub']}</sub>" if r.get("cost_sub") else ""), f"[^{key}]" if r["notes"] else ""]) + " |")
     L += ["", f"## Table 2 — smaller sets, probes and partial runs ({len(data['table2'])} runs)", "",

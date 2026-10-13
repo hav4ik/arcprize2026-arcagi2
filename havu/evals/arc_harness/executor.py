@@ -102,7 +102,7 @@ class LocalExecutor:
     task data (`state_reset`)."""
 
     def __init__(self, train, test_input, timeout=30, max_output=16000, memory_mb=4096, grace=5,
-                 python=sys.executable, cpu_seconds=1200, fsize_mb=64, nice=10, start_timeout=90):
+                 python=sys.executable, cpu_seconds=1200, fsize_mb=64, nice=10, start_timeout=90, prelude_extra=""):
         self.train, self.test_input = train, test_input
         self.timeout, self.max_output, self.memory_mb, self.grace = timeout, max_output, memory_mb, grace
         self.python, self.cpu_seconds, self.fsize_mb, self.nice = python, cpu_seconds, fsize_mb, nice
@@ -115,7 +115,7 @@ class LocalExecutor:
             f"_arc_data = json.loads({data!r})\n"
             "train, test_input = _arc_data['train'], _arc_data['test_input']\n"
             "del _arc_data\n"
-        )
+        ) + prelude_extra  # E020 --helpers: re-run with the task data after a restart
 
     def _spawn_once(self, timeout):
         r, w = os.pipe()
@@ -241,9 +241,32 @@ def local_factory(timeout=30, max_output=16000, memory_mb=4096, **kwargs):
     return lambda train, test_input: LocalExecutor(train, test_input, timeout, max_output, memory_mb, **kwargs)
 
 
-def sandbox_factory(url, timeout=30, max_output=16000):
+# E021 (Kaggle v3): the evals/run_qwen_tools.py --session-mem-mb prelude (same text), importable without the
+# runner. Run first in a session (prelude_extra): caps the kernel's address space at its current VmSize + {mb} MB,
+# so a runaway cell raises MemoryError instead of exhausting host memory.
+SESSION_MEM_CAP = """
+def _arc_memcap():
+    import resource
+    try:
+        with open('/proc/self/status') as f:
+            vm = next(int(l.split()[1]) * 1024 for l in f if l.startswith('VmSize:'))
+        cap = vm + {mb} * 2 ** 20
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        if hard == resource.RLIM_INFINITY or cap < hard:
+            resource.setrlimit(resource.RLIMIT_AS, (cap, hard if hard != resource.RLIM_INFINITY else cap))
+    except Exception:
+        pass
+_arc_memcap()
+del _arc_memcap
+"""
+
+
+def sandbox_factory(url, timeout=30, max_output=16000, prelude_extra=""):
     """Docker sandbox sessions (evals/sandbox_client.py must be importable, i.e. evals/ on sys.path)."""
     from sandbox_client import SandboxSession
+    if prelude_extra:
+        return lambda train, test_input: SandboxSession(url, train, test_input, timeout, max_output,
+                                                        prelude_extra=prelude_extra)
     return lambda train, test_input: SandboxSession(url, train, test_input, timeout, max_output)
 
 
@@ -439,3 +462,251 @@ finally:
     if best is None:
         return {"functions": list(found)}, None
     return {"function": best[1], "train_matched": best[0], "train_pairs": len(session.train)}, best[2]
+
+
+# ---------------------------------------------------------------- program answers (qwen-tools-4, answer_mode=program)
+
+_PROGRAM_CHILD = r'''
+import contextlib, io, json, linecache, resource, signal, sys, traceback
+req = json.loads(sys.stdin.read())
+code, timeout = req["code"], req["timeout"]
+try:
+    if req.get("mem"):
+        resource.setrlimit(resource.RLIMIT_AS, (req["mem"], req["mem"]))
+except (ValueError, OSError):
+    pass
+
+class _ProgramTimeout(BaseException):
+    pass
+
+def _alarm(*_):
+    raise _ProgramTimeout()
+
+def _plain(o):
+    if hasattr(o, "tolist"):
+        return o.tolist()
+    return int(o)
+
+linecache.cache["<program>"] = (len(code), None, code.splitlines(True), "<program>")
+signal.signal(signal.SIGALRM, _alarm)
+buf = io.StringIO()
+try:
+    signal.setitimer(signal.ITIMER_REAL, timeout)
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        import numpy as np
+        ns = {"__name__": "__arc_program__", "np": np}
+        if req.get("prelude"):
+            exec(compile(req["prelude"], "<helpers>", "exec"), ns)
+        exec(compile(code, "<program>", "exec"), ns)
+        fn = ns.get("solve")
+        if not callable(fn):
+            raise NameError("the program does not define solve(grid)")
+        value = fn(req["grid"])
+        value = json.loads(json.dumps(value, default=_plain))
+    res = {"out": value}
+except _ProgramTimeout:
+    res = {"error": f"timeout: more than {timeout:g}s", "kind": "timeout"}
+except BaseException as exc:
+    frames = [f for f in traceback.extract_tb(exc.__traceback__) if f.filename == "<program>"]
+    lines = [f"  line {f.lineno}, in {f.name}: {(f.line or '').strip()[:160]}" for f in frames[-2:]]
+    msg = "".join(traceback.format_exception_only(type(exc), exc)).strip()[-400:]
+    res = {"error": "\n".join(lines + [msg]), "kind": type(exc).__name__}
+finally:
+    signal.setitimer(signal.ITIMER_REAL, 0)
+sys.stdout.write(req["marker"] + json.dumps(res) + "\n")
+'''
+
+
+def _marker_json(result, marker):
+    if result.get("process_status") != "completed":
+        return None
+    for line in reversed(result.get("stdout", "").splitlines()):
+        if line.startswith(marker):
+            try:
+                return json.loads(line[len(marker):])
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+def run_program(session, code, grid, timeout=10, memory_mb=3072, prelude=""):
+    """Run self-contained `code` (which must define solve(grid)) on one grid in a FRESH Python process started
+    from the session's environment (sandbox or LocalExecutor child), so session state cannot leak in.
+    Returns {'out': value} or {'error': text, 'kind': name}; per-grid wall-clock limit `timeout` seconds.
+    `prelude` (E020 --helpers) is executed in the program's namespace first (e.g. the arc_helpers source)."""
+    marker = f"ARC_PROGRAM_{uuid4().hex}:"
+    body = {"code": code, "grid": grid, "timeout": timeout, "marker": marker, "mem": memory_mb * 2 ** 20}
+    if prelude:
+        body["prelude"] = prelude
+    req = json.dumps(body)
+    cell = f'''
+def _arc_program():
+    import os, shutil, subprocess, sys
+    exe = sys.executable  # the Docker sandbox runs cells under uwsgi: use the python on PATH there
+    if not os.path.basename(exe or "").startswith("python"):
+        exe = shutil.which("python3") or shutil.which("python") or exe
+    try:
+        r = subprocess.run([exe, "-I", "-c", {_PROGRAM_CHILD!r}], input={req!r}, capture_output=True,
+                           text=True, timeout={timeout + 10!r}, cwd="/tmp")
+        out = r.stdout
+    except subprocess.TimeoutExpired:
+        out = ""
+    for line in out.splitlines()[::-1]:
+        if line.startswith({marker!r}):
+            print(line)
+            return
+    print({marker!r} + '{{"error": "timeout or crash (no result; memory limit {memory_mb} MB)", "kind": "crash"}}')
+try:
+    _arc_program()
+finally:
+    del _arc_program
+'''
+    res = _marker_json(session.execute(cell), marker)
+    return res if isinstance(res, dict) else {"error": "program runner failed", "kind": "runner"}
+
+
+def run_session_solve(session, grid, timeout=10):
+    """Apply the session's own `solve` to one grid (fallback when no submitted program gives a test output).
+    Runs inside the session (it may use session helpers). Returns {'out': value} or {'error': text}; None if the
+    session has no callable `solve`."""
+    marker = f"ARC_SSOLVE_{uuid4().hex}:"
+    cell = f'''
+def _arc_ssolve():
+    import contextlib, copy, io, json, signal
+    if not callable(globals().get("solve")):
+        print({marker!r} + "null")
+        return
+    class _T(BaseException):
+        pass
+    def _h(*_):
+        raise _T()
+    def _plain(o):
+        return o.tolist() if hasattr(o, "tolist") else int(o)
+    old = signal.signal(signal.SIGALRM, _h)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, {timeout!r})
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            v = globals()["solve"](copy.deepcopy(json.loads({json.dumps(grid)!r})))
+            v = json.loads(json.dumps(v, default=_plain))
+        res = {{"out": v}}
+    except _T:
+        res = {{"error": "timeout"}}
+    except Exception as exc:
+        res = {{"error": type(exc).__name__ + ": " + str(exc)[:200]}}
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+    print({marker!r} + json.dumps(res))
+try:
+    _arc_ssolve()
+finally:
+    del _arc_ssolve
+'''
+    result = session.execute(cell)
+    if result.get("process_status") != "completed":
+        return {"error": "session solve did not complete"}
+    for line in reversed(result.get("stdout", "").splitlines()):
+        if line.startswith(marker):
+            try:
+                return json.loads(line[len(marker):])
+            except json.JSONDecodeError:
+                break
+    return {"error": "no result"}
+
+
+def grid_shape(g):
+    if isinstance(g, list) and g and all(isinstance(r, list) for r in g):
+        widths = sorted({len(r) for r in g})
+        return f"{len(g)}x{widths[0]}" if len(widths) == 1 else f"{len(g)} rows of widths {widths[:5]}"
+    return type(g).__name__
+
+
+def score_outputs(outs, train):
+    """Per training pair: {'ok', 'error'?, 'shape'?, 'wrong'?} comparing program outputs with the host's outputs."""
+    rows = []
+    for o, pair in zip(outs, train):
+        exp = pair["output"]
+        if "error" in o:
+            rows.append({"ok": False, "error": o["error"], "kind": o.get("kind")})
+            continue
+        got = o["out"]
+        if got == exp:
+            rows.append({"ok": True})
+        elif not valid_grid(got):
+            rows.append({"ok": False, "error": f"not a valid grid ({grid_shape(got)}; need a rectangular 1-30 x "
+                                               "1-30 grid of ints 0-9)", "kind": "invalid"})
+        elif (len(got), len(got[0])) != (len(exp), len(exp[0])):
+            rows.append({"ok": False, "shape": (grid_shape(got), grid_shape(exp)), "got": got})
+        else:
+            rows.append({"ok": False, "wrong": [(r, c, exp[r][c], got[r][c]) for r in range(len(exp))
+                                                for c in range(len(exp[0])) if exp[r][c] != got[r][c]]})
+    return rows
+
+
+def _digits(g):
+    return "\n".join("".join(str(v) for v in row) for row in g)
+
+
+def rich_detail(row, pair, max_side=20):
+    """E020 --feedback rich: extra lines for one failing pair (needs the host's training output)."""
+    exp, lines = pair["output"], []
+    if "wrong" in row:
+        conf = {}
+        for _, _, e, g in row["wrong"]:
+            conf[(e, g)] = conf.get((e, g), 0) + 1
+        top = sorted(conf.items(), key=lambda kv: -kv[1])[:8]
+        lines.append("colour confusions (expected->got x count): " + ", ".join(f"{e}->{g} x{n}" for (e, g), n in top))
+        if len(exp) <= max_side and len(exp[0]) <= max_side:
+            bad = {(r, c): g for r, c, _, g in row["wrong"]}
+            got = "\n".join("".join(str(bad[(r, c)]) if (r, c) in bad else "." for c in range(len(exp[0])))
+                            for r in range(len(exp)))
+            lines.append(f"expected output:\n{_digits(exp)}\nyour output ('.' = correct cell, digit = your wrong "
+                         f"value):\n{got}")
+    elif "shape" in row and row.get("got") is not None:
+        got = row["got"]
+        h, w = len(exp), len(exp[0])
+        gh, gw = len(got), len(got[0])
+        hint = []
+        if (gh, gw) == (w, h):
+            hint.append("your output is transposed in shape")
+        for name, a, b in (("height", gh, h), ("width", gw, w)):
+            if a != b and b and a % b == 0:
+                hint.append(f"your {name} is {a // b}x the expected")
+            elif a != b and a and b % a == 0:
+                hint.append(f"the expected {name} is {b // a}x yours")
+        if hint:
+            lines.append("shape hint: " + "; ".join(hint))
+        if max(h, w, gh, gw) <= 12:
+            lines.append(f"expected output:\n{_digits(exp)}\nyour output:\n{_digits(got)}")
+    return lines
+
+
+def program_feedback(rows, k, cap, max_cells=12, test_error=None, rich=False, train=None):
+    """Short tool result for a rejected program: which pairs fail and why, a capped diff for the first one.
+    rich (E020): also colour confusions and a small-grid diff of the first failing pair (needs `train`)."""
+    n, bad = len(rows), [i for i, r in enumerate(rows) if not r["ok"]]
+    if not bad:
+        head = (f"[program rejected (submission {k} of {cap}): it passes all {n} training pairs but failed on "
+                f"test_input: {test_error}]")
+        return head + "\nFix solve so that it also handles the test input."
+    lines = [f"[program rejected (submission {k} of {cap}): {len(bad)} of {n} training pairs fail]"]
+    for i, r in enumerate(rows):
+        if r["ok"]:
+            lines.append(f"pair {i}: OK")
+        elif "error" in r:
+            err = r["error"].splitlines()
+            lines.append(f"pair {i}: error: " + (err[-1] if err else ""))
+        elif "shape" in r:
+            lines.append(f"pair {i}: wrong shape: got {r['shape'][0]}, expected {r['shape'][1]}")
+        else:
+            lines.append(f"pair {i}: right shape, {len(r['wrong'])} wrong cells")
+    first = rows[bad[0]]
+    if "error" in first and "\n" in first["error"]:
+        lines.append(f"pair {bad[0]} traceback (last lines):\n{first['error']}")
+    elif "wrong" in first:
+        cells = "; ".join(f"({r},{c}) expected {e} got {g}" for r, c, e, g in first["wrong"][:max_cells])
+        more = len(first["wrong"]) - max_cells
+        lines.append(f"pair {bad[0]} first wrong cells (row,col): {cells}" + (f"; ... {more} more" if more > 0 else ""))
+    if rich and train is not None:
+        lines += rich_detail(first, train[bad[0]])
+    return "\n".join(lines)

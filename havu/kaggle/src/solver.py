@@ -56,7 +56,9 @@ RATE_PRIOR = envf("ARC_RATE_PRIOR", 350.0)          # tok/s before the run measu
 MAX_MODEL_LEN = envf("ARC_MAX_MODEL_LEN", 131072)
 MAX_SEQS = envf("ARC_MAX_SEQS", 64)
 CONCURRENCY = envf("ARC_CONCURRENCY", 0)            # 0 = from KV capacity
-TOKENS_PER_SEQ_KV = envf("ARC_KV_PER_SEQ", 30000)   # KV tokens assumed per sequence when sizing concurrency
+# KV tokens per sequence when sizing concurrency = p90 context of a live tool attempt (E014/E019 rule: KV / p90,
+# not the mean): 1.40M (vLLM 0.23) / 48k = 29. v2 used 40000 (-> 35).
+TOKENS_PER_SEQ_KV = envf("ARC_KV_PER_SEQ", 48000)
 MTP = envf("ARC_MTP", 0)                            # speculative tokens (0 = off)
 TIER = os.environ.get("ARC_TIER", "xhigh")
 TEMPERATURE = envf("ARC_TEMPERATURE", 1.0)
@@ -68,6 +70,22 @@ TOOLS_CAP = envf("ARC_TOOLS_CAP", 48000)             # E012: hard cap per attemp
 TOOLS_SOFT = envf("ARC_TOOLS_SOFT", 24000)
 TOOLS_TIER = os.environ.get("ARC_TOOLS_TIER", "medium")
 TOOL_TIMEOUT = envf("ARC_TOOL_TIMEOUT", 30.0)
+TOOLS_ANSWER_MODE = os.environ.get("ARC_TOOLS_ANSWER_MODE", "submit")  # E019: "program" = submit_program only
+# ---- v3 (E021) toggles; every default reproduces v2 except the robustness items (memory cap, KV/p90 concurrency)
+TOOLS_PROMPT = os.environ.get("ARC_TOOLS_PROMPT", "")  # "" = lean2sub (submit) / lean2prog (program); lean2progroles
+TASK_SUMMARY = envf("ARC_TASK_SUMMARY", 0)          # E017/E020: host-computed perception pack in the first message
+HELPERS = envf("ARC_HELPERS", 0)                    # E017/E020: arc_helpers preloaded in session + programs
+FEEDBACK = os.environ.get("ARC_FEEDBACK", "basic")  # program mode: basic | rich (E020)
+TURN_THINK_CAP = envf("ARC_TURN_THINK_CAP", 0)      # E020: thinking tokens per turn before the "run code" nudge
+TURN_THINK_GRACE = envf("ARC_TURN_THINK_GRACE", 2048)  # then close the thinking into a run_python call
+THINK_CALL_RESCUE = envf("ARC_THINK_CALL_RESCUE", 1)  # E020/E021: after a nudge, run a <tool_call> written inside
+                                                    # still-open thinking (only acts with the think cap on)
+FREE_ATTEMPT2 = envf("ARC_FREE_ATTEMPT2", 0)        # 1: attempt_2 from the attempt's own alternatives (no tokens)
+ATTEMPT2 = os.environ.get("ARC_ATTEMPT2", "legacy")  # legacy (v2/v1 rule) | off | gated (E021)
+ATTEMPT2_UNKNOWN = envf("ARC_ATTEMPT2_UNKNOWN", 1)  # gated: also retry submitted answers without a train check (E012)
+ATTEMPT2_SAFETY = envf("ARC_ATTEMPT2_SAFETY", 0.85)  # gated: budget <= safety x per-attempt speed x time to force
+SESSION_MEM_MB = envf("ARC_SESSION_MEM_MB", 2048)   # session kernel RLIMIT_AS = VmSize + this; programs min(3072, .)
+                                                    # 0 = v2 (only the executor's absolute 4 GB RLIMIT_AS)
 LOCAL_FORCE_MIN = envf("ARC_LOCAL_FORCE_MIN", 40.0)  # local validation: force at max(T0 + this, ready + 20 min)
 LOCAL_FORCE_CAP_MIN = envf("ARC_LOCAL_FORCE_CAP_MIN", 60.0)  # ... but never later than T0 + this
 LOCAL_READY_MIN = envf("ARC_LOCAL_READY_MIN", 0.0)  # > 0: local force = server ready + this (overrides the above)
@@ -199,21 +217,39 @@ class Submission:
     def __init__(self, tasks):
         self.tasks = tasks
         self.answers = {}  # (tid, pair) -> {attempt_index: grid}
+        self.meta = {}     # (tid, pair) -> {attempt_index: {train_pass, train_frac, answer_source, alternatives}}
+        self.sources = {}  # (tid, pair) -> (source of attempt_1, source of attempt_2), set by build()
 
     def fallback(self, tid, p):
         g = self.tasks[tid]["test"][p]["input"]
         return g if valid_grid(g) else [[0]]
+
+    def _pick(self, tid, p):
+        """Top-2 distinct grids with their sources (v3 ranking, arc_harness.selection); v2's rule if that fails."""
+        answers = self.answers.get((tid, p), {})
+        try:
+            from arc_harness import selection as SEL
+            meta = self.meta.get((tid, p), {})
+            recs = {a: {**meta.get(a, {}), "pred": answers.get(a)} for a in set(answers) | set(meta)}
+            top = SEL.select_two(SEL.candidates(recs))
+            return [c["grid"] for c in top], [f"a{c['attempt']}:{c['src']}" for c in top]
+        except Exception:
+            got = [g for _, g in sorted(answers.items()) if valid_grid(g)]
+            return got, ["v2"] * len(got)
 
     def build(self):
         sub = {}
         for tid, task in self.tasks.items():
             lst = []
             for p in range(len(task["test"])):
-                got = [g for _, g in sorted(self.answers.get((tid, p), {}).items()) if valid_grid(g)]
-                a1 = got[0] if got else self.fallback(tid, p)
+                got, src = self._pick(tid, p)
+                fb = self.fallback(tid, p)
+                a1 = got[0] if got else fb
                 a2 = next((g for g in got[1:] if g != a1), None)
+                s2 = src[1] if a2 is not None else None
                 if a2 is None:
-                    a2 = self.fallback(tid, p) if a1 != self.fallback(tid, p) else a1
+                    a2, s2 = (fb, "fallback") if a1 != fb else (a1, "dup")
+                self.sources[(tid, p)] = (src[0] if got else "fallback", s2)
                 lst.append({"attempt_1": a1, "attempt_2": a2})
             sub[tid] = lst
         return sub
@@ -466,8 +502,16 @@ def kill_server(proc=None):
             os.killpg(proc.pid, 9)
         except Exception:
             pass
-    sh("pkill -9 -f '[v]llm.entrypoints' ; pkill -9 -f '[V]LLM::' ; pkill -9 -f '[s]glang.launch_server' ; "
-       "pkill -9 -f '[s]glang::' ; sleep 5", timeout=60)
+    if proc is not None:
+        for pid in descendants(proc.pid):
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+    if ON_KAGGLE:  # name patterns only on Kaggle (a shared host has other users' vllm/sglang processes)
+        sh("pkill -9 -f '[v]llm.entrypoints' ; pkill -9 -f '[V]LLM::' ; pkill -9 -f '[s]glang.launch_server' ; "
+           "pkill -9 -f '[s]glang::'", timeout=60)
+    time.sleep(5)
     for _ in range(24):
         _, out = sh("nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits", timeout=30)
         used = [int(x) for x in out.split() if x.strip().isdigit()]
@@ -538,8 +582,15 @@ def server_stats(timeout=5.0):
     SGLang: /v1/loads (running/waiting, token_usage, cumulative uncached prefill tokens, retracted queue)."""
     import urllib.request
     try:
+        if SERVER == "sglang" and _SGL_PROM.get("use"):
+            return _sglang_prometheus(timeout)
         if SERVER == "sglang":
-            with urllib.request.urlopen(BASE + "/v1/loads", timeout=timeout) as r:
+            try:
+                r = urllib.request.urlopen(BASE + "/v1/loads", timeout=timeout)
+            except Exception:  # older SGLang (e.g. 0.5.14 locally): /v1/loads fails; use /metrics from now on
+                _SGL_PROM["use"] = True
+                return _sglang_prometheus(timeout)
+            with r:
                 ld = json.loads(r.read())["loads"]
             return {"running": sum(x.get("num_running_reqs", 0) for x in ld),
                     "waiting": sum(x.get("num_waiting_reqs", 0) for x in ld),
@@ -566,12 +617,37 @@ def server_stats(timeout=5.0):
         return None
 
 
+_SGL_PROM = {}
+_SGL_METRICS = {"sglang:num_running_reqs": "running", "sglang:num_queue_reqs": "waiting",
+                "sglang:token_usage": "kv_usage", "sglang:prompt_tokens_total": "pc_queries",
+                "sglang:cached_tokens_total": "pc_hits", "sglang:num_retracted_reqs": "preemptions"}
+
+
+def _sglang_prometheus(timeout):
+    """SGLang /metrics (needs --enable-metrics) in the vLLM field names: cached / prompt tokens, retractions."""
+    import urllib.request
+    with urllib.request.urlopen(BASE + "/metrics", timeout=timeout) as r:
+        txt = r.read().decode(errors="ignore")
+    out = {"_prom": True}
+    for line in txt.splitlines():
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        if line.startswith("#") or name not in _SGL_METRICS:
+            continue
+        try:
+            v = float(line.rsplit(" ", 1)[1])
+        except ValueError:
+            continue
+        k = _SGL_METRICS[name]
+        out[k] = max(out.get(k, 0.0), v) if k == "kv_usage" else out.get(k, 0.0) + v
+    return out
+
+
 def cache_line(cur, prev):
     """One progress-line fragment: prefix-cache hit rate over the window, KV usage, preemptions/retractions."""
     if not cur:
         return "server stats n/a"
     prev = prev or {}
-    if SERVER == "sglang":
+    if SERVER == "sglang" and not cur.get("_prom"):
         new = cur["uncached_prefill"] - prev.get("uncached_prefill", 0)
         sent = cur.get("_client_prompt", 0) - prev.get("_client_prompt", 0)
         hit = f"{100 * (1 - new / sent):.1f}%" if sent > 0 else "n/a"
@@ -668,14 +744,62 @@ class Client:
 
 # ---------------------------------------------------------------- tool executor (Kaggle hardening)
 
-def robust_executor_factory(timeout):
-    """E012 LocalExecutor (qwen-tools-3 executor: RLIMIT_AS/CPU/FSIZE, nice, oom_score_adj=1000, SIGINT to the
-    process group, retried start with a longer timeout). nice 15 so tool code never starves the model server."""
+def session_prelude(mem_mb=None, helpers=None):
+    """Extra session prelude (re-run after every restart): the E020 --session-mem-mb cap first, then the helpers."""
+    from arc_harness import agent_qwen as AQ
     from arc_harness import executor as EX
+    mem_mb = SESSION_MEM_MB if mem_mb is None else mem_mb
+    helpers = HELPERS if helpers is None else helpers
+    extra = EX.SESSION_MEM_CAP.format(mb=int(mem_mb)) if mem_mb and hasattr(EX, "SESSION_MEM_CAP") else ""
+    return extra + (AQ.HELPERS_SRC if helpers else "")
+
+
+def robust_executor_factory(timeout, prelude_extra=None):
+    """E012 LocalExecutor (qwen-tools-3 executor: RLIMIT_AS/CPU/FSIZE, nice, oom_score_adj=1000, SIGINT to the
+    process group, retried start with a longer timeout). nice 15 so tool code never starves the model server.
+    v3: the session prelude adds the per-session memory cap and (with ARC_HELPERS) the helper functions."""
+    from arc_harness import executor as EX
+    extra = session_prelude() if prelude_extra is None else prelude_extra
     try:
-        return EX.local_factory(timeout=timeout, nice=15)
+        return EX.local_factory(timeout=timeout, nice=15, **({"prelude_extra": extra} if extra else {}))
     except TypeError:  # older executor without the hardening knobs
         return EX.local_factory(timeout=timeout)
+
+
+def build_agent_config(AQ, cap):
+    """The AgentConfig every tool attempt runs with (hard cap `cap` = min(ARC_TOOLS_CAP, the attempt's budget))."""
+    fields = AQ.AgentConfig.__dataclass_fields__
+    extra = {"context": MAX_MODEL_LEN} if "context" in fields else {}
+    extra.update(agent_options(fields))
+    return AQ.AgentConfig(**extra, tier=TOOLS_TIER, max_total_output=cap, budget_soft=min(TOOLS_SOFT, cap),
+                          budget_notes=0.01, budget_warn=0.75, verify_submit=False, max_turns=60,
+                          chunk_tokens=16384, force_submit_tokens=256, tool_timeout=TOOL_TIMEOUT,
+                          temperature=TEMPERATURE, top_p=0.95, top_k=20)
+
+
+def agent_options(fields):
+    """v3 AgentConfig options from the settings (only fields the bundled agent knows). The defaults give v2's
+    config exactly. record_train_check / record_alternatives are bookkeeping: no model tokens."""
+    opt = {}
+    if TOOLS_ANSWER_MODE == "program":
+        opt.update(answer_mode="program", prompt="lean2prog")  # E019 (qwen-tools-4)
+    if TOOLS_PROMPT:
+        opt["prompt"] = TOOLS_PROMPT
+    if TASK_SUMMARY:
+        opt["task_summary"] = True
+    if HELPERS:
+        opt["helpers"] = True
+    if FEEDBACK != "basic" and TOOLS_ANSWER_MODE == "program":
+        opt["feedback"] = FEEDBACK
+    if TURN_THINK_CAP:
+        opt.update(turn_think_cap=int(TURN_THINK_CAP), turn_think_grace=int(TURN_THINK_GRACE))
+        if THINK_CALL_RESCUE:
+            opt["think_call_rescue"] = True
+    if FREE_ATTEMPT2:
+        opt["record_alternatives"] = True
+    if (FREE_ATTEMPT2 or ATTEMPT2 == "gated") and TOOLS_ANSWER_MODE != "program":
+        opt["record_train_check"] = True  # train check of the submitted expression (ranking, retry gating)
+    return {k: v for k, v in opt.items() if k in fields}
 
 
 # ---------------------------------------------------------------- scheduler
@@ -697,6 +821,14 @@ class Scheduler:
         self.retries = {}
         self.server_down = lambda: False  # set by main(): True while the vLLM server is dead or restarting
         self.cache_stats = []  # periodic server cache/load counters (summary)
+        self.priority = {}  # gated attempt 2: job -> selection.retry_priority key
+        self.gated = {"eligible": 0, "started": 0, "dropped_time": 0}
+
+    def may_get_work(self):
+        """Gated mode: a worker with nothing to do now waits while first attempts can still queue retries."""
+        if ATTEMPT2 != "gated" or time.time() >= self.force_at - self.launch_margin:
+            return False
+        return bool(self.pending1 or self.pending2 or any(j[2] == 0 for j in self.inflight))
 
     def on_tokens(self, n):
         self.tokens += n
@@ -716,12 +848,47 @@ class Scheduler:
         cap = self.rate() * max(0.0, self.force_at - time.time())
         return cap - sum(max(0, b - u) for b, u in self.inflight.values())
 
+    def attempt_speed(self):
+        """Generated tokens per second of one attempt (tool time included): median over finished first attempts
+        that ran >= 60 s, else the total rate / concurrency."""
+        sp = sorted(r["tokens"] / r["elapsed_s"] for r in self.records
+                    if r.get("attempt") == 0 and (r.get("elapsed_s") or 0) >= 60 and r.get("tokens"))
+        if len(sp) >= 5:
+            return sp[len(sp) // 2]
+        return self.rate() / max(1, self.concurrency)
+
+    def gated_budget(self):
+        """(budget, reason) for a gated second attempt now; budget 0 if it cannot start now."""
+        left_s = self.force_at - self.launch_margin - time.time()
+        by_time = ATTEMPT2_SAFETY * self.attempt_speed() * left_s
+        cap = min(B_MAX2, TOOLS_CAP) if AGENT == "tools" else B_MAX2
+        budget = min(cap, self.capacity_left(), by_time)
+        if by_time < B_MIN2:
+            return 0, "time"
+        return (int(budget), "ok") if budget >= B_MIN2 else (0, "capacity")
+
     def next_job(self):
         """(job, budget) or None. Attempt-1 jobs first; attempt 2 only with spare capacity."""
         if self.pending1:
             job = self.pending1.pop(0)
             share = self.capacity_left() / (len(self.pending1) + 1)
             return job, int(min(B_MAX1, max(B_MIN1, share)))
+        if ATTEMPT2 == "off":
+            return None
+        if ATTEMPT2 == "gated":
+            if not self.pending2:
+                return None
+            budget, why = self.gated_budget()
+            if why == "time":  # time only shrinks: no gated attempt can start any more
+                log(f"gated attempt 2: no time left for {len(self.pending2)} queued pairs; dropping them")
+                self.gated["dropped_time"] += len(self.pending2)
+                self.pending2.clear()
+                return None
+            if not budget:
+                return None  # capacity frees up as running attempts finish under budget
+            self.pending2.sort(key=lambda j: self.priority.get(j, (9,)))
+            self.gated["started"] += 1
+            return self.pending2.pop(0), budget
         while self.pending2:
             job = self.pending2.pop(0)
             share = self.capacity_left() / (len(self.pending2) + 1)
@@ -746,11 +913,7 @@ class Scheduler:
         tid, p, a = job
         task = self.tasks[tid]
         cap = int(min(TOOLS_CAP, budget))
-        extra = {"context": MAX_MODEL_LEN} if "context" in AQ.AgentConfig.__dataclass_fields__ else {}
-        cfg = AQ.AgentConfig(**extra, tier=TOOLS_TIER, max_total_output=cap, budget_soft=min(TOOLS_SOFT, cap),
-                             budget_notes=0.01, budget_warn=0.75, verify_submit=False, max_turns=60,
-                             chunk_tokens=16384, force_submit_tokens=256, tool_timeout=TOOL_TIMEOUT,
-                             temperature=TEMPERATURE, top_p=0.95, top_k=20)
+        cfg = build_agent_config(AQ, cap)
         sch, client = self, self.client
         stats = {"tokens": 0, "requests": 0, "deadline_cuts": 0, "stream_errors": 0}
 
@@ -806,7 +969,10 @@ class Scheduler:
                    force_reason=("deadline" if stats["deadline_cuts"] else res.get("stop_reason")),
                    elapsed_s=round(time.time() - t0),
                    **{k: res.get(k) for k in ("answer_source", "stop_reason", "turns", "tool_calls", "tool_errors",
-                                              "parse_failures", "eos_continues", "chunks", "seconds", "turn_log")})
+                                              "parse_failures", "eos_continues", "chunks", "seconds", "turn_log",
+                                              "train_pass", "train_frac", "alternatives", "think_nudges",
+                                              "think_forced", "think_call_rescued", "n_submissions",
+                                              "harness_version")})
         if res.get("error"):
             rec["error"] = res["error"]
         try:
@@ -879,6 +1045,9 @@ class Scheduler:
         while time.time() < self.force_at - self.launch_margin:
             nj = self.next_job()
             if nj is None:
+                if self.may_get_work():
+                    await asyncio.sleep(5)
+                    continue
                 return
             job, budget = nj
             rec = await self.attempt(job, budget)
@@ -895,11 +1064,22 @@ class Scheduler:
             with open(self.rec_path, "a") as f:
                 f.write(json.dumps(rec) + "\n")
             tid, p, a = job
+            meta = {k: rec.get(k) for k in ("train_pass", "train_frac", "answer_source", "alternatives")}
+            if any(v is not None for v in meta.values()):
+                self.sub.meta.setdefault((tid, p), {})[a] = meta
             if rec["answered"]:
                 self.sub.answers.setdefault((tid, p), {})[a] = rec["pred"]
+            if rec["answered"] or rec.get("alternatives"):
                 self.sub.write()
-            if a == 0 and self.attempts > 1:
+            if a == 0 and self.attempts > 1 and ATTEMPT2 == "legacy":
                 self.pending2.append((tid, p, 1))
+            elif a == 0 and self.attempts > 1 and ATTEMPT2 == "gated":
+                from arc_harness.selection import retry_priority
+                key = retry_priority(rec, include_unknown=bool(ATTEMPT2_UNKNOWN))
+                if key is not None:
+                    self.priority[(tid, p, 1)] = key
+                    self.pending2.append((tid, p, 1))
+                    self.gated["eligible"] += 1
             log(f"done {tid}.{p}#{a} answered={rec['answered']} tok={rec['tokens']} budget={budget} "
                 f"forced={rec['forced']}/{rec['force_reason']} "
                 f"{rec['elapsed_s']}s {rec.get('error', '')}")
@@ -916,7 +1096,9 @@ class Scheduler:
             if cur is not None:
                 cur["_client_prompt"] = getattr(self.client, "prompt_tokens", 0)
             log(f"progress: {len(self.records)} attempts done, in flight {len(self.inflight)}, pending1 "
-                f"{len(self.pending1)}, pending2 {len(self.pending2)}, tokens {self.tokens}, window {r:.0f} tok/s, "
+                f"{len(self.pending1)}, pending2 {len(self.pending2)}"
+                + (f" (gated {self.gated}, attempt speed {self.attempt_speed():.1f} tok/s)" if ATTEMPT2 == "gated"
+                   else "") + f", tokens {self.tokens}, window {r:.0f} tok/s, "
                 f"rate est {self.rate():.0f} tok/s, avg {self.tokens / max(1, now - self.gen_start):.0f} tok/s | "
                 + cache_line(cur, prev))
             if cur is not None:
@@ -1031,10 +1213,115 @@ def setup_harness():
             f"{time.time() - t:.1f}s")
         if not ok:
             log("self-test results:", json.dumps([r1, r2, r3, r4, r5, out])[:1500])
+        if ok:
+            v3_selftest()
         return ok
     except Exception as exc:
         log(f"harness/executor self-test error: {type(exc).__name__}: {exc}")
         return False
+
+
+def v3_selftest():
+    """Check each enabled v3 feature on CPU before any GPU work; a broken one is switched off (v2 behaviour for
+    that feature) and logged loudly. Sets agent_qwen.PROGRAM_MEMORY_MB from the session memory cap."""
+    global SESSION_MEM_MB, HELPERS, TASK_SUMMARY, TOOLS_ANSWER_MODE, TOOLS_PROMPT, FREE_ATTEMPT2, TURN_THINK_CAP, \
+        THINK_CALL_RESCUE
+    from arc_harness import agent_qwen as AQ
+    from arc_harness import executor as EX
+    fields = AQ.AgentConfig.__dataclass_fields__
+    train = [{"input": [[1, 0], [0, 0]], "output": [[0, 1], [0, 0]]}, {"input": [[2, 3]], "output": [[3, 2]]}]
+    test_input = [[4, 5], [6, 7]]
+    status = {}
+
+    def run(prelude, cells):
+        with EX.LocalExecutor(train, test_input, timeout=10, prelude_extra=prelude) as ex:
+            return [ex.execute(c) for c in cells]
+
+    if SESSION_MEM_MB:
+        try:
+            big = int(SESSION_MEM_MB) + 512
+            r = run(session_prelude(SESSION_MEM_MB, False),
+                    [f"x = bytearray({big} * 2 ** 20)", "print('alive', len(train))"])
+            ok = "MemoryError" in r[0]["stderr"] and r[1]["stdout"].strip() == "alive 2" and not r[1].get("state_reset")
+            status["session_mem"] = ok
+            if ok:
+                AQ.PROGRAM_MEMORY_MB = min(AQ.PROGRAM_MEMORY_MB, int(SESSION_MEM_MB))
+            else:
+                log("SELF-TEST: session memory cap FAILED; using the executor's 4 GB limit only:", json.dumps(r)[:600])
+                SESSION_MEM_MB = 0
+        except Exception as exc:
+            log(f"SELF-TEST: session memory cap error {exc!r}; off")
+            SESSION_MEM_MB, status["session_mem"] = 0, False
+    if HELPERS:
+        try:
+            r = run(session_prelude(SESSION_MEM_MB, True), ["print(d8([[1, 2], [3, 4]])['fliplr'].tolist(), len(objects(train[0]['input'])))"])
+            ok = "helpers" in fields and bool(AQ.HELPERS_SRC) and r[0]["stdout"].strip() == "[[2, 1], [4, 3]] 1"
+            status["helpers"] = ok
+            if not ok:
+                log("SELF-TEST: helpers FAILED; off:", json.dumps(r)[:400])
+                HELPERS = 0
+        except Exception as exc:
+            log(f"SELF-TEST: helpers error {exc!r}; off")
+            HELPERS, status["helpers"] = 0, False
+    if TOOLS_ANSWER_MODE == "program":
+        try:
+            code = ("def solve(grid):\n    return [row[::-1] for row in grid]" if not HELPERS else
+                    "def solve(grid):\n    return d8(grid)['fliplr'].tolist()")
+            with EX.LocalExecutor(train, test_input, timeout=10, prelude_extra=session_prelude()) as ex:
+                outs = [EX.run_program(ex, code, g, 10, AQ.PROGRAM_MEMORY_MB, AQ.HELPERS_SRC if HELPERS else "")
+                        for g in [pair["input"] for pair in train] + [test_input]]
+                hog = EX.run_program(ex, "def solve(grid):\n    x = bytearray(%d * 2 ** 20)\n    return grid"
+                                     % (AQ.PROGRAM_MEMORY_MB + 512), test_input, 10, AQ.PROGRAM_MEMORY_MB)
+            ok = ("answer_mode" in fields and [o.get("out") for o in outs] == [p["output"] for p in train]
+                  + [[[5, 4], [7, 6]]] and hog.get("kind") in ("MemoryError", "crash"))
+            status["program"] = ok
+            if not ok:
+                log("SELF-TEST: program mode FAILED; back to submit_answer:", json.dumps([outs, hog])[:600])
+                TOOLS_ANSWER_MODE, TOOLS_PROMPT = "submit", ""
+        except Exception as exc:
+            log(f"SELF-TEST: program mode error {exc!r}; back to submit_answer")
+            TOOLS_ANSWER_MODE, TOOLS_PROMPT, status["program"] = "submit", "", False
+    if TOOLS_PROMPT and TOOLS_PROMPT not in getattr(AQ, "PROMPTS", {}):
+        log(f"SELF-TEST: unknown prompt {TOOLS_PROMPT!r}; using the mode default")
+        TOOLS_PROMPT = ""
+    if TOOLS_PROMPT and ("prog" in TOOLS_PROMPT) != (TOOLS_ANSWER_MODE == "program"):
+        log(f"SELF-TEST: prompt {TOOLS_PROMPT!r} does not match answer mode {TOOLS_ANSWER_MODE}; mode default")
+        TOOLS_PROMPT = ""
+    if TASK_SUMMARY:
+        try:
+            from task_summary import task_summary
+            txt = task_summary(train, test_input)
+            ok = "task_summary" in fields and isinstance(txt, str) and len(txt) > 50
+            status["task_summary"] = ok
+            if not ok:
+                log("SELF-TEST: task summary FAILED; off")
+                TASK_SUMMARY = 0
+        except Exception as exc:
+            log(f"SELF-TEST: task summary error {exc!r}; off")
+            TASK_SUMMARY, status["task_summary"] = 0, False
+    if TURN_THINK_CAP and "turn_think_cap" not in fields:
+        log("SELF-TEST: bundled agent has no turn_think_cap; off")
+        TURN_THINK_CAP, status["think_cap"] = 0, False
+    if TURN_THINK_CAP and THINK_CALL_RESCUE and "think_call_rescue" not in fields:
+        log("SELF-TEST: bundled agent has no think_call_rescue; off")
+        THINK_CALL_RESCUE, status["think_call_rescue"] = 0, False
+    if FREE_ATTEMPT2 and "record_alternatives" not in fields:
+        log("SELF-TEST: bundled agent has no record_alternatives; free attempt_2 off")
+        FREE_ATTEMPT2, status["free_attempt2"] = 0, False
+    try:  # the agent config the attempts will use (also checks the field names)
+        cfg = build_agent_config(AQ, int(TOOLS_CAP))
+        AQ.initial_prompt(train, test_input, cfg)
+        PHASES["agent_config"] = AQ.config_dict(cfg, SERVED)  # what a full-budget attempt runs with
+    except Exception as exc:
+        log(f"SELF-TEST: agent config/prompt error {exc!r}; dropping all v3 agent options")
+        HELPERS = TASK_SUMMARY = TURN_THINK_CAP = FREE_ATTEMPT2 = 0
+        TOOLS_ANSWER_MODE, TOOLS_PROMPT = "submit", ""
+    PHASES["v3_selftest"] = status
+    log(f"v3 self-test {status}; effective: answer_mode={TOOLS_ANSWER_MODE} prompt={TOOLS_PROMPT or 'default'} "
+        f"summary={TASK_SUMMARY} helpers={HELPERS} think_cap={TURN_THINK_CAP}/{TURN_THINK_GRACE} "
+        f"rescue={THINK_CALL_RESCUE} tier={TOOLS_TIER} feedback={FEEDBACK} "
+        f"free_attempt2={FREE_ATTEMPT2} attempt2={ATTEMPT2} session_mem={SESSION_MEM_MB} MB "
+        f"program_mem={AQ.PROGRAM_MEMORY_MB} MB")
 
 
 def is_rerun(test_path):
@@ -1047,6 +1334,43 @@ def is_rerun(test_path):
     except Exception:
         differs = False
     return env or differs, env, differs
+
+
+def descendants(pid=None):
+    """PIDs of all descendants of `pid` (default: this process), from /proc parent links."""
+    pid = os.getpid() if pid is None else pid
+    children = {}
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                with open(f"/proc/{d}/stat") as f:
+                    ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+                children.setdefault(ppid, []).append(int(d))
+            except (OSError, ValueError, IndexError):
+                pass
+    out, todo = [], [pid]
+    while todo:
+        for c in children.get(todo.pop(), []):
+            out.append(c)
+            todo.append(c)
+    return out
+
+
+ON_KAGGLE = os.path.isdir("/kaggle/input") and not EXTERNAL
+
+
+def kill_children():
+    """Kill everything this solver started (server, its workers, tool executors), by descendant PIDs. The
+    name-based pkill of the server is added only on Kaggle: on a shared host it would hit other users'
+    processes whose command line mentions vllm/sglang (E021 incident)."""
+    for pid in descendants():
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+    if ON_KAGGLE:
+        subprocess.run("pkill -9 -f '[V]LLM::'; pkill -9 -f '[v]llm.entrypoints'; pkill -9 -f '[s]glang'",
+                       shell=True)
 
 
 def emergency_timer():
@@ -1066,9 +1390,10 @@ def emergency_timer():
                 OUT_SUB = path
                 Submission(tasks).write()
         finally:
-            subprocess.run("pkill -9 -f '[V]LLM::'; pkill -9 -f '[v]llm.entrypoints'; pkill -9 -f '[s]glang'",
-                           shell=True)
-            os._exit(0)
+            try:
+                kill_children()
+            finally:
+                os._exit(0)
     t = threading.Timer(max(1.0, T0 + envf("ARC_EMERGENCY_S", 11.7 * 3600) - time.time()), fire)
     t.daemon = True
     t.start()
@@ -1217,15 +1542,39 @@ def main():
                    "tool_errors": sum(r.get("tool_errors") or 0 for r in recs),
                    "parse_failures": sum(r.get("parse_failures") or 0 for r in recs),
                    "answer_sources": {k: sum(r.get("answer_source") == k for r in recs)
-                                      for k in ("submit", "forced", "session", "salvage", "parse", "lenient", None)}}
+                                      for k in ("submit", "forced", "session", "salvage", "parse", "lenient",
+                                                "program_pass", "program_best_fail", "session_solve", None)},
+                   "v3": {"answer_mode": TOOLS_ANSWER_MODE, "prompt": TOOLS_PROMPT or "default",
+                          "task_summary": TASK_SUMMARY, "helpers": HELPERS, "turn_think_cap": TURN_THINK_CAP,
+                          "think_call_rescue": THINK_CALL_RESCUE, "tier": TOOLS_TIER, "feedback": FEEDBACK,
+                          "think_rescued": sum(r.get("think_call_rescued") or 0 for r in recs),
+                          "free_attempt2": FREE_ATTEMPT2, "attempt2": ATTEMPT2, "session_mem_mb": SESSION_MEM_MB,
+                          "gated": sch.gated, "attempts_by_index": {str(i): sum(r["attempt"] == i for r in recs)
+                                                                    for i in (0, 1)},
+                          "think_nudges": sum(r.get("think_nudges") or 0 for r in recs),
+                          "think_forced": sum(r.get("think_forced") or 0 for r in recs),
+                          "train_pass": sum(r.get("train_pass") is True for r in recs),
+                          "with_alternatives": sum(bool(r.get("alternatives")) for r in recs),
+                          "slot2_sources": {k: sum(1 for v in sub.sources.values() if (v[1] or "").startswith(k))
+                                            for k in ("a0:alt", "a1:alt", "a0:", "a1:", "fallback", "dup")}}}
         if solutions:
-            sc, n = score(json.load(open(OUT_SUB)), solutions, tasks)
+            final = json.load(open(OUT_SUB))
+            sc, n = score(final, solutions, tasks)
             summary["score"] = f"{sc:.2f}/{n} tasks"
+            only1 = {t: [{"attempt_1": s["attempt_1"], "attempt_2": s["attempt_1"]} for s in v] for t, v in final.items()}
+            summary["score_attempt1_only"] = f"{score(only1, solutions, tasks)[0]:.2f}/{n} tasks"
+            summary["slots"] = [{"task": t, "pair": p, "src": sub.sources.get((t, p)),
+                                 "correct1": final[t][p]["attempt_1"] == solutions[t][p],
+                                 "correct2": final[t][p]["attempt_2"] == solutions[t][p]}
+                                for t in tasks for p in range(len(tasks[t]["test"]))]
             summary["per_pair"] = [{"task": r["task_id"], "pair": r["pair"], "attempt": r["attempt"],
                                     "correct": r["pred"] == solutions[r["task_id"]][r["pair"]],
                                     "tokens": r["tokens"], "turns": r.get("turns"), "tool_calls": r.get("tool_calls"),
                                     "tool_errors": r.get("tool_errors"), "source": r.get("answer_source"),
-                                    "stop": r.get("stop_reason"), "s": r["elapsed_s"], "error": r.get("error")}
+                                    "stop": r.get("stop_reason"), "s": r["elapsed_s"], "error": r.get("error"),
+                                    "train_pass": r.get("train_pass"), "n_alt": len(r.get("alternatives") or []),
+                                    "alt_correct": any(a.get("pred") == solutions[r["task_id"]][r["pair"]]
+                                                       for a in r.get("alternatives") or [] if isinstance(a, dict))}
                                    for r in recs]
         json.dump(summary, open(os.path.join(WORK, f"summary_{mode}.json"), "w"), indent=1)
         log("SUMMARY", json.dumps(summary))
@@ -1249,4 +1598,7 @@ if __name__ == "__main__":
             log(f"submission check failed ({exc}); rewriting fallback")
             OUT_SUB = os.path.join(WORK, "submission.json")
             Submission(json.load(open(comp_file("arc-agi_test_challenges.json")))).write()
-        os._exit(0)
+        try:
+            kill_children()  # executors / server still alive after a hard-stop cancel (descendants only off Kaggle)
+        finally:
+            os._exit(0)

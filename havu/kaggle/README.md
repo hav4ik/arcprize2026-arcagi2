@@ -136,3 +136,63 @@ kill "$(cat kaggle/runs/submission_watch.pid)"                    # stop
   backoff 30 s doubling to 30 min.
 - Elapsed is measured from submission, so it includes queueing before the notebook's first cell; the notebook's
   11.75 h self-stop therefore fires at ~11.75 h elapsed or a bit later.
+
+## v3 (E021, 2026-10-12): v2 + today's harness findings, as toggles
+
+Notebook `nb_v3/` (same slug `chankhavu/arc2-qwen38-tools-submit`, so a push makes version 3), built by
+`build_notebook.py --variant v3 --env '{...}'`. Experiment notes, tests, budget analysis and push commands:
+`experiments/E021_kaggle_v3/README.md`.
+
+- **Same code as the evals.** The notebook writes the eval modules (`evals/arc_harness/{grids,arcprize,prompts,
+  executor,audit,selection,agent_qwen}.py`, `worked_example.txt`, `evals/arc_helpers.py`, `evals/task_summary.py`)
+  as readable `%%writefile` cells with the repo layout under `/kaggle/working/arc_solver/`. The solver only maps
+  settings to `AgentConfig` fields (`solver.agent_options`); it has no agent logic of its own.
+- **Feature self-test (CPU, seconds).** Before any GPU work each enabled feature is exercised (memory cap ->
+  MemoryError and the session survives; helpers; `submit_program` on a toy task + a 2.5 GB program -> MemoryError;
+  task summary; prompt/mode consistency). A failing feature is switched off (v2 behaviour) and logged
+  (`v3 self-test {...}` line, `phases_s.v3_selftest` in the summary).
+
+| Setting | Default | What |
+|---|---|---|
+| `ARC_FREE_ATTEMPT2` | 0 | 1: `record_alternatives` + `record_train_check` (no tokens); attempt_2 = the best other grid of the same attempt (`selection.py`: train-passing grids first, then the attempts' own answers, then the rest by train fraction). Test-input copy only if nothing else. |
+| `ARC_ATTEMPT2` | `legacy` | `legacy` = v2 rule (attempt 2 queued for every pair, launched only with >= `ARC_B_MIN2` share; in practice never). `off`. `gated`: see below. |
+| `ARC_ATTEMPT2_UNKNOWN` | 1 | gated: also retry submitted answers that cannot be train-checked (E012 data: the most valuable retries per token). |
+| `ARC_B_MIN2` / `ARC_B_MAX2` / `ARC_ATTEMPT2_SAFETY` | 32000 / 64000 / 0.85 | gated: minimum / maximum budget (also <= `ARC_TOOLS_CAP`), and the time-feasibility factor. |
+| `ARC_TURN_THINK_CAP` / `ARC_TURN_THINK_GRACE` | 0 / 2048 | E020 per-turn thinking cap: nudge "test it with code now" after N thinking tokens in one turn; G tokens later close the thinking into a `run_python` call. |
+| `ARC_THINK_CALL_RESCUE` | 1 | with the think cap on: a complete `<tool_call>` written inside still-open thinking after the nudge is executed (E020 `think_call_rescue`; seen on local AWQ in program mode, E021). |
+| `ARC_TOOLS_ANSWER_MODE` | `submit` | `program`: `submit_program(solve)` only (E019). |
+| `ARC_TOOLS_PROMPT` | "" | "" = `lean2sub` / `lean2prog` by mode; `lean2progroles` (program mode only). |
+| `ARC_TASK_SUMMARY` / `ARC_HELPERS` | 0 / 0 | E017/E020 perception pack in the first message / `arc_helpers` in the session and in submitted programs. |
+| `ARC_FEEDBACK` | `basic` | program mode: `rich` (E020). |
+| `ARC_TOOLS_TIER` / `ARC_TOOLS_CAP` / `ARC_TOOLS_SOFT` | medium / 48000 / 24000 | as v2 (K3 = xhigh). |
+| `ARC_SESSION_MEM_MB` | **2048** | robustness, on: session RLIMIT_AS = VmSize + 2 GB (E020 `--session-mem-mb` prelude, `executor.SESSION_MEM_CAP`), submitted programs 2 GB. 0 = v2 (absolute 4 GB only). |
+| `ARC_KV_PER_SEQ` | **48000** | robustness, on: concurrency = KV tokens / p90 live context = 1.40M / 48k = **29** on vLLM 0.23 (v2: 40000 -> 35). `ARC_CONCURRENCY` overrides. |
+
+**Gated second attempt.** First attempts are scheduled exactly as in v2. A pair qualifies when its first attempt
+ends without a train-passing grid (answer fails the train check, fallback/no answer, optionally unchecked
+submissions); qualifying pairs wait in a priority queue (`selection.retry_priority`). A second attempt starts only
+when (1) no first attempt is pending (all have started; a server-crash requeue goes first again), (2) the
+capacity left (measured rate x time to force - remaining budgets of everything in flight) covers its budget, and
+(3) it can finish before the force deadline: budget <= 0.85 x per-attempt speed (median tokens / wall s of
+finished first attempts) x (time to force - 2 min). If (3) fails the queue is dropped; if (2) fails the worker
+waits (capacity frees as attempts finish under budget). Deadline forcing applies to second attempts as to first ones.
+
+**Answer slots.** `Submission.build` ranks every valid grid of a pair (each attempt's answer and its
+alternatives) with `selection.select_two`; with no train checks and no alternatives this is v2's rule exactly. If
+ranking ever raises, the pair falls back to v2's rule (attempt order); the fallback copy fills empty slots.
+SGLang servers without `/v1/loads` (local 0.5.14) are monitored through `/metrics` (`sglang:cached_tokens_total`
+/ `prompt_tokens_total`, `token_usage`, `num_retracted_reqs`).
+
+Tests (CPU): `tests/fake_v3_test.py` (selection, gated scheduler unit + end to end, deadlines, memory caps and
+self-test, program mode + helpers + summary + think cap, emergency writer with a corrupted file, final repair cell),
+plus `fake_server_test.py` / `fake_tools_test.py`; `tests/check_notebook.py --variant v3 --extract-to DIR` runs all
+three against the modules extracted from the built notebook. Off-Kaggle run of the notebook code on the rerun path:
+`experiments/E021_kaggle_v3/scripts/local_run.py`.
+
+### v4 = the v3 code with E020's K3 settings (`experiments/E021_kaggle_v3/v4_settings.json` -> `nb_v4/`)
+`build_notebook.py --variant v3 --env "$(cat experiments/E021_kaggle_v3/v4_settings.json)"` (the file sets
+`_outdir: nb_v4`; same slug). K3: tier xhigh, program answers (`lean2progroles`), task summary, helpers, rich feedback,
+think cap 8192/2048 + think-call rescue, 48k hard / 24k soft; free attempt_2 and gated retries (no unknowns).
+`experiments/E021_kaggle_v3/scripts/k3_config_diff.py` checks the notebook's AgentConfig against K3's recorded run
+config field by field (28/30 equal: `routing_key_header` is gateway-only, `think_call_rescue` is new).
+Check: `tests/check_notebook.py --variant v4 --extract-to DIR`.

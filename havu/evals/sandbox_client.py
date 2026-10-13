@@ -11,7 +11,7 @@ import httpx
 
 
 class SandboxSession:
-    def __init__(self, url, train, test_input, timeout=30, max_output=16000, transport=None):
+    def __init__(self, url, train, test_input, timeout=30, max_output=16000, transport=None, prelude_extra=""):
         self.session_id = uuid4().hex
         self.timeout, self.max_output = timeout, max_output
         # Host-side copies for submission checks: model code may rebind train/test_input in the session.
@@ -25,7 +25,7 @@ class SandboxSession:
             f"_arc_data = json.loads({data!r})\n"
             "train, test_input = _arc_data['train'], _arc_data['test_input']\n"
             "del _arc_data\n"
-        )
+        ) + prelude_extra  # E017 --helpers: helper source, re-run with the task data after a state reset
         self.initialized = self.closed = False
 
     def _execute(self, code):
@@ -74,7 +74,10 @@ class SandboxSession:
             return
         self.closed = True
         try:
-            response = self.client.delete(f"/sessions/{self.session_id}", timeout=10)
+            # X-Session-ID routes the DELETE to the worker that owns the session (nginx hashes on it); without it
+            # the request lands on a random worker, gets 404 and the kernel lives until the idle reaper (E020)
+            response = self.client.delete(f"/sessions/{self.session_id}", headers={"X-Session-ID": self.session_id},
+                                          timeout=10)
             if response.status_code != 404:
                 response.raise_for_status()
         except Exception as exc:

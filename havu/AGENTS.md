@@ -68,8 +68,22 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
   - Prompts: `lean2sub`, `lean2subv`.
   - Recommended configs and commands: `experiments/E011_pareto_tool_harness/README.md`.
   - `evals/paired_vs_baseline.py`: runs vs E004-GL on the same pairs, with bootstrap CIs, pass@2 and the long tail.
+- **E017 options (harness `persistent-v5`, opt-in; recorded in the config):**
+  - `--task-summary`: a host-computed perception pack (`evals/task_summary.py`) appended to the first message, about 1.5k tokens on average and capped near 3k. It holds object tables, in→out matching and an "Outside train range" line for the test.
+  - `--prompt lean2roles`: `lean2sub` plus a ROLES note, a ban on unproven "noise" labels, and a test-difference audit before submitting.
+  - `--helpers`: preloads `evals/arc_helpers.py` in the session (`objects`, `d8`/`match_d8`, `panels`, `stamp`, `ray`, `show`, `check(solve)`) and documents them in the tool description.
+  - `--train-check`: after each attempt, re-runs the answer program on the training inputs and records `train_pass` / `train_frac` / `train_trace` (`evals/train_check.py`). It uses no model tokens; the host compares hashes.
+  - Not part of the config, so files resume without them:
+    - `--extra-attempt-if-no-train-pass` (with `--attempts 2 --train-check`): runs attempt 2 for pairs where neither attempt 0 nor 1 passes the train check.
+    - `--auto-peak-price`: prices each turn at 2× inside weekday peak windows.
+  - `evals/train_check.py:ranked_answers` ranks attempts for Kaggle by train_pass, then attempt order, and keeps the top-2 distinct answers.
+  - Phase-2 comparison against sub80s40: `experiments/E017_reasoning_efficiency/scripts/phase2_compare.py`. Results: `experiments/E017_reasoning_efficiency/README.md`.
   - `evals/frontier.py`: accuracy/token frontier and mixed-config pass@2.
   - Other agents may share the sandbox container: check `docker stats` before restarting it.
+- **Qwen tool harness (`evals/run_qwen_tools.py`, `evals/arc_harness/agent_qwen.py`, harness `qwen-tools-4`):** the defaults behave as `qwen-tools-3` (E012).
+  - `--answer-mode program` (E019): the only answer tool is `submit_program(code defining solve(grid))`. It is checked host-side in a fresh process on every train pair before the test; no typed or forced answers, and the fallback is the best submitted program or the session's `solve`. Kaggle: `ARC_TOOLS_ANSWER_MODE=program`.
+  - Other options: `--record-train-check` (submit mode, bookkeeping only), `--base-url` (unauthenticated server such as local SGLang), `--context`, `--out`.
+  - Tests: `evals/tests/test_qwen_tools.py`, `evals/tests/test_qwen_program.py`. Cache-health logger: `evals/sglang_cache_monitor.py`. Results: `experiments/E019_qwen_program_answers/README.md`.
 - **Self-hosted serving for tool use (rule):** agentic, multi-turn tool use re-sends the whole growing transcript on every turn (typically 20–80k tokens, ~15 turns per attempt). So:
   - **Prefix caching is mandatory.** Use vLLM `--enable-prefix-caching` or SGLang's radix cache. Never benchmark, tune or submit a tool-use configuration with it off: throughput or KV numbers measured with it off do not transfer.
   - **Choose the continuous-batching size (concurrency) by cache health, not just KV capacity.**
@@ -77,5 +91,22 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
     - When sizing concurrency, measure the prefix-cache hit rate and evictions/preemptions on a realistic multi-turn replay (E014).
     - Keep the hit rate healthy, high and stable over the run. If it drops or evictions grow, lower concurrency or add KV offload to host memory.
   - **Log cache metrics during real runs:** the prefix-cache hit rate, KV usage and preemptions/retractions.
+  - **Pool sizing (E019/E020):** one model copy per GPU (~600–630 tok/s per RTX PRO 6000 on tool traffic) beats TP4. Size concurrency per box as KV tokens ÷ p90 attempt context (≈10–12 for xhigh-96k attempts, ≈20 for 48k); early-run windows overstate it. Summary: `notes/2026-10-13_qwen_harness_and_pool_findings.md`.
   - Current setup and evidence: `experiments/E013_kaggle_submission/README.md` (vLLM 0.23, prefix caching on, KV 1.40M tokens, concurrency 35) and `experiments/E014_sglang_kaggle/README.md`.
+- **E020 options of `evals/run_qwen_tools.py` (harness `qwen-tools-5`, opt-in; defaults reproduce `qwen-tools-4`):**
+  - `--task-summary`, `--helpers` (also preloaded inside `submit_program` processes), `--prompt lean2progroles`: E017 ports.
+  - `--turn-think-cap N --turn-think-grace G`: after N thinking tokens in a turn, a "test it with code now" note; after G more, the thinking is closed into a `run_python` call.
+  - `--feedback rich`: colour confusions, small-grid diffs and shape hints for rejected programs.
+  - `--confirm-test`: shows the first train-passing test output once; the model re-submits to answer (`first_tp_pred` recorded).
+  - `--settle N --pool-in F`: adaptive k; skip a pair's next attempt once N train-passing attempts agree on the test output.
+  - `--augment d8|colour|d8colour`: attempts ≥1 see a transformed task; the answer is mapped back.
+  - `--record-alternatives` (free attempt_2 bookkeeping), `--think-call-rescue` (execute a tool call written inside open thinking after a nudge).
+  - Pool operation: `--worker-slots auto:N` (harness-side per-box slots, direct worker URLs; the gateway ignores `x-smg-target-worker`), `--request-timeout 1200`, `--session-mem-mb 2048`; see `experiments/E019_qwen_program_answers/router/README.md`.
+  - Never put "sglang" in eval command lines (use `--base-url`): other agents' `pkill -f sglang` killed every run once.
+  - Offline selection vs k: `experiments/E020_qwen_harness_80/select_sim.py`. Launcher: `experiments/E020_qwen_harness_80/launch.sh`.
+- **Never kill processes by name on this host.** `pkill -f` patterns such as `sglang` or `vllm` also match other agents'
+  eval runs and the SGLang gateway (E021 incident, 2026-10-12: a test of the Kaggle emergency writer killed E020's runs).
+  In `kaggle/`, the emergency writer, the notebook guard cell and `kill_server` use name patterns **only on Kaggle**
+  (`/kaggle/input` exists and no `ARC_EXTERNAL_SERVER`); everywhere else they kill only the solver's own descendants
+  (`solver.descendants`). `kaggle/tests/fake_v3_test.py` checks this with a decoy process.
 - `data_tools/contamination_check.py`: checks training data against ARC-AGI-2 eval grids, invariant to rotation, flip and colour relabelling. Reports go to `data_tools/contamination_report.json`.

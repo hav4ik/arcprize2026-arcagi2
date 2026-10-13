@@ -19,7 +19,9 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-NB = ROOT / "kaggle/nb_v2/arc2-qwen38-tools-submit.ipynb"
+NBS = {"v2": ROOT / "kaggle/nb_v2/arc2-qwen38-tools-submit.ipynb",
+       "v3": ROOT / "kaggle/nb_v3/arc2-qwen38-tools-submit.ipynb",
+       "v4": ROOT / "kaggle/nb_v4/arc2-qwen38-tools-submit.ipynb"}  # v4 = the v3 build with v4_settings.json
 DEST = "/kaggle/working/arc_solver"
 
 
@@ -27,7 +29,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--extract-to")
     ap.add_argument("--skip-fake", action="store_true")
+    ap.add_argument("--variant", default="v2", choices=sorted(NBS))
     a = ap.parse_args()
+    NB = NBS[a.variant]
     import nbformat
     nb = nbformat.read(str(NB), as_version=4)
     nbformat.validate(nb)
@@ -54,28 +58,30 @@ def main():
         p = out / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         # IPython's %%writefile writes the cell body plus a trailing newline
-        p.write_text(text if rel.endswith(".txt") else text + "\n")
+        p.write_text(text if rel.startswith("notes/prompts/") else text + "\n")
     print("extracted", len(written), "files to", out)
     sys.path[:0] = [str(ROOT / "kaggle")]
     import build_notebook
     assert written["solver.py"] == build_notebook.solver_source(), "embedded solver differs from solver_source()"
-    for repo, rel in build_notebook.V2_MODULES:
+    modules = build_notebook.V3_MODULES if a.variant in ("v3", "v4") else build_notebook.V2_MODULES
+    for repo, rel in modules:
         assert written[rel] == (ROOT / repo).read_text(), f"{rel} differs from the repo"
     assert written["notes/prompts/arcprize_official_system_prompt.txt"] == \
         (ROOT / "notes/prompts/arcprize_official_system_prompt.txt").read_text()
     print("embedded sources equal the repo sources")
     env = dict(os.environ, ARC_WORK=tempfile.mkdtemp())
-    code = ("import sys, importlib; sys.path[:0] = [%r, %r]\n"
-            "for m in ['arc_harness.grids', 'arc_harness.arcprize', 'arc_harness.prompts', 'arc_harness.executor',"
-            " 'arc_harness.agent_qwen', 'solver']:\n"
+    mods = [m[1][len("evals/"):-3].replace("/", ".") for m in modules
+            if m[1].endswith(".py") and not m[1].endswith("__init__.py")] + ["solver"]
+    code = (f"import sys, importlib; sys.path[:0] = [{str(out)!r}, {str(out / 'evals')!r}]\n"
+            f"for m in {mods!r}:\n"
             "    mod = importlib.import_module(m); print('import ok', m, getattr(mod, 'HARNESS_VERSION', ''))\n"
-            "import arc_harness.arcprize as A; assert A.TEMPLATE.endswith('Your response:')\n"
-            % (str(out), str(out / "evals")))
+            "import arc_harness.arcprize as A; assert A.TEMPLATE.endswith('Your response:')\n")
     r = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, env=env, cwd=str(out))
     print(r.stdout.strip())
     assert r.returncode == 0, r.stderr[-2000:]
     if not a.skip_fake:
-        for t in ["fake_server_test.py", "fake_tools_test.py"]:
+        tests = ["fake_server_test.py", "fake_tools_test.py"] + (["fake_v3_test.py"] if a.variant in ("v3", "v4") else [])
+        for t in tests:
             r = subprocess.run([sys.executable, str(ROOT / "kaggle/tests" / t)], capture_output=True, text=True,
                                env=dict(os.environ, ARC_TEST_SRC=str(out)), timeout=600)
             print(t, "against extracted modules:", r.stdout.strip().splitlines()[-1] if r.stdout else r.stderr[-500:])
