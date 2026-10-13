@@ -91,6 +91,8 @@ LOCAL_FORCE_CAP_MIN = envf("ARC_LOCAL_FORCE_CAP_MIN", 60.0)  # ... but never lat
 LOCAL_READY_MIN = envf("ARC_LOCAL_READY_MIN", 0.0)  # > 0: local force = server ready + this (overrides the above)
 LOCAL_HARD_MIN = envf("ARC_LOCAL_HARD_MIN", 8.0)    # local hard stop = force + this
 LOCAL_TASKS = os.environ.get("ARC_LOCAL_TASKS", "")  # comma-separated subset of the local test set
+LOCAL_SOURCE = os.environ.get("ARC_LOCAL_SOURCE", "local")  # local: arc2-local-testcases; eval: competition evaluation set
+                                                    # (load probe: real scheduler on public-eval pairs, self-scored)
 PUBLIC_TEST_IDS_SHA256 = "4cab35dea7bde6ee39bbfcfdcfc101153e19f333c14b68c68b84a7a3278c265e"  # public test file
 PHASES = {}  # phase timings (s since T0), written to the summary
 PKG = os.path.join(WORK, "arc_solver")  # evals/arc_harness + notes/prompts + solver.py, written by the notebook
@@ -1417,8 +1419,12 @@ def main():
         return
     if mode == "local":
         # Non-rerun commit/interactive run: small local test set with known solutions, self-scored, time-boxed.
-        tasks = json.load(open(find_one(f"{INPUT}/**/arc-agi_local_challenges.json")))
-        solutions = json.load(open(find_one(f"{INPUT}/**/arc-agi_local_solutions.json")))
+        if LOCAL_SOURCE == "eval":
+            tasks = json.load(open(comp_file("arc-agi_evaluation_challenges.json")))
+            solutions = json.load(open(comp_file("arc-agi_evaluation_solutions.json")))
+        else:
+            tasks = json.load(open(find_one(f"{INPUT}/**/arc-agi_local_challenges.json")))
+            solutions = json.load(open(find_one(f"{INPUT}/**/arc-agi_local_solutions.json")))
         if LOCAL_TASKS:
             tasks = {t: tasks[t] for t in LOCAL_TASKS.split(",") if t in tasks}
         force_at = hard_stop = None  # set once the server is ready
