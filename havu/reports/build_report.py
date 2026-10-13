@@ -474,6 +474,7 @@ E020_PROG = ("program answers (`submit_program`: a `solve()` checked on every tr
 E020_BASE = "temp 1.0 / top_p 0.95 / top_k 20, budget notes on every output, harness qwen-tools-5"
 # Kaggle rerun budget: ~295 tok/s end-to-end on 4×L4 (E013) × ~11 h usable / 259 test pairs ≈ 44k generated tokens per pair.
 KAGGLE_PAIR_BUDGET = 44000
+T1_GROUP_KAGGLE = "Kaggle budget: Qwen3.8-27B configs where one attempt per test pair fits the 4×L4 / 12 h rerun (≤ ~44k tokens per pair)"
 E017_H = "low effort, sub80s40 budgets (80k hard / 40k soft, notes on every output, `submit_answer`), harness persistent-v5"
 
 
@@ -847,7 +848,10 @@ def build():
         if not (res["complete"] and spec["set"] == "full"):
             continue
         t1_rows.append(t1_row(spec, res))
-    t1_rows.sort(key=lambda r: (fam_order[r["fam"]], -(r["raw"]["k_pass2"] if r["raw"]["k_pass2"] is not None else -1),
+    for r in t1_rows:  # rows that fit the Kaggle rerun budget get their own section at the top
+        r["group"] = "kaggle" if r["kb_cls"] == "kb-ok" else r["fam"]
+    grp_order = {"kaggle": -1, **fam_order}
+    t1_rows.sort(key=lambda r: (grp_order[r["group"]], -(r["raw"]["k_pass2"] if r["raw"]["k_pass2"] is not None else -1),
                                 -(r["raw"]["k_pass1"] or 0)))
     mark_best(t1_rows, {"k_pass1": max, "k_pass2": max, "tok_mean": min, "tok_median": min, "tok_p90": min, "ctok_median": min},
               band={"k_pass1": NOISE_BAND, "k_pass2": NOISE_BAND})
@@ -1897,7 +1901,7 @@ def render_html(data, wrapper=True):
     _FN_SEEN.clear()
     m = data["meta"]
     t1, t2 = data["table1"], data["table2"]
-    fam_name = {DS: "DeepSeek", QW: "Qwen", NM: "Nemotron"}
+    fam_name = {"kaggle": T1_GROUP_KAGGLE, DS: "DeepSeek (API; not runnable on Kaggle)", QW: "Qwen (over the Kaggle budget, or throughput not measured)", NM: "Nemotron"}
     head = f"<title>{html.escape(m['title'])}</title>\n<style>{CSS}</style>"
     out = ['<div class="wrap">']
     out.append(f"<header><h1>{html.escape(m['title'])}</h1>")
@@ -1926,8 +1930,8 @@ def render_html(data, wrapper=True):
     out.append("</tr></thead><tbody>")
     cur = None
     for r in t1:
-        if r["fam"] != cur:
-            cur = r["fam"]
+        if r["group"] != cur:
+            cur = r["group"]
             out.append(f'<tr class="fam-row"><td colspan="16">{fam_name[cur]}</td></tr>')
         raw, b = r["raw"], r["best"]
         out.append("<tr>")
@@ -2153,7 +2157,13 @@ def render_md(data):
           "pass@1 difference in pp, 95% cluster-bootstrap CI (tasks resampled).", "",
           "| Experiment ID | LLM model | Harness | Description | Samples | Kaggle 4×L4 / 12 h | Kaggle pass@1 | Kaggle pass@2 | *ARC Prize pass@1 (task-wt.)* | *ARC Prize pass@2 (task-wt.)* | Tok mean | Tok median | Tok p90 | Correct tok median | Cost | Notes |",
           "|---|---|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|"]
+    md_groups = {"kaggle": T1_GROUP_KAGGLE, "DeepSeek": "DeepSeek (API; not runnable on Kaggle)",
+                 "Qwen": "Qwen (over the Kaggle budget, or throughput not measured)", "Nemotron": "Nemotron"}
+    cur_g = None
     for i, r in enumerate(data["table1"]):
+        if r.get("group") != cur_g:
+            cur_g = r.get("group")
+            L.append("| **" + md_groups.get(cur_g, str(cur_g)) + "** |" + " |" * 15)
         b = r["best"]
         p1 = best(r["k_pass1"], b.get("k_pass1")) + (f"<br><sub>{r['k_pass1_sub']}</sub>" if r["k_pass1_sub"] else "")
         p2 = best(r["k_pass2"], b.get("k_pass2")) + (f"<br><sub>{r['k_pass2_sub']}</sub>" if r["k_pass2_sub"] else "")
