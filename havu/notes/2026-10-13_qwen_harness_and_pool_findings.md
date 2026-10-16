@@ -73,6 +73,12 @@ The Kaggle rerun gets about 44k generated tokens per test pair: ~295 tok/s end t
 
 ## Kaggle submissions
 
+- **Scores so far (public LB):**
+  - v2 (57088016) **11.94**: concurrency 35, reproduced by the load probe as a KV/prefix-cache collapse (10.4% on 48 pairs).
+  - v3 (57121897) **18**: the same agent at concurrency 29, plus free attempt_2 and the gated retry. The +6 is mostly the concurrency cut, as predicted (estimate ~18–23).
+  - v4b (57157836, submitted 2026-10-13 22:39 UTC): **19.44**.
+  - v4b resubmitted unchanged (57197296, 2026-10-14 23:01 UTC): **26.0**.
+  - **The same notebook moves by ~6.6 points between runs** (sd ~4.5–5 per submission). The external no-tool notebook moved 21 → 13. Compare configs only by averages over several submissions, or by paired 48-pair probes; v4b's expected LB is ~22–23.
 - **v2** (submission 57088016, 2026-10-11) was still pending after 20+ h, because of a Kaggle compute shortage.
 - **v3** = v2 agent + free attempt_2 + gated retry + concurrency 29 + a 2 GB session cap. It passed the 4×L4 commit run on 2026-10-12, with expected gain ≈ +1–2 pp.
 - **v4** = K3 + think-call rescue + gated retry. It is built in `kaggle/nb_v4/` and passes the CPU and local checks. Before submitting, it needs a 4×L4 commit run, and `ARC_RATE_PRIOR` should be considered at ~280.

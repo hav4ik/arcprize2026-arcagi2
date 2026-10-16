@@ -1,0 +1,2083 @@
+# ARC agent sub q38 direct b98k c16
+
+REPL program-synthesis agent (python + submit tools, verified on the demos) on the hidden test set. Config:
+
+```
+{
+ "model_glob": "/kaggle/input/**/qwen3-8-27b-fp8-repacked-v1/**/config.json",
+ "overlay": "/kaggle/input/**/taaf-duck-qwen38-serving-v1/serving_wheels/*.whl",
+ "parsers": [
+  "--tool-call-parser",
+  "qwen3_coder",
+  "--reasoning-parser",
+  "qwen3"
+ ],
+ "server_ladder": [
+  [
+   "--reasoning-config",
+   "{\"reasoning_start_str\": \"<think>\", \"reasoning_end_str\": \"</think>\"}",
+   "--kv-cache-dtype",
+   "fp8",
+   "--language-model-only",
+   "--speculative-config",
+   "{\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": 2}"
+  ],
+  [
+   "--reasoning-config",
+   "{\"reasoning_start_str\": \"<think>\", \"reasoning_end_str\": \"</think>\"}",
+   "--kv-cache-dtype",
+   "fp8",
+   "--speculative-config",
+   "{\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": 2}"
+  ],
+  [
+   "--reasoning-config",
+   "{\"reasoning_start_str\": \"<think>\", \"reasoning_end_str\": \"</think>\"}",
+   "--kv-cache-dtype",
+   "fp8",
+   "--speculative-config",
+   "{\"method\": \"mtp\", \"num_speculative_tokens\": 2}"
+  ],
+  [
+   "--reasoning-config",
+   "{\"reasoning_start_str\": \"<think>\", \"reasoning_end_str\": \"</think>\"}",
+   "--kv-cache-dtype",
+   "fp8"
+  ],
+  [
+   "--reasoning-config",
+   "{\"reasoning_start_str\": \"<think>\", \"reasoning_end_str\": \"</think>\"}"
+  ],
+  []
+ ],
+ "max_model_len": 131072,
+ "max_num_seqs": 16,
+ "mode": "direct",
+ "samples": 2,
+ "concurrency": 16,
+ "min_start_s": 600,
+ "template_kwargs": {
+  "reasoning_effort": "xhigh"
+ },
+ "temperature": 1.0,
+ "top_p": 0.95,
+ "top_k": 20,
+ "thinking_token_budget": 98304,
+ "max_tokens": 106496,
+ "rescue_tokens": 8192,
+ "tok_per_s": 140
+}
+```
+
+# Runs first and cannot fail the notebook: a valid submission exists before anything heavy.
+import json, glob, time, os
+from pathlib import Path
+START = time.time()
+Path("/kaggle/working/start_epoch.txt").write_text(str(START))
+try:
+    ch = json.load(open(glob.glob("/kaggle/input/**/arc-agi_test_challenges.json", recursive=True)[0]))
+    with open("/kaggle/working/submission.json", "w") as f:
+        json.dump({t: [{"attempt_1": x["input"], "attempt_2": x["input"]} for x in task["test"]]
+                   for t, task in ch.items()}, f)
+    print("fallback submission written for", len(ch), "tasks; rerun =",
+          os.environ.get("KAGGLE_IS_COMPETITION_RERUN"))
+except Exception as e:
+    print("fallback FAILED:", repr(e))
+os.makedirs("/kaggle/working/agent", exist_ok=True)
+
+%%writefile /kaggle/working/agent/grids.py
+"""Grid <-> text, task prompts and failure feedback for the program-synthesis agent.
+
+Grids are shown as rows of digits with no separators, the same layout NVARC's
+formatter uses, plus explicit dimensions -- reasoning models miscount rows and
+columns of long digit strings otherwise.
+"""
+
+SYSTEM = (
+    "You are an expert at solving ARC-AGI puzzles by writing Python programs. "
+    "Each puzzle has a few input->output example pairs that share one hidden "
+    "transformation rule. Grids are 2D lists of integers 0-9 (colours); 0 is "
+    "usually the background."
+)
+
+INSTRUCTIONS = """Find the transformation rule that maps EVERY example input to its output, then write it as a Python function.
+
+Requirements:
+- Define `def transform(grid: list[list[int]]) -> list[list[int]]:`.
+- Use only the Python standard library and numpy (already importable as `np` if you `import numpy as np`).
+- The function must work for every example input AND the test input(s); do not hard-code example outputs.
+- Return a new 2D list of ints 0-9 (numpy arrays are accepted).
+
+Reason about the rule first, then give the final program in ONE ```python code block."""
+
+
+def grid_text(g):
+    return "\n".join("".join(str(int(v)) for v in row) for row in g)
+
+
+def shape(g):
+    return (len(g), len(g[0]) if g else 0)
+
+
+def show(g, name):
+    r, c = shape(g)
+    return f"{name} ({r}x{c}):\n{grid_text(g)}"
+
+
+def task_prompt(task):
+    parts = [INSTRUCTIONS, ""]
+    for i, pair in enumerate(task["train"], 1):
+        parts.append(f"## Example {i}")
+        parts.append(show(pair["input"], "Input"))
+        parts.append(show(pair["output"], "Output"))
+        parts.append("")
+    for j, t in enumerate(task["test"], 1):
+        parts.append(f"## Test input {j}")
+        parts.append(show(t["input"], "Input"))
+        parts.append("")
+    return "\n".join(parts).rstrip()
+
+
+def diff_text(expected, got, max_cells=900):
+    """Expected grid with wrong cells marked, so the model sees WHERE it failed.
+
+    '.' marks a correct cell; a wrong cell shows `expected/got` inline is too
+    wide, so two aligned grids are given: the expected output, and the
+    program's output with correct cells replaced by '.'.
+    """
+    re_, ce = shape(expected)
+    rg, cg = shape(got)
+    if (re_, ce) != (rg, cg):
+        return (f"Wrong output SIZE: expected {re_}x{ce}, your program returned {rg}x{cg}.\n"
+                + show(expected, "Expected") + "\n" + show(got, "Your output"))
+    if re_ * ce > max_cells:
+        wrong = sum(expected[r][c] != got[r][c] for r in range(re_) for c in range(ce))
+        return f"{wrong} of {re_ * ce} cells are wrong (grid too large to print the diff)."
+    wrong = 0
+    rows = []
+    for r in range(re_):
+        s = []
+        for c in range(ce):
+            if expected[r][c] == got[r][c]:
+                s.append(".")
+            else:
+                s.append(str(int(got[r][c])))
+                wrong += 1
+        rows.append("".join(s))
+    return (f"{wrong} of {re_ * ce} cells are wrong.\n"
+            + show(expected, "Expected") + "\n"
+            + f"Your output, with CORRECT cells shown as '.' ({re_}x{ce}):\n" + "\n".join(rows))
+
+
+def feedback_prompt(results, train, max_examples=3):
+    """Tell the model which examples failed and how; ask for a corrected program."""
+    lines = []
+    n_ok = sum(r["ok"] for r in results)
+    lines.append(f"Your program reproduced {n_ok} of {len(results)} examples.")
+    shown = 0
+    for i, (r, pair) in enumerate(zip(results, train), 1):
+        if r["ok"]:
+            continue
+        if shown >= max_examples:
+            break
+        shown += 1
+        lines.append(f"\n## Example {i} failed")
+        if r.get("error"):
+            lines.append(f"Error: {r['error']}")
+        else:
+            lines.append(diff_text(pair["output"], r["output"]))
+    lines.append("\nRe-examine the rule against ALL examples, then give the corrected "
+                 "complete program in ONE ```python code block.")
+    return "\n".join(lines)
+
+%%writefile /kaggle/working/agent/sandbox.py
+"""Run model-written `transform` programs in isolated subprocesses.
+
+Each job is (code, inputs). The program runs in a fresh interpreter with a
+wall-clock timeout (and, on Linux, an address-space cap), so an infinite loop,
+a crash or a memory blow-up costs one job, never the run. Anything the program
+prints is swallowed; the result travels back as one marked JSON line.
+
+Per input the result is {"output": grid} or {"error": message}. An output is
+only accepted if it is a 2D rectangular grid of ints 0-9, 1..30 on each side.
+"""
+import json
+import os
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+MARK = "@@ARC_RESULT@@"
+
+RUNNER = r'''
+import sys, json, io, contextlib, copy, traceback
+MARK = "@@ARC_RESULT@@"
+job = json.loads(sys.stdin.read())
+
+def clean(res):
+    try:
+        import numpy as np
+        if isinstance(res, np.ndarray):
+            res = res.tolist()
+    except Exception:
+        pass
+    if isinstance(res, tuple):
+        res = list(res)
+    if not isinstance(res, list) or not res:
+        return None, "output is not a non-empty list of rows"
+    rows = []
+    for row in res:
+        if hasattr(row, "tolist"):
+            row = row.tolist()
+        if not isinstance(row, (list, tuple)) or not row:
+            return None, "output rows must be non-empty lists"
+        out = []
+        for v in row:
+            try:
+                iv = int(v)
+            except Exception:
+                return None, f"non-integer cell {v!r}"
+            if iv != v or not 0 <= iv <= 9:
+                return None, f"cell value {v!r} outside 0-9"
+            out.append(iv)
+        rows.append(out)
+    w = len(rows[0])
+    if any(len(r) != w for r in rows):
+        return None, "output is not rectangular"
+    if not (1 <= len(rows) <= 30 and 1 <= w <= 30):
+        return None, f"output size {len(rows)}x{w} outside 1..30"
+    return rows, None
+
+results = []
+sink = io.StringIO()
+ns = {"__name__": "__arc_program__"}
+try:
+    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+        exec(compile(job["code"], "<program>", "exec"), ns)
+    fn = ns.get("transform")
+    if not callable(fn):
+        raise NameError("no function named transform")
+except Exception as e:
+    msg = "".join(traceback.format_exception_only(type(e), e)).strip()
+    results = [{"error": "program failed to load: " + msg[-400:]} for _ in job["inputs"]]
+else:
+    for grid in job["inputs"]:
+        try:
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                res = fn(copy.deepcopy(grid))
+            rows, err = clean(res)
+            results.append({"output": rows} if err is None else {"error": err})
+        except Exception as e:
+            tb = traceback.format_exc().strip().splitlines()
+            results.append({"error": " | ".join(tb[-3:])[-400:]})
+sys.stdout.write(MARK + json.dumps(results) + "\n")
+sys.stdout.flush()
+'''
+
+
+def _limits(mem_bytes):
+    def apply():
+        try:
+            import resource
+            resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+        except Exception:
+            pass
+    return apply if os.name == "posix" else None
+
+
+def run_one(code, inputs, timeout=10.0, mem_bytes=2 << 30):
+    """Run one program on a list of input grids; never raises."""
+    try:
+        p = subprocess.run(
+            [sys.executable, "-c", RUNNER],
+            input=json.dumps({"code": code, "inputs": inputs}),
+            capture_output=True, text=True, timeout=timeout,
+            preexec_fn=_limits(mem_bytes),
+            env=dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
+                     MKL_NUM_THREADS="1", PYTHONHASHSEED="0"))
+    except subprocess.TimeoutExpired:
+        return [{"error": f"timed out after {timeout:.0f}s"} for _ in inputs]
+    for line in reversed(p.stdout.splitlines()):
+        if line.startswith(MARK):
+            try:
+                res = json.loads(line[len(MARK):])
+                if len(res) == len(inputs):
+                    return res
+            except Exception:
+                break
+    tail = (p.stderr or "").strip().splitlines()[-2:]
+    why = " | ".join(tail)[-300:] or f"exit code {p.returncode}"
+    return [{"error": "program crashed: " + why} for _ in inputs]
+
+
+def run_many(jobs, timeout=10.0, workers=None, mem_bytes=2 << 30):
+    """jobs: list of (code, inputs). Returns results in the same order."""
+    workers = workers or max(1, (os.cpu_count() or 2) - 1)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(run_one, c, i, timeout, mem_bytes) for c, i in jobs]
+        return [f.result() for f in futs]
+
+%%writefile /kaggle/working/agent/backend.py
+"""LLM backends. The agent only needs one call: complete a batch of chats.
+
+`VLLMBackend` runs offline on the Kaggle GPUs. `MockBackend` replays scripted
+programs so the whole harness can be exercised on CPU with no model.
+"""
+import re
+import time
+
+CODE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.S)
+THINK_RE = re.compile(r"<think>.*?</think>", re.S)
+
+
+def extract_code(text):
+    """The last fenced block that defines transform(); falls back to any block
+    containing it, then to a bare `def transform` in unfenced text."""
+    if not text:
+        return None
+    body = THINK_RE.sub("", text)
+    if "<think>" in body and "</think>" not in body:
+        return None                      # truncated inside the reasoning
+    blocks = [b for b in CODE_RE.findall(body) if "def transform" in b]
+    if blocks:
+        return blocks[-1].strip()
+    i = body.rfind("def transform")
+    if i >= 0:                           # unfenced: take the function to the end
+        return "import numpy as np\n" + body[i:].strip()
+    return None
+
+
+class VLLMBackend:
+    """Offline vLLM chat. One engine over all GPUs (tensor parallel)."""
+
+    def __init__(self, model, tp=4, max_model_len=32768, gpu_mem=0.90,
+                 max_tokens=16384, temperature=0.8, top_p=0.95, seed=0,
+                 chat_kwargs=None, quantization=None, enforce_eager=False):
+        from vllm import LLM, SamplingParams
+        self.SamplingParams = SamplingParams
+        self.llm = LLM(model=model, tensor_parallel_size=tp, max_model_len=max_model_len,
+                       gpu_memory_utilization=gpu_mem, seed=seed, trust_remote_code=True,
+                       quantization=quantization, enforce_eager=enforce_eager)
+        self.max_tokens, self.temperature, self.top_p = max_tokens, temperature, top_p
+        self.chat_kwargs = chat_kwargs or {}
+        self.seed = seed
+        self.tokenizer = self.llm.get_tokenizer()
+
+    def prompt_tokens(self, messages):
+        ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True,
+                                                 **self.chat_kwargs)
+        return len(ids)
+
+    def chat(self, conversations, max_tokens=None, metas=None):
+        """Returns [(text, n_generated_tokens, finish_reason)] in order."""
+        params = [self.SamplingParams(temperature=self.temperature, top_p=self.top_p,
+                                      max_tokens=max_tokens or self.max_tokens,
+                                      seed=self.seed + i)
+                  for i in range(len(conversations))]
+        self.seed += len(conversations)
+        outs = self.llm.chat(conversations, params, use_tqdm=False,
+                             chat_template_kwargs=self.chat_kwargs)
+        res = []
+        for o in outs:
+            c = o.outputs[0]
+            res.append((c.text, len(c.token_ids), c.finish_reason))
+        return res
+
+
+class MockBackend:
+    """Replays `script(task_id, round, attempt, conversation) -> text`.
+
+    `metas` (task_id, attempt) travel beside the conversations, never inside
+    them, so the vLLM path sees plain chat messages.
+    """
+
+    def __init__(self, script, delay=0.0):
+        self.script = script
+        self.delay = delay
+        self.calls = 0
+
+    def prompt_tokens(self, messages):
+        return sum(len(m["content"]) for m in messages) // 3
+
+    def chat(self, conversations, max_tokens=None, metas=None):
+        self.calls += 1
+        time.sleep(self.delay)
+        out = []
+        for conv, meta in zip(conversations, metas or [{}] * len(conversations)):
+            rnd = sum(m["role"] == "assistant" for m in conv)
+            text = self.script(meta.get("task_id"), rnd, meta.get("attempt", 0), conv)
+            out.append((text, len(text) // 3, "stop"))
+        return out
+
+%%writefile /kaggle/working/agent/agent.py
+"""Batched program-synthesis agent for ARC tasks.
+
+Every task gets K independent attempts (conversations). Each ROUND sends every
+live conversation to the model in ONE batch -- that is what keeps the GPUs
+busy -- then runs each extracted `transform` on the task's train and test inputs
+in the sandbox. An attempt whose program reproduces every train output is
+VERIFIED and stops. Otherwise the model is shown where its program failed and
+asked again, up to R rounds.
+
+The verification against the demos is the point of the whole approach: a
+program that reproduces all examples is a far stronger selector than any
+likelihood score (exp06: the NLL scorer prefers a wrong grid over the injected
+truth for 83 % of missed outputs).
+
+Answers per test output are voted over verified programs; if fewer than two
+distinct verified answers exist, the gap is filled from the best unverified
+programs (most train examples right), and the source of each answer is kept so
+a fallback solver can be preferred over weak guesses.
+"""
+import time
+from collections import Counter, defaultdict
+
+from grids import SYSTEM, task_prompt, feedback_prompt
+from backend import extract_code
+from sandbox import run_many
+
+
+def visible_reply(text, keep=6000):
+    """What goes back into the conversation: the answer without the reasoning.
+
+    Qwen3-style models wrap reasoning in <think>; gpt-oss via raw harmony output
+    puts the answer after a 'final' channel marker. Either way the program is in
+    the tail, and re-sending long reasoning would crowd out the context.
+    """
+    t = text or ""
+    if "</think>" in t:
+        t = t.split("</think>")[-1]
+    for marker in ("<|channel|>final<|message|>", "assistantfinal"):
+        if marker in t:
+            t = t.split(marker)[-1]
+    t = t.strip()
+    return t[-keep:] if len(t) > keep else t
+
+
+def _key(g):
+    return tuple(tuple(r) for r in g)
+
+
+class Attempt:
+    __slots__ = ("task_id", "idx", "messages", "rounds", "status", "programs",
+                 "tokens", "note")
+
+    def __init__(self, task_id, idx, prompt):
+        self.task_id, self.idx = task_id, idx
+        self.messages = [{"role": "system", "content": SYSTEM},
+                         {"role": "user", "content": prompt}]
+        self.rounds = 0
+        self.status = "active"          # active | verified | failed | dropped
+        self.programs = []              # dicts: round, code, n_ok, n_train, test
+        self.tokens = 0
+        self.note = ""
+
+
+def solve(tasks, backend, samples=4, rounds=3, max_tokens=None, deadline=None,
+          stop_after=2, max_prompt_tokens=None, sandbox_timeout=10.0,
+          sandbox_workers=None, log=print):
+    """tasks: {task_id: {"train": [...], "test": [...]}}.
+
+    Returns (answers, report). answers[task_id] is a list over test inputs of
+    [(grid, source), ...] best first; report holds per-attempt diagnostics.
+    """
+    t0 = time.time()
+    deadline = deadline or float("inf")
+    attempts = [Attempt(tid, i, task_prompt(task))
+                for tid, task in tasks.items() for i in range(samples)]
+    verified_count = Counter()
+    rounds_log = []
+
+    for rnd in range(1, rounds + 1):
+        live = [a for a in attempts if a.status == "active"
+                and verified_count[a.task_id] < stop_after]
+        for a in attempts:
+            if a.status == "active" and verified_count[a.task_id] >= stop_after:
+                a.status, a.note = "failed", "task already verified"
+        if not live:
+            break
+        if time.time() > deadline:
+            log(f"round {rnd}: deadline reached with {len(live)} attempts live")
+            break
+        if max_prompt_tokens:
+            keep = []
+            for a in live:
+                if backend.prompt_tokens(a.messages) > max_prompt_tokens:
+                    a.status, a.note = "dropped", "prompt too long"
+                else:
+                    keep.append(a)
+            live = keep
+            if not live:
+                break
+
+        tg = time.time()
+        replies = backend.chat([a.messages for a in live], max_tokens=max_tokens,
+                               metas=[{"task_id": a.task_id, "attempt": a.idx} for a in live])
+        gen_s = time.time() - tg
+
+        jobs, owners = [], []
+        for a, (text, ntok, finish) in zip(live, replies):
+            a.rounds += 1
+            a.tokens += ntok
+            code = extract_code(text)
+            a.messages.append({"role": "assistant", "content": visible_reply(text)})
+            if code is None:
+                why = ("Your reply was cut off before the program." if finish == "length"
+                       else "No ```python block defining transform() was found.")
+                a.messages.append({"role": "user", "content":
+                                   why + " Give the complete program in ONE ```python code block."})
+                if a.rounds >= rounds:
+                    a.status, a.note = "failed", "no code"
+                continue
+            task = tasks[a.task_id]
+            inputs = [p["input"] for p in task["train"]] + [t["input"] for t in task["test"]]
+            jobs.append((code, inputs))
+            owners.append((a, code))
+
+        ts = time.time()
+        results = run_many(jobs, timeout=sandbox_timeout, workers=sandbox_workers)
+        run_s = time.time() - ts
+
+        n_ver = 0
+        for (a, code), res in zip(owners, results):
+            task = tasks[a.task_id]
+            ntr = len(task["train"])
+            train_res = []
+            for r, pair in zip(res[:ntr], task["train"]):
+                ok = "output" in r and r["output"] == pair["output"]
+                train_res.append({"ok": ok, "output": r.get("output"), "error": r.get("error")})
+            n_ok = sum(t["ok"] for t in train_res)
+            test_out = [r.get("output") for r in res[ntr:]]
+            a.programs.append({"round": a.rounds, "code": code, "n_ok": n_ok,
+                               "n_train": ntr, "test": test_out,
+                               "test_errors": [r.get("error") for r in res[ntr:]]})
+            if n_ok == ntr and all(o is not None for o in test_out):
+                a.status = "verified"
+                verified_count[a.task_id] += 1
+                n_ver += 1
+            elif a.rounds >= rounds:
+                a.status, a.note = "failed", f"best {max(p['n_ok'] for p in a.programs)}/{ntr}"
+            else:
+                a.messages.append({"role": "user",
+                                   "content": feedback_prompt(train_res, task["train"])})
+
+        toks = sum(r[1] for r in replies)
+        rounds_log.append({"round": rnd, "live": len(live), "programs": len(jobs),
+                           "verified_now": n_ver, "gen_s": gen_s, "run_s": run_s,
+                           "tokens": toks, "tok_per_s": toks / max(gen_s, 1e-9)})
+        log(f"round {rnd}: {len(live)} live, {len(jobs)} programs, {n_ver} newly verified, "
+            f"tasks verified {sum(1 for t in tasks if verified_count[t])}/{len(tasks)}, "
+            f"gen {gen_s:.0f}s ({toks / max(gen_s, 1e-9):.0f} tok/s) run {run_s:.1f}s")
+
+    answers = {tid: aggregate(tid, tasks[tid], attempts) for tid in tasks}
+    report = {
+        "rounds": rounds_log,
+        "wall_s": time.time() - t0,
+        "attempts": [{"task_id": a.task_id, "idx": a.idx, "status": a.status,
+                      "rounds": a.rounds, "tokens": a.tokens, "note": a.note,
+                      "best_ok": max((p["n_ok"] for p in a.programs), default=-1),
+                      "n_train": len(tasks[a.task_id]["train"]),
+                      "programs": a.programs} for a in attempts],
+    }
+    return answers, report
+
+
+def aggregate(tid, task, attempts):
+    """Per test input: candidate grids best first, each tagged with its source.
+
+    Verified programs vote; unverified programs are ranked by train examples
+    solved, then by how many programs agree.
+    """
+    mine = [a for a in attempts if a.task_id == tid]
+    out = []
+    for j in range(len(task["test"])):
+        ver = Counter()
+        unv = defaultdict(lambda: [0, 0])          # key -> [best n_ok, votes]
+        grids = {}
+        for a in mine:
+            for p in a.programs:
+                g = p["test"][j] if j < len(p["test"]) else None
+                if g is None:
+                    continue
+                k = _key(g)
+                grids[k] = g
+                if p["n_ok"] == p["n_train"]:
+                    ver[k] += 1
+                else:
+                    u = unv[k]
+                    u[0] = max(u[0], p["n_ok"])
+                    u[1] += 1
+        ranked = [(grids[k], f"verified x{n}") for k, n in ver.most_common()]
+        seen = {k for k in ver}
+        rest = sorted((k for k in unv if k not in seen),
+                      key=lambda k: (-unv[k][0], -unv[k][1]))
+        ranked += [(grids[k], f"unverified {unv[k][0]}/{len(task['train'])}") for k in rest]
+        out.append(ranked)
+    return out
+
+
+def to_submission(answers, tasks, fallback=None):
+    """Kaggle format. `fallback(task_id, j)` supplies grids when the agent has
+    fewer than two; otherwise the test input is echoed."""
+    sub = {}
+    for tid, task in tasks.items():
+        rows = []
+        for j, t in enumerate(task["test"]):
+            cands = [g for g, _ in answers.get(tid, [[]] * len(task["test"]))[j]]
+            if fallback and len(cands) < 2:
+                for g in fallback(tid, j):
+                    if g not in cands:
+                        cands.append(g)
+            while len(cands) < 2:
+                cands.append(t["input"])
+            rows.append({"attempt_1": cands[0], "attempt_2": cands[1]})
+        sub[tid] = rows
+    return sub
+
+
+def score(sub, solutions):
+    """ARC Prize scoring: a task scores the fraction of its test outputs matched
+    by either attempt; the total is the sum over tasks (and / n as a percent)."""
+    total, per = 0.0, {}
+    for tid, sols in solutions.items():
+        rows = sub.get(tid, [])
+        hit = 0
+        for j, sol in enumerate(sols):
+            if j < len(rows) and sol in (rows[j]["attempt_1"], rows[j]["attempt_2"]):
+                hit += 1
+        per[tid] = hit / len(sols)
+        total += per[tid]
+    return total, 100.0 * total / max(len(solutions), 1), per
+
+%%writefile /kaggle/working/agent/repl.py
+"""The `python` tool: run an exploratory snippet with the task preloaded.
+
+Each call is a fresh subprocess (nothing persists between calls, as in the
+Tufa duck harness), so a crash or an infinite loop costs one call. The task is
+injected as numpy arrays plus a few ARC helpers; stdout is captured and capped.
+
+Optional function retention (dfranzen's ARC-AGI-3 fork of the duck harness): with a
+store, plain top-level functions a call defines are kept as SOURCE and replayed into
+later calls; variables never persist. Old transcripts show why: 30-38% of all
+function code the model wrote re-defined a function it had already written, and
+19 of 20 ab3q36 submits re-typed functions first written in a python call.
+"""
+import json
+import os
+import subprocess
+import sys
+
+HELPERS = r'''
+import numpy as np
+from collections import Counter, defaultdict, deque
+import itertools, math, functools, copy, re
+
+def show(g):
+    """Digit rows, one line per row."""
+    return "\n".join("".join(str(int(v)) for v in row) for row in np.asarray(g))
+
+def diff(a, b):
+    """Cells where a and b differ, as (row, col, a_value, b_value); size mismatch -> string."""
+    a, b = np.asarray(a), np.asarray(b)
+    if a.shape != b.shape:
+        return f"shape mismatch {a.shape} vs {b.shape}"
+    return [(int(r), int(c), int(a[r, c]), int(b[r, c])) for r, c in zip(*np.nonzero(a != b))]
+
+def objects(g, bg=None, diagonal=False, multicolor=False):
+    """Connected components. bg defaults to the most common colour.
+    Returns dicts: color (or colors), cells [(r,c)], bbox (r0,c0,r1,c1), size, shape (cropped mask)."""
+    g = np.asarray(g)
+    if bg is None:
+        vals, counts = np.unique(g, return_counts=True)
+        bg = int(vals[np.argmax(counts)])
+    H, W = g.shape
+    seen = np.zeros_like(g, dtype=bool)
+    nbrs = [(-1,0),(1,0),(0,-1),(0,1)] + ([(-1,-1),(-1,1),(1,-1),(1,1)] if diagonal else [])
+    out = []
+    for r in range(H):
+        for c in range(W):
+            if seen[r, c] or g[r, c] == bg:
+                continue
+            col = g[r, c]
+            q, cells = deque([(r, c)]), []
+            seen[r, c] = True
+            while q:
+                y, x = q.popleft(); cells.append((y, x))
+                for dy, dx in nbrs:
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < H and 0 <= nx < W and not seen[ny, nx] and g[ny, nx] != bg \
+                            and (multicolor or g[ny, nx] == col):
+                        seen[ny, nx] = True; q.append((ny, nx))
+            ys, xs = zip(*cells)
+            r0, c0, r1, c1 = min(ys), min(xs), max(ys), max(xs)
+            mask = np.zeros((r1 - r0 + 1, c1 - c0 + 1), dtype=int)
+            for y, x in cells:
+                mask[y - r0, x - c0] = g[y, x]
+            d = {"cells": cells, "bbox": (r0, c0, r1, c1), "size": len(cells), "shape": mask}
+            if multicolor:
+                d["colors"] = sorted({int(g[y, x]) for y, x in cells})
+            else:
+                d["color"] = int(col)
+            out.append(d)
+    return out
+'''
+
+RUNNER = r'''
+import sys, json, io, contextlib, traceback
+job = json.loads(sys.stdin.read())
+ns = {"__name__": "__arc_repl__"}
+exec(job["helpers"], ns)
+import numpy as np
+ns["train_inputs"] = [np.array(g) for g in job["train_inputs"]]
+ns["train_outputs"] = [np.array(g) for g in job["train_outputs"]]
+ns["test_inputs"] = [np.array(g) for g in job["test_inputs"]]
+ns["train"] = list(zip(ns["train_inputs"], ns["train_outputs"]))
+keep = job.get("retained")                # None: retention off (each call starts fresh)
+preloaded = set(ns)
+restore_failed = []
+if keep is not None:
+    # Replay what earlier calls kept: their imports, then their function definitions.
+    # Source only -- no variable or array is ever carried over.
+    for src in keep["imports"]:
+        try:
+            exec(compile(src, "<kept>", "exec"), ns)
+        except Exception:
+            pass
+    for name, src in keep["defs"].items():
+        try:
+            exec(compile(src, "<kept>", "exec"), ns)
+        except Exception:
+            restore_failed.append(name)
+buf = io.StringIO()
+try:
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        exec(compile(job["code"], "<snippet>", "exec"), ns)
+        if "result" in ns and ns["result"] is not None:
+            print(repr(ns["result"]))
+except Exception:
+    tb = traceback.format_exc().strip().splitlines()
+    buf.write("\n" + "\n".join(tb[-4:]))
+sys.stdout.write("@@REPL@@" + json.dumps(buf.getvalue()) + "\n")
+if keep is not None:
+    import ast, builtins, dis, types
+    defs, imports, rejected = {}, [], {}
+    try:
+        tree = ast.parse(job["code"])
+    except SyntaxError:
+        tree = ast.Module(body=[], type_ignores=[])
+    bound = set()
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and not getattr(node, "level", 0):
+            src = ast.get_source_segment(job["code"], node)
+            if src:
+                imports.append(src)
+                bound |= {(a.asname or a.name).split(".")[0] for a in node.names}
+    new = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    available = (set(dir(builtins)) | preloaded | set(keep["defs"]) | bound
+                 | {n.name for n in new} | set(keep.get("bound", [])))
+    for node in new:
+        fn = ns.get(node.name)
+        # only a def that actually ran and still holds the name (not reassigned later)
+        if not (isinstance(fn, types.FunctionType) and fn.__code__.co_filename == "<snippet>"
+                and fn.__code__.co_firstlineno == node.lineno):
+            continue
+        reads, todo = set(), [fn.__code__]
+        while todo:
+            co = todo.pop()
+            reads |= {i.argval for i in dis.get_instructions(co)
+                      if i.opname in ("LOAD_GLOBAL", "LOAD_NAME")}
+            todo += [c for c in co.co_consts if isinstance(c, types.CodeType)]
+        missing = sorted(r for r in reads if isinstance(r, str) and r not in available)
+        if missing:
+            rejected[node.name] = missing
+        else:
+            defs[node.name] = ast.get_source_segment(job["code"], node)
+    sys.stdout.write("@@KEPT@@" + json.dumps({"defs": defs, "imports": imports, "bound": sorted(bound),
+                                             "rejected": rejected,
+                                             "restore_failed": restore_failed}) + "\n")
+'''
+
+PREAMBLE_DOC = (
+    "Preloaded in every `python` call (each call starts fresh; nothing persists): "
+    "`np`, `train_inputs`, `train_outputs`, `test_inputs` (lists of numpy int arrays), "
+    "`train` (list of (input, output) pairs), and helpers `show(g)` (digit rows), "
+    "`diff(a, b)` (differing cells as (row, col, a, b)), "
+    "`objects(g, bg=None, diagonal=False, multicolor=False)` (connected components with "
+    "color, cells, bbox, size, shape). Print compact summaries, never whole large grids."
+)
+
+
+RETAIN_DOC = (
+    "Variables do not persist between calls, but every function you define with a plain "
+    "top-level `def` is kept: later `python` calls and `submit` can call it without "
+    "redefining it. A kept function may use builtins, the preloaded names, imports and "
+    "other kept functions; pass anything else in as an argument.")
+
+
+def new_store():
+    """Per-attempt record of what python calls have kept (source only)."""
+    return {"defs": {}, "imports": [], "bound": []}
+
+
+def run_snippet(code, task, timeout=30.0, max_chars=4000, mem_bytes=2 << 30, store=None):
+    """Run one snippet. With `store` (from new_store()), functions defined by earlier calls
+    are replayed first and the ones this call defines are added to the store; a line at
+    the end of the output says what was kept."""
+    job = {"code": code, "helpers": HELPERS,
+           "train_inputs": [p["input"] for p in task["train"]],
+           "train_outputs": [p["output"] for p in task["train"]],
+           "test_inputs": [t["input"] for t in task["test"]]}
+    if store is not None:
+        job["retained"] = store
+    pre = None
+    if os.name == "posix":
+        def pre():
+            try:
+                import resource
+                resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+            except Exception:
+                pass
+    try:
+        p = subprocess.run([sys.executable, "-c", RUNNER], input=json.dumps(job),
+                           capture_output=True, text=True, timeout=timeout, preexec_fn=pre,
+                           env=dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1"))
+    except subprocess.TimeoutExpired:
+        return f"[timed out after {timeout:.0f}s]"
+    out, kept = None, None
+    for line in reversed(p.stdout.splitlines()):
+        if line.startswith("@@KEPT@@") and kept is None:
+            kept = json.loads(line[len("@@KEPT@@"):])
+        if line.startswith("@@REPL@@"):
+            out = json.loads(line[len("@@REPL@@"):])
+            break
+    if out is None:
+        out = "[snippet crashed] " + " | ".join((p.stderr or "").strip().splitlines()[-2:])
+    out = out.strip() or "[no output -- print() what you want to see]"
+    if len(out) > max_chars:
+        out = out[:max_chars] + f"\n... [truncated {len(out) - max_chars} chars]"
+    if store is not None and kept is not None:
+        out += _absorb(store, kept)
+    return out
+
+
+def _absorb(store, kept):
+    """Merge one call's kept definitions into the store; return the note for the model."""
+    for name in kept["restore_failed"]:
+        store["defs"].pop(name, None)
+    for src in kept["imports"]:
+        if src not in store["imports"]:
+            store["imports"].append(src)
+    store["bound"] = sorted(set(store["bound"]) | set(kept["bound"]))
+    notes = []
+    for name, src in kept["defs"].items():
+        if store["defs"].get(name) != src:
+            store["defs"].pop(name, None)            # re-insert: newest definition last
+            store["defs"][name] = src
+    if kept["defs"]:
+        notes.append("kept for later calls: " + ", ".join(sorted(kept["defs"])))
+    for name, missing in kept["rejected"].items():
+        notes.append(f"not kept: {name} (uses {', '.join(missing[:4])} from this snippet -- "
+                     "pass it as an argument to keep the function)")
+    if kept["restore_failed"]:
+        notes.append("dropped (failed to reload): " + ", ".join(kept["restore_failed"]))
+    return ("\n[" + "; ".join(notes) + "]") if notes else ""
+
+
+def with_kept(code, store):
+    """A submitted program plus the kept functions (and imports) it relies on.
+
+    Returns (full_source, names_added). The program's own definitions win; kept
+    functions are added only if the program uses them, transitively, and transform()
+    itself is taken from the store if the program does not define one."""
+    import ast
+    if not store or not store["defs"]:
+        return code, []
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, []
+    defined = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            defined |= {(a.asname or a.name).split(".")[0] for a in node.names}
+        elif isinstance(node, ast.Assign):
+            defined |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+
+    def used(src):
+        try:
+            return {n.id for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Name)}
+        except SyntaxError:
+            return set()
+
+    need = (used(code) & set(store["defs"])) - defined
+    if "transform" not in defined and "transform" in store["defs"]:
+        need.add("transform")
+    todo = list(need)
+    while todo:
+        for n in (used(store["defs"][todo.pop()]) & set(store["defs"])) - defined - need:
+            need.add(n)
+            todo.append(n)
+    if not need:
+        return code, []
+    # Kept functions were written against the python tool's namespace (np, objects(), ...),
+    # so the helper preamble goes in first; the program's own definitions still win.
+    parts = ([HELPERS.strip()] + list(store["imports"])
+             + [src for n, src in store["defs"].items() if n in need])
+    return "\n".join(parts) + "\n\n" + code, sorted(need)
+
+%%writefile /kaggle/working/agent/client.py
+"""Minimal OpenAI-compatible chat client for a local vLLM server (stdlib only).
+
+Returns a normalised dict: content, reasoning, tool_calls [{id, name, arguments}],
+finish_reason, prompt_tokens, completion_tokens. If the server's tool parser
+misses a call that the model wrote as qwen3_coder markup in its text, the call
+is recovered from the markup, as the Tufa harness does.
+"""
+import json
+import re
+import urllib.error
+import urllib.request
+
+TOOL_BLOCK = re.compile(r"<tool_call>\s*<function=([\w\-]+)>(.*?)</function>\s*</tool_call>", re.S)
+PARAM = re.compile(r"<parameter=([\w\-]+)>\n?(.*?)\n?</parameter>", re.S)
+
+
+def recover_markup(text):
+    calls = []
+    for name, body in TOOL_BLOCK.findall(text or ""):
+        args = {k: v for k, v in PARAM.findall(body)}
+        calls.append({"id": f"markup-{len(calls) + 1}", "name": name, "arguments": args})
+    return calls
+
+
+def strip_markup(text):
+    return TOOL_BLOCK.sub("", text or "").strip()
+
+
+class ChatClient:
+    def __init__(self, base_url, model, temperature=0.6, top_p=0.95, top_k=20,
+                 max_tokens=16384, thinking=True, timeout=1800, reasoning_effort=None,
+                 thinking_token_budget=None, template_kwargs=None):
+        self.url = base_url.rstrip("/") + "/chat/completions"
+        self.model = model
+        # top_k=None leaves it to the server (gpt-oss wants no top-k).
+        self.sampling = {k: v for k, v in {"temperature": temperature, "top_p": top_p,
+                                           "top_k": top_k}.items() if v is not None}
+        self.reasoning_effort = reasoning_effort
+        # vLLM >= 0.19 forces </think> after this many reasoning tokens (needs the server
+        # flag --reasoning-config). Qwen3.8 otherwise spends whole 16k turns thinking.
+        self.thinking_token_budget = thinking_token_budget
+        # Extra chat-template kwargs, e.g. Qwen3.8's reasoning_effort (xhigh default /
+        # medium / low) -- the template itself turns it into a system instruction.
+        self.template_kwargs = template_kwargs or {}
+        self.max_tokens = max_tokens
+        self.thinking = thinking
+        self.timeout = timeout
+
+    def chat(self, messages, tools=None, max_tokens=None, seed=None, timeout=None,
+             tool_choice=None, template_kwargs=None):
+        # template_kwargs: per-request overrides on top of the client's own, e.g. the
+        # reasoning-effort ladder stepping one turn down to "medium".
+        payload = {"model": self.model, "messages": messages,
+                   "max_tokens": max_tokens or self.max_tokens,
+                   "chat_template_kwargs": {"enable_thinking": self.thinking, **self.template_kwargs,
+                                            **(template_kwargs or {})},
+                   **self.sampling}
+        if seed is not None:
+            payload["seed"] = seed
+        if self.reasoning_effort:          # gpt-oss: low / medium / high
+            payload["reasoning_effort"] = self.reasoning_effort
+        if self.thinking_token_budget:
+            payload["thinking_token_budget"] = self.thinking_token_budget
+        if tools:
+            payload["tools"] = tools
+            # A named tool forces that call (vLLM guided decoding); default lets it choose.
+            payload["tool_choice"] = ({"type": "function", "function": {"name": tool_choice}}
+                                      if tool_choice else "auto")
+        req = urllib.request.Request(self.url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+                body = json.loads(r.read().decode())
+            return normalise(body)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:500]
+            overflow = "maximum context length" in detail or "context length" in detail
+            if (e.code == 400 and not overflow and "thinking_token_budget" in payload
+                    and any(w in detail.lower() for w in ("thinking", "budget", "reasoning"))):
+                # A server started without --reasoning-config (the last rungs of the startup
+                # ladder) may refuse the budget: drop it for every later call, not fail them all.
+                self.thinking_token_budget = None
+                return self.chat(messages, tools, max_tokens, seed, timeout, tool_choice, template_kwargs)
+            return {"error": f"HTTP {e.code}: {detail}", "context_overflow": overflow}
+        except Exception as e:
+            # probe24 lost every result to one uncaught socket TimeoutError.
+            text = f"{type(e).__name__}: {e}"
+            return {"error": text[:300], "context_overflow": False,
+                    "timeout": isinstance(e, TimeoutError) or "timed out" in text}
+
+
+def normalise(body):
+    ch = body["choices"][0]
+    msg = ch.get("message", {}) or {}
+    content = msg.get("content") or ""
+    reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    calls = []
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function", {})
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {"_raw": fn.get("arguments")}
+        calls.append({"id": tc.get("id") or f"call-{len(calls) + 1}",
+                      "name": fn.get("name"), "arguments": args})
+    if not calls:
+        calls = recover_markup(content) or recover_markup(reasoning)
+        content = strip_markup(content)
+    usage = body.get("usage") or {}
+    return {"content": content, "reasoning": reasoning, "tool_calls": calls,
+            "finish_reason": ch.get("finish_reason"),
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0)}
+
+%%writefile /kaggle/working/agent/repl_agent.py
+"""REPL tool agent for ARC-AGI-2 tasks, modelled on the Tufa Labs duck harness.
+
+The model gets two tools:
+  python(code)  explore the task: train/test grids are preloaded as numpy
+                arrays with ARC helpers; stdout comes back, capped.
+  submit(code)  a program defining transform(grid). It is run on every train
+                input; the reply says which examples it reproduced and shows a
+                cell diff for the rest. Reproducing ALL of them verifies the
+                program, records its test outputs and ends the attempt.
+
+Many attempts run concurrently against one vLLM OpenAI server, which batches
+them. Old turns are evicted when the context budget is exceeded; the system
+prompt and the task stay. Answers are aggregated exactly as in agent.py.
+
+Optional, off by default, from dfranzen's ARC-AGI-3 fork of the duck harness (see
+run_attempt): reasoning-effort ladder on cut turns, function retention, kept
+reasoning, hysteresis trimming, repetition-loop guard, timeout-as-cut.
+"""
+import json
+import threading
+import time
+import zlib
+from concurrent.futures import ThreadPoolExecutor
+
+from agent import aggregate
+from backend import extract_code
+from grids import SYSTEM, show, diff_text
+from repl import run_snippet, PREAMBLE_DOC, RETAIN_DOC, new_store, with_kept
+from sandbox import run_one
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "python",
+        "description": "Run Python to inspect the task. " + PREAMBLE_DOC,
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string", "description": "Python code; print() what you need."}},
+            "required": ["code"]}}},
+    {"type": "function", "function": {
+        "name": "submit",
+        "description": ("Submit a complete program defining transform(grid) -> grid. It is run on "
+                        "every example input; you are told which examples it reproduces. "
+                        "When it reproduces all of them it is accepted and you are done."),
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string", "description": "Full Python source defining transform(grid)."}},
+            "required": ["code"]}}},
+]
+
+REPL_INSTRUCTIONS = """Solve this ARC puzzle. The examples below share one hidden transformation rule.
+
+Work like a scientist: use the `python` tool to measure the examples (objects, colours, sizes, positions, differences between input and output), form a hypothesis, and test it in code. Then call `submit` with the full source defining `transform(grid)`. Use only the standard library and numpy.
+
+Submit EARLY and often: submitting is free, and a failing submission tells you exactly which examples and which cells are wrong -- that is the fastest way to find the rule. Do not wait for certainty. If a submission fails, study the diff and fix the rule rather than special-casing examples."""
+
+# probe24: every failed attempt spent 30-73k tokens exploring and never submitted
+# once, so it never saw a diff. After this many python calls without a submit,
+# the tool output carries a reminder.
+NUDGE_EVERY = 6
+NUDGE = ("\n\n[harness] You have run {n} python calls without submitting. Submitting is free "
+         "and returns a cell-level diff against every example. Submit your current best "
+         "transform now, then refine it from the diff.")
+
+# probe9q38: every failed attempt had 1-3 turns cut at 16k tokens mid-thought, while
+# solves used 2-3k tokens a turn. The thinking-cap treatment lowers the per-turn cap
+# and, when a turn is cut, orders the model to act instead of resuming the analysis.
+THINKCAP_HINT = ("[harness] You hit the per-turn thinking limit. Stop analysing. In your next "
+                 "reply, call `python` to test your current best hypothesis in code, or "
+                 "`submit` a transform implementing it -- a failing submit shows exactly "
+                 "which cells are wrong.")
+
+
+# The probe24 wording, kept verbatim so a run with the nudge off matches it exactly.
+REPL_INSTRUCTIONS_V1 = """Solve this ARC puzzle. The examples below share one hidden transformation rule.
+
+Work like a scientist: use the `python` tool to measure the examples (objects, colours, sizes, positions, differences between input and output), form a hypothesis, and test it in code. When you have a program that you believe reproduces EVERY example, call `submit` with the full source defining `transform(grid)`. Use only the standard library and numpy. If a submission fails, study the diff and fix the rule rather than special-casing examples."""
+
+
+# probe9q38 transcripts: failures parse and count grids IN THE REASONING, cell by cell,
+# often filling a whole 16k-token turn before any tool call ("col 7=8, 8=0, 9=0 ...").
+# Tufa's harness says the same thing to its model. Optional, its own arm.
+IN_PYTHON_RULE = """
+
+Never read, count, index or transcribe grid cells in your head. Do ALL of that with the `python` tool -- the grids are already loaded as numpy arrays. Keep your own reasoning to hypotheses and plans; let code do the looking."""
+
+
+def repl_prompt(task, early_submit=True, in_python=False):
+    head = REPL_INSTRUCTIONS if early_submit else REPL_INSTRUCTIONS_V1
+    parts = [head + (IN_PYTHON_RULE if in_python else ""), ""]
+    for i, p in enumerate(task["train"], 1):
+        parts += [f"## Example {i}", show(p["input"], "Input"), show(p["output"], "Output"), ""]
+    for j, t in enumerate(task["test"], 1):
+        parts += [f"## Test input {j}", show(t["input"], "Input"), ""]
+    return "\n".join(parts).rstrip()
+
+
+def verify(code, task, timeout=10.0):
+    """Run a submitted program; return (n_ok, test_outputs, feedback_text)."""
+    tr = task["train"]
+    res = run_one(code, [p["input"] for p in tr] + [t["input"] for t in task["test"]],
+                  timeout=timeout)
+    n_ok, lines, shown = 0, [], 0
+    for i, (r, p) in enumerate(zip(res[:len(tr)], tr), 1):
+        if "output" in r and r["output"] == p["output"]:
+            n_ok += 1
+            continue
+        if shown < 2:
+            shown += 1
+            lines.append(f"## Example {i} failed")
+            lines.append(f"Error: {r['error']}" if "error" in r else diff_text(p["output"], r["output"]))
+    test_out = [r.get("output") for r in res[len(tr):]]
+    test_err = [r.get("error") for r in res[len(tr):] if "error" in r]
+    if n_ok == len(tr):
+        if test_err:
+            return n_ok, test_out, ("Reproduces all examples but FAILS on a test input: "
+                                    + test_err[0] + " -- fix it and submit again.")
+        return n_ok, test_out, f"Accepted: reproduces all {len(tr)} examples."
+    return n_ok, test_out, (f"Reproduced {n_ok} of {len(tr)} examples.\n" + "\n".join(lines)
+                            + "\nFix the rule and submit again.")
+
+
+def _est_tokens(messages):
+    return len(json.dumps(messages)) // 3
+
+
+def trim(messages, budget, keep_recent=6, drain=0, state=None):
+    """Drop the oldest assistant/tool/user groups after the task prompt until the
+    estimate fits. A group starts at an assistant message, so tool results are
+    never separated from the call that produced them.
+
+    With `drain` and a per-attempt `state` dict the cut has hysteresis (dfranzen's
+    ARC-AGI-3 harness): it only moves when the estimate exceeds `budget`, and then
+    drops down to `budget - drain`. Between those moments the retained history is
+    byte-identical from turn to turn, so the server's prefix cache keeps serving it;
+    without it, every turn past the budget shifts the cut by one group and
+    re-prefills everything after the task prompt."""
+    if drain and state is not None:
+        return _trim_hysteresis(messages, budget, keep_recent, drain, state)
+    head, rest = messages[:2], messages[2:]
+    starts = [i for i, m in enumerate(rest) if m["role"] == "assistant"]
+    dropped = 0
+    while _est_tokens(head + rest) > budget and len(starts) > keep_recent:
+        cut = starts[1]
+        rest = rest[cut:]
+        starts = [i - cut for i in starts[1:]]
+        dropped += 1
+    if dropped:
+        note = {"role": "user", "content": f"[{dropped} older turns were removed to save context.]"}
+        rest = [note] + rest
+    return head + rest
+
+
+def _trim_hysteresis(messages, budget, keep_recent, drain, state):
+    head, rest = messages[:2], messages[2:]
+    starts = [i for i, m in enumerate(rest) if m["role"] == "assistant"]
+    max_cut = max(0, len(starts) - keep_recent)
+
+    def view(cut):
+        if cut <= 0:
+            return head + rest
+        note = {"role": "user", "content": f"[{cut} older turns were removed to save context.]"}
+        return head + [note] + rest[starts[cut]:]
+
+    cut = min(state.get("cut", 0), max_cut)
+    if _est_tokens(view(cut)) > budget:
+        while cut < max_cut and _est_tokens(view(cut)) > budget - drain:
+            cut += 1
+        state["evictions"] = state.get("evictions", 0) + 1
+    state["cut"] = cut
+    return view(cut)
+
+
+def degenerate(text, min_chars=500, ratio=0.01):
+    """A repetition loop rather than text: zlib compresses it below `ratio`. dfranzen saw a
+    reasoning-only reply of 6,144 '!' under speculative decoding; prose compresses to
+    0.2-0.3, an ASCII grid to ~0.02, so 0.01 only catches genuine loops."""
+    if not text or len(text) < min_chars:
+        return False
+    raw = text.encode("utf-8", "replace")
+    return len(zlib.compress(raw, 6)) / len(raw) < ratio
+
+
+DEGENERATE_STUB = ("(previous reply was a repetition loop and has been omitted; do not continue "
+                   "that pattern)")
+
+
+def make_tools(retain=False):
+    """The two tools; with function retention their descriptions say what persists."""
+    if not retain:
+        return TOOLS
+    py = dict(TOOLS[0]["function"], description=(
+        "Run Python to inspect the task. "
+        + PREAMBLE_DOC.replace(" (each call starts fresh; nothing persists)", "") + " " + RETAIN_DOC))
+    sub = dict(TOOLS[1]["function"], description=(
+        TOOLS[1]["function"]["description"] + " The program may call functions kept from your "
+        "python calls (they are added automatically); if it defines no transform(), the kept "
+        "transform() is submitted."))
+    return [{"type": "function", "function": py}, {"type": "function", "function": sub}]
+
+
+class _Shared:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.verified = {}
+
+
+class Attempt:
+    def __init__(self, task_id, idx):
+        self.task_id, self.idx = task_id, idx
+        self.programs, self.status, self.note = [], "active", ""
+        self.turns = self.python_calls = self.submits = 0
+        self.python_at_submit = self.nudges = self.cuts = self.forced = 0
+        self.gen_tokens = self.prompt_tokens = 0
+        # ARC-AGI-3 takeaways (all zero unless their option is on)
+        self.effort_steps = self.timeouts = self.degenerate = self.kept_used = 0
+        self.evictions = 0
+        self.wall = 0.0
+        # Everything the model thought, ran and saw -- so a failure can be read as
+        # "right idea, out of budget" vs "never found the rule".
+        self.transcript = []
+
+
+TIMEOUT_HINT = ("[harness] Your previous reply took too long and was abandoned. Keep your "
+                "reasoning short: call `python` to test your current best hypothesis, or `submit`.")
+
+
+def run_attempt(att, task, client, shared, deadline, max_turns=40, max_gen_tokens=120000,
+                context_budget=28000, stop_after=1, seed=0, snippet_timeout=30.0,
+                nudge_every=NUDGE_EVERY, turn_max_tokens=None, in_python=False,
+                force_submit_after=0, effort_ladder=None, retain_functions=False,
+                keep_reasoning=False, reasoning_key="reasoning_content", keep_recent=6,
+                trim_drain=0, degenerate_guard=False, timeout_as_cut=False):
+    """One attempt at one task. The options after force_submit_after are the ARC-AGI-3
+    (dfranzen / duck harness) takeaways, each off by default so the baseline is unchanged:
+
+    effort_ladder     e.g. ["medium", "low"]: after a turn is cut at max_tokens (or times
+                      out, with timeout_as_cut) the next turns run one reasoning_effort rung
+                      lower; a submit that reproduces more examples than before restores
+                      the client's own effort.
+    retain_functions  python-defined functions persist (as source) into later python calls
+                      and into submits that use them.
+    keep_reasoning    send each completed turn's reasoning back under `reasoning_key`
+                      (pair with chat-template kwarg preserve_thinking=True). Cut turns and
+                      repetition loops are never sent back.
+    trim_drain        hysteresis for the context trim (see trim()); keep_recent groups are
+                      never evicted.
+    degenerate_guard  a repetition-loop reply is replaced by a stub in the history.
+                      Loops are COUNTED in every arm (att.degenerate).
+    timeout_as_cut    a request timeout before the deadline is treated like a cut turn
+                      (retry, one rung lower) instead of failing the attempt."""
+    t0 = time.time()
+    # The early-submit wording and the nudge are ONE treatment: off means probe24's harness.
+    messages = [{"role": "system", "content": SYSTEM},
+                {"role": "user", "content": repl_prompt(task, early_submit=bool(nudge_every),
+                                                        in_python=in_python)}]
+    tools = make_tools(retain_functions)
+    store = new_store() if retain_functions else None
+    trim_state = {} if trim_drain else None
+    rung, best_ok = -1, -1                   # rung -1 = the client's own reasoning effort
+
+    def step_down():
+        nonlocal rung
+        if effort_ladder and rung < len(effort_ladder) - 1:
+            rung += 1
+            att.effort_steps += 1
+
+    while att.turns < max_turns:
+        with shared.lock:
+            if shared.verified.get(att.task_id, 0) >= stop_after:
+                att.status, att.note = "stopped", "task verified by a sibling"
+                break
+        if time.time() > deadline:
+            att.status, att.note = "stopped", "deadline"
+            break
+        if att.gen_tokens >= max_gen_tokens:
+            att.status, att.note = "failed", "token budget"
+            break
+        att.turns += 1
+        # A request may not outlive the deadline by more than a minute.
+        req_timeout = max(60.0, min(3600.0, deadline - time.time() + 60.0))
+        # mini2arm: the text nudge was read and ignored. The forcesubmit treatment
+        # makes the NEXT call a submit after this many python calls without one.
+        force = (force_submit_after
+                 and att.python_calls - att.python_at_submit >= force_submit_after)
+        if force:
+            att.forced += 1
+        extra = {}
+        if rung >= 0:            # only then, so clients without the kwarg keep working
+            extra["template_kwargs"] = {"reasoning_effort": effort_ladder[rung]}
+        r = client.chat(trim(messages, context_budget, keep_recent, trim_drain, trim_state),
+                        tools=tools, seed=seed + att.turns,
+                        timeout=req_timeout, max_tokens=turn_max_tokens,
+                        tool_choice="submit" if force else None, **extra)
+        if trim_state is not None:
+            att.evictions = trim_state.get("evictions", 0)
+        if "error" in r:
+            if r.get("context_overflow") and keep_reasoning:
+                # Kept reasoning can make even the protected recent turns too long for
+                # the model; shed it (oldest first, newest last) before shrinking.
+                held = [m for m in messages if reasoning_key in m]
+                if held:
+                    for m in held[:max(1, len(held) - 1)]:
+                        m.pop(reasoning_key)
+                    continue
+            if r.get("context_overflow") and context_budget > 8000:
+                context_budget = int(context_budget * 0.7)
+                continue
+            if time.time() >= deadline:
+                # Requests are timed to end a minute after the deadline: this is the run
+                # ending, not the attempt failing (ab3q36 logged 21 of these as failures).
+                att.status, att.note = "stopped", "deadline (request cut)"
+                break
+            if timeout_as_cut and r.get("timeout"):
+                att.timeouts += 1
+                step_down()
+                if messages[-1]["role"] != "user":
+                    messages.append({"role": "user", "content": TIMEOUT_HINT})
+                continue
+            att.status, att.note = "failed", r["error"][:200]
+            break
+        att.gen_tokens += r["completion_tokens"]
+        att.prompt_tokens += r["prompt_tokens"]
+        cut = r["finish_reason"] == "length"
+        loops = [k for k in ("reasoning", "content") if degenerate(r[k])]
+        att.degenerate += bool(loops)
+        att.transcript.append({"turn": att.turns, "t": round(time.time() - t0, 1),
+                               "reasoning": r["reasoning"], "content": r["content"],
+                               "calls": [c["name"] for c in r["tool_calls"]],
+                               "finish": r["finish_reason"], "tokens": r["completion_tokens"],
+                               **({"effort": effort_ladder[rung]} if rung >= 0 else {}),
+                               **({"loop": loops} if loops else {})})
+        if cut:
+            step_down()
+        content = r["content"] or ""
+        if degenerate_guard and "content" in loops:
+            content = DEGENERATE_STUB
+        msg = {"role": "assistant", "content": content}
+        if keep_reasoning and r["reasoning"] and not cut and "reasoning" not in loops:
+            msg[reasoning_key] = r["reasoning"]
+        calls = r["tool_calls"]
+        if not calls:
+            code = extract_code(r["content"])
+            if code:                       # answered with a code block instead of submit
+                calls = [{"id": f"implicit-{att.turns}", "name": "submit",
+                          "arguments": {"code": code}, "implicit": True}]
+            else:
+                messages.append(msg)
+                if r["finish_reason"] == "length":
+                    # The thinking-cap treatment answers a cut with an order to act; the
+                    # baseline keeps probe24's wording.
+                    hint = THINKCAP_HINT if turn_max_tokens else "Your reply was cut off. Be more concise."
+                    att.cuts += 1
+                else:
+                    hint = "Use the `python` tool to explore, or `submit` your transform program."
+                messages.append({"role": "user", "content": hint})
+                continue
+        if not any(c.get("implicit") for c in calls):
+            msg["tool_calls"] = [{"id": c["id"], "type": "function",
+                                  "function": {"name": c["name"],
+                                               "arguments": json.dumps(c["arguments"])}}
+                                 for c in calls]
+        messages.append(msg)
+        done = False
+        for c in calls:
+            code = (c["arguments"] or {}).get("code") or ""
+            if c["name"] == "python":
+                att.python_calls += 1
+                out = run_snippet(code, task, timeout=snippet_timeout, store=store)
+                since = att.python_calls - att.python_at_submit
+                if nudge_every and since and since % nudge_every == 0:
+                    out += NUDGE.format(n=since)
+                    att.nudges += 1
+            elif c["name"] == "submit":
+                att.submits += 1
+                att.python_at_submit = att.python_calls
+                full, added = with_kept(code, store) if store else (code, [])
+                n_ok, test_out, out = verify(full, task)
+                if added:
+                    att.kept_used += 1
+                    out += f"\n(Ran with your kept functions: {', '.join(added)}.)"
+                ntr = len(task["train"])
+                att.programs.append({"turn": att.turns, "code": full, "n_ok": n_ok,
+                                     "n_train": ntr, "test": test_out})
+                if n_ok > best_ok:
+                    if best_ok >= 0 or n_ok > 0:
+                        rung = -1            # progress: back to the client's own effort
+                    best_ok = n_ok
+                if n_ok == ntr and all(o is not None for o in test_out):
+                    done = True
+            else:
+                out = f"Unknown tool {c['name']!r}. Tools: python, submit."
+            att.transcript.append({"turn": att.turns, "tool": c["name"], "code": code,
+                                   "output": out})
+            if c.get("implicit"):
+                messages.append({"role": "user", "content": out})
+            else:
+                messages.append({"role": "tool", "tool_call_id": c["id"], "content": out})
+        if done:
+            att.status = "verified"
+            with shared.lock:
+                shared.verified[att.task_id] = shared.verified.get(att.task_id, 0) + 1
+            break
+    else:
+        att.status, att.note = "failed", "turn budget"
+    att.wall = time.time() - t0
+    return att
+
+
+# run_attempt options a probe or submission config may set for the whole run
+# (probe arms can set any run_attempt keyword).
+AGENT_OPTS = ("turn_max_tokens", "in_python", "force_submit_after", "effort_ladder",
+              "retain_functions", "keep_reasoning", "reasoning_key", "keep_recent", "trim_drain",
+              "degenerate_guard", "timeout_as_cut", "snippet_timeout")
+
+
+def attempt_record(a, task):
+    return {"task_id": a.task_id, "idx": a.idx, "status": a.status,
+            "note": a.note, "turns": a.turns, "python_calls": a.python_calls,
+            "submits": a.submits, "nudges": a.nudges, "cuts": a.cuts, "forced": a.forced, "gen_tokens": a.gen_tokens,
+            "prompt_tokens": a.prompt_tokens, "wall": a.wall,
+            "effort_steps": a.effort_steps, "timeouts": a.timeouts, "degenerate": a.degenerate,
+            "kept_used": a.kept_used, "evictions": a.evictions,
+            "best_ok": max((p["n_ok"] for p in a.programs), default=-1),
+            "n_train": len(task["train"]),
+            "programs": a.programs, "transcript": a.transcript}
+
+
+def solve_repl(tasks, client, attempts=2, concurrency=32, deadline=None, stop_after=1,
+               log=print, on_done=None, task_kw=None, **kw):
+    """Same return shape as agent.solve: (answers, report).
+
+    `on_done(record)` is called as each attempt finishes, so a caller can persist
+    results incrementally -- probe24 lost everything to one late exception."""
+    deadline = deadline or float("inf")
+    shared = _Shared()
+    # attempt-major order: every task gets its first attempt before any gets a second
+    atts = [Attempt(tid, k) for k in range(attempts) for tid in tasks]
+    t0 = time.time()
+    done_n = [0]
+
+    def work(att):
+        try:
+            # task_kw lets arms of an A/B share one run: key -> per-arm overrides. An arm
+            # may bring its own client (different sampling / chat-template kwargs).
+            over = dict(kw, **(task_kw or {}).get(att.task_id, {}))
+            arm_client = over.pop("client", client)
+            run_attempt(att, tasks[att.task_id], arm_client, shared, deadline,
+                        stop_after=stop_after, seed=1000 * att.idx, **over)
+        except Exception as e:                  # one attempt must never sink the run
+            import traceback
+            att.status, att.note = "crashed", f"{type(e).__name__}: {e}"[:300]
+            att.transcript.append({"crash": traceback.format_exc()[-2000:]})
+        if on_done:
+            try:
+                on_done(attempt_record(att, tasks[att.task_id]))
+            except Exception as e:
+                log(f"on_done failed: {e}")
+        with shared.lock:
+            done_n[0] += 1
+            n_ver = sum(1 for v in shared.verified.values() if v)
+        log(f"[{time.time() - t0:6.0f}s] {att.task_id}#{att.idx} {att.status:8s} "
+            f"turns {att.turns:2d} py {att.python_calls:2d} sub {att.submits} "
+            f"tok {att.gen_tokens:6d} | done {done_n[0]}/{len(atts)} tasks verified {n_ver}")
+        return att
+
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        list(ex.map(work, atts))
+
+    answers = {tid: aggregate(tid, tasks[tid], atts) for tid in tasks}
+    report = {"wall_s": time.time() - t0,
+              "attempts": [attempt_record(a, tasks[a.task_id]) for a in atts]}
+    return answers, report
+
+%%writefile /kaggle/working/agent/run_direct.py
+"""Direct-answer mode: the model reasons (e.g. Qwen3.8 at reasoning_effort xhigh) and
+writes the test output grid(s) itself -- no tools. Two samples per task give the two
+attempts. This is how headline ARC-AGI-2 numbers for chat models are usually measured,
+so it is the comparison the REPL agent has to beat.
+
+    python run_direct.py '<json config>'
+
+Config: base_url, model, task_ids, samples (2), concurrency, max_tokens, deadline_epoch,
+temperature/top_p/top_k, template_kwargs, out, data_dir.
+Writes <out> (JSON) and <out>.jsonl (one line per finished sample).
+"""
+import json
+import os
+import re
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from client import ChatClient                       # noqa: E402
+from grids import show                              # noqa: E402
+
+# grids.SYSTEM tells the model it solves puzzles "by writing Python programs" -- right for
+# the REPL agent, wrong when the answer is the grid itself.
+DIRECT_SYSTEM = (
+    "You are an expert at solving ARC-AGI puzzles. Each puzzle has a few input->output "
+    "example pairs that share one hidden transformation rule. Grids are 2D arrays of digits "
+    "0-9 (colours); 0 is usually the background."
+)
+
+# A reply cut off before any grid (the thinking budget missing or ignored, or the answer
+# itself cut) gets ONE short follow-up without thinking: the tail of its own reasoning,
+# and an order to commit. An unanswered task scores nothing; a committed guess may score.
+RESCUE = """{prompt}
+
+## Your notes so far (they were cut off)
+{notes}
+
+Stop analysing now. Apply the rule you were converging on and give the final test output grid(s): each as rows of digits in its own ```grid code block, in test order, with nothing else in the block."""
+
+DIRECT_INSTRUCTIONS = """Solve this ARC puzzle. The examples share one hidden transformation rule. Work out the rule, check it against every example, then apply it to the test input(s).
+
+At the very end of your answer, give each test output grid as rows of digits inside its own ```grid code block, in test order, with nothing else in the block."""
+
+
+def direct_prompt(task):
+    parts = [DIRECT_INSTRUCTIONS, ""]
+    for i, p in enumerate(task["train"], 1):
+        parts += [f"## Example {i}", show(p["input"], "Input"), show(p["output"], "Output"), ""]
+    for j, t in enumerate(task["test"], 1):
+        parts += [f"## Test input {j}", show(t["input"], "Input"), ""]
+    return "\n".join(parts).rstrip()
+
+
+def parse_grids(text, n_tests):
+    """The last n_tests digit-only code blocks (```grid preferred, any fence accepted)."""
+    blocks = re.findall(r"```(?:grid)?[^\n]*\n(.*?)```", text or "", re.S)
+    grids = []
+    for b in blocks:
+        rows = [r.strip() for r in b.strip().splitlines() if r.strip()]
+        rows = [r.replace(" ", "").replace(",", "") for r in rows]
+        if rows and all(r.isdigit() for r in rows) and len({len(r) for r in rows}) == 1:
+            grids.append([[int(c) for c in r] for r in rows])
+    return grids[-n_tests:] if len(grids) >= n_tests else None
+
+
+def answer(client, task, seed, deadline, max_tokens=None, rescue_tokens=8192, notes_chars=16000):
+    """One direct answer to `task`: reason, then write the test grid(s). Returns a record;
+    rec["grids"] is the list of test grids, or None when nothing parseable came back."""
+    n = len(task["test"])
+    prompt = direct_prompt(task)
+
+    def timeout():
+        return max(60.0, min(4 * 3600, deadline - time.time() + 60))
+
+    mt = max_tokens or client.max_tokens
+    for _ in range(3):
+        r = client.chat([{"role": "system", "content": DIRECT_SYSTEM},
+                         {"role": "user", "content": prompt}],
+                        seed=seed, max_tokens=mt, timeout=timeout())
+        if not (r.get("context_overflow") and mt > 8192):
+            break
+        mt = int(mt * 0.75)                    # a long prompt: shrink the reply, never give up
+    if "error" in r:
+        return {"status": "error: " + r["error"][:200], "grids": None, "gen_tokens": 0}
+    rec = {"finish": r["finish_reason"], "gen_tokens": r["completion_tokens"],
+           "reasoning_chars": len(r["reasoning"] or ""),
+           "content_tail": (r["content"] or "")[-1500:],
+           "reasoning_tail": (r["reasoning"] or "")[-3000:]}
+    grids = parse_grids(r["content"], n)
+    if grids:
+        return dict(rec, status="answered", grids=grids)
+    notes = ((r["reasoning"] or "") + "\n" + (r["content"] or "")).strip()
+    if notes and deadline - time.time() > 120:
+        r2 = client.chat([{"role": "system", "content": DIRECT_SYSTEM},
+                          {"role": "user", "content": RESCUE.format(prompt=prompt,
+                                                                    notes=notes[-notes_chars:])}],
+                         seed=seed + 1, max_tokens=rescue_tokens, timeout=timeout(),
+                         template_kwargs={"enable_thinking": False, "reasoning_effort": "low"})
+        if "error" in r2:
+            rec["rescue_error"] = r2["error"][:200]
+        else:
+            rec["gen_tokens"] += r2["completion_tokens"]
+            rec["rescue_finish"] = r2["finish_reason"]
+            rec["rescue_tail"] = ((r2["content"] or "") or (r2["reasoning"] or ""))[-1500:]
+            # Without thinking, a reasoning parser may still file the reply as reasoning.
+            grids = parse_grids(r2["content"], n) or parse_grids(r2["reasoning"], n)
+            if grids:
+                return dict(rec, status="rescued", grids=grids)
+    return dict(rec, status="no grid", grids=None)
+
+
+def main(cfg):
+    t0 = time.time()
+    root = cfg.get("data_dir", "/kaggle/input")
+    import glob
+    ch = json.load(open(glob.glob(f"{root}/**/arc-agi_evaluation_challenges.json", recursive=True)[0]))
+    sol = json.load(open(glob.glob(f"{root}/**/arc-agi_evaluation_solutions.json", recursive=True)[0]))
+    ids = cfg["task_ids"]
+    client = ChatClient(cfg["base_url"], cfg["model"], max_tokens=cfg.get("max_tokens", 49152),
+                        temperature=cfg.get("temperature", 1.0), top_p=cfg.get("top_p", 0.95),
+                        top_k=cfg.get("top_k", 20), thinking=cfg.get("thinking", True),
+                        thinking_token_budget=cfg.get("thinking_token_budget"),
+                        template_kwargs=cfg.get("template_kwargs"), timeout=4 * 3600)
+    out = cfg.get("out", "/kaggle/working/direct_results.json")
+    jsonl = out.replace(".json", ".jsonl")
+    deadline = cfg.get("deadline_epoch", float("inf"))
+    lock = threading.Lock()
+    recs = []
+    jobs = [(t, k) for k in range(cfg.get("samples", 2)) for t in ids]   # sample-major
+
+    def work(job):
+        t, k = job
+        rec = {"task_id": t, "sample": k}
+        if time.time() > deadline:
+            rec["status"] = "skipped: deadline"
+        else:
+            ts = time.time()
+            rec.update(answer(client, ch[t], 1000 * k + 7, deadline,
+                              rescue_tokens=cfg.get("rescue_tokens", 8192)))
+            rec["wall"] = round(time.time() - ts, 1)
+            grids = rec["grids"]
+            rec["correct"] = [g == s for g, s in zip(grids, sol[t])] if grids else None
+        with lock:
+            recs.append(rec)
+            with open(jsonl, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            print(f"[{time.time() - t0:6.0f}s] {t}#{k} {rec['status']:10s} "
+                  f"tok {rec.get('gen_tokens', 0):6d} finish {rec.get('finish')} "
+                  f"correct {rec.get('correct')}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=cfg.get("concurrency", 16)) as ex:
+        list(ex.map(work, jobs))
+
+    # pass@2 per task: any test output matched by either sample (fractional per test).
+    per = {}
+    for t in ids:
+        n = len(sol[t])
+        hit = [False] * n
+        for r in recs:
+            if r["task_id"] == t and r.get("correct"):
+                hit = [h or c for h, c in zip(hit, r["correct"])]
+        per[t] = sum(hit) / n
+    tok = [r["gen_tokens"] for r in recs if "gen_tokens" in r]
+    summary = {"config": cfg, "per_task": per, "score": sum(per.values()), "n_tasks": len(ids),
+               "samples": len(recs), "mean_gen_tokens": sum(tok) / max(len(tok), 1),
+               "cut_at_max_tokens": sum(1 for r in recs if r.get("finish") == "length"),
+               "wall_s": time.time() - t0, "records": recs}
+    json.dump(summary, open(out, "w"))
+    print(f"\nDIRECT SCORE {summary['score']:.2f} / {len(ids)}  mean tokens {summary['mean_gen_tokens']:.0f}  "
+          f"cut {summary['cut_at_max_tokens']}  wall {summary['wall_s']:.0f}s", flush=True)
+    print("per task:", {t: round(v, 2) for t, v in per.items()}, flush=True)
+
+
+if __name__ == "__main__":
+    main(json.loads(sys.argv[1]))
+
+%%writefile /kaggle/working/agent/run_submit.py
+"""Competition run: the REPL agent on the hidden test set, writing submission.json.
+
+    python run_submit.py '<json config>'
+
+Safety first, because a crashed rerun wastes a day's submission:
+  * the notebook writes a valid FALLBACK submission (each test input copied into
+    both attempts) before anything heavy runs, via write_fallback();
+  * as every attempt finishes, the submission is rewritten atomically with the
+    best answers so far;
+  * the agent stops at a hard deadline well inside the 12 h limit.
+
+Budget: the per-attempt token cap is the estimated token supply (throughput x
+time) divided by the number of hidden tasks, clamped -- the task count is only
+known at run time (the public placeholder has 240).
+"""
+import glob
+import json
+import os
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from client import ChatClient                      # noqa: E402
+from repl_agent import solve_repl, AGENT_OPTS      # noqa: E402
+
+SUB = "/kaggle/working/submission.json"
+
+
+def find(name, root="/kaggle/input"):
+    hits = glob.glob(f"{root}/**/{name}", recursive=True)
+    if not hits:
+        raise FileNotFoundError(name)
+    return hits[0]
+
+
+def write_atomic(obj, path=SUB):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def write_fallback(challenges, path=SUB):
+    """A valid submission with no model at all: every attempt is the test input."""
+    write_atomic({t: [{"attempt_1": x["input"], "attempt_2": x["input"]} for x in task["test"]]
+                  for t, task in challenges.items()}, path)
+
+
+def ranked_answers(records, task):
+    """Per test input: candidate grids best first. Verified programs vote; then the
+    unverified programs by train examples reproduced. Mirrors agent.aggregate."""
+    out = []
+    ntr = len(task["train"])
+    for j in range(len(task["test"])):
+        score = {}
+        grids = {}
+        for r in records:
+            for p in r["programs"]:
+                g = p["test"][j] if j < len(p["test"]) else None
+                if g is None:
+                    continue
+                k = json.dumps(g)
+                grids[k] = g
+                verified = p["n_ok"] == ntr
+                s = score.get(k, (0, 0, 0))
+                score[k] = (s[0] + verified, max(s[1], p["n_ok"]), s[2] + 1)
+        out.append([grids[k] for k in sorted(score, key=lambda k: score[k], reverse=True)])
+    return out
+
+
+def direct(cfg, tasks, client, deadline, sub, sub_path, t0):
+    """Direct answers (run_direct.answer): every task's sample 0 before any sample 1, each
+    task in `tasks` order. attempt_1 = the first answer; attempt_2 = the next DIFFERENT one."""
+    from run_direct import answer
+    lock = threading.Lock()
+    got = {}
+    jobs = [(t, k) for k in range(cfg.get("samples", 2)) for t in tasks]
+    log = open(cfg.get("log_path", "/kaggle/working/direct_attempts.jsonl"), "a")
+    count = {}
+
+    def work(job):
+        t, k = job
+        if deadline - time.time() < cfg.get("min_start_s", 600):
+            rec = {"status": "skipped: deadline", "grids": None, "gen_tokens": 0}
+        else:
+            ts = time.time()
+            rec = answer(client, tasks[t], 1000 * k + 7, deadline, max_tokens=cfg.get("max_tokens"),
+                         rescue_tokens=cfg.get("rescue_tokens", 8192))
+            rec["wall"] = round(time.time() - ts, 1)
+        with lock:
+            if rec["grids"]:
+                got.setdefault(t, []).append(rec["grids"])
+                for j, x in enumerate(tasks[t]["test"]):
+                    cands = []
+                    for grids in got[t]:
+                        if grids[j] not in cands:
+                            cands.append(grids[j])
+                    sub[t][j] = {"attempt_1": cands[0],
+                                 "attempt_2": cands[1] if len(cands) > 1 else x["input"]}
+                write_atomic(sub, sub_path)
+            st = rec["status"].split(":")[0]
+            count[st] = count.get(st, 0) + 1
+            log.write(json.dumps(dict({k2: v for k2, v in rec.items() if k2 != "grids"},
+                                      task_id=t, sample=k)) + "\n")
+            log.flush()
+            print(f"[{time.time() - t0:6.0f}s] {t}#{k} {rec['status'][:40]:12s} "
+                  f"tok {rec.get('gen_tokens', 0):6d} finish {rec.get('finish')} | {count}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=cfg.get("concurrency", 10)) as ex:
+        list(ex.map(work, jobs))
+    log.close()
+    print(f"done: {len(got)}/{len(tasks)} tasks answered, {count}, {time.time() - t0:.0f}s", flush=True)
+
+
+def main(cfg):
+    t0 = time.time()
+    rerun = os.environ.get("KAGGLE_IS_COMPETITION_RERUN", "").strip().lower() in {"1", "true"}
+    sub_path = cfg.get("sub_path", SUB)
+    ch = json.load(open(find(cfg.get("challenges", "arc-agi_test_challenges.json"),
+                             cfg.get("data_dir", "/kaggle/input"))))
+    if not rerun and not cfg.get("full_interactive"):
+        # Interactive run (should not happen -- versions are Quick Saved): stay tiny.
+        ch = {t: ch[t] for t in sorted(ch)[:cfg.get("interactive_tasks", 3)]}
+    if not os.path.exists(sub_path):
+        write_fallback(ch, sub_path)
+    n = len(ch)
+    deadline = cfg["deadline_epoch"]
+    avail = max(0.0, deadline - time.time())
+    supply = cfg.get("tok_per_s", 140) * avail
+    cap = int(min(cfg.get("max_cap", 60000), max(cfg.get("min_cap", 15000), supply / max(n, 1) * 1.3)))
+    print(f"rerun={rerun} tasks={n} available {avail / 3600:.2f} h, est supply {supply / 1e6:.1f}M "
+          f"tokens -> per-attempt cap {cap}", flush=True)
+
+    # Cheapest prompts first: if the deadline bites, the long tasks are the ones lost.
+    order = sorted(ch, key=lambda t: len(json.dumps(ch[t])))
+    tasks = {t: ch[t] for t in order}
+    client = ChatClient(cfg["base_url"], cfg["model"], max_tokens=cfg.get("max_tokens", 16384),
+                        temperature=cfg.get("temperature", 0.6), top_p=cfg.get("top_p", 0.95),
+                        top_k=cfg.get("top_k", 20), thinking=cfg.get("thinking", True),
+                        reasoning_effort=cfg.get("reasoning_effort"),
+                        thinking_token_budget=cfg.get("thinking_token_budget"),
+                        template_kwargs=cfg.get("template_kwargs"))
+
+    sub = json.load(open(sub_path))
+    if cfg.get("mode") == "direct":
+        return direct(cfg, tasks, client, deadline, sub, sub_path, t0)
+
+    lock = threading.Lock()
+    done = {}
+
+    def on_done(rec):
+        with lock:
+            done.setdefault(rec["task_id"], []).append(rec)
+            task = tasks[rec["task_id"]]
+            for j, cands in enumerate(ranked_answers(done[rec["task_id"]], task)):
+                inp = task["test"][j]["input"]
+                a1 = cands[0] if cands else inp
+                a2 = cands[1] if len(cands) > 1 else inp
+                sub[rec["task_id"]][j] = {"attempt_1": a1, "attempt_2": a2}
+            write_atomic(sub, sub_path)
+
+    _, report = solve_repl(
+        tasks, client, attempts=cfg.get("attempts", 1), concurrency=cfg.get("concurrency", 24),
+        deadline=deadline, stop_after=1, max_turns=cfg.get("max_turns", 40), max_gen_tokens=cap,
+        context_budget=cfg.get("context_budget", 24000), nudge_every=cfg.get("nudge_every", 0),
+        turn_max_tokens=cfg.get("turn_max_tokens"), in_python=cfg.get("in_python", False),
+        log=lambda m: print(m, flush=True), on_done=on_done,
+        **{k: cfg[k] for k in AGENT_OPTS if k in cfg and k not in ("turn_max_tokens", "in_python")})
+
+    ver = sum(1 for a in report["attempts"] if a["status"] == "verified")
+    print(f"done: {ver}/{n} tasks verified, {sum(a['gen_tokens'] for a in report['attempts'])} "
+          f"tokens, {time.time() - t0:.0f}s", flush=True)
+
+
+if __name__ == "__main__":
+    main(json.loads(sys.argv[1]))
+
+%%writefile /kaggle/working/agent/submit_main.py
+"""Everything the competition rerun does after the fallback submission is written:
+install the vLLM wheelhouse, start the server, run the agent. It NEVER raises --
+an exception in a rerun fails the submission even when submission.json exists --
+so every stage is caught and logged, and the fallback stands if a stage fails.
+
+    python submit_main.py '<json config>'
+"""
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+import urllib.request
+from pathlib import Path
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+WORK = Path("/kaggle/working")
+SITE = WORK / "vllm-site-packages"
+LOG = WORK / "vllm-server.log"
+
+
+def one(pattern):
+    hits = glob.glob(pattern, recursive=True)
+    if not hits:
+        raise FileNotFoundError(pattern)
+    return Path(hits[0])
+
+
+def install(cfg):
+    wh = one("/kaggle/input/**/arc3-vllm-h100-wheelhouse-v3/**/requirements.lock").parent
+    t = time.time()
+    subprocess.run([sys.executable, "-m", "pip", "install", "--no-index", "--find-links", str(wh),
+                    "--requirement", str(wh / "requirements.lock"), "--target", str(SITE),
+                    "--upgrade", "--ignore-installed", "--only-binary", ":all:", "--no-compile",
+                    "--disable-pip-version-check", "--no-warn-conflicts", "-q"], check=True)
+    print(f"wheelhouse installed in {time.time() - t:.0f}s", flush=True)
+    if cfg.get("overlay"):
+        wheels = sorted(glob.glob(cfg["overlay"], recursive=True))
+        if not wheels:
+            raise FileNotFoundError(cfg["overlay"])
+        for pat in ("transformers", "transformers-*.dist-info", "huggingface_hub",
+                    "huggingface_hub-*.dist-info"):
+            for p in SITE.glob(pat):
+                shutil.rmtree(p) if p.is_dir() else p.unlink()
+        subprocess.run([sys.executable, "-m", "pip", "install", "--no-index", "--no-deps",
+                        "--target", str(SITE), "--upgrade", "--force-reinstall", "--no-compile",
+                        "--disable-pip-version-check", "-q", *wheels], check=True)
+        print("overlay installed:", [Path(w).name for w in wheels], flush=True)
+
+
+def cuda_link_dir():
+    """FlashInfer JIT-links its kernels with plain `-lcuda` (FP8 KV on vLLM 0.19, the sampler on
+    0.30). X1/X6/X8 (2026-10-09) died on `ld: cannot find -lcuda`. Link the container's
+    libcuda.so* into one folder for LIBRARY_PATH, wherever the driver mounted it."""
+    d = WORK / "cuda-link"
+    d.mkdir(parents=True, exist_ok=True)
+    hits = []
+    for pat in ("/usr/local/nvidia/lib64/libcuda.so*", "/usr/lib/x86_64-linux-gnu/libcuda.so*",
+                "/usr/lib64/libcuda.so*", "/usr/local/cuda/compat/libcuda.so*"):
+        hits += sorted(glob.glob(pat))
+    link = d / "libcuda.so"
+    if hits and not os.path.lexists(link):
+        os.symlink(next((h for h in hits if h.endswith(".so.1")), hits[0]), link)
+    print("libcuda:", hits[:4], flush=True)
+    return str(d)
+
+
+def start_server(cfg, extra):
+    model = one(cfg["model_glob"]).parent
+    env = dict(os.environ, PYTHONPATH=str(SITE), USE_TF="0", TRANSFORMERS_NO_TF="1",
+               TRANSFORMERS_NO_TORCHVISION="1", VLLM_NO_USAGE_STATS="1",
+               LIBRARY_PATH=":".join([cuda_link_dir(), "/usr/local/nvidia/lib64",
+                                      os.environ.get("LIBRARY_PATH", "")]))
+    cmd = [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--model", str(model),
+           "--served-model-name", "qwen", "--host", "127.0.0.1", "--port", "1234",
+           "--tensor-parallel-size", "4", "--enable-auto-tool-choice", *cfg["parsers"],
+           "--generation-config", "vllm", "--enable-prefix-caching",
+           "--max-model-len", str(cfg.get("max_model_len", 65536)), "--gpu-memory-utilization", "0.90",
+           "--max-num-seqs", str(cfg.get("max_num_seqs", 32)), *extra]
+    print(" ".join(cmd), flush=True)
+    t = time.time()
+    # "w": a retry must not see the previous attempt's "EngineCore failed".
+    proc = subprocess.Popen(cmd, env=env, stdout=open(LOG, "w"), stderr=subprocess.STDOUT,
+                            start_new_session=True)
+    while time.time() - t < 1500:
+        text = LOG.read_text(errors="replace") if LOG.exists() else ""
+        if proc.poll() is not None or "EngineCore failed" in text:
+            break
+        try:
+            urllib.request.urlopen("http://127.0.0.1:1234/v1/models", timeout=5)
+            print(f"server ready after {time.time() - t:.0f}s", flush=True)
+            return proc
+        except Exception:
+            time.sleep(10)
+    print("server FAILED to start; tail:\n" + "\n".join(
+        LOG.read_text(errors="replace").splitlines()[-30:]), flush=True)
+    kill(proc)
+    return None
+
+
+def kill(proc):
+    """Kill the server's whole process group -- engine workers hold GPU memory -- and wait
+    for the GPUs to drain, so a restart does not hit out-of-memory."""
+    import signal
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        proc.kill()
+    try:
+        proc.wait(timeout=60)
+    except Exception:
+        pass
+    for _ in range(36):
+        used = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                              capture_output=True, text=True).stdout.split()
+        if used and all(int(u) < 1500 for u in used if u.strip().isdigit()):
+            return
+        time.sleep(5)
+
+
+def server_ladder(cfg):
+    """Option sets to try in order. An explicit cfg["server_ladder"] wins (plain serving is
+    appended if missing); otherwise server_extra + server_try -> server_extra -> plain."""
+    if cfg.get("server_ladder"):
+        ladder = [list(x) for x in cfg["server_ladder"]]
+        return ladder if [] in ladder else ladder + [[]]
+    base = cfg.get("server_extra", [])
+    ladder = [base + cfg["server_try"]] if cfg.get("server_try") else []
+    return ladder + [base] + ([[]] if base else [])
+
+
+def main(cfg):
+    proc = None
+    try:
+        install(cfg)
+        # A ladder of server option sets, most ambitious first; the last is plain serving.
+        # Untested-on-L4 options (MTP, --reasoning-config) must never cost the whole run.
+        ladder = server_ladder(cfg)
+        for i, extra in enumerate(ladder):
+            proc = start_server(cfg, extra)
+            if proc is not None:
+                print(f"server up with option set {i}: {extra}", flush=True)
+                break
+            print(f"option set {i} failed -> next", flush=True)
+            time.sleep(20)
+        if proc is None:
+            return
+        sys.path.insert(0, HERE)
+        import run_submit
+        run_submit.main(dict(cfg, base_url="http://127.0.0.1:1234/v1", model="qwen"))
+    except BaseException:
+        print("submit_main caught:\n" + traceback.format_exc(), flush=True)
+    finally:
+        if proc is not None:
+            kill(proc)
+        shutil.rmtree(SITE, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    try:
+        main(json.loads(sys.argv[1]))
+    except BaseException:
+        print(traceback.format_exc(), flush=True)
+    sys.exit(0)
+
+import json, os, subprocess, sys, time
+from pathlib import Path
+START = float(Path("/kaggle/working/start_epoch.txt").read_text())
+cfg = json.loads(r"""{"model_glob": "/kaggle/input/**/qwen3-8-27b-fp8-repacked-v1/**/config.json", "overlay": "/kaggle/input/**/taaf-duck-qwen38-serving-v1/serving_wheels/*.whl", "parsers": ["--tool-call-parser", "qwen3_coder", "--reasoning-parser", "qwen3"], "server_ladder": [["--reasoning-config", "{\"reasoning_start_str\": \"<think>\", \"reasoning_end_str\": \"</think>\"}", "--kv-cache-dtype", "fp8", "--language-model-only", "--speculative-config", "{\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": 2}"], ["--reasoning-config", "{\"reasoning_start_str\": \"<think>\", \"reasoning_end_str\": \"</think>\"}", "--kv-cache-dtype", "fp8", "--speculative-config", "{\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": 2}"], ["--reasoning-config", "{\"reasoning_start_str\": \"<think>\", \"reasoning_end_str\": \"</think>\"}", "--kv-cache-dtype", "fp8", "--speculative-config", "{\"method\": \"mtp\", \"num_speculative_tokens\": 2}"], ["--reasoning-config", "{\"reasoning_start_str\": \"<think>\", \"reasoning_end_str\": \"</think>\"}", "--kv-cache-dtype", "fp8"], ["--reasoning-config", "{\"reasoning_start_str\": \"<think>\", \"reasoning_end_str\": \"</think>\"}"], []], "max_model_len": 131072, "max_num_seqs": 16, "mode": "direct", "samples": 2, "concurrency": 16, "min_start_s": 600, "template_kwargs": {"reasoning_effort": "xhigh"}, "temperature": 1.0, "top_p": 0.95, "top_k": 20, "thinking_token_budget": 98304, "max_tokens": 106496, "rescue_tokens": 8192, "tok_per_s": 140}""")
+cfg["deadline_epoch"] = START + 12 * 3600 - 35 * 60        # 35 min reserve inside the 12 h limit
+RERUN = os.environ.get("KAGGLE_IS_COMPETITION_RERUN", "").strip().lower() in {"1", "true"}
+if not RERUN:
+    # A version is only submittable once a run has produced submission.json. The save run
+    # therefore writes the fallback and stops here (a minute of quota); the agent itself
+    # runs only in the competition rerun, which does not bill quota.
+    print("not a competition rerun: fallback submission only, agent skipped")
+else:
+    try:
+        rc = subprocess.run([sys.executable, "/kaggle/working/agent/submit_main.py", json.dumps(cfg)],
+                            timeout=max(60, cfg["deadline_epoch"] + 15 * 60 - time.time())).returncode
+        print("submit_main exit code", rc)
+    except Exception as e:
+        print("submit_main did not finish cleanly:", repr(e))
+
+# Last line of defence: a malformed file is replaced by the fallback.
+import json, glob
+try:
+    ch = json.load(open(glob.glob("/kaggle/input/**/arc-agi_test_challenges.json", recursive=True)[0]))
+    sub = json.load(open("/kaggle/working/submission.json"))
+    def ok_grid(g):
+        return (isinstance(g, list) and g and all(isinstance(r, list) and r and len(r) == len(g[0]) for r in g)
+                and all(isinstance(v, int) and 0 <= v <= 9 for r in g for v in r))
+    bad = [t for t, task in ch.items()
+           if t not in sub or len(sub[t]) != len(task["test"])
+           or not all(ok_grid(r.get("attempt_1")) and ok_grid(r.get("attempt_2")) for r in sub[t])]
+    if bad:
+        print("INVALID rows for", len(bad), "tasks -> fallback for those")
+        for t in bad:
+            sub[t] = [{"attempt_1": x["input"], "attempt_2": x["input"]} for x in ch[t]["test"]]
+        json.dump(sub, open("/kaggle/working/submission.json", "w"))
+    changed = sum(r["attempt_1"] != x["input"] for t in ch for r, x in zip(sub[t], ch[t]["test"]))
+    print(f"submission.json valid: {len(sub)} tasks, {changed} test outputs answered by the agent")
+except Exception as e:
+    print("validation error:", repr(e))

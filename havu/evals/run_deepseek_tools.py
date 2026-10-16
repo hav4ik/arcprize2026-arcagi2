@@ -11,7 +11,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 from uuid import uuid4
 
@@ -348,6 +348,12 @@ def lenient_parse(text):
     return best
 
 
+def compat_extra_body(args, think):
+    """--base-url (OpenAI-compatible self-hosted server): request extras from --extra-body / --extra-body-nothink."""
+    body = dict(json.loads(args.extra_body or "{}") if think else json.loads(args.extra_body_nothink or args.extra_body or "{}"))
+    return body
+
+
 class TurnError(RuntimeError):
     def __init__(self, message, assistant, usage, finish):
         super().__init__(message)
@@ -363,8 +369,9 @@ def turn(client, args, messages, max_tokens, final=False, think=True):
             model=args.model, messages=messages, tools=tools_for(args),
             tool_choice="none" if final else "auto", max_tokens=max_tokens, stream=True,
             stream_options={"include_usage": True},
-            extra_body=({"reasoning_effort": args.effort, "thinking": {"type": "enabled"}} if think
-                        else {"thinking": {"type": "disabled"}}),
+            extra_body=(compat_extra_body(args, think) if getattr(args, "base_url", None) else
+                        ({"reasoning_effort": args.effort, "thinking": {"type": "enabled"}} if think
+                         else {"thinking": {"type": "disabled"}})),
         )
         for chunk in stream:
             if chunk.usage is not None:
@@ -375,7 +382,7 @@ def turn(client, args, messages, max_tokens, final=False, think=True):
             d = choice.delta
             if d is not None:
                 content.append(d.content or "")
-                reasoning.append(getattr(d, "reasoning_content", None) or "")
+                reasoning.append(getattr(d, "reasoning_content", None) or (d.model_extra or {}).get("reasoning") or "")
                 for tc in d.tool_calls or []:
                     call = calls.setdefault(tc.index, {"id": "", "type": "function",
                                                       "function": {"name": "", "arguments": ""}})
@@ -407,7 +414,7 @@ def add_usage(total, usage):
 
 
 def estimated_cost(total, model, multiplier):
-    hit, miss, output = PRICES[model]
+    hit, miss, output = PRICES.get(model, (0.0, 0.0, 0.0))
     return multiplier * (total["cache_hit"] * hit + max(0, total["prompt"] - total["cache_hit"]) * miss
                          + total["completion"] * output) / 1e6
 
@@ -669,7 +676,12 @@ def summarize(records, tasks, attempts):
 
 def parser():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", default="deepseek-flash", choices=list(PRICES))
+    ap.add_argument("--model", default="deepseek-flash",
+                    help="DeepSeek model id, or the served model name of a --base-url server")
+    ap.add_argument("--base-url", help="self-hosted OpenAI-compatible server(s), comma-separated; each attempt is "
+                    "pinned to one server (data parallel). Skips the DeepSeek balance/cost guards")
+    ap.add_argument("--extra-body", help="JSON request extras for --base-url (e.g. sampling, chat_template_kwargs)")
+    ap.add_argument("--extra-body-nothink", help="JSON request extras for non-thinking turns (default: --extra-body)")
     ap.add_argument("--effort", default="max", choices=["low", "high", "max"])
     ap.add_argument("--mode", default="grid", choices=["grid", "code"])
     ap.add_argument("--prompt", default="plain", choices=list(PROMPT_SUFFIXES))
@@ -798,8 +810,9 @@ def main():
     if policy:
         jobs += [(t, p, 2) for t, task in tasks.items() for p in range(len(task["test"]))
                  if (pairs is None or (t, p) in pairs) and needs_extra(t, p)]
-    output_cap = len(jobs) * args.max_total_output * PRICES[args.model][2] * args.price_multiplier / 1e6
-    expected = len(jobs) * 65000 * PRICES[args.model][2] * args.price_multiplier / 1e6
+    price_out = PRICES.get(args.model, (0.0, 0.0, 0.0))[2]
+    output_cap = len(jobs) * args.max_total_output * price_out * args.price_multiplier / 1e6
+    expected = len(jobs) * 65000 * price_out * args.price_multiplier / 1e6
     print(f"{len(tasks)} tasks, {len(jobs)} remaining attempts, {args.workers} workers -> {out}", flush=True)
     print(f"Output-only estimate at 65k tokens/attempt: ${expected:.2f}; budget cap ${output_cap:.2f} "
           f"(price multiplier {args.price_multiplier:g}). Multi-turn input costs are additional.", flush=True)
@@ -813,6 +826,8 @@ def main():
     if not args.sandbox_url:
         ap.error("Pass --sandbox-url or ARC_SANDBOX_URL from evals/sandbox_docker/start.sh")
     check_health(args.sandbox_url)
+    if args.base_url:
+        return run_compat(args, tasks, jobs, records, latest, out, config, policy, needs_extra)
     key = api_key()
     balance = deepseek_balance(key)
     print(f"DeepSeek balance ${balance:.2f}; stop launching below ${args.max_balance_stop:.2f}", flush=True)
@@ -882,6 +897,44 @@ def main():
                         futures[executor.submit(work, rec["task_id"], rec["pair"], 2)] = (rec["task_id"], rec["pair"], 2)
                         total_jobs += 1
                     report(rec, index, total_jobs)
+    summarize(records, tasks, args.attempts)
+
+
+def run_compat(args, tasks, jobs, records, latest, out, config, policy, needs_extra):
+    """Self-hosted OpenAI-compatible servers (--base-url, comma-separated): each attempt is pinned to one server by a
+    hash of (task, pair, attempt), so every turn of a conversation reuses that server's prefix cache (data parallel)."""
+    import hashlib
+    urls = [u.strip() for u in args.base_url.split(",") if u.strip()]
+    clients = [OpenAI(api_key="none", base_url=u, timeout=7200, max_retries=0) for u in urls]
+    trace_dir = out.with_suffix("")
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    lock = threading.Lock()
+
+    def work(t, p, a):
+        task = tasks[t]
+        client = clients[int(hashlib.md5(f"{t}:{p}:{a}".encode()).hexdigest(), 16) % len(clients)]
+        rec = {"task_id": t, "pair": p, "attempt": a, "model": args.model, "effort": args.effort, "mode": args.mode,
+               "config": config, "base_url": str(client.base_url)}
+        trace, result = solve(client, args, task, task["test"][p]["input"])
+        path = trace_dir / f"{t}_p{p}_a{a}_{uuid4().hex[:8]}.messages.json.gz"
+        with gzip.open(path, "wt") as f:
+            json.dump(trace, f)
+        rec.update(result, trace_path=str(path))
+        if "output" in task["test"][p]:
+            rec["correct"] = rec["pred"] == task["test"][p]["output"]
+        with lock, out.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+            f.flush()
+        return rec
+
+    with ThreadPoolExecutor(args.workers) as executor:
+        futures = [executor.submit(work, *job) for job in jobs]
+        for i, fut in enumerate(as_completed(futures), 1):
+            rec = fut.result()
+            records.append(rec)
+            report(rec, i, len(jobs))
+    for c in clients:
+        c.close()
     summarize(records, tasks, args.attempts)
 
 
