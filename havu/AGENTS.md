@@ -17,6 +17,16 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
   export KAGGLE_API_TOKEN="$(sed -n 's/^kaggle_api_token:[[:space:]]*//p' SECRETS.yaml | tr -d "\"' ")"
   ```
 
+## GitHub snapshot
+
+- The workspace is mirrored into the private repo `hav4ik/arcprize2026-arcagi2` under `havu/`. The local clone is `/home/vu/Workspace/arcprize2026-arcagi2`.
+- Sync with `data_tools/sync_github.sh`:
+  - with no arguments it mirrors, stages and secret-scans (`data_tools/secret_scan.py`), then shows the diff;
+  - with a message (`"havu: ..."`) it also commits and pushes to main.
+- What it leaves out: `data/`, `.venv`, `SECRETS.yaml` and `ENDPOINTS.yaml` are never synced, and the repo's `.gitignore` skips `*.log`, `*.pid` and vendor copies.
+- Commits are unsigned, as in the history, because GPG cannot prompt from agent shells. Push only when the user asks.
+- E025 rollouts are also on Hugging Face as the private dataset `livobereshka/arc-agi2-deepseek-v3-rollouts-e025`. The org is `livobereshka`, spelled with an "s"; the token is `huggingface_api_key` in `SECRETS.yaml`.
+
 ## Environment
 
 - Python venv is at `.venv`, managed with [uv](https://docs.astral.sh/uv/).
