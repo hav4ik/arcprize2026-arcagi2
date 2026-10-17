@@ -96,6 +96,10 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
   - Tests: `evals/tests/test_qwen_tools.py`, `evals/tests/test_qwen_program.py`. Cache-health logger: `evals/sglang_cache_monitor.py`. Results: `experiments/E019_qwen_program_answers/README.md`.
 - **Self-hosted serving for tool use (rule):** agentic, multi-turn tool use re-sends the whole growing transcript on every turn (typically 20–80k tokens, ~15 turns per attempt). So:
   - **Prefix caching is mandatory.** Use vLLM `--enable-prefix-caching` or SGLang's radix cache. Never benchmark, tune or submit a tool-use configuration with it off: throughput or KV numbers measured with it off do not transfer.
+  - **Hybrid models (Qwen3.5/3.8 DeltaNet layers) on vLLM ≥ 0.31: pass `--mamba-cache-mode align`.**
+    - vLLM 0.31 defaults `mamba_cache_mode` to `"none"`, where cached prefixes are mostly unusable for the DeltaNet state. In E027, prefix-cache hits fell to ~62% (vs ~86% on 0.23), prompt recompute doubled, and generation fell ~40%.
+    - vLLM 0.23 enables align mode by itself. Check that the server log says `Mamba cache 'align' mode is currently enabled`.
+    - With speculative decoding (MTP), align mode is where the cached-state bug lived, so re-check accuracy whenever the two are combined (`experiments/E027_l4_throughput/README.md`).
   - **Choose the continuous-batching size (concurrency) by cache health, not just KV capacity.**
     - Too many concurrent attempts evict each other's cached prefixes, and every turn then re-prefills from scratch.
     - When sizing concurrency, measure the prefix-cache hit rate and evictions/preemptions on a realistic multi-turn replay (E014).
