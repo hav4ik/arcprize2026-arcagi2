@@ -216,3 +216,20 @@ GPU busy 96–97% of the window. **On this box, TP4 decode spends more time in a
   - A re-run with explicit `--mamba-cache-mode align` (`p31_mtp2_align_c20`) gave the same numbers: hits 62.5%, generation 152 tok/s, prompt 402 tok/s, acceptance 2.37.
 - **Open: why 0.31 hits less than 0.23 on this workload.** The same-version no-MTP probe (`p31_base_align_c24`, queued) will separate a vLLM-version effect from an MTP effect (e.g., speculative tokens making fewer blocks cacheable). E023 already saw worse cache hits on 0.31 without MTP.
 - The RTX 6000 full evals (e6_base, e6_mtp2, e6_tq) used align by default: accuracy comparisons are valid; their low hit rates (44–61%) come from the same open issue.
+
+### Full-eval results: MTP2 vs baseline on vLLM 0.31 (1× RTX PRO 6000 each, 172 pairs, 2026-10-17 04:36 UTC)
+
+| Run | Score (120 tasks) | Pairs correct | Box tok/s | Concurrency | Per-attempt tok/s | Prefix-cache hits | Tokens per attempt | Cap hits |
+|---|---|---|---|---|---|---|---|---|
+| e6_base (no MTP) | **50.50 (42.1%)** | 70 | **362** | 32 | 12.96 | 58.5% | 37.0k | 82 |
+| e6_mtp2 | 48.00 (40.0%) | 64 | 334 | 28 | 13.72 | 47.8% | 36.6k | 79 |
+
+**MTP2 accuracy is a statistical tie:** paired MTP-only 17 vs baseline-only 23, McNemar p = 0.43, no extra tokens. The vLLM 0.23 MTP failure (14.6% vs 39.6% on the probe) does not reproduce on 0.31.
+
+**MTP2 does not raise throughput on real tool traffic:**
+- Per-attempt speed +6%, but the box is 8% slower overall: KV for the draft forces lower concurrency (28 vs 32), and prefix hits drop a further ~11 points.
+- The L4 probe agrees: ~150 tok/s with MTP2 on 0.31, against v4b's ~200 on 0.23.
+
+**vLLM 0.31's prefix caching is the bottleneck, with or without MTP.** The no-MTP baseline reaches only 58.5% hits, against ~86% on vLLM 0.23 for the same agent (E023 run B; Kaggle v4b 85.4%).
+
+**Decision:** keep v4b on vLLM 0.23 without MTP. Revisit MTP on a vLLM version with both the MTP fix and 0.23-level prefix reuse, after finding what changed between 0.23 and 0.31.
