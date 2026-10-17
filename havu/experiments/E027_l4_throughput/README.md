@@ -255,3 +255,29 @@ Tuning changes kernel tiling only, not the arithmetic, so accuracy is unaffected
 ### TurboQuant `k8v4` full-eval accuracy (RTX box C, vLLM 0.31, concurrency 40; stopped at 129 of 172 pairs)
 
 56 vs 57 correct on 129 shared pairs against e6_base (TurboQuant-only 17, baseline-only 18, p = 1.00); 35.0k vs 35.9k tokens per attempt. **No accuracy cost.** It was not pursued further, because it only mattered as KV room for MTP, and on Kaggle KV is not the binding constraint at concurrency 24. Box C was destroyed with partial results.
+
+### Transcript compaction full eval (RTX box B, vLLM 0.31, concurrency 32, `ARC_COMPACT_AT=24000`, keep 2, tool outputs cut to 1,500 chars)
+
+| Run | Score (120 tasks) | Pairs correct | Box tok/s | Prompt tokens (total) | Prefix hits | Tokens per attempt |
+|---|---|---|---|---|---|---|
+| e6_base | 50.50 | 70 | 362 | 69.2M | 58.5% | 37.0k |
+| e6_compact | **44.50** | **60** | **329** | 56.5M (−18%) | 49.3% | 37.8k |
+
+Paired: compact-only 16, baseline-only 26, McNemar p = 0.16. Compaction sent 18% fewer prompt tokens, but each compaction forces a full re-prefill (the hit rate drops), the model spends slightly more tokens, and accuracy trends down. **Rejected in this form.** The solver's attempt records do not carry the agent's `compactions` counter; the prompt-token drop shows it ran.
+
+### vLLM 0.31 no-MTP tool probe on L4 (`p31_base_align_c24`, concurrency 24, NCCL default)
+
+| L4 probe (48 pairs, 120 min) | Score | tok/s | Prefix hits |
+|---|---|---|---|
+| vLLM 0.23 v4b (E023 run B) | 13.33 / 35 | **201** | 86.7% |
+| vLLM 0.31, no MTP | 8.83 / 35 | 154 | 70.9% |
+| vLLM 0.31, MTP2 (c20) | 6.50 / 35 | 134 | 58.6% |
+
+**vLLM 0.31 itself is ~23% slower than 0.23 on this tool traffic** (lower prefix reuse), and MTP2 lowers it further. Stay on vLLM 0.23. Finding the 0.23 → 0.31 caching regression is an open item for any later upgrade.
+
+## Final status (2026-10-17 18:30 UTC)
+
+- **Kept:** tuned FP8 GEMM configs (decode +7–25% on L4, accuracy-neutral) → Kaggle notebook v4d (`kaggle/nb_probe_v4d`), awaiting a Kaggle probe.
+- **Rejected:** 4-bit weights, GGUF/llama.cpp, ternary Bonsai, Triton W8A8 instead of Marlin, async scheduling, bigger prefill chunks, NCCL P2P on Kaggle, pipeline parallelism, MTP2 on vLLM 0.31 (accuracy tie, slower on real traffic), MTP2 + TurboQuant (broken), transcript compaction (accuracy trend down, no throughput gain).
+- **Neutral:** TurboQuant `k8v4` (accuracy tie; KV +26%, only useful if KV becomes binding).
+- **Boxes:** RTX A/B/C/D destroyed; L4 box 55889595 stopped (not destroyed) at 18:25 UTC. It was idle ~9 h after the last probe (~$12).
