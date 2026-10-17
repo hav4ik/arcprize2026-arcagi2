@@ -281,3 +281,20 @@ Paired: compact-only 16, baseline-only 26, McNemar p = 0.16. Compaction sent 18%
 - **Rejected:** 4-bit weights, GGUF/llama.cpp, ternary Bonsai, Triton W8A8 instead of Marlin, async scheduling, bigger prefill chunks, NCCL P2P on Kaggle, pipeline parallelism, MTP2 on vLLM 0.31 (accuracy tie, slower on real traffic), MTP2 + TurboQuant (broken), transcript compaction (accuracy trend down, no throughput gain).
 - **Neutral:** TurboQuant `k8v4` (accuracy tie; KV +26%, only useful if KV becomes binding).
 - **Boxes:** RTX A/B/C/D destroyed; L4 box 55889595 stopped (not destroyed) at 18:25 UTC. It was idle ~9 h after the last probe (~$12).
+
+### Why MTP + TurboQuant breaks, and why vLLM 0.31 reuses less cache (2026-10-17 ~18:45 UTC)
+
+**MTP + TurboQuant is a known open upstream bug.** [vllm#53180](https://github.com/vllm-project/vllm/issues/53180) reports degenerate output and collapsed MTP acceptance for `turboquant_k8v4` + MTP on Qwen3.8-27B hybrids on stock v0.27.1, reproduced on SM89 and SM86. We saw the same: 19 of 64 degenerate outputs, acceptance 2.81 → 2.17.
+- **Suspected cause:** `TurboQuantMetadataBuilder` declares `UNIFORM_BATCH` cudagraph support and also `supports_spec_as_decode=False`, so spec-decode verify batches are full-graph captured on the wrong path.
+- **Fix status:** PR #53406 ("Do not FULL-capture spec-decode batches in TurboQuant attention backend") is open. Earlier reports (#40831, #40880) were closed via downstream patches.
+- **Workaround test queued:** PIECEWISE CUDA graphs and `--enforce-eager` (`chain_fill2.sh`).
+
+**vLLM 0.31's lower prefix reuse: likely the hybrid align-mode design.**
+- [vllm#45238](https://github.com/vllm-project/vllm/issues/45238): align mode keeps one Mamba (DeltaNet) checkpoint per request, "at the last block boundary before the prompt ends", and `HybridKVCacheCoordinator` requires every group to hit, so a Mamba miss vetoes the attention hits.
+- For our agent, turn k+1's prompt is turn k's prompt plus turn k's generated tokens. If only the prompt-end checkpoint exists, the generated tokens (often thousands) are recomputed every turn. That fits 0.31's ~2× prompt recompute and 60–71% hits against 0.23's ~86%.
+- Partial mitigations exist (#43447 retention interval, #37898 admission), plus an experimental `--prefix-match-unit` that reportedly backfires with MTP. The issue is open.
+- **Direct test queued:** `cache_probe.py` checks whether turn 2 reuses turn 1's generated tokens on 0.23, 0.31 and 0.31 + MTP2, using the server's prefix-cache counters.
+
+**MTP + prefix caching accuracy on hybrids:** [vllm#53912](https://github.com/vllm-project/vllm/issues/53912) reports ~1% corrupted outputs through v0.30, scaling with cache hits. Partial fixes: #50729 merged in 0.28.1; #48375 and #53919 open. Our full eval (64 vs 70 of 172, p = 0.43) is consistent with a low-rate effect.
+
+**Harness tokenization is stable** (`tok_check.py`, 25 real transcripts from e6_base, 257 turn boundaries): every turn-k prompt tokenizes to an exact prefix of turn k+1. transformers 4.57.6 (vLLM 0.23 env) and 5.17.0 (vLLM 0.31 env) give identical token ids (hash `a5891fcf7d00`). So turn boundaries and the tokenizer upgrade don't cost cache hits. Not yet tested: whether generated token ids equal the re-tokenized text of the next turn; `cache_probe.py` covers that indirectly.
