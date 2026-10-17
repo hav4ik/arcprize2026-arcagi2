@@ -203,12 +203,16 @@ GPU busy 96–97% of the window. **On this box, TP4 decode spends more time in a
 - Under PP4, per-request speed is flat at ~3.2 tok/s at every batch size: each decode step takes ~0.31 s regardless of load, so stages don't overlap across micro-batches in vLLM 0.23.
 - Decode dominates tool traffic, so PP loses. A prefill/decode split (disaggregated serving) would be needed to use the prefill gain.
 
-### vLLM 0.31 prefix caching for hybrid models: `mamba_cache_mode` defaults to "none" (2026-10-17 03:15 UTC)
+### vLLM 0.31 prefix caching: lower hit rate on tool traffic (cause open)
 
-- **First real-traffic MTP2 probe on L4** (`p31_mtp2_c20`: vLLM 0.31, MTP2, concurrency 20, no cache-mode flag), first ~65 min: mean generation **147 tok/s**, computed prompt tokens 412 tok/s, prefix-cache hit rate **61.6%**, MTP acceptance 2.3–2.5.
-- **Kaggle v4b** (vLLM 0.23), same window: generation 246 tok/s, computed prompt 220 tok/s, hits ~85–87%.
-- **Cause:** vLLM 0.23 logs `Mamba cache 'align' mode is currently enabled` (DeltaNet states saved at block boundaries, which is what makes prefix caching work for this hybrid model). vLLM 0.31's `CacheConfig.mamba_cache_mode` defaults to `"none"`, and our 0.31 runs did not set it. They recomputed ~2× the prompt tokens, which swallowed MTP's per-step gain. This also explains E023's "vLLM 0.31: worse cache hits than 0.23".
-- **Re-test with `--mamba-cache-mode align`:**
-  - L4 probes `p31_mtp2_align_c20` and `p31_base_align_c24`.
-  - Full-eval accuracy `e6_mtp2_align` on RTX box A. **align + speculative decoding is exactly where the remembered bug lived** (wrong DeltaNet state committed to the cache), so this is the decisive accuracy check.
-- The RTX 6000 full evals so far (e6_base, e6_mtp2, e6_tq) ran with mode "none": accuracy comparisons are valid, cache hits are not representative.
+- **Observation:** the first real-traffic MTP2 probe on L4 (`p31_mtp2_c20`: vLLM 0.31, MTP2, concurrency 20), first ~65 min:
+  - mean generation **147 tok/s**;
+  - computed prompt tokens 412 tok/s;
+  - prefix-cache hit rate **61.6%**;
+  - MTP acceptance 2.3–2.5.
+- **Comparison:** Kaggle v4b (vLLM 0.23), same window: generation 246 tok/s, computed prompt 220 tok/s, hits ~85–87%. The 0.31 run recomputed ~2× the prompt tokens, which swallowed MTP's per-step gain.
+- **Retracted hypothesis (03:15 → 04:35 UTC):** I first blamed `mamba_cache_mode` defaulting to `"none"` in 0.31. That was wrong.
+  - vLLM 0.31 logs `Mamba cache mode is set to 'align' for Qwen3_5ForConditionalGeneration by default when prefix caching is enabled`. My log search used 0.23's wording and missed it.
+  - A re-run with explicit `--mamba-cache-mode align` (`p31_mtp2_align_c20`) gave the same numbers: hits 62.5%, generation 152 tok/s, prompt 402 tok/s, acceptance 2.37.
+- **Open: why 0.31 hits less than 0.23 on this workload.** The same-version no-MTP probe (`p31_base_align_c24`, queued) will separate a vLLM-version effect from an MTP effect (e.g., speculative tokens making fewer blocks cacheable). E023 already saw worse cache hits on 0.31 without MTP.
+- The RTX 6000 full evals (e6_base, e6_mtp2, e6_tq) used align by default: accuracy comparisons are valid; their low hit rates (44–61%) come from the same open issue.
