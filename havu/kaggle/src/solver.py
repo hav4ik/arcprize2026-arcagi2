@@ -79,6 +79,9 @@ FEEDBACK = os.environ.get("ARC_FEEDBACK", "basic")  # program mode: basic | rich
 TURN_THINK_CAP = envf("ARC_TURN_THINK_CAP", 0)      # E020: thinking tokens per turn before the "run code" nudge
 TURN_THINK_GRACE = envf("ARC_TURN_THINK_GRACE", 2048)  # then close the thinking into a run_python call
 THINK_CALL_RESCUE = envf("ARC_THINK_CALL_RESCUE", 1)  # E020/E021: after a nudge, run a <tool_call> written inside
+COMPACT_AT = envf("ARC_COMPACT_AT", 0)            # E027: compact transcripts past this many tokens (0 = off)
+COMPACT_KEEP = envf("ARC_COMPACT_KEEP", 2)        # E027: recent turns left untouched by a compaction
+COMPACT_TOOL_CHARS = envf("ARC_COMPACT_TOOL_CHARS", 1500)  # E027: older tool outputs cut to this length
                                                     # still-open thinking (only acts with the think cap on)
 FREE_ATTEMPT2 = envf("ARC_FREE_ATTEMPT2", 0)        # 1: attempt_2 from the attempt's own alternatives (no tokens)
 ATTEMPT2 = os.environ.get("ARC_ATTEMPT2", "legacy")  # legacy (v2/v1 rule) | off | gated (E021)
@@ -799,6 +802,8 @@ def agent_options(fields):
             opt["think_call_rescue"] = True
     if FREE_ATTEMPT2:
         opt["record_alternatives"] = True
+    if COMPACT_AT:  # E027 (opt-in)
+        opt.update(compact_at=int(COMPACT_AT), compact_keep=int(COMPACT_KEEP), compact_tool_chars=int(COMPACT_TOOL_CHARS))
     if (FREE_ATTEMPT2 or ATTEMPT2 == "gated") and TOOLS_ANSWER_MODE != "program":
         opt["record_train_check"] = True  # train check of the submitted expression (ranking, retry gating)
     return {k: v for k, v in opt.items() if k in fields}

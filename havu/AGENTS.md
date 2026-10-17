@@ -114,6 +114,12 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
   - Pool operation: `--worker-slots auto:N` (harness-side per-box slots, direct worker URLs; the gateway ignores `x-smg-target-worker`), `--request-timeout 1200`, `--session-mem-mb 2048`; see `experiments/E019_qwen_program_answers/router/README.md`.
   - Never put "sglang" in eval command lines (use `--base-url`): other agents' `pkill -f sglang` killed every run once.
   - Offline selection vs k: `experiments/E020_qwen_harness_80/select_sim.py`. Launcher: `experiments/E020_qwen_harness_80/launch.sh`.
+- **E027 throughput findings for 4×L4 (`experiments/E027_l4_throughput/README.md`):**
+  - **Kaggle hardware:** 4×L4 is only available to notebooks attached to the ARC-AGI-2 competition (otherwise the push silently gets 2×T4). The links are PCIe Gen3, and NCCL's default SHM all-reduce runs at ~4.9 GB/s.
+  - **Never set `NCCL_P2P_LEVEL=SYS` on Kaggle:** P2P there is ~12× slower than SHM. It helps only on the Vast box.
+  - **Rejected:** 4-bit weights (INT4/AWQ) lose tool accuracy; pipeline parallelism is slower on decode; MTP2 + TurboQuant KV produces broken text on vLLM 0.31.
+  - **Promising:** MTP2 on vLLM 0.31.
+  - **Transcript compaction (opt-in, off by default):** `AgentConfig.compact_at/compact_keep/compact_tool_chars`, solver `ARC_COMPACT_AT/ARC_COMPACT_KEEP/ARC_COMPACT_TOOL_CHARS`. It empties earlier turns' thinking and cuts old tool outputs once per +50% transcript growth. Tests: `evals/tests/test_qwen_tools.py` `CompactTest`.
 - **Never kill processes by name on this host.** `pkill -f` patterns such as `sglang` or `vllm` also match other agents'
   eval runs and the SGLang gateway (E021 incident, 2026-10-12: a test of the Kaggle emergency writer killed E020's runs).
   In `kaggle/`, the emergency writer, the notebook guard cell and `kill_server` use name patterns **only on Kaggle**

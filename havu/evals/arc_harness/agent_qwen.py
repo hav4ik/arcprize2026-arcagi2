@@ -201,6 +201,10 @@ class AgentConfig:
     worked_example: bool = False    # append the worked_example.txt workflow demo (ARC training task; needs --helpers)
     record_alternatives: bool = False  # bookkeeping: other test grids of the attempt (free attempt_2), no tokens
     think_call_rescue: bool = False  # after a think nudge, a complete <tool_call> inside open thinking is executed
+    # E027 (opt-in): one-time transcript compaction to cut KV, prefill and attention cost of long attempts.
+    compact_at: int = 0             # estimated prompt tokens that trigger a compaction (0 = off); again after +50%
+    compact_keep: int = 2           # most recent assistant turns / tool-response messages left untouched
+    compact_tool_chars: int = 1500  # older tool responses are cut to this many characters
 
 
 # ---------------------------------------------------------------- rendering (Qwen3.8 chat template, tools on)
@@ -286,6 +290,40 @@ def initial_prompt(train, test_input, cfg, note=None):
     return render_system(cfg.tier, tool_specs(cfg)) + render_user(
         user_content(train, test_input, cfg.prompt, cfg.helpers, cfg.task_summary, cfg.worked_example)
         + (note or "")) + GEN_PROMPT
+
+
+_SEG = "<|im_start|>"
+_THINK_BODY = re.compile(r"(<\|im_start\|>assistant\n<think>\n).*?(\n?</think>)", re.DOTALL)
+_TOOL_RESP = re.compile(r"(<tool_response>\n)(.*?)(\n</tool_response>)", re.DOTALL)
+
+
+def compact(prompt, keep=2, tool_chars=1500):
+    """E027: the transcript with the thinking of all but the last `keep` finished assistant turns emptied (the
+    rendering Qwen's chat template uses for past turns) and tool responses in all but the last `keep` tool messages
+    cut to `tool_chars` characters. The system prompt, the task message, nudges, tool calls, assistant replies
+    and the open turn at the end are kept verbatim. Returns (new_prompt, characters_removed)."""
+    parts = prompt.split(_SEG)
+    head, segs = parts[0], [_SEG + p for p in parts[1:]]
+    done_asst = [i for i, s in enumerate(segs) if s.startswith(_SEG + "assistant\n") and s.endswith("<|im_end|>\n")]
+    tool_msgs = [i for i, s in enumerate(segs) if s.startswith(_SEG + "user") and "<tool_response>" in s]
+    old_asst = set(done_asst[:-keep] if keep else done_asst)
+    old_tool = set(tool_msgs[:-keep] if keep else tool_msgs)
+
+    def cut(m):
+        body = m.group(2)
+        if len(body) <= tool_chars or body.endswith(" characters cut]"):  # short, or cut by an earlier compaction
+            return m.group(0)
+        return m.group(1) + body[:tool_chars] + f"\n[... {len(body) - tool_chars} characters cut]" + m.group(3)
+
+    out = []
+    for i, s in enumerate(segs):
+        if i in old_asst:
+            s = _THINK_BODY.sub(lambda m: m.group(1) + "\n</think>", s, count=1)
+        elif i in old_tool:
+            s = _TOOL_RESP.sub(cut, s)
+        out.append(s)
+    new = head + "".join(out)
+    return new, len(prompt) - len(new)
 
 
 # ---------------------------------------------------------------- parsing
@@ -532,6 +570,7 @@ async def solve(llm, make_executor, train, test_input, cfg, note=None):
     cache = {"prompt": 0, "cached": 0, "ideal": 0, "reported": 0, "last": ""}
     last_solve_cell, servers = None, {}
     think_stats = {"nudges": 0, "forced": 0, "rescued": 0}
+    compact_state = {"n": 0, "removed": 0, "next": cfg.compact_at}  # E027
     confirm = {"shown": None}
 
     async def complete(text, max_tokens, stop_strings=None):
@@ -605,6 +644,18 @@ async def solve(llm, make_executor, train, test_input, cfg, note=None):
                     stop = "max_turns"
                     break
                 turns += 1
+                if cfg.compact_at and turns > 1:  # E027: compact a long transcript once per +50% growth
+                    est = estimate_tokens(known_tokens, known_chars, prompt)
+                    if est > compact_state["next"]:
+                        new_prompt, removed = compact(prompt, cfg.compact_keep, cfg.compact_tool_chars)
+                        if removed > 0:
+                            ratio = len(new_prompt) / max(1, len(prompt))
+                            prompt, known_tokens, known_chars = new_prompt, int(est * ratio), len(new_prompt)
+                            compact_state["n"] += 1
+                            compact_state["removed"] += removed
+                        compact_state["next"] = max(cfg.compact_at,
+                                                    estimate_tokens(known_tokens, known_chars, prompt)
+                                                    + cfg.compact_at // 2)
                 text, low_streak, after_eos, out_of_budget = "", 0, False, None
                 turn_tokens = 0
                 nudge_at, act_forced, nudge_pos = None, False, 0  # E020 per-turn thinking cap state
@@ -844,6 +895,8 @@ async def solve(llm, make_executor, train, test_input, cfg, note=None):
         result["think_nudges"], result["think_forced"] = think_stats["nudges"], think_stats["forced"]
         if cfg.think_call_rescue:
             result["think_call_rescued"] = think_stats["rescued"]
+    if cfg.compact_at:
+        result["compactions"], result["compact_removed_chars"] = compact_state["n"], compact_state["removed"]
     if cfg.confirm_test or cfg.test_audit or cfg.lint:  # the first train-passing test output that was shown
         result["first_tp_pred"] = confirm["shown"]
         if confirm.get("audit") is not None:
@@ -987,6 +1040,9 @@ def config_dict(cfg, model):
             del d[key]
     if "turn_think_grace" in d and not cfg.turn_think_cap:
         del d["turn_think_grace"]
+    if not cfg.compact_at:  # E027 options: recorded only when compaction is on
+        for key in ("compact_at", "compact_keep", "compact_tool_chars"):
+            d.pop(key, None)
     for key, default in (("soft_wording", "gentle"), ("context", CONTEXT), ("salvage", True), ("exec_margin", 35)):
         if d[key] == default:  # keep configs of runs made before the option existed unchanged
             del d[key]

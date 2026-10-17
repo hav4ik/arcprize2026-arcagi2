@@ -1,6 +1,35 @@
-# E025: faster weight and KV formats for Qwen3.8-27B on 4×L4
+# E027: faster inference for Qwen3.8-27B on 4×L4 (weight and KV formats, MTP, interconnect, parallelism)
 
 Started 2026-10-16. The goal is more decode throughput (and KV room) on the Kaggle-like 4×L4 box than the FP8 checkpoint gives, without losing ARC accuracy.
+
+(First numbered E025; renamed because `E025_train_rollouts` already existed. The Kaggle notebooks pushed on 2026-10-16/17 still say "E025".)
+
+## Summary (2026-10-17 03:00 UTC)
+
+**Goal:** 1.5–2× v4b's tool-traffic throughput on Kaggle 4×L4 at unchanged accuracy. v4b reference: 224 tok/s on Kaggle, 201 on the Vast L4 box, 13–19 of 48 probe pairs.
+
+| Lever | Verdict | Evidence |
+|---|---|---|
+| INT4 GPTQ / AWQ weights | **rejected** (accuracy) | decode +17–66%, real traffic only +15%; probe 9 and 10 of 48 vs FP8 13–19 (INT4 vs FP8 McNemar p = 0.039) |
+| NVFP4 weights | not better than INT4 | Marlin FP4 W4A16 on L4, ~5% slower than INT4 |
+| GGUF Q4_K_M, llama.cpp ×4 | **rejected** (speed) | 97–206 tok/s; vLLM 0.23 cannot load Qwen3.8 GGUFs |
+| Ternary Bonsai 2 27B, llama.cpp ×4 | not pursued | ties INT4 up to c16, plateaus near 287 tok/s; ARC quality unknown |
+| Triton block-FP8 W8A8 instead of Marlin, async scheduling | no gain | −2–12% and −5–15% decode |
+| Larger `max_num_batched_tokens` | no gain | prefill 916 → 888 → 870 tok/s (2048 → 4096 → 8192) |
+| NCCL P2P (`NCCL_P2P_LEVEL=SYS`) | box only; **harmful on Kaggle** | box: all-reduce 8–9× faster, prefill 3×; Kaggle: P2P 12× slower than SHM (v4c commit run several times slower) |
+| Pipeline parallelism (PP4, PP2×TP2) | **rejected** | prefill 3.2–3.3× faster, decode 14–77% slower |
+| TurboQuant KV (`k8v4`, `4bit_nc`, `3bit_nc`) | KV +26/+84/+135%, decode −4–18% | `k8v4` full-eval accuracy so far equal to baseline (26 vs 27 of 56) |
+| **MTP2 on vLLM 0.31** | **promising** | decode +26–46% on L4, clean output; full-eval interim 45 vs 50 of 112 (p = 0.46), same tokens per attempt |
+| MTP2 + TurboQuant | **broken** in vLLM 0.31 | 19 of 64 degenerate outputs |
+| Transcript compaction (`ARC_COMPACT_AT`) | implemented, untested on accuracy | evals queued on the RTX 6000 boxes |
+| Tuned FP8 GEMM configs for L4 | queued | Kaggle vLLM warns "Using default W8A8 Block FP8 kernel config"; GEMM is 24–31% of decode |
+
+**Where time goes on 4×L4:**
+- The box profile of TP4 decode at ~25k context: NCCL all-reduce 40–52%, FP8 GEMM 24–31%, attention 16–19%, DeltaNet 3–4%.
+- Kaggle's default all-reduce is ~2× faster than the box's, so comm is ~19% of a decode step there.
+- Kaggle v4b decodes at 336 tok/s with short contexts, falling to ~200–256 as transcripts grow.
+
+**Next:** finish the MTP2 accuracy eval (box A vs B) and its L4 tool probe; tune the FP8 GEMM configs; evaluate compaction. A candidate (v4b + vLLM 0.31 + MTP2, concurrency ~20, maybe compaction or tuned configs) needs one Kaggle validation probe before submission.
 
 **Box:** Vast 55889595 (4× L4 24 GB, PCIe; same box as E023), restarted 2026-10-16 11:22 UTC.
 
@@ -104,3 +133,72 @@ Started 2026-10-16. The goal is more decode throughput (and KV room) on the Kagg
 
 1. Finish NVFP4 and the TurboQuant presets.
 2. Run an accuracy probe on the fastest candidates. **INT4 has never had one:** the E023 `k3_int4_*` probes died at startup during a failed download.
+
+### MTP and TurboQuant on vLLM 0.31.0 (L4 box, FP8, TP4; 2026-10-16 22:45–23:55 UTC)
+
+Decode bench: `bench_decode.py`, ~2.5k-token prompts, 3k out, NCCL_P2P_LEVEL=SYS.
+
+| Variant | KV capacity | c=16 | c=24 | c=32 | MTP acceptance | Degenerate outputs (`mtp_check.py`, 64) |
+|---|---|---|---|---|---|---|
+| a: no MTP, fp8 KV | 1.56M | 195 | 230 | 268 | — | 0 |
+| b: **MTP2**, fp8 KV | 1.25M (−19%) | **286 (+46%)** | **305 (+32%)** | **338 (+26%)** | 2.81 | 0 |
+| c: MTP2 + `turboquant_k8v4` | 1.49M | 271 | 305 | 336 | 2.17 | **19 (broken)** |
+| d: `turboquant_k8v4`, no MTP | 1.99M | — | — | — | — | 0 |
+
+- **MTP2 + TurboQuant is broken in vLLM 0.31.** Even with a cold cache, c's text degenerates: `"apply to some \" \" \" \" ma"`, an early `</think>` followed by blank lines, and `"The user says: \" \"Find..."`. In addition, all 16 second turns diverge at the same character as soon as the prefix is cached.
+- The TurboQuant backend treats any batch with `max_query_len > 1` as prefill, so every MTP verify step goes through that path. MTP2 alone and TurboQuant alone look clean.
+- **The greedy consistency check cannot test the MTP cache bug.** Without MTP the stack is not bit-deterministic either (variant a: cold vs cached identical in 2 of 16). Also, turn 2 builds on generated turn 1, so turn-2 prompts differ between runs. The bug question is settled by downstream accuracy instead (RTX 6000 full evals).
+
+### Full-eval accuracy on 1× RTX PRO 6000 boxes (v4b agent recipe, attempt 1 + free attempt_2, vLLM 0.31, FP8)
+
+| Run | Box | Lever | Concurrency (KV ÷ 55k) | Status |
+|---|---|---|---|---|
+| e6_base | B 56310184 (WS) | none | 32 (1.81M KV) | running from 23:41 |
+| e6_mtp2 | A 56310182 (Max-Q) | MTP2 | 28 (1.56M) | running from 23:10 |
+| e6_tq | C 56310968 (Max-Q) | `turboquant_k8v4` | 40 (2.31M) | running from 23:40 |
+| e6_compact | B, after e6_base | compaction at 24k tokens (`ARC_COMPACT_AT=24000`) | — | queued |
+| e6_mtp2_compact | A, after e6_mtp2 | MTP2 + compaction | — | queued (replaces MTP2 + TurboQuant) |
+
+Results are copied to `e6/<label>/`, and each box is destroyed by `box_pipeline.sh` once its last run is fetched.
+
+### Profile of steady decode (vLLM 0.23 FP8 TP4, 24 requests at ~24.6k-token context, 20-s torch-profiler window, rank 0)
+
+`prof_run.sh` / `prof_parse.py`; traces in `/root/arc/runs/prof_{shm,p2p}/trace` on the L4 box. The FP8 GEMM ran as `_w8a8_triton_block_scaled_mm` here, not Marlin.
+
+| GPU time share | NCCL default (SHM) | NCCL_P2P_LEVEL=SYS |
+|---|---|---|
+| NCCL all-reduce (`AllReduce_Sum_bf16_RING_LL`), including waits for other ranks | **52%** | **40%** |
+| FP8 GEMM (Triton block W8A8) | 24% | 31% |
+| Full attention (`kernel_unified_attention`) | 16% | 19% |
+| DeltaNet decode (FLA `fused_recurrent_gated_delta_rule_packed_decode`) | 3% | 4% |
+| BF16 GEMMs, norms, activations, sampling | ~5% | ~5% |
+
+GPU busy 96–97% of the window. **On this box, TP4 decode spends more time in all-reduce (transfer plus synchronization) than in GEMM and attention combined.**
+- This motivates pipeline parallelism: only one hidden-state send per stage boundary per step (~0.25 MB at 24 requests), against 128 all-reduces per step under TP4, and no P2P needed.
+- `chain_pp.sh` benches PP4 and PP2×TP2 on vLLM 0.23.
+
+### Kaggle 4×L4 interconnect (`chankhavu/arc2-l4-p2p-check2` v2, 2026-10-17 ~01:30 UTC, ~2 min of GPU)
+
+- **Hardware:** 4 × NVIDIA L4, driver 580.178.04, **PCIe Gen3 max** (Gen1 at idle), x16. All GPU pairs PHB; `nvidia-smi` reports P2P read/write OK.
+- **v1 of the check got 2×T4:** without the ARC-AGI-2 competition attached, Kaggle silently uses the default accelerator.
+
+| bf16 [tokens, 5120] all-reduce | Kaggle default (SHM) | Kaggle `NCCL_P2P_LEVEL=SYS` | Vast box default (SHM) | Vast box P2P |
+|---|---|---|---|---|
+| 24 tokens | 0.14 ms (×128 = 18 ms) | 0.53 ms | 0.18 ms | 0.06 ms |
+| 2,048 tokens | 6.4 ms, 4.9 GB/s (×128 = 0.82 s) | ~70+ ms, 0.4 GB/s | 14.2 ms, 2.2 GB/s | 1.6 ms, 19.4 GB/s |
+
+- **Kaggle's P2P is ~12× slower than its SHM path,** which explains v4c. Keep the NCCL default on Kaggle.
+- **Kaggle's default all-reduce is ~2× faster than the box's,** so communication is ~19% of a c24 decode step there (vs 40–52% on the box). The box overstates comm-bound effects.
+- **Prefill is still communication-heavy on Kaggle:** ~0.8 s of all-reduce per 2,048-token chunk, a ceiling near 2.5k tok/s (v4b measured 1.4–2.2k). So pipeline parallelism's prefill gain should transfer, but its decode trade-off is less favourable than on the box.
+
+### Pipeline parallelism (vLLM 0.23, FP8, NCCL default, L4 box) — rejected
+
+| Layout | KV | c=8 | c=16 | c=32 | c=48 | Prefill (16 × 12.3k) |
+|---|---|---|---|---|---|---|
+| TP4 (v4b) | 1.59M | 131 | 171 | 256 | 302 | 916 tok/s |
+| PP2 × TP2 (custom AR off) | 1.50M | 65 | 108 | 193 | 259 | **3,007 tok/s** |
+| PP4 | 1.24M | 30 | 53 | 102 | 149 | 2,896 tok/s |
+
+- **Prefill 3.2–3.3× faster, decode much slower.**
+- Under PP4, per-request speed is flat at ~3.2 tok/s at every batch size: each decode step takes ~0.31 s regardless of load, so stages don't overlap across micro-batches in vLLM 0.23.
+- Decode dominates tool traffic, so PP loses. A prefill/decode split (disaggregated serving) would be needed to use the prefill gain.

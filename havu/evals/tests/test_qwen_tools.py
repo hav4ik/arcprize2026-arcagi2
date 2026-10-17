@@ -272,5 +272,41 @@ class RobustnessTest(unittest.TestCase):
             os.kill(pid, 0)
 
 
+class CompactTest(unittest.TestCase):
+    """E027 transcript compaction (AgentConfig.compact_at)."""
+
+    def test_compact_keeps_recent_turns_and_structure(self):
+        cfg = aq.AgentConfig(prompt="lean2sub")
+        p = head = aq.initial_prompt(TRAIN, TEST, cfg)
+        for i in range(4):
+            p += (f"thinking {i} " * 300 + f"\n</think>\n\nreply {i}\n\n<tool_call>\n<function=run_python>\n"
+                  f"<parameter=code>\nprint({i})\n</parameter>\n</function>\n</tool_call><|im_end|>\n")
+            p += aq.render_tool_responses([f"out {i} " + "x" * 3000]) + aq.GEN_PROMPT
+        new, removed = aq.compact(p, keep=2, tool_chars=1500)
+        self.assertGreater(removed, 0)
+        self.assertTrue(new.startswith(head.rsplit(aq.GEN_PROMPT, 1)[0]) and new.endswith(aq.GEN_PROMPT))
+        for i in range(4):
+            self.assertIn(f"reply {i}", new)
+            self.assertIn(f"print({i})", new)
+            self.assertEqual(f"thinking {i} " in new, i >= 2)
+        self.assertEqual(new.count("characters cut]"), 2)
+        self.assertEqual(aq.compact(new, 2, 1500)[1], 0)  # idempotent
+
+    def test_loop_compacts_and_still_answers(self):
+        long = "consider the grid " * 1500  # ~27k chars of thinking per turn (FakeLLM: chars / 4 tokens)
+        script = [(call("run_python", f"x{i} = {i}\nprint(x{i})", pre=long), "stop") for i in range(5)]
+        script += [(call("run_python", "def solve(g): return [r[::-1] for r in g]"), "stop"),
+                   (call("submit_answer", "solve(test_input)"), "stop")]
+        llm = FakeLLM(script)
+        cfg = aq.AgentConfig(tool_timeout=5, compact_at=12000, compact_keep=2, max_total_output=200000)
+        _, res = run(llm, cfg)
+        self.assertEqual(res["pred"], ANSWER)
+        self.assertGreaterEqual(res["compactions"], 1)
+        last_prompt = llm.prompts[-1][0]
+        self.assertLess(last_prompt.count("consider the grid"), 5 * 1500)  # old thinking removed
+        self.assertIn("print(x0)", last_prompt)  # tool calls kept
+        self.assertNotIn("compactions", run(FakeLLM(script[5:]))[1])  # off by default: no bookkeeping
+
+
 if __name__ == "__main__":
     unittest.main()
