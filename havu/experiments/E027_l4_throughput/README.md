@@ -233,3 +233,25 @@ GPU busy 96–97% of the window. **On this box, TP4 decode spends more time in a
 **vLLM 0.31's prefix caching is the bottleneck, with or without MTP.** The no-MTP baseline reaches only 58.5% hits, against ~86% on vLLM 0.23 for the same agent (E023 run B; Kaggle v4b 85.4%).
 
 **Decision:** keep v4b on vLLM 0.23 without MTP. Revisit MTP on a vLLM version with both the MTP fix and 0.23-level prefix reuse, after finding what changed between 0.23 and 0.31.
+
+### Tuned W8A8 block-FP8 Triton configs for NVIDIA L4 (vLLM 0.23, 2026-10-17 05:24–06:22 UTC)
+
+- **Why:** on L4, vLLM 0.23 runs the official FP8 checkpoint's GEMMs with `_w8a8_triton_block_scaled_mm` and warns `Using default W8A8 Block FP8 kernel config ... Config file not found` for all five Qwen3.8-27B TP4 shapes: (N, K) = (3584, 5120), (4096, 5120), (5120, 1536), (5120, 4352), (8704, 5120). The same warning appears in Kaggle's v4b and v4c logs.
+- **How:** vLLM's `benchmarks/kernels/benchmark_w8a8_block_fp8.py` (v0.23.0), with Qwen's shapes, BF16 output, batch sizes 1–2048, on 4 GPUs; 30 min. Config files: `fp8_configs_L4/`, installed into `vllm/model_executor/layers/quantization/utils/configs/`.
+- **Bug in run 1:** all four GPU workers wrote the same per-shape files, so only the batch sizes of the last writer (256–2048) survived. Run 2 (`chain_retune.sh`) writes per-GPU folders and merges them.
+
+| Decode tok/s | c=8 | c=16 | c=32 | c=48 | Prefill |
+|---|---|---|---|---|---|
+| untuned (default config) | 131 | 171 | 256 | 302 | 916 |
+| run 1 (configs for M ≥ 256 only) | 133.5 (+2%) | 199 (+16%) | 283 (+11%) | 319 (+6%) | 877 |
+| **run 2 (merged, M = 1–2048)** | **144 (+10%)** | **214 (+25%)** | **294 (+15%)** | **324 (+7%)** | 904 |
+
+Tuning changes kernel tiling only, not the arithmetic, so accuracy is unaffected. The configs can ship in the Kaggle notebook (copied into vLLM's config folder before the server starts).
+
+- **Run 2 merge bug:** the first merge of run 2 used `glob` on the file names, and their `[128,128]` part acts as a character class, so the merged files came out empty (vLLM then found configs and stopped warning, but used defaults). It was redone with explicit paths (`remerge.sh`). `fp8_configs_L4/` holds the complete files (15 batch sizes × 5 shapes).
+- **Solver:** opt-in `ARC_FP8_CONFIGS=<dir>`. `install_fp8_configs()` runs right after the vLLM install and never fails the run. It was tested with a fake vLLM package and `fake_v3_test.py`.
+- **Kaggle validation notebook v4d** (`kaggle/nb_probe_v4d`, settings `probe_v4d_settings.json`): v4b plus `ARC_FP8_CONFIGS` and a cell that writes the five configs. `check_notebook.py` (patched to this path) passes: NOTEBOOK CHECK OK. Not pushed to Kaggle yet: it needs ~2.3 GPU-h and the user's approval.
+
+### TurboQuant `k8v4` full-eval accuracy (RTX box C, vLLM 0.31, concurrency 40; stopped at 129 of 172 pairs)
+
+56 vs 57 correct on 129 shared pairs against e6_base (TurboQuant-only 17, baseline-only 18, p = 1.00); 35.0k vs 35.9k tokens per attempt. **No accuracy cost.** It was not pursued further, because it only mattered as KV room for MTP, and on Kaggle KV is not the binding constraint at concurrency 24. Box C was destroyed with partial results.

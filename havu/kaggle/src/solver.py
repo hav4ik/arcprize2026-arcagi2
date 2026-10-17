@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -421,6 +422,27 @@ def install_server():
     open(os.path.join(LOG_DIR, "pip_freeze.txt"), "w").write(freeze)
     log("installed:", " ".join(l for l in freeze.splitlines() if l.split("==")[0].lower() in
                                ("vllm", "torch", "transformers", "flashinfer-python", "triton", "sglang", "numpy")))
+
+
+def install_fp8_configs():
+    """E027: copy tuned W8A8 block-FP8 Triton configs (ARC_FP8_CONFIGS=<dir> of vLLM-named JSON files) into the installed
+    vLLM's configs folder, which is where vLLM 0.23 looks them up (no env override). Never fails the run."""
+    src = os.environ.get("ARC_FP8_CONFIGS", "")
+    if not src or SERVER != "vllm":
+        return
+    try:
+        files = sorted(glob.glob(os.path.join(src, "*.json")))
+        code, out = sh(f"{sys.executable} -c 'import os, vllm; print(os.path.join(os.path.dirname(vllm.__file__), "
+                       f"\"model_executor/layers/quantization/utils/configs\"))'", timeout=600)
+        dst = out.strip().splitlines()[-1] if code == 0 and out.strip() else ""
+        if not files or not os.path.isdir(dst):
+            log(f"fp8 configs: nothing installed (files={len(files)}, configs dir {dst!r})")
+            return
+        for f in files:
+            shutil.copy(f, os.path.join(dst, os.path.basename(f)))
+        log(f"fp8 configs: installed {len(files)} tuned files from {src} into {dst}")
+    except Exception as exc:
+        log(f"fp8 configs: install failed ({type(exc).__name__}: {exc}); vLLM uses its default configs")
 
 
 def file_hashes(paths, workers=16):
@@ -1470,6 +1492,7 @@ def main():
         mdir = model_dir()
         log("model dir:", mdir)
         install_server()
+        install_fp8_configs()
         PHASES["installed"] = round(time.time() - T0)
         preload(mdir)
         PHASES["preloaded"] = round(time.time() - T0)
