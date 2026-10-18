@@ -349,6 +349,15 @@ class E009OptionTests(unittest.TestCase):
         self.assertEqual(result["cap_nudges"], 0)
         self.assertEqual(result["stop_reason"], "output_budget")
 
+    def test_effort_header_is_first_system_message(self):
+        self.args.effort_header = "minimal"
+        client = FakeClient([[chunk(content="[[4,3]]", finish="stop", tokens=5)]])
+        self.solve(client)
+        first = client.requests[0]["messages"][0]
+        self.assertEqual(first["role"], "system")
+        self.assertTrue(first["content"].startswith("Reasoning Effort: Minimal."))
+        self.assertEqual(client.requests[0]["messages"][1]["role"], "user")
+
     def test_lean2code_prompt_extends_lean2sub(self):
         self.assertTrue(PROMPT_SUFFIXES["lean2code"].startswith(PROMPT_SUFFIXES["lean2sub"]))
         self.assertIn("Let code do the perceiving", PROMPT_SUFFIXES["lean2code"])

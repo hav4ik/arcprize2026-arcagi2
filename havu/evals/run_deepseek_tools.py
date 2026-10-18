@@ -88,7 +88,7 @@ V5_DEFAULTS = {"task_summary": False, "helpers": False, "train_check": False}
 V5_PROMPTS = {"lean2roles"}
 # v6 (E029) is recorded when an E029 option or prompt is active; it adds the keys below to the config.
 HARNESS_VERSION_V6 = "persistent-v6"
-V6_DEFAULTS = {"turns_note": 0, "fallback_solve": False, "cap_nudge": False}
+V6_DEFAULTS = {"turns_note": 0, "fallback_solve": False, "cap_nudge": False, "effort_header": ""}
 V6_PROMPTS = {"lean2code"}
 HELPERS_SRC = (Path(__file__).resolve().parent / "arc_helpers.py").read_text()
 HELPERS_DOC = (
@@ -464,6 +464,14 @@ def budget_note(args, used):
     return note
 
 
+# E030: a "below low" effort header, written like DeepSeek's own effort prefixes (notes/prompts/
+# deepseek_v4_0813_reasoning_effort_prefixes.txt: `high`/`max` prepend one, `low` adds nothing), sent as a system message.
+EFFORT_HEADERS = {
+    "minimal": ("Reasoning Effort: Minimal. Keep your thinking short and terse: write brief notes, not full sentences. "
+                "Do not restate the task, do not re-read or re-derive what code has already printed, and do not re-verify "
+                "what has already been checked. Test ideas with small code experiments instead of long deliberation, and "
+                "submit as soon as the rule reproduces every training pair."),
+}
 CAP_NOTE = ("[per-turn thinking limit: this turn reached {k}k tokens without running code, so it was stopped here. "
             "Do not keep deliberating: write the smallest code experiment that tests your current best hypothesis on "
             "the training pairs and run it now.]")
@@ -490,6 +498,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
     if getattr(args, "task_summary", False):
         prompt += task_summary(task["train"], test_input)
     messages = [{"role": "user", "content": prompt}]
+    if getattr(args, "effort_header", ""):
+        messages.insert(0, {"role": "system", "content": EFFORT_HEADERS[args.effort_header]})
     total = {"prompt": 0, "cache_hit": 0, "completion": 0}
     n_tools, n_errors, n_turns, finish, stop, pred = 0, 0, 0, None, None, None
     n_nudges = 0  # E030 --cap-nudge
@@ -785,6 +795,8 @@ def parser():
                          "attempt 0 nor 1 passes the train check (not part of the config, so files resume)")
     ap.add_argument("--turns-note", type=int, default=0,
                     help="E029: append a 'N turns left, submit now' note to tool output when N or fewer turns remain (0=off)")
+    ap.add_argument("--effort-header", default="", choices=["", *EFFORT_HEADERS],
+                    help="E030: system message in DeepSeek's effort-prefix style (minimal = terse thinking)")
     ap.add_argument("--cap-nudge", action="store_true",
                     help="E030: when a turn hits --max-tokens, keep its reasoning and close it with a synthetic run_python "
                          "call whose output tells the model to test its hypothesis in code (per-turn thinking cap)")

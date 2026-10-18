@@ -360,4 +360,8 @@ The two W8A8 kernels tie, and greedy outputs agree. The same day on this box, th
 
 Paired SFT − base: **−12.9 pp, 95% CI [−23.3, −2.2]** (task-cluster bootstrap). Both solved 18 pairs; only base 17, only SFT 5.
 
+**Second base sample (2026-10-18 07:54–11:40 UTC, `base93_v4b_s2/`):** 38/93 = 40.9%; vs sample 1 +3.2 pp [−7.1, +13.0] (run-to-run noise). SFT vs base sample 2: −16.1 pp [−25.0, −7.9]; vs the mean of both base samples: **−14.5 pp [−22.7, −6.5]**.
+
+**Third base sample (2026-10-18 11:45–15:30 UTC, `base93_v4b_s3/`):** 35/93 = 37.6%. Base over 3 samples: 38.7% (sd 1.9 pp). **SFT − base mean: −14.0 pp [−21.8, −6.0].**
+
 **Reading:** the SFT model is accurate when it finishes (22/23 of its submissions are correct), but at Kaggle's pace it rarely finishes inside its ~29k share. This matches E028's finding that the 64K training cut removed the teacher's wrap-ups after the 60k note, so the model doesn't react to budget notes. At Kaggle pace it scores well below the base v4b agent.

@@ -74,3 +74,12 @@ All configs below are within the ~2–3 pp noise band of each other, so pick by 
 5. **Run Qwen at the medium tier (or no tier line) for SFT and inference, not xhigh.** About 75% of correct DeepSeek traces fit a 48k cap in Qwen's tokenizer.
 6. **Input format:** both harnesses use JSON grids (ARC Prize prompt) in the first message. Digit rows with dimensions would take 64% fewer prompt tokens (E018); the accuracy effect is untested.
 7. **Hard data is scarce.** Over-sample the kind of pair DeepSeek solves with a relational rule, and grow the hard pool (ARC-2-only seeds, generated or composed tasks), since there are only 233 real ARC-2 tasks outside eval.
+
+## Update 2026-10-18: Flash-1017 and the minimal effort header (E029, E030)
+- **The teacher changed.** Since 2026-10-17 `deepseek-flash` serves V4.1-Flash-1017; E025 is from the old model. Label the model version in any dataset that mixes the two.
+- **1017 is better and shorter:** sub80s40 gets 82.4% pass@2 (+4.9 pp) at 31.7k tokens (−22%).
+- **`--effort-header minimal`** is a "Reasoning Effort: Minimal …" system message, in the same style as DeepSeek's own effort prefixes. It shortens traces without hurting hard pairs:
+  - sub80s40 + header: 84.9% pass@2 at 27.4k tokens;
+  - s20x60 + header: 80.3% pass@2 at 23.3k tokens (−27%), still in the noise band.
+- **Share of correct traces under 40k output tokens:** sub80s40 80%, + header 86%, s20x60 91%, s20x60 + header 93%. Shorter teacher traces suit Qwen's 48k Kaggle budget.
+- **For SFT:** the header is a system message, so either drop it from the SFT input (Qwen learns the terse style as its default) or keep it at Qwen inference. These runs used `lean2sub` without `--helpers --train-check`; the next batch should combine the header with those flags.

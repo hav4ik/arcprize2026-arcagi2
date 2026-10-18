@@ -656,6 +656,31 @@ T1_SPECS = [
          desc=f"E009 sub80s40 unchanged (lean2sub, low effort, 80k hard / 40k soft, notes on every output; {SUB}; persistent-v4) on the new model",
          cost=REC_EST, ref="E009 sub80s40", ref_extra=["E004-GL"],
          note="New model, same harness: the paired Δ vs E009 sub80s40 is the model change (old model, 3 samples)."),
+    dict(id="E030 sub80s40 + effort header (1017)", fam=DS, model=FLASH1017, harness="tools-grid", set="full",
+         files=["tools_persistent_grid_lean2sub_deepseek-flash_low_e030_hdrmin.jsonl"],
+         desc=f"sub80s40 + <code>--effort-header minimal</code>: a \"Reasoning Effort: Minimal\" system message in DeepSeek's own effort-prefix style (terse notes, no restating or re-verifying, test ideas in code, submit once train passes); {SUB}; persistent-v6",
+         cost=REC_EST, ref="E029 sub80s40 (1017)", ref_extra=["E009 sub80s40"],
+         note="E030's best accuracy pick: −14% tokens with hard pairs kept. The same request as a user-prompt suffix (E009 lean2brief, old model) cost accuracy."),
+    dict(id="E030 s20x60 + effort header (1017)", fam=DS, model=FLASH1017, harness="tools-grid", set="full",
+         files=["tools_persistent_grid_lean2sub_deepseek-flash_low_e030_s20x60_hdrmin.jsonl"],
+         desc=f"E010 s20x60 budgets (60k hard / 20k soft, strong wording) + <code>--effort-header minimal</code>; {SUB}; persistent-v6",
+         cost=REC_EST, ref="E029 sub80s40 (1017)", ref_extra=["E029 s20x60 (1017)"],
+         note="E030's fewest-tokens pick within 5 pp of the best pass@2 (−27% tokens vs E029 sub80s40)."),
+    dict(id="E030 s20x80 (1017)", fam=DS, model=FLASH1017, harness="tools-grid", set="full",
+         files=["tools_persistent_grid_lean2sub_deepseek-flash_low_e030_s20x80.jsonl"],
+         desc=f"80k hard / 20k soft target with strong wording; {SUB}; persistent-v4", cost=REC_EST, ref="E029 sub80s40 (1017)",
+         note="Budget pressure alone: shorter by trimming the long tail, at the cost of hard pairs."),
+    dict(id="E030 s15x80 (1017)", fam=DS, model=FLASH1017, harness="tools-grid", set="full",
+         files=["tools_persistent_grid_lean2sub_deepseek-flash_low_e030_s15x80.jsonl"],
+         desc=f"80k hard / 15k soft target with strong wording; {SUB}; persistent-v4", cost=REC_EST, ref="E029 sub80s40 (1017)"),
+    dict(id="E030 cap16 nudge (1017)", fam=DS, model=FLASH1017, harness="tools-grid", set="full",
+         files=["tools_persistent_grid_lean2sub_deepseek-flash_low_e030_cap16.jsonl"],
+         desc="sub80s40 with a 16k per-turn cap and <code>--cap-nudge</code> (a cut turn keeps its reasoning and is closed by a synthetic run_python call saying to test the hypothesis in code); persistent-v6",
+         cost=REC_EST, ref="E029 sub80s40 (1017)", note="Fired in 15% of attempts; no token saving (the model resumes the same deliberation)."),
+    dict(id="E030 cap12 nudge (1017)", fam=DS, model=FLASH1017, harness="tools-grid", set="full",
+         files=["tools_persistent_grid_lean2sub_deepseek-flash_low_e030_cap12.jsonl"],
+         desc="as cap16 with a 12k per-turn cap; persistent-v6", cost=REC_EST, ref="E029 sub80s40 (1017)",
+         note="Fired in 31% of attempts; −2.5% tokens, hard pairs drop."),
     dict(id="E029 s20x60 (1017)", fam=DS, model=FLASH1017, harness="tools-grid", set="full",
          files=["tools_persistent_grid_lean2sub_deepseek-flash_low_e029_flash1017_s20x60.jsonl"],
          desc=f"E010 s20x60 unchanged (lean2sub, low effort, 60k hard / 20k soft with strong wording; {SUB}) on the new model",
@@ -877,6 +902,24 @@ T2_SPECS = [
          cost=("text", "box time [^rent-e028]"), ref="E028 dev base", ref_extra=[("E017 V3 all", True)], setlabel="dev-56", expected=56, e017=True,
          note="1 attempt hit SGLang's 131k context limit (error, scored wrong). The SFT model ignores the budget notes: the 64K "
               "training cut removed every teacher wrap-up after the 60k note (README). Tinker training cost ~$336.5."),
+    # Kaggle-pace runs on the 93 non-dev pairs (71 tasks), forced at server-ready + 225 min = 11 h / 259 pairs (E027 / E028)
+    dict(id="E027 base v4b, Kaggle pace s1 (L4 box)", fam=QW, model=QWEN_L4BOX, harness="tools-program", set="nondev93",
+         files=["@experiments/E027_l4_throughput/base93_v4b"], desc=PROBE_V4B + "; 93 non-dev pairs, forced at 225 min",
+         cost=("text", "box time [^rent-e027]"), setlabel="nondev-93 (Kaggle pace)", status="done",
+         note="Paired base reference for the E028 SFT run. 192 tok/s, prefix hits 82%."),
+    dict(id="E027 base v4b, Kaggle pace s2 (L4 box)", fam=QW, model=QWEN_L4BOX, harness="tools-program", set="nondev93",
+         files=["@experiments/E027_l4_throughput/base93_v4b_s2"], desc=PROBE_V4B + "; 93 non-dev pairs, forced at 225 min",
+         cost=("text", "box time [^rent-e027]"), ref="E027 base v4b, Kaggle pace s1 (L4 box)", setlabel="nondev-93 (Kaggle pace)", status="done",
+         note="Second sample (run-to-run noise)."),
+    dict(id="E027 base v4b, Kaggle pace s3 (L4 box)", fam=QW, model=QWEN_L4BOX, harness="tools-program", set="nondev93",
+         files=["@experiments/E027_l4_throughput/base93_v4b_s3"], desc=PROBE_V4B + "; 93 non-dev pairs, forced at 225 min",
+         cost=("text", "box time [^rent-e027]"), ref="E027 base v4b, Kaggle pace s1 (L4 box)", setlabel="nondev-93 (Kaggle pace)", status="done",
+         note="Third sample. Base over 3 samples 38.7% (sd 1.9 pp)."),
+    dict(id="E028 SFT v5 notebook, Kaggle pace (L4 box)", fam=QW, model="Qwen3.8-27B E028 SFT, ModelOpt FP8 (v1), vLLM 0.23 on vast.ai 4×L4",
+         harness="tools-grid", set="nondev93", files=["@experiments/E027_l4_throughput/sft_nb_kaggle"],
+         desc="nb_v5_sft solver (cad74873) with kaggle_v5_sft_settings.json (DeepSeek-harness interface, 64k ceiling / 32k soft, adaptive share), c24; 93 non-dev pairs, forced at 225 min",
+         cost=("text", "box time [^rent-e027]"), ref="E027 base v4b, Kaggle pace s1 (L4 box)", setlabel="nondev-93 (Kaggle pace)", status="done",
+         note="70/93 attempts stop at the ~29k adaptive share (1 correct); 22/23 submissions correct. vs the mean of 3 base samples: −14.0 pp [−21.8, −6.0] (E027 README)."),
     # 48-pair throughput/accuracy probes (35 tasks, forced at server-ready + 120 min) [^probe]
     dict(id="E021 probe v2 (Kaggle)", fam=QW, model=QWEN_KAGGLE, harness="tools-grid", set="probe48", files=["@kaggle/runs/probe-v2"],
          desc="v2 agent (medium 48k / 24k, `submit_answer`, qwen-tools-4), concurrency 35", cost=("none",), ref="E021 probe v4b (Kaggle)",
@@ -1000,6 +1043,8 @@ def build():
     SETS["e004"] = E004_SUBSET
     probe_lat, _ = load("@kaggle/runs/probe-v4b")  # the 48-pair Kaggle load probe (E021); every probe run uses the same pairs
     SETS["probe48"] = sorted({(t, p) for t, p, _ in probe_lat})
+    nd_lat, _ = load("@experiments/E027_l4_throughput/sft_nb_kaggle")  # E027/E028 Kaggle-pace runs: 93 non-dev pairs
+    SETS["nondev93"] = sorted({(t, p) for t, p, _ in nd_lat})
 
     results = {}
     t1_rows, t2_rows = [], []
