@@ -18,3 +18,8 @@ This is a read-only analysis of existing eval traces; no API calls. Reports:
   - Keep only rollouts whose answer comes from a train-passing program.
   - Down-weight long prose turns.
   - Train with the summary only if Qwen also gets it at inference.
+
+## Decisions (2026-10-17)
+- Collect future DeepSeek batches without `--task-summary`, keeping `--helpers` and `--train-check`.
+- The E025 data contains the summary, so a Qwen model trained on it needs the summary at inference too.
+- SFT filters, format conversion, and the switch to the medium tier are listed in `notes/2026-10-17_distillation_data_findings.md`.

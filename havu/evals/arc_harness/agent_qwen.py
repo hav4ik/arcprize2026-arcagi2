@@ -45,8 +45,8 @@ HARNESS_VERSION_V5 = "qwen-tools-5"
 V5_DEFAULTS = {"task_summary": False, "helpers": False, "turn_think_cap": 0, "turn_think_grace": 2048,
                "feedback": "basic", "confirm_test": False, "test_audit": False, "lint": False,
                "worked_example": False, "record_alternatives": False,
-               "think_call_rescue": False}
-V5_PROMPTS = {"lean2progroles"}
+               "think_call_rescue": False, "tool_desc": "", "solve_fallback": False}
+V5_PROMPTS = {"lean2progroles", "lean2roles"}
 CONTEXT = 262144
 PROGRAM_MEMORY_MB = 3072  # address-space limit of a submitted program's process (runner --session-mem-mb lowers it;
 # an execution-safety setting, deliberately not part of the config so result files resume)
@@ -80,7 +80,9 @@ _ROLES = ("\n\nBefore writing solve(), write a short ROLES note: what each kind 
           "if your rule ignores some non-background cells of test_input, explain them before submitting. If any "
           "training pair still fails, or a test difference is unhandled, do not submit: fix the rule.")
 PROMPTS = {"lean2sub": PROMPT_SUFFIXES["lean2"] + _SUBMIT, "lean2prog": PROMPT_SUFFIXES["lean2"] + _PROGRAM,
-           "lean2progroles": PROMPT_SUFFIXES["lean2"] + _PROGRAM + _ROLES}
+           "lean2progroles": PROMPT_SUFFIXES["lean2"] + _PROGRAM + _ROLES,
+           # E028: run_deepseek_tools.py lean2roles (= lean2sub + roles), the prompt of the E025 SFT rollouts
+           "lean2roles": PROMPT_SUFFIXES["lean2"] + _SUBMIT + _ROLES}
 # E017 P3 (--helpers): evals/arc_helpers.py preloaded in the session and in every submitted program's namespace.
 _HELPERS_PATH = __import__("pathlib").Path(__file__).resolve().parents[1] / "arc_helpers.py"
 HELPERS_SRC = _HELPERS_PATH.read_text() if _HELPERS_PATH.exists() else ""
@@ -205,11 +207,32 @@ class AgentConfig:
     compact_at: int = 0             # estimated prompt tokens that trigger a compaction (0 = off); again after +50%
     compact_keep: int = 2           # most recent assistant turns / tool-response messages left untouched
     compact_tool_chars: int = 1500  # older tool responses are cut to this many characters
+    # E028 (opt-in): "e025" = the interface the SFT model was trained on (E025 DeepSeek rollouts): tool specs exactly
+    # as experiments/E028_qwen38_sft/e025_tools.json and run_deepseek_tools.py's strings for tool errors, skips and
+    # executor timeouts. Use with prompt="lean2roles", helpers, task_summary, submit mode and a LocalExecutor with
+    # style="ipython" (see experiments/E028_qwen38_sft/HARNESS_E025_MODE.md).
+    tool_desc: str = ""
+    solve_fallback: bool = False    # no answer at the end and no valid `answer`: try solve(test_input) before salvage
 
 
 # ---------------------------------------------------------------- rendering (Qwen3.8 chat template, tools on)
 
 def tool_specs(cfg):
+    if cfg.tool_desc == "e025":  # run_deepseek_tools.tools_for() with E025's flags (grid, helpers, answer tool)
+        return [{"type": "function", "function": {
+            "name": name, "description": description,
+            "parameters": {"type": "object", "properties": {"code": {"type": "string"}},
+                           "required": ["code"], "additionalProperties": False},
+        }} for name, description in (
+            ("run_python", "Execute a Python cell in your persistent IPython session. Variables/functions persist. "
+                           "Preloaded: train (list of {'input': grid, 'output': grid}), test_input (grid), numpy as np. "
+                           f"scipy is available. No internet or host files. Timeout {cfg.tool_timeout:g}s. "
+                           "Use print() to inspect results. Check transformations on all training pairs." + HELPERS_DOC),
+            ("submit_answer", "End this attempt with your test output. `code` is a Python expression evaluated in your "
+                              "session, e.g. solve(test_input) or answer, giving a rectangular grid of ints 0-9 (list or "
+                              "numpy array); statements that set a variable `answer` also work. The harness reads the "
+                              "grid directly: do not retype it. Invalid grids return an error and the attempt "
+                              "continues."))]
     descriptions = {
         "run_python": (
             "Execute a Python cell in your persistent IPython session. Variables/functions persist. "
@@ -630,10 +653,17 @@ async def solve(llm, make_executor, train, test_input, cfg, note=None):
                 rec["test"] = out["out"]
         return rec, rows
 
+    e025 = cfg.tool_desc == "e025"
+    # E028 e025 mode: an executor-cap hit reads like the sandbox's killed-shell timeout (run_deepseek_tools.py)
+    killed = {"process_status": "timeout", "stdout": "", "state_reset": True,
+              "stderr": f"Execution timed out after {cfg.tool_timeout:g} seconds\n"}
+
     async def submit(code):
         try:
             return await ex.run(submit_answer, code)
         except ExecutorTimeout:
+            if e025:
+                return tool_output(killed, cfg.max_tool_output)[:2000] + "\n[answer not accepted]", None
             return "[answer not accepted] evaluation timed out; Python state lost (train/test_input/np restored)", None
 
     try:
@@ -762,7 +792,14 @@ async def solve(llm, make_executor, train, test_input, cfg, note=None):
                     n_calls += 1
                     code = params.get("code")
                     if accepted is not None:
-                        outputs.append("[skipped: answer already accepted]")
+                        outputs.append("[skipped: solution already accepted]" if e025 else
+                                       "[skipped: answer already accepted]")
+                        continue
+                    if e025 and (not isinstance(code, str) or name not in ("run_python", answer_tool)):
+                        n_parse_err += 1
+                        n_tool_err += 1
+                        outputs.append("[tool error: Expected an object with a string code field]"
+                                       if not isinstance(code, str) else f"[tool error: Unknown tool: {name}]")
                         continue
                     if not isinstance(code, str) or name not in ("run_python", answer_tool):
                         n_parse_err += 1
@@ -781,8 +818,9 @@ async def solve(llm, make_executor, train, test_input, cfg, note=None):
                         try:
                             result = await ex.run(_execute, code)
                         except ExecutorTimeout as exc:
-                            result = {"process_status": "timeout", "stdout": "", "state_reset": True,
-                                      "stderr": f"[{exc}; the session was restarted]"}
+                            result = dict(killed) if e025 else {
+                                "process_status": "timeout", "stdout": "", "state_reset": True,
+                                "stderr": f"[{exc}; the session was restarted]"}
                         n_tool_err += result["process_status"] != "completed"
                         outputs.append(tool_output(result, cfg.max_tool_output))
                         continue
@@ -864,7 +902,11 @@ async def solve(llm, make_executor, train, test_input, cfg, note=None):
                 out, grid = await submit("answer")
                 if grid is not None:
                     pred, source = grid, "session"
-                elif cfg.salvage:
+                if pred is None and cfg.solve_fallback:  # E028 opt-in: the session's solve on test_input
+                    out, grid = await submit("solve(test_input)")
+                    if grid is not None:
+                        pred, source = grid, "session_solve"
+                if pred is None and cfg.salvage:
                     salvage_info, grid = await ex.run(salvage_answer)
                     if grid is not None:
                         pred, source = grid, "salvage"

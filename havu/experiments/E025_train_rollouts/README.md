@@ -101,3 +101,12 @@ Task-level difficulty tiers (mean output tokens over the task's pairs):
 - 5 attempts failed with API errors (1 in arc2_train, 4 in nvarc_b0). They are not retried yet. Re-running `launch.sh` retries them, because resume re-queues rows that carry `error`; that costs about $0.1.
 
 - **Hugging Face (2026-10-16):** private dataset `livobereshka/arc-agi2-deepseek-v3-rollouts-e025`. It holds rollouts as parquet (one row per attempt, with the transcript in `messages`), the task pool files, `run_config.json` and a dataset card.
+
+## Notes for using this data (E026, 2026-10-17)
+- **The summary is baked in.** These rollouts were collected with `--task-summary`, and the traces quote it about 23 times per attempt. A Qwen model trained on them must get the same summary at inference.
+- **Next batches drop it.** Later batches are planned without `--task-summary`; see `notes/2026-10-17_distillation_data_findings.md`.
+- **Suggested filters:**
+  - keep answers from train-passing programs;
+  - prefer a first tool call at ≤5k tokens;
+  - down-weight turns of 16k+ tokens;
+  - re-check NVARC answers that pass train but are wrong, using the unused pairs in the manifest.

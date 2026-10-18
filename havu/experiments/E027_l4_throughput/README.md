@@ -298,3 +298,16 @@ Paired: compact-only 16, baseline-only 26, McNemar p = 0.16. Compaction sent 18%
 **MTP + prefix caching accuracy on hybrids:** [vllm#53912](https://github.com/vllm-project/vllm/issues/53912) reports ~1% corrupted outputs through v0.30, scaling with cache hits. Partial fixes: #50729 merged in 0.28.1; #48375 and #53919 open. Our full eval (64 vs 70 of 172, p = 0.43) is consistent with a low-rate effect.
 
 **Harness tokenization is stable** (`tok_check.py`, 25 real transcripts from e6_base, 257 turn boundaries): every turn-k prompt tokenizes to an exact prefix of turn k+1. transformers 4.57.6 (vLLM 0.23 env) and 5.17.0 (vLLM 0.31 env) give identical token ids (hash `a5891fcf7d00`). So turn boundaries and the tokenizer upgrade don't cost cache hits. Not yet tested: whether generated token ids equal the re-tokenized text of the next turn; `cache_probe.py` covers that indirectly.
+
+### Tuned FP8 configs on real tool traffic: slower, so far (2026-10-17 20:35 UTC)
+
+| L4 v4b probe (48 pairs, 120 min, vLLM 0.23, c24) | Score | tok/s | gen tok/s while ≥ 22 running | Prefix hits | Config warnings |
+|---|---|---|---|---|---|
+| untuned (E023 run B, 2026-10-14) | 13.33 / 35 | **201** | 222 | 86.7% | 20 |
+| tuned merged configs (`p_fp8_tuned_c24`, today) | 8.50 / 35 | **143** | 147 | 79.5% | 0 |
+
+This contradicts the clean decode bench (+7–25%). The candidates are:
+- tuned configs that are worse on real traffic (prefix caching on, 20–48k contexts, prefill chunks mixed into decode steps);
+- the box being slower since its restart: idle temperatures 60–78 °C at ~20 W, and run B is 3 days old.
+
+**Do not push v4d until resolved.** `chain_ab.sh` is queued after the SFT tests: same-session untuned / tuned / untuned, each with prefix caching on, 24 × ~24k-token prompts plus the short decode bench, and GPU clock/throttle logging. Then the same-day untuned v4b repeat probe.

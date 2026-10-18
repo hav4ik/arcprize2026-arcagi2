@@ -84,6 +84,27 @@ COMPACT_AT = envf("ARC_COMPACT_AT", 0)            # E027: compact transcripts pa
 COMPACT_KEEP = envf("ARC_COMPACT_KEEP", 2)        # E027: recent turns left untouched by a compaction
 COMPACT_TOOL_CHARS = envf("ARC_COMPACT_TOOL_CHARS", 1500)  # E027: older tool outputs cut to this length
                                                     # still-open thinking (only acts with the think cap on)
+# ---- v5_sft (E028) toggles, all opt-in; with every one unset the solver behaves exactly as v4
+MODEL_SOURCE = os.environ.get("ARC_MODEL_SOURCE", "")  # owner/slug of the Kaggle model to serve, e.g.
+                                                    # chankhavu/qwen3-8-27b-e028-sft ("" = the official FP8 mirror)
+TOKENIZER = os.environ.get("ARC_TOKENIZER", "")     # vLLM --tokenizer: "" = the model's own; "official" = the
+                                                    # official FP8 mirror's dir (E028: vLLM 0.23 cannot load the SFT
+                                                    # checkpoint's Qwen3_5Tokenizer config); else an owner/slug or path
+TOOLS_DESC = os.environ.get("ARC_TOOLS_DESC", "")   # AgentConfig.tool_desc ("e025": the E025 training tool texts)
+TOOLS_FALLBACK_SOLVE = int(os.environ.get("ARC_TOOLS_SOLVE_FALLBACK", os.environ.get("ARC_TOOLS_FALLBACK_SOLVE", 0)))
+                                                    # AgentConfig.solve_fallback: no answer -> solve(test_input)
+TOOLS_MAX_TURNS = envf("ARC_TOOLS_MAX_TURNS", 60)   # AgentConfig.max_turns (E025 training rollouts: 40)
+MODEL_REQUIRE = os.environ.get("ARC_MODEL_REQUIRE", "")  # file that must exist in the served model dir, else the run
+                                                    # fails loudly (E028: e028_quant_info.json, only in our checkpoint)
+EXEC_STYLE = os.environ.get("ARC_EXEC_STYLE", "plain")  # LocalExecutor output format; "ipython" = the E025 sandbox's
+                                                    # text format (use with ARC_TOOLS_DESC=e025)
+LOCAL_WALL_MIN = envf("ARC_LOCAL_WALL_MIN", 0.0)    # > 0: local (commit) runs only: emergency exit at T0 + this
+TOOLS_SOFT_FRAC = envf("ARC_TOOLS_SOFT_FRAC", 0.0)  # > 0: budget_soft = this x the attempt's hard cap (E028 trained on
+                                                    # 40k/80k = 0.5); 0 = min(ARC_TOOLS_SOFT, cap) as before
+AGENT_EXTRA = os.environ.get("ARC_AGENT_EXTRA", "")  # JSON {AgentConfig field: value}, applied last (unknown fields
+                                                    # are logged and skipped); hook for new harness options
+STRICT_FEATURES = envf("ARC_STRICT_FEATURES", 0)    # 1: a requested agent option the self-test switches off fails
+                                                    # the commit gate (summary v3.dropped)
 FREE_ATTEMPT2 = envf("ARC_FREE_ATTEMPT2", 0)        # 1: attempt_2 from the attempt's own alternatives (no tokens)
 ATTEMPT2 = os.environ.get("ARC_ATTEMPT2", "legacy")  # legacy (v2/v1 rule) | off | gated (E021)
 ATTEMPT2_UNKNOWN = envf("ARC_ATTEMPT2_UNKNOWN", 1)  # gated: also retry submitted answers without a train check (E012)
@@ -99,6 +120,9 @@ LOCAL_SOURCE = os.environ.get("ARC_LOCAL_SOURCE", "local")  # local: arc2-local-
                                                     # (load probe: real scheduler on public-eval pairs, self-scored)
 PUBLIC_TEST_IDS_SHA256 = "4cab35dea7bde6ee39bbfcfdcfc101153e19f333c14b68c68b84a7a3278c265e"  # public test file
 PHASES = {}  # phase timings (s since T0), written to the summary
+KNOWN_SOURCES = ("submit", "forced", "session", "salvage", "parse", "lenient", "program_pass", "program_best_fail",
+                 "session_solve")
+DROPPED = []  # requested agent options the self-test switched off (summary v3.dropped; ARC_STRICT_FEATURES gate)
 PKG = os.path.join(WORK, "arc_solver")  # evals/arc_harness + notes/prompts + solver.py, written by the notebook
 
 PROMPT_TEMPLATE = __TEMPLATE__  # noqa: F821  (ARC Prize official prompt, injected by build_notebook.py)
@@ -198,7 +222,9 @@ def comp_file(name):
             or find_one(f"{INPUT}/**/{name}"))
 
 
-def model_dir():
+def official_model_dir():
+    """The official Qwen3.8-27B-FP8 mirror (mikedan7/qwen3-8-27b-fp8-official), mounted by Kaggle at
+    /kaggle/input/models/mikedan7/qwen3-8-27b-fp8-official/pytorch/hf-fp8/1 (framework lower-cased)."""
     for pat in [f"{INPUT}/models/mikedan7/qwen3-8-27b-fp8-official/**/config.json",
                 f"{INPUT}/qwen3-8-27b-fp8-official/**/config.json",
                 f"{INPUT}/**/qwen3-8-27b-fp8*/**/config.json"]:
@@ -206,6 +232,70 @@ def model_dir():
         if p:
             return os.path.dirname(p)
     raise FileNotFoundError("model dir")
+
+
+def source_dir(source, need="config.json"):
+    """Directory of an attached Kaggle model given as owner/slug (mounted at
+    /kaggle/input/models/<owner>/<slug>/<framework>/<variation>/<version>/) or as an existing path."""
+    if os.path.isdir(source):
+        return source
+    owner, _, slug = source.strip("/").partition("/")
+    for pat in [f"{INPUT}/models/{owner}/{slug}/**/{need}", f"{INPUT}/{slug}/**/{need}"]:
+        p = find_one(pat)
+        if p:
+            return os.path.dirname(p)
+    raise FileNotFoundError(f"model {source!r} not attached (no {need} under {INPUT})")
+
+
+def model_dir():
+    """Model to serve: ARC_MODEL_SOURCE if set (never silently another model), else the official FP8 mirror."""
+    return source_dir(MODEL_SOURCE) if MODEL_SOURCE else official_model_dir()
+
+
+def model_identity(mdir):
+    """What is about to be served (logged as MODEL IDENTITY before the server starts). Raises if ARC_MODEL_REQUIRE
+    is set and that file is missing, or if ARC_MODEL_SOURCE's slug is not in the resolved path."""
+    info = {"dir": mdir, "tokenizer": tokenizer_dir()}
+    if MODEL_SOURCE and "/" + MODEL_SOURCE.split("/")[-1] + "/" not in mdir + "/":
+        raise RuntimeError(f"WRONG MODEL: {mdir} is not {MODEL_SOURCE}")
+    if MODEL_REQUIRE:
+        req = os.path.join(mdir, MODEL_REQUIRE)
+        if not os.path.isfile(req):
+            raise RuntimeError(f"WRONG MODEL: {MODEL_REQUIRE} missing in {mdir}")
+        info[MODEL_REQUIRE] = open(req).read()[:2000]
+    raw = open(os.path.join(mdir, "config.json"), "rb").read()
+    info["config_md5"] = hashlib.md5(raw).hexdigest()
+    cfg = json.loads(raw)
+    qc = cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config") or {}
+    info["quant_method"] = qc.get("quant_method")
+    info["shards"] = {os.path.basename(p): os.path.getsize(p) for p in sorted(glob.glob(f"{mdir}/*.safetensors"))}
+    return info
+
+
+def server_identity(slog):
+    """After startup: the server's quantization / KV lines and /v1/models (served id -> model path)."""
+    import urllib.request
+    out = {}
+    try:
+        lines = open(slog, errors="ignore").read().splitlines()
+        out["quant_lines"] = [ln[-300:] for ln in lines if re.search(r"quantiz|modelopt", ln, re.I)][:6]
+        out["kv_lines"] = [ln[-200:] for ln in lines if re.search(r"KV cache size|GPU KV cache|Maximum concurrency",
+                                                                  ln)][:4]
+    except Exception as exc:
+        out["log_error"] = repr(exc)
+    try:
+        with urllib.request.urlopen(BASE + "/v1/models", timeout=10) as r:
+            out["models"] = [(m.get("id"), m.get("root")) for m in json.load(r).get("data", [])]
+    except Exception as exc:
+        out["models_error"] = repr(exc)
+    return out
+
+
+def tokenizer_dir():
+    """vLLM --tokenizer override (None = the model's own tokenizer)."""
+    if not TOKENIZER:
+        return None
+    return official_model_dir() if TOKENIZER == "official" else source_dir(TOKENIZER, "tokenizer.json")
 
 
 def wheel_dir():
@@ -513,6 +603,9 @@ def launch_server(mdir):
         if MTP > 0:
             cmd += ["--speculative-config", json.dumps({"method": "mtp", "num_speculative_tokens": MTP})]
         env.update(VLLM_FORCE_ATTN_BACKEND=attn, VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS="1")
+    tok = tokenizer_dir()
+    if tok:  # E028: the SFT checkpoint's tokenizer_config names Qwen3_5Tokenizer (transformers 4.57 can't load it)
+        cmd += ["--tokenizer-path" if SERVER == "sglang" else "--tokenizer", tok]
     cmd += json.loads(os.environ.get("ARC_SERVER_EXTRA", "[]"))  # extra server flags (bench / experiments)
     log("server cmd:", " ".join(cmd))
     path = os.path.join(LOG_DIR, f"{SERVER}_server.log")
@@ -787,8 +880,11 @@ def robust_executor_factory(timeout, prelude_extra=None):
     v3: the session prelude adds the per-session memory cap and (with ARC_HELPERS) the helper functions."""
     from arc_harness import executor as EX
     extra = session_prelude() if prelude_extra is None else prelude_extra
+    kw = {"prelude_extra": extra} if extra else {}
+    if EXEC_STYLE != "plain":
+        kw["style"] = EXEC_STYLE
     try:
-        return EX.local_factory(timeout=timeout, nice=15, **({"prelude_extra": extra} if extra else {}))
+        return EX.local_factory(timeout=timeout, nice=15, **kw)
     except TypeError:  # older executor without the hardening knobs
         return EX.local_factory(timeout=timeout)
 
@@ -796,12 +892,27 @@ def robust_executor_factory(timeout, prelude_extra=None):
 def build_agent_config(AQ, cap):
     """The AgentConfig every tool attempt runs with (hard cap `cap` = min(ARC_TOOLS_CAP, the attempt's budget))."""
     fields = AQ.AgentConfig.__dataclass_fields__
-    extra = {"context": MAX_MODEL_LEN} if "context" in fields else {}
-    extra.update(agent_options(fields))
-    return AQ.AgentConfig(**extra, tier=TOOLS_TIER, max_total_output=cap, budget_soft=min(TOOLS_SOFT, cap),
-                          budget_notes=0.01, budget_warn=0.75, verify_submit=False, max_turns=60,
-                          chunk_tokens=16384, force_submit_tokens=256, tool_timeout=TOOL_TIMEOUT,
-                          temperature=TEMPERATURE, top_p=0.95, top_k=20)
+    soft = int(TOOLS_SOFT_FRAC * cap) if TOOLS_SOFT_FRAC > 0 else min(TOOLS_SOFT, cap)
+    kw = dict(tier=TOOLS_TIER, max_total_output=cap, budget_soft=soft,
+              budget_notes=0.01, budget_warn=0.75, verify_submit=False, max_turns=int(TOOLS_MAX_TURNS),
+              chunk_tokens=16384, force_submit_tokens=256, tool_timeout=TOOL_TIMEOUT,
+              temperature=TEMPERATURE, top_p=0.95, top_k=20)
+    if "context" in fields:
+        kw["context"] = MAX_MODEL_LEN
+    kw.update(agent_options(fields))
+    return AQ.AgentConfig(**kw)
+
+
+def agent_extra(fields):
+    """ARC_AGENT_EXTRA (JSON object) restricted to the bundled agent's fields; ({}, []) when unset."""
+    if not AGENT_EXTRA:
+        return {}, []
+    try:
+        extra = json.loads(AGENT_EXTRA)
+        assert isinstance(extra, dict)
+    except Exception:
+        return {}, ["ARC_AGENT_EXTRA (not a JSON object)"]
+    return {k: v for k, v in extra.items() if k in fields}, [k for k in extra if k not in fields]
 
 
 def agent_options(fields):
@@ -828,6 +939,11 @@ def agent_options(fields):
         opt.update(compact_at=int(COMPACT_AT), compact_keep=int(COMPACT_KEEP), compact_tool_chars=int(COMPACT_TOOL_CHARS))
     if (FREE_ATTEMPT2 or ATTEMPT2 == "gated") and TOOLS_ANSWER_MODE != "program":
         opt["record_train_check"] = True  # train check of the submitted expression (ranking, retry gating)
+    if TOOLS_DESC:  # E028: tool descriptions as in the E025 training rollouts
+        opt["tool_desc"] = TOOLS_DESC
+    if TOOLS_FALLBACK_SOLVE:  # E028: no answer at the end -> the session's solve(test_input)
+        opt["solve_fallback"] = opt["fallback_solve"] = True  # the harness field is solve_fallback
+    opt.update(agent_extra(fields)[0])
     return {k: v for k, v in opt.items() if k in fields}
 
 
@@ -1242,6 +1358,7 @@ def setup_harness():
             f"{time.time() - t:.1f}s")
         if not ok:
             log("self-test results:", json.dumps([r1, r2, r3, r4, r5, out])[:1500])
+            DROPPED.append("tools_agent")
         if ok:
             v3_selftest()
         return ok
@@ -1254,7 +1371,7 @@ def v3_selftest():
     """Check each enabled v3 feature on CPU before any GPU work; a broken one is switched off (v2 behaviour for
     that feature) and logged loudly. Sets agent_qwen.PROGRAM_MEMORY_MB from the session memory cap."""
     global SESSION_MEM_MB, HELPERS, TASK_SUMMARY, TOOLS_ANSWER_MODE, TOOLS_PROMPT, FREE_ATTEMPT2, TURN_THINK_CAP, \
-        THINK_CALL_RESCUE
+        THINK_CALL_RESCUE, TOOLS_DESC, TOOLS_FALLBACK_SOLVE, AGENT_EXTRA, EXEC_STYLE
     from arc_harness import agent_qwen as AQ
     from arc_harness import executor as EX
     fields = AQ.AgentConfig.__dataclass_fields__
@@ -1289,9 +1406,11 @@ def v3_selftest():
             if not ok:
                 log("SELF-TEST: helpers FAILED; off:", json.dumps(r)[:400])
                 HELPERS = 0
+                DROPPED.append("helpers")
         except Exception as exc:
             log(f"SELF-TEST: helpers error {exc!r}; off")
             HELPERS, status["helpers"] = 0, False
+            DROPPED.append("helpers")
     if TOOLS_ANSWER_MODE == "program":
         try:
             code = ("def solve(grid):\n    return [row[::-1] for row in grid]" if not HELPERS else
@@ -1312,9 +1431,11 @@ def v3_selftest():
             TOOLS_ANSWER_MODE, TOOLS_PROMPT, status["program"] = "submit", "", False
     if TOOLS_PROMPT and TOOLS_PROMPT not in getattr(AQ, "PROMPTS", {}):
         log(f"SELF-TEST: unknown prompt {TOOLS_PROMPT!r}; using the mode default")
+        DROPPED.append(f"prompt:{TOOLS_PROMPT}")
         TOOLS_PROMPT = ""
     if TOOLS_PROMPT and ("prog" in TOOLS_PROMPT) != (TOOLS_ANSWER_MODE == "program"):
         log(f"SELF-TEST: prompt {TOOLS_PROMPT!r} does not match answer mode {TOOLS_ANSWER_MODE}; mode default")
+        DROPPED.append(f"prompt:{TOOLS_PROMPT}")
         TOOLS_PROMPT = ""
     if TASK_SUMMARY:
         try:
@@ -1325,9 +1446,11 @@ def v3_selftest():
             if not ok:
                 log("SELF-TEST: task summary FAILED; off")
                 TASK_SUMMARY = 0
+                DROPPED.append("task_summary")
         except Exception as exc:
             log(f"SELF-TEST: task summary error {exc!r}; off")
             TASK_SUMMARY, status["task_summary"] = 0, False
+            DROPPED.append("task_summary")
     if TURN_THINK_CAP and "turn_think_cap" not in fields:
         log("SELF-TEST: bundled agent has no turn_think_cap; off")
         TURN_THINK_CAP, status["think_cap"] = 0, False
@@ -1337,20 +1460,51 @@ def v3_selftest():
     if FREE_ATTEMPT2 and "record_alternatives" not in fields:
         log("SELF-TEST: bundled agent has no record_alternatives; free attempt_2 off")
         FREE_ATTEMPT2, status["free_attempt2"] = 0, False
+    # E028 options: the field must exist in the bundled agent (agent_options drops unknown fields silently)
+    if TOOLS_DESC and "tool_desc" not in fields:
+        log(f"SELF-TEST: bundled agent has no tool_desc; ARC_TOOLS_DESC={TOOLS_DESC!r} ignored")
+        status["tool_desc"] = False
+        DROPPED.append("tool_desc")
+    if TOOLS_FALLBACK_SOLVE and "solve_fallback" not in fields and "fallback_solve" not in fields:
+        log("SELF-TEST: bundled agent has no solve_fallback; ARC_TOOLS_FALLBACK_SOLVE ignored")
+        status["fallback_solve"] = False
+        DROPPED.append("solve_fallback")
+    if EXEC_STYLE != "plain":  # E028: executor text format of the training rollouts
+        try:
+            with EX.LocalExecutor(train, test_input, timeout=10, prelude_extra=session_prelude(),
+                                  style=EXEC_STYLE) as ex:
+                r = [ex.execute(c) for c in ("print(len(train))", "1/0", "x = 3\nx + 1")]
+            ok = (r[0]["stdout"].strip() == "2" and "ZeroDivisionError" in r[1]["stdout"] + r[1]["stderr"]
+                  and "4" in r[2]["stdout"])
+            status["exec_style"] = ok
+            if not ok:
+                log(f"SELF-TEST: executor style {EXEC_STYLE!r} FAILED; plain:", json.dumps(r)[:600])
+        except Exception as exc:
+            log(f"SELF-TEST: executor style {EXEC_STYLE!r} error {exc!r}; plain")
+            ok = status["exec_style"] = False
+        if not ok:
+            DROPPED.append(f"exec_style:{EXEC_STYLE}")
+            EXEC_STYLE = "plain"
+    unknown = agent_extra(fields)[1]
+    if unknown:
+        log(f"SELF-TEST: ARC_AGENT_EXTRA fields unknown to the bundled agent, ignored: {unknown}")
+        DROPPED.extend(f"extra:{k}" for k in unknown)
     try:  # the agent config the attempts will use (also checks the field names)
         cfg = build_agent_config(AQ, int(TOOLS_CAP))
         AQ.initial_prompt(train, test_input, cfg)
         PHASES["agent_config"] = AQ.config_dict(cfg, SERVED)  # what a full-budget attempt runs with
     except Exception as exc:
         log(f"SELF-TEST: agent config/prompt error {exc!r}; dropping all v3 agent options")
-        HELPERS = TASK_SUMMARY = TURN_THINK_CAP = FREE_ATTEMPT2 = 0
-        TOOLS_ANSWER_MODE, TOOLS_PROMPT = "submit", ""
+        DROPPED.append("all_agent_options")
+        HELPERS = TASK_SUMMARY = TURN_THINK_CAP = FREE_ATTEMPT2 = TOOLS_FALLBACK_SOLVE = 0
+        TOOLS_ANSWER_MODE, TOOLS_PROMPT, TOOLS_DESC, AGENT_EXTRA = "submit", "", "", ""
     PHASES["v3_selftest"] = status
     log(f"v3 self-test {status}; effective: answer_mode={TOOLS_ANSWER_MODE} prompt={TOOLS_PROMPT or 'default'} "
         f"summary={TASK_SUMMARY} helpers={HELPERS} think_cap={TURN_THINK_CAP}/{TURN_THINK_GRACE} "
         f"rescue={THINK_CALL_RESCUE} tier={TOOLS_TIER} feedback={FEEDBACK} "
         f"free_attempt2={FREE_ATTEMPT2} attempt2={ATTEMPT2} session_mem={SESSION_MEM_MB} MB "
-        f"program_mem={AQ.PROGRAM_MEMORY_MB} MB")
+        f"program_mem={AQ.PROGRAM_MEMORY_MB} MB tool_desc={TOOLS_DESC or 'default'} "
+        f"fallback_solve={TOOLS_FALLBACK_SOLVE} exec_style={EXEC_STYLE} extra={AGENT_EXTRA or '-'} dropped={DROPPED}")
 
 
 def is_rerun(test_path):
@@ -1402,9 +1556,9 @@ def kill_children():
                        shell=True)
 
 
-def emergency_timer():
-    """Last-resort timer (review S1): at T0 + ARC_EMERGENCY_S, make sure a valid submission.json exists, kill the
-    server and all children, and exit, whatever the asyncio side is doing."""
+def emergency_timer(at_s=None):
+    """Last-resort timer (review S1): at T0 + ARC_EMERGENCY_S (or `at_s`), make sure a valid submission.json exists,
+    kill the server and all children, and exit, whatever the asyncio side is doing."""
     import threading
 
     def fire():
@@ -1423,7 +1577,8 @@ def emergency_timer():
                 kill_children()
             finally:
                 os._exit(0)
-    t = threading.Timer(max(1.0, T0 + envf("ARC_EMERGENCY_S", 11.7 * 3600) - time.time()), fire)
+    at_s = envf("ARC_EMERGENCY_S", 11.7 * 3600) if at_s is None else at_s
+    t = threading.Timer(max(1.0, T0 + at_s - time.time()), fire)
     t.daemon = True
     t.start()
 
@@ -1437,6 +1592,9 @@ def main():
     rerun, env_rerun, ids_differ = is_rerun(comp_file("arc-agi_test_challenges.json"))
     mode = "submit" if rerun else MODE
     log(f"rerun={rerun} (env {env_rerun}, test ids differ from public {ids_differ})")
+    if os.environ.get("ARC_INTERNET"):  # set by the notebook's connectivity cell
+        PHASES["internet"] = os.environ["ARC_INTERNET"]
+        log(f"INTERNET: {os.environ['ARC_INTERNET']}")
     log(f"mode={mode} server={SERVER} agent={AGENT} rerun={rerun} "
         f"T0={time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(T0))} UTC")
     test_tasks = json.load(open(comp_file("arc-agi_test_challenges.json")))
@@ -1444,6 +1602,9 @@ def main():
     log(f"fallback submission written ({len(test_tasks)} tasks)")
     if mode == "fallback":
         return
+    if mode == "local" and LOCAL_WALL_MIN > 0:  # commit-run wall-clock bound (never on the rerun: mode is submit)
+        emergency_timer(LOCAL_WALL_MIN * 60)
+        log(f"local wall-clock limit: emergency exit at {LOCAL_WALL_MIN:.0f} min")
     if mode == "local":
         # Non-rerun commit/interactive run: small local test set with known solutions, self-scored, time-boxed.
         if LOCAL_SOURCE == "eval":
@@ -1490,7 +1651,9 @@ def main():
         if TP != 4:
             log(f"WARNING: running with TP={TP} instead of 4; KV capacity and concurrency shrink accordingly")
         mdir = model_dir()
-        log("model dir:", mdir)
+        log("model dir:", mdir, "tokenizer:", tokenizer_dir() or "(model's own)")
+        PHASES["model"] = model_identity(mdir)  # raises (run fails, fallback kept) on the wrong model
+        log("MODEL IDENTITY", json.dumps(PHASES["model"]))
         install_server()
         install_fp8_configs()
         PHASES["installed"] = round(time.time() - T0)
@@ -1504,6 +1667,8 @@ def main():
         if not wait_ready(proc, slog, timeout=1800):
             raise RuntimeError("server failed to start (twice)")
     PHASES["server_ready"] = round(time.time() - T0)
+    PHASES["server_identity"] = server_identity(slog)
+    log("SERVER IDENTITY", json.dumps(PHASES["server_identity"]))
     if mode == "local":
         if LOCAL_READY_MIN > 0:
             force_at = time.time() + LOCAL_READY_MIN * 60
@@ -1576,13 +1741,18 @@ def main():
                    "tool_errors": sum(r.get("tool_errors") or 0 for r in recs),
                    "parse_failures": sum(r.get("parse_failures") or 0 for r in recs),
                    "answer_sources": {k: sum(r.get("answer_source") == k for r in recs)
-                                      for k in ("submit", "forced", "session", "salvage", "parse", "lenient",
-                                                "program_pass", "program_best_fail", "session_solve", None)},
+                                      for k in ["submit", "forced", "session", "salvage", "parse", "lenient",
+                                                "program_pass", "program_best_fail", "session_solve", None]
+                                      + sorted({r["answer_source"] for r in recs if isinstance(  # new harness
+                                          r.get("answer_source"), str)} - set(KNOWN_SOURCES))},  # sources too
                    "v3": {"answer_mode": TOOLS_ANSWER_MODE, "prompt": TOOLS_PROMPT or "default",
                           "task_summary": TASK_SUMMARY, "helpers": HELPERS, "turn_think_cap": TURN_THINK_CAP,
                           "think_call_rescue": THINK_CALL_RESCUE, "tier": TOOLS_TIER, "feedback": FEEDBACK,
                           "think_rescued": sum(r.get("think_call_rescued") or 0 for r in recs),
                           "free_attempt2": FREE_ATTEMPT2, "attempt2": ATTEMPT2, "session_mem_mb": SESSION_MEM_MB,
+                          "tool_desc": TOOLS_DESC or "default", "fallback_solve": TOOLS_FALLBACK_SOLVE,
+                          "model_source": MODEL_SOURCE or "official", "dropped": DROPPED, "exec_style": EXEC_STYLE,
+                          "strict_features": STRICT_FEATURES,
                           "gated": sch.gated, "attempts_by_index": {str(i): sum(r["attempt"] == i for r in recs)
                                                                     for i in (0, 1)},
                           "think_nudges": sum(r.get("think_nudges") or 0 for r in recs),

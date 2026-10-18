@@ -196,3 +196,13 @@ think cap 8192/2048 + think-call rescue, 48k hard / 24k soft; free attempt_2 and
 `experiments/E021_kaggle_v3/scripts/k3_config_diff.py` checks the notebook's AgentConfig against K3's recorded run
 config field by field (28/30 equal: `routing_key_header` is gateway-only, `think_call_rescue` is new).
 Check: `tests/check_notebook.py --variant v4 --extract-to DIR`.
+
+## v5_sft (E028, 2026-10-17): the E028 SFT model with the v3/v4 machinery
+`build_notebook.py --variant v5_sft --env "$(cat experiments/E028_qwen38_sft/kaggle_v5_sft_settings.json)"` builds
+`nb_v5_sft/` (new slug `chankhavu/arc2-qwen38-e028-sft-submit`; models: the SFT FP8 checkpoint and the official
+mirror, which supplies the tokenizer). Check: `tests/check_notebook.py --variant v5_sft --extract-to DIR`.
+- New opt-in solver settings: `ARC_MODEL_SOURCE`, `ARC_TOKENIZER`, `ARC_MODEL_REQUIRE`, `ARC_TOOLS_DESC`,
+  `ARC_EXEC_STYLE`, `ARC_TOOLS_SOLVE_FALLBACK`, `ARC_TOOLS_MAX_TURNS`, `ARC_TOOLS_SOFT_FRAC`, `ARC_AGENT_EXTRA`,
+  `ARC_STRICT_FEATURES`, `ARC_LOCAL_WALL_MIN`.
+- The notebook adds an `INTERNET: OFF` cell, plus `MODEL IDENTITY` / `SERVER IDENTITY` log lines.
+- Settings, budget arithmetic and commands: `experiments/E028_qwen38_sft/KAGGLE_V5_SFT.md`.

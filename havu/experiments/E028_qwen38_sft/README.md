@@ -1,6 +1,6 @@
 # E028: LoRA SFT of Qwen3.8-27B on Tinker, on E025 DeepSeek-Flash tool-use rollouts
 
-Status: training done (2026-10-17); evaluation pending. Started 2026-10-16. Originally named E026_qwen38_sft;
+Status: trained, merged, quantized (ModelOpt FP8 and official-layout block FP8), evaluated on dev56 (2026-10-17): ties base; Kaggle notebooks v1/v2 built. Started 2026-10-16. Originally named E026_qwen38_sft;
 renamed because E026 and E027 were already taken.
 
 Goal: SFT Qwen3.8-27B on DeepSeek-V4.1-Flash agentic rollouts (E025), training every assistant turn
@@ -119,6 +119,164 @@ are included on purpose.
 - **Every datum token is billed at the train price,** masked weight-0 prompt and tool tokens included (minus one per
   datum, from the shift). A pilot billed 5,623,335 tokens = $23.07, where trained-only billing would have been $15.06.
 - **Total E028 Tinker spend:** 3 pilots × $23.07 + full run $267.25 ≈ **$336.5**, plus storage.
+
+## Export, merge, parity and FP8 (2026-10-17, on a rented 4× RTX PRO 6000 WS box)
+
+**Export.**
+- The deprecated `get_checkpoint_archive_url` path (server builds a .tar) timed out twice, after 20+ minutes each.
+- `TrainingClient.save_weights_external()` + `RestClient.get_external_weights_urls()` worked in 82 s. Load the client
+  from `.../weights/final`, save the external weights, then fetch one signed URL per file. Only the signed URLs
+  reached the box, never the API key.
+- Result: `adapter_model.safetensors` (994 tensors, fp32, 3.86 GB) plus `adapter_config.json` (r 128, alpha 32).
+  Keys are in Tinker's native naming: split `in_proj_q/k/v`, `unembed_tokens`.
+
+**Merge.**
+- `tinker_cookbook.weights.build_hf_model(base_model=Qwen/Qwen3.8-27B, adapter_path=...)`, shard by shard: 127 s,
+  52 GB BF16.
+- The merger doesn't copy `generation_config.json`; copy it from the base model.
+- The box environment is a uv venv with `zz_sglang_site.pth` pointing at `/opt/sglang` site-packages, plus
+  `flash-linear-attention`. The cookbook is installed with `SETUPTOOLS_SCM_PRETEND_VERSION`.
+
+**Tinker reference** (`tinker_reference.py`, under $1, 28 s). Tinker sampling client with the adapter applied, and
+the base model:
+- `compute_logprobs` on 8 training sequences: 6.6k–12.6k tokens; correct and incorrect; arc2 and nvarc.
+- Greedy first-turn generation (top_k=1, 1,024 tokens) on 4 task prompts.
+
+Tinker reproduces the training logs: base matches the step-0 NLL to 4 decimals, the SFT adapter matches step 251
+within 0.0003. SFT lowers trained-token NLL on every sequence by 0.05–0.17. Base and SFT greedy outputs diverge
+within 3–8 tokens.
+
+**Parity** (`parity_check.py`, SGLang 0.5.20, one model copy per GPU, BF16 KV, radix off). Mean NLL over the 8
+sequences:
+
+| | Tinker | merged BF16 | merged FP8 (ModelOpt) |
+|---|---|---|---|
+| trained (assistant) tokens | 0.5269 | 0.5273 (per-sequence Δ ≤ ±0.0013) | 0.5272 (Δ ≤ ±0.0020) |
+| untrained tokens (prompt grids, tool outputs) | 5.172 | 5.211 | 5.105 |
+| greedy tokens identical to Tinker's (of 1,024) | – | 18–317 | 5–184 |
+
+- **Untrained positions** are very high-NLL and overconfident on task grids (4–8 nats per token, for every engine).
+  Individual positions there swing by up to ±29 nats between engines, but there is no systematic bias.
+- **Greedy divergence** is ordinary kernel-level noise: base BF16 diverges from Tinker base after 28–696 tokens too.
+- **Conclusion:** both the merge and the FP8 quantization are faithful.
+
+**FP8 (`quantize_fp8.py`, ModelOpt 0.46.1, `FP8_DEFAULT_CFG`, max calibration).**
+- **Format.** Static per-tensor E4M3 weights and activations on every language-model linear layer: self_attn
+  q/k/v/o, linear_attn in_proj_qkv/in_proj_z/out_proj, and mlp gate/up/down. That is the same layer set NVIDIA
+  quantizes in `nvidia/Qwen3.8-27B-NVFP4`.
+- **Kept in BF16:** lm_head, embeddings, linear_attn in_proj_a/b and conv1d, and vision.
+- **Calibration.** 96 windows of 2,048 tokens of E028 training sequences (seed 0; a quarter start at the beginning of
+  the sequence). This took 92 s; the export took 140 s in total.
+- **Output.** 29 GB, `quant_method: modelopt`, loaded by SGLang as `modelopt_fp8`. Weights take 28.5 GB of GPU
+  memory, which leaves 444k KV tokens per RTX PRO 6000 in BF16 KV (195k for the BF16 model).
+- **The MTP head is not in the FP8 export** (the HF class drops `mtp.*`; the merged BF16 model has 15 MTP tensors).
+  It only matters for speculative decoding and was never trained.
+- **Artifacts.** Locally: `data/sft/e028_parity/` (the reference with full logprob arrays, the parity data, the
+  calibration windows) and `parity/bf16_merged_vs_tinker.json`. The models (`Qwen3.8-27B-e028-sft`, BF16, and
+  `-FP8`) are only on the box, which is not persistent.
+
+## dev56 evaluation (2026-10-17, 20:12 → 23:20 UTC, rented 4× RTX PRO 6000)
+
+**Setup.**
+- **Harness:** the DeepSeek harness itself (`evals/run_deepseek_tools.py`) with E025's exact flags: lean2roles, task
+  summary, helpers, `submit_answer`, budget notes at 40k soft / 80k hard, 64k per turn, sampling at temperature 1.0,
+  top_p 0.95, top_k 20, xhigh.
+- **Arms:** both models in ModelOpt FP8 (same recipe and calibration), SGLang 0.5.20, FP8 KV, radix cache, one server
+  per GPU. Each attempt is pinned to one server, which gave 93–99% prefix-cache hits; DP round-robin had broken cache
+  reuse.
+- **Prompt format check:** stock SGLang re-serializes tools, adding `"strict": false` and `"defer_loading": null` and
+  reordering keys: +22 tokens. Patched in the container (protocol.py). After that, `format_check.py` shows 12/12
+  prompts token-identical to training. vLLM 0.23 needs no patch.
+
+| dev56, 1 attempt per pair | SFT | base | DeepSeek-Flash teacher (E017 v3all, same harness and limits) |
+|---|---|---|---|
+| pass@1 | 21/56 = 37.5% | 22/56 = 39.3% | 39/56 = 69.6% |
+| plus offline `solve(test_input)` fallback on capped attempts | 22/56 = 39.3% (1 of 8 with a solve() rescued) | 22/56 (0 of 5) | — |
+| mean output tokens | 60.0k | 55.0k | 39.1k |
+| cap hits (80k) | 23 | 19 | — |
+| submitted answers that were correct | 20/32 (62%) | 22/37 (59%) | — |
+
+- **Paired comparison:** both solve 14, SFT-only 7, base-only 8. They are complementary: the union is 29/56.
+- **On the 37 pairs the teacher solved,** SFT and base each solve 19.
+- **Reasoning quality is healthy** (trace monitor): no loops or language drift, thinking closes, tool calls are valid,
+  and it verifies solve() on the train pairs and writes ROLES notes like the teacher. It inherited the "Let me…" end-of-turn
+  dithering.
+- **Main failure: budget adherence.** After the 40k note the SFT model spends a median of 29k more tokens (base 15k,
+  teacher 6k), and it ignored every "Budget nearly spent" (60k) note.
+- **Root cause, in the data:**
+  - E025 has 713 rollouts that saw the 60k warning, and DeepSeek submitted after it in 623 of them (87%).
+  - None of the 252 such rollouts in our 2,500-rollout SFT set kept a turn after the warning, because the 64K
+    turn-boundary cut always lands before it: a rollout with 60k output plus prompt plus tool outputs exceeds 64K.
+- **For E028b:**
+  - train on the 256K-context model (`:peft:262144`) so the wrap-up and submit stay in the data;
+  - add more data and/or epochs;
+  - consider emphasizing efficient teacher rollouts;
+  - test the SFT+base ensemble for Kaggle's two answer slots.
+- **Files:** `evals/results/tools_persistent_grid_lean2roles_{sft,base}_low_e028_dev56.jsonl` (+ traces),
+  `solve_fallback_rescue.py`, `eval_status.py`, `format_check.py`.
+
+## Adversarial audit (2026-10-17 ~23:30 UTC, 4 read-only sub-agents) and corrections
+
+**Kaggle rerun path: sound, no blocker.**
+- What ran on Kaggle is byte-identical to the repo.
+- Rerun detection, the 240-task / 259-input fallback with atomic rewrites, the repair cell and the deadlines are all
+  the same as v2/v4, whose reruns scored.
+- 188 GB RAM fits 24 sessions; the ipython executor self-test passed on Kaggle.
+
+**Block-FP8 checkpoint: CORRECT.**
+- The scale convention was verified against a real official shard: dequantization is fp8 × scale_inv, with relative
+  error 0.026.
+- All 1,606 tensors were checked. BF16 tensors are bit-identical to the merged model; config, tokenizer and chat
+  template are identical to the official files.
+- Long context (33–62.5k tokens), versus BF16: block FP8 +0.001 to +0.002 NLL, ModelOpt +0.002 to +0.004, with no
+  growth with length.
+- Sampled generation: 0/48 loops.
+- Not tested: vLLM logprobs. The Kaggle commit runs load and generate fine.
+
+**Harness interface: faithful in format, but:**
+- **(material) budget notes on Kaggle use the adaptive cap,** e.g. "15k (hard limit 30k)" against training's
+  "40k (80k)". Fix: show the notes on the 80k scale.
+- **(bug) `executor.py` `salvage_answer` / `check_answer_on_train` print all grids on one line,** which is truncated at
+  16,000 characters, so salvage and train_pass are lost on large tasks (e.g. 4 × 30×30 train pairs). This affects v4b
+  as well.
+- **FORCE_THINK forced submits are mostly useless:** of 19, 4 copied test_input, 1 was a truncated grid and 14 raised
+  NameError. An accepted copy also skips the solve/salvage fallbacks. Fix: `force_submit_tokens=0`, or reject the input
+  copy.
+- **The free attempt_2 found no alternatives in any run.**
+- **The off-Kaggle box run had no scipy and no IPython** (3/6 traces hit ModuleNotFoundError). Kaggle has both; add
+  them to the self-test.
+
+**Evals and hygiene.**
+- **Contamination:** no dev56 contamination.
+- **Missed near-match:** training task `b7999b51`'s test output matches eval `89565ca0` up to D8 + colour. It is not
+  in dev56; add it to `EXCLUDE_TASKS`.
+- **Secrets:** none in the repo, the snapshot or its history, and none left on the box. The HF and Kaggle artifacts
+  are private.
+
+**Corrections to statements above.**
+- SFT − base on dev56 is −1.8 pp with a paired-bootstrap 95% CI of [−16, +12.5] (McNemar p = 1): **inconclusive**,
+  not "ties".
+- The 7/8 SFT-only / base-only split is consistent with sampling noise: the teacher's own attempts 0 and 1 disagree
+  on 11 pairs.
+- SFT submitted after the 60k note in 10 of 28 warned attempts, not 0 (base 8/16, teacher 16/17).
+- Extra tokens after the 40k note: SFT 30k, base 21k, teacher 18k (not 29k / 15k / 6k).
+- The teacher solved 39 dev56 pairs; on those, SFT solves 18 and base 19.
+- `format_check.py` compares prompt token counts, not ids.
+- The eval used fp8 KV, while parity used bf16 KV.
+- SFT pair 981571dc ended with an error at SGLang's 131,072-token context limit.
+
+**Kaggle cap context.** At about a 30k cap, SFT finished only 8 of 56 dev56 attempts (7 correct), against 9 correct
+for base, so the expected leaderboard score is at or below v4b's (19 / 26 / 23).
+
+**Queued fixes for the next build:**
+- `force_submit_tokens=0`;
+- budget notes on the training scale;
+- the executor salvage / train-check fix (also helps v4b);
+- scipy and IPython in the self-test;
+- exclude `b7999b51`;
+- record extra_body and the launch command in eval rows.
+
+Box artifacts (scripts, logs, audit outputs) are in `box_artifacts/`.
 
 ## Commands
 

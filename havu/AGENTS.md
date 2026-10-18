@@ -25,6 +25,10 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
   - with a message (`"havu: ..."`) it also commits and pushes to main.
 - What it leaves out: `data/`, `.venv`, `SECRETS.yaml` and `ENDPOINTS.yaml` are never synced, and the repo's `.gitignore` skips `*.log`, `*.pid` and vendor copies.
 - Commits are unsigned, as in the history, because GPG cannot prompt from agent shells. Push only when the user asks.
+- **Distillation data (DeepSeek → Qwen SFT):**
+  - The findings and decisions are in `notes/2026-10-17_distillation_data_findings.md`.
+  - Collect new DeepSeek batches without `--task-summary`, but keep `--helpers --train-check` (E026: the summary saves only 9% of tokens and its framing misleads the model).
+  - The task pool and launcher are in `experiments/E025_train_rollouts/` (`build_dataset.py --batch nvarc_bN`, `launch.sh`).
 - E025 rollouts are also on Hugging Face as the private dataset `livobereshka/arc-agi2-deepseek-v3-rollouts-e025`. The org is `livobereshka`, spelled with an "s"; the token is `huggingface_api_key` in `SECRETS.yaml`.
 
 ## Environment

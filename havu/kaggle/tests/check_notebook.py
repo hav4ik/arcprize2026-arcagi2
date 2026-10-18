@@ -21,7 +21,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 NBS = {"v2": ROOT / "kaggle/nb_v2/arc2-qwen38-tools-submit.ipynb",
        "v3": ROOT / "kaggle/nb_v3/arc2-qwen38-tools-submit.ipynb",
-       "v4": ROOT / "kaggle/nb_v4/arc2-qwen38-tools-submit.ipynb"}  # v4 = the v3 build with v4_settings.json
+       "v4": ROOT / "kaggle/nb_v4/arc2-qwen38-tools-submit.ipynb",  # v4 = the v3 build with v4_settings.json
+       # v5_sft = --variant v5_sft with experiments/E028_qwen38_sft/kaggle_v5_sft_settings.json (E028 SFT model)
+       "v5_sft": ROOT / "kaggle/nb_v5_sft/arc2-qwen38-e028-sft-submit.ipynb"}
+V3_FAMILY = ("v3", "v4", "v5_sft")
 DEST = "/kaggle/working/arc_solver"
 
 
@@ -63,12 +66,28 @@ def main():
     sys.path[:0] = [str(ROOT / "kaggle")]
     import build_notebook
     assert written["solver.py"] == build_notebook.solver_source(), "embedded solver differs from solver_source()"
-    modules = build_notebook.V3_MODULES if a.variant in ("v3", "v4") else build_notebook.V2_MODULES
+    modules = (build_notebook.V5_SFT_MODULES if a.variant == "v5_sft" else
+               build_notebook.V3_MODULES if a.variant in V3_FAMILY else build_notebook.V2_MODULES)
     for repo, rel in modules:
         assert written[rel] == (ROOT / repo).read_text(), f"{rel} differs from the repo"
     assert written["notes/prompts/arcprize_official_system_prompt.txt"] == \
         (ROOT / "notes/prompts/arcprize_official_system_prompt.txt").read_text()
     print("embedded sources equal the repo sources")
+    if a.variant == "v5_sft":  # own slug, SFT model + the official mirror (tokenizer), same inputs as v4 otherwise
+        meta = json.loads((NB.parent / "kernel-metadata.json").read_text())
+        assert meta["id"] == "chankhavu/arc2-qwen38-e028-sft-submit" and meta["is_private"], meta["id"]
+        sft_variants = [build_notebook.SFT_MODEL, build_notebook.SFT_MODEL.replace("/fp8/", "/fp8block/")]  # E028 v1 / v2
+        assert meta["model_sources"] in ([v, build_notebook.MODEL] for v in sft_variants), meta["model_sources"]
+        assert meta["kernel_sources"] == [build_notebook.VLLM_SOURCE] and not meta["enable_internet"]
+        assert meta["dataset_sources"] == [build_notebook.LOCAL_DATA]
+        assert meta["competition_sources"] == ["arc-prize-2026-arc-agi-2"] and meta["machine_shape"] == "NvidiaL4"
+        cfg = next(c.source for c in nb.cells if c.cell_type == "code" and "SETTINGS = " in c.source)
+        settings = json.loads(cfg.split("SETTINGS = ", 1)[1].split("\nfor k, v in", 1)[0])
+        assert any(c.cell_type == "code" and c.source == build_notebook.NET_CELL for c in nb.cells), "no INTERNET cell"
+        for k in ("ARC_MODEL_SOURCE", "ARC_MODEL_REQUIRE", "ARC_TOKENIZER", "ARC_TOOLS_PROMPT", "ARC_TOOLS_DESC",
+                  "ARC_EXEC_STYLE", "ARC_STRICT_FEATURES"):
+            assert settings.get(k) not in (None, ""), f"v5_sft setting {k} missing"
+        print("v5_sft metadata and settings OK:", meta["id"], meta["model_sources"])
     env = dict(os.environ, ARC_WORK=tempfile.mkdtemp())
     mods = [m[1][len("evals/"):-3].replace("/", ".") for m in modules
             if m[1].endswith(".py") and not m[1].endswith("__init__.py")] + ["solver"]
@@ -80,7 +99,7 @@ def main():
     print(r.stdout.strip())
     assert r.returncode == 0, r.stderr[-2000:]
     if not a.skip_fake:
-        tests = ["fake_server_test.py", "fake_tools_test.py"] + (["fake_v3_test.py"] if a.variant in ("v3", "v4") else [])
+        tests = ["fake_server_test.py", "fake_tools_test.py"] + (["fake_v3_test.py"] if a.variant in V3_FAMILY else [])
         for t in tests:
             r = subprocess.run([sys.executable, str(ROOT / "kaggle/tests" / t)], capture_output=True, text=True,
                                env=dict(os.environ, ARC_TEST_SRC=str(out)), timeout=600)

@@ -37,6 +37,7 @@ import ast, contextlib, io, json, os, resource, signal, sys, traceback
 resp = os.fdopen(int(sys.argv[1]), "w")
 limit = int(sys.argv[2])
 mem, cpu, fsize, nice = (int(x) for x in sys.argv[3:7])
+style = sys.argv[7] if len(sys.argv) > 7 else "plain"
 # Self-imposed limits (no preexec_fn: the parent spawns from many threads). The child leads its own session.
 if mem:
     resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
@@ -70,10 +71,85 @@ def plain_traceback(exc):
     text = "".join(traceback.format_list(frames)) if frames else ""
     return "Traceback (most recent call last):\n" + text + "".join(traceback.format_exception_only(type(exc), exc))
 
+if style == "ipython":  # E028 e025 mode: the text format of the NeMo-Skills IPython sandbox (sandbox_docker/main.py)
+    import hashlib, linecache, pprint, re
+    try:
+        from IPython.lib.pretty import pretty as _pretty
+    except Exception:
+        _pretty = None
+
+    def show(value):  # IPython displayhook: "Out[n]: " (removed by the sandbox), a newline before multi-line values
+        if _pretty is not None:
+            text = _pretty(value, max_width=79)
+        elif isinstance(value, (list, tuple, dict, set, frozenset)):
+            text = pprint.pformat(value, width=79, sort_dicts=False)
+        else:
+            text = repr(value)
+        print("\n" + text if "\n" in text else text)
+
+    def run(code):
+        cell = code if code.endswith("\n") else code + "\n"  # IPython names a cell by the hash of its transformed source
+        name = "<ipython-input-1-%s>" % hashlib.sha1(cell.encode()).hexdigest()[:12]
+        linecache.cache[name] = (len(code), None, code.splitlines(True), name)
+        tree = ast.parse(code, name, "exec")
+        last = None
+        if tree.body and isinstance(tree.body[-1], ast.Expr):
+            last = ast.Expression(tree.body.pop().value)
+        exec(compile(tree, name, "exec"), ns)
+        if last is not None:
+            value = eval(compile(last, name, "eval"), ns)
+            if value is not None:
+                show(value)
+
+    def ipython_traceback(exc):  # IPython "Plain" mode after the sandbox's filter (cell frames: source line only)
+        if isinstance(exc, SyntaxError):
+            lines = traceback.format_exception_only(type(exc), exc)
+            text = "".join(lines)
+            return text.split("\n", 1)[1] if text.startswith("  File ") else text
+        s = "Traceback (most recent call last):\n"
+        for f in traceback.extract_tb(exc.__traceback__):
+            if f.filename == "<string>":  # this child's own frames
+                continue
+            if not f.filename.startswith("<ipython-input-"):
+                s += "  File %s:%d in %s\n" % (f.filename, f.lineno, f.name)
+            if f.line:
+                s += "    " + f.line.strip() + "\n"
+        msg = str(exc)
+        return s + type(exc).__name__ + (": " + msg if msg else "") + "\n"  # IPython: the bare class name
+
+    def post(text):  # sandbox_docker/main.py postprocess_output (Plain), then its max_output_characters cut
+        lines = [re.sub(r"^Out\[\d+\]:\s*", "", l) for l in text.split("\n")
+                 if not l.strip().startswith("File <ipython-")]
+        while lines and lines[0] == "":
+            lines.pop(0)
+        text = "\n".join(lines).rstrip()
+        text = text + ("\n" if text else "")
+        return text[:limit] + "<output cut>" if len(text) > limit else text
+
 for line in sys.stdin:
     req = json.loads(line)
     out, err = io.StringIO(), io.StringIO()
     status = "completed"
+    if style == "ipython":
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    run(req["code"])
+                except KeyboardInterrupt as exc:
+                    status = "timeout"
+                    out.write(ipython_traceback(exc))
+                except BaseException as exc:
+                    status = "error"
+                    out.write(ipython_traceback(exc))
+        except KeyboardInterrupt:
+            status = "timeout"
+        except BaseException as exc:
+            status = "error"
+            out.write("%s: %s\n" % (type(exc).__name__, exc))
+        resp.write(json.dumps({"process_status": status, "stdout": post(out.getvalue()),
+                               "stderr": post(err.getvalue())}) + "\n")
+        resp.flush()
+        continue
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             run(req["code"])
@@ -102,8 +178,12 @@ class LocalExecutor:
     task data (`state_reset`)."""
 
     def __init__(self, train, test_input, timeout=30, max_output=16000, memory_mb=4096, grace=5,
-                 python=sys.executable, cpu_seconds=1200, fsize_mb=64, nice=10, start_timeout=90, prelude_extra=""):
+                 python=sys.executable, cpu_seconds=1200, fsize_mb=64, nice=10, start_timeout=90, prelude_extra="",
+                 style="plain"):
         self.train, self.test_input = train, test_input
+        # style="ipython" (E028 e025 mode): cell output, tracebacks, timeouts and truncation in the text format of the
+        # Docker IPython sandbox the E025 training rollouts were recorded with; "plain" is the original format.
+        self.style = style
         self.timeout, self.max_output, self.memory_mb, self.grace = timeout, max_output, memory_mb, grace
         self.python, self.cpu_seconds, self.fsize_mb, self.nice = python, cpu_seconds, fsize_mb, nice
         self.start_timeout = start_timeout  # the prelude (numpy import) may be slow on a busy 4-CPU box
@@ -121,7 +201,8 @@ class LocalExecutor:
         r, w = os.pipe()
         self.proc = subprocess.Popen(
             [self.python, "-I", "-u", "-c", _CHILD, str(w), str(self.max_output), str(self.memory_mb * 2 ** 20),
-             str(int(self.cpu_seconds)), str(self.fsize_mb * 2 ** 20), str(self.nice)],
+             str(int(self.cpu_seconds)), str(self.fsize_mb * 2 ** 20), str(self.nice)]
+            + ([self.style] if self.style != "plain" else []),
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=(w,),
             start_new_session=True, text=True, cwd="/tmp",
             env={"PATH": os.environ.get("PATH", ""), "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
@@ -217,6 +298,8 @@ class LocalExecutor:
             result = {"process_status": self.last_failure, "stdout": "", "state_reset": True,
                       "stderr": ("Cell did not stop after the timeout; process restarted." if self.last_failure == "timeout"
                                  else "Python process died (crash, exit or memory limit); process restarted.")}
+            if self.style == "ipython" and self.last_failure == "timeout":  # the sandbox's killed-shell text
+                result["stderr"] = f"Execution timed out after {self.timeout:g} seconds\n"
         return result
 
     def close(self):
