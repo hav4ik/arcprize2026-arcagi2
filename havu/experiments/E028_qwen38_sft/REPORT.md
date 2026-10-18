@@ -29,6 +29,8 @@ incorrect rollouts both included.
 - The model never saw how a long attempt ends.
 - Fix for E028b: train with 256K context so full rollouts survive, plus more data or epochs.
 
+> **Teacher provenance (2026-10-17):** all E028 training data (E025) and the dev56 teacher comparison (E017 v3all) come from the *original* DeepSeek-V4.1-Flash. From ~2026-10-17 the API name `deepseek-flash` (and the legacy names) serves **DeepSeek-V4.1-Flash-1017**, and the old model is retired. New rollouts for E028b therefore come from a different teacher. Record the request date and `system_fingerprint` per rollout, and don't mix the two silently.
+
 ## 1. Goal
 
 Distil DeepSeek-V4.1-Flash's agentic ARC reasoning into Qwen3.8-27B, the model we can run offline on Kaggle (4×L4).

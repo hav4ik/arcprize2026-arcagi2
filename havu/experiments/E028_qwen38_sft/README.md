@@ -278,6 +278,8 @@ for base, so the expected leaderboard score is at or below v4b's (19 / 26 / 23).
 
 Box artifacts (scripts, logs, audit outputs) are in `box_artifacts/`.
 
+> **Teacher provenance (2026-10-17):** all E028 training data (E025) and the dev56 teacher comparison (E017 v3all) come from the *original* DeepSeek-V4.1-Flash. From ~2026-10-17 the API name `deepseek-flash` (and the legacy names) serves **DeepSeek-V4.1-Flash-1017**, and the old model is retired. New rollouts for E028b therefore come from a different teacher. Record the request date and `system_fingerprint` per rollout, and don't mix the two silently.
+
 ## Commands
 
 ```bash
