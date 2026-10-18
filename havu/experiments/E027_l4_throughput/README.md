@@ -19,10 +19,10 @@ Started 2026-10-16. The goal is more decode throughput (and KV room) on the Kagg
 | NCCL P2P (`NCCL_P2P_LEVEL=SYS`) | box only; **harmful on Kaggle** | box: all-reduce 8–9× faster, prefill 3×; Kaggle: P2P 12× slower than SHM (v4c commit run several times slower) |
 | Pipeline parallelism (PP4, PP2×TP2) | **rejected** | prefill 3.2–3.3× faster, decode 14–77% slower |
 | TurboQuant KV (`k8v4`, `4bit_nc`, `3bit_nc`) | KV +26/+84/+135%, decode −4–18% | `k8v4` full-eval accuracy so far equal to baseline (26 vs 27 of 56) |
-| **MTP2 on vLLM 0.31** | **promising** | decode +26–46% on L4, clean output; full-eval interim 45 vs 50 of 112 (p = 0.46), same tokens per attempt |
+| **MTP2 on vLLM 0.31** | **rejected** | decode +26–46% on the clean bench, but full eval 64 vs 70 of 172 (p = 0.43) and slower on real traffic (L4 probe 134 vs 201 tok/s; 0.31 reuses less prefix cache) |
 | MTP2 + TurboQuant | **broken** in vLLM 0.31 | 19 of 64 degenerate outputs |
-| Transcript compaction (`ARC_COMPACT_AT`) | implemented, untested on accuracy | evals queued on the RTX 6000 boxes |
-| Tuned FP8 GEMM configs for L4 | queued | Kaggle vLLM warns "Using default W8A8 Block FP8 kernel config"; GEMM is 24–31% of decode |
+| Transcript compaction (`ARC_COMPACT_AT`) | **rejected** | full eval 60 vs 70 of 172 (p = 0.16); re-prefill after each compaction cancels the prompt savings |
+| Tuned FP8 GEMM configs for L4 | **unresolved** | decode bench +7–25%, but the real-traffic probe was slower (143 vs 201 tok/s); v4d not pushed |
 
 **Where time goes on 4×L4:**
 - The box profile of TP4 decode at ~25k context: NCCL all-reduce 40–52%, FP8 GEMM 24–31%, attention 16–19%, DeltaNet 3–4%.
@@ -277,7 +277,7 @@ Paired: compact-only 16, baseline-only 26, McNemar p = 0.16. Compaction sent 18%
 
 ## Final status (2026-10-17 18:30 UTC)
 
-- **Kept:** tuned FP8 GEMM configs (decode +7–25% on L4, accuracy-neutral) → Kaggle notebook v4d (`kaggle/nb_probe_v4d`), awaiting a Kaggle probe.
+- **Unresolved, not shipped:** tuned FP8 GEMM configs. Decode bench +7–25% on L4 and accuracy-neutral, but the real-traffic v4b probe was slower (143 vs 201 tok/s, see below). Notebook v4d (`kaggle/nb_probe_v4d`) passed its check and was not pushed. Nothing from E027 changed the submitted v4b stack.
 - **Rejected:** 4-bit weights, GGUF/llama.cpp, ternary Bonsai, Triton W8A8 instead of Marlin, async scheduling, bigger prefill chunks, NCCL P2P on Kaggle, pipeline parallelism, MTP2 on vLLM 0.31 (accuracy tie, slower on real traffic), MTP2 + TurboQuant (broken), transcript compaction (accuracy trend down, no throughput gain).
 - **Neutral:** TurboQuant `k8v4` (accuracy tie; KV +26%, only useful if KV becomes binding).
 - **Boxes:** RTX A/B/C/D destroyed; L4 box 55889595 stopped (not destroyed) at 18:25 UTC. It was idle ~9 h after the last probe (~$12).
@@ -311,3 +311,44 @@ This contradicts the clean decode bench (+7–25%). The candidates are:
 - the box being slower since its restart: idle temperatures 60–78 °C at ~20 W, and run B is 3 days old.
 
 **Do not push v4d until resolved.** `chain_ab.sh` is queued after the SFT tests: same-session untuned / tuned / untuned, each with prefix caching on, 24 × ~24k-token prompts plus the short decode bench, and GPU clock/throttle logging. Then the same-day untuned v4b repeat probe.
+
+## E028 SFT checkpoint on 4×L4 under the Kaggle submission setting (2026-10-17/18)
+
+Model: `livobereshka/Qwen3.8-27B-e028-sft-FP8` (ModelOpt static per-tensor FP8, no MTP head), the "v1" export behind Kaggle notebook `chankhavu/arc2-qwen38-e028-sft-submit` v1. The notebook's v2 uses a block-FP8 re-export in the official layout.
+
+**Serving on vLLM 0.23 (Kaggle stack):**
+- It needs `--tokenizer Qwen/Qwen3.8-27B-FP8`, because its `tokenizer_config.json` names `Qwen3_5Tokenizer` (transformers 5). Its `chat_template.jinja` is identical to the official one.
+- E028's `format_check.py` passes on vLLM 0.23 without patches: all 12 checks match.
+- vLLM selects `CutlassFP8ScaledMMLinearKernel` (W8A8). KV is 1.49–1.59M tokens.
+
+**Kernel A/B, notebook solver at c24 (12 min per arm, 24 non-dev tasks):**
+
+| Arm | Generation tok/s | Per stream | Prompt tok/s |
+|---|---|---|---|
+| CUTLASS W8A8 (default) | 134 | 5.94 | 229 |
+| `VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel` (falls back to `PerTensorTorchFP8ScaledMMLinearKernel`, also W8A8) | 140 | 6.20 | 234 |
+| `VLLM_TEST_FORCE_FP8_MARLIN=1` | fails at load: `'MergedColumnParallelLinear' object has no attribute 'orig_dtype'` | | |
+
+The two W8A8 kernels tie, and greedy outputs agree. The same day on this box, the official block FP8 under the v4b solver made 147 tok/s at ≥22 running. So the ModelOpt export runs within 5–10% of it, and the box has been slower since its restart (222 three days earlier).
+
+**Kaggle-paced run.** Exact notebook solver `cad74873` with `kaggle_v5_sft_settings.json`. The only change is the local window (forced at 225 min, cap 235, wall 250), i.e. Kaggle's 11 h / 259-pair pace for 93 pairs. All 71 non-dev tasks (93 pairs), 1 attempt each, c24. Logs: `sft_nb_kaggle/`. (A first try read the shared settings file after its commit window was shortened to 45 min and stopped with 4 attempts: `sft_nb_kaggle_cut45/`.)
+
+| | Value |
+|---|---|
+| Score | **23/93 pairs = 24.7%** Kaggle-weighted (17.00/71 tasks = 23.9% task-weighted) |
+| How attempts end | 70/93 at `output_budget` (1 correct); 23 submitted (**22 correct**) |
+| Answer sources | submit 23, forced 31, none 37, salvage 1, session_solve 1 |
+| Train check | 8 pass (7 correct), 26 fail, 59 none |
+| Per-attempt budget (adaptive share) | median 28.8k (ceiling 64k) |
+| Output tokens per attempt (mean / median / p95 / max) | 22.5k / 25.0k / 31.9k / 39.5k |
+| Wall time per attempt (median / p90) | 52 / 85 min |
+| Server | 159 tok/s at ≥20 running = 6.65 tok/s per stream; prefix-cache hit 75.3%; max KV 58%; 0 preemptions |
+
+**Base model on the same pairs:**
+- Kaggle v4b probe (paced, base FP8, 120 min for 48 pairs): 14/29 common pairs, vs SFT 4/29.
+- E027 vLLM 0.31 base (v4b solver, unpaced): 47.3% vs 24.7% on all 93.
+- E020 K3 attempt 0 (unpaced): 37.8% vs 24.4% on 90.
+
+A paired, same-pace base run (official FP8 + v4b solver, same 93 pairs, forced at 225 min) was queued on 2026-10-18 at 03:40 UTC; see below when done.
+
+**Reading:** the SFT model is accurate when it finishes (22/23 of its submissions are correct), but at Kaggle's pace it rarely finishes inside its ~29k share. This matches E028's finding that the 64K training cut removed the teacher's wrap-ups after the 60k note, so the model doesn't react to budget notes. At Kaggle pace it scores well below the base v4b agent.

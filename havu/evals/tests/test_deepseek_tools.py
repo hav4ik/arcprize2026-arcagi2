@@ -296,6 +296,40 @@ class E009OptionTests(unittest.TestCase):
         self.assertIn("nearly spent", outs[2])
         self.assertNotIn("Past the target", outs[2])
 
+    def test_turns_note_warns_near_turn_cap(self):
+        self.args.max_turns, self.args.turns_note, self.args.final_mode = 4, 2, "session"
+        client = FakeClient([[chunk(calls=[call(str(i))], finish="tool_calls", tokens=5)] for i in range(4)])
+        with patch("run_deepseek_tools.submit_answer", return_value=("[answer not accepted]", None)):
+            trace, result = self.solve(client)
+        outs = [m["content"] for m in trace["messages"] if m["role"] == "tool"]
+        self.assertNotIn("turns left", outs[0])
+        self.assertIn("[2 turns left: call submit_answer", outs[1])
+        self.assertIn("[1 turn left: call submit_answer", outs[2])
+        self.assertNotIn("left:", outs[3])
+        self.assertEqual(result["stop_reason"], "max_turns")
+
+    def test_fallback_solve_after_missing_answer(self):
+        self.args.max_total_output, self.args.final_mode, self.args.fallback_solve = 50, "session", True
+        client = FakeClient([[chunk(calls=[call("def solve(g): return g")], finish="tool_calls", tokens=50)]])
+        replies = {"answer": ("[answer not accepted]", None), "solve(test_input)": ("ok", [[4, 3]])}
+        with patch("run_deepseek_tools.submit_answer", side_effect=lambda s, code: replies[code]) as sub:
+            _, result = self.solve(client)
+        self.assertEqual([c.args[1] for c in sub.call_args_list], ["answer", "solve(test_input)"])
+        self.assertEqual((result["pred"], result["answer_source"]), ([[4, 3]], "session_solve"))
+
+    def test_fallback_solve_off_by_default(self):
+        self.args.max_total_output, self.args.final_mode = 50, "session"
+        client = FakeClient([[chunk(calls=[call("x = 1")], finish="tool_calls", tokens=50)]])
+        with patch("run_deepseek_tools.submit_answer", return_value=("[answer not accepted]", None)) as sub:
+            _, result = self.solve(client)
+        self.assertEqual([c.args[1] for c in sub.call_args_list], ["answer"])
+        self.assertIsNone(result["pred"])
+
+    def test_lean2code_prompt_extends_lean2sub(self):
+        self.assertTrue(PROMPT_SUFFIXES["lean2code"].startswith(PROMPT_SUFFIXES["lean2sub"]))
+        self.assertIn("Let code do the perceiving", PROMPT_SUFFIXES["lean2code"])
+        self.assertNotIn("brief", PROMPT_SUFFIXES["lean2code"][len(PROMPT_SUFFIXES["lean2sub"]):])
+
     def test_think_turns_disables_thinking_after_n(self):
         self.args.think_turns = 1
         client = FakeClient([[chunk(calls=[call("1")], finish="tool_calls", tokens=5)],

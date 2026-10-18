@@ -67,7 +67,15 @@ PROMPT_SUFFIXES["lean2roles"] = PROMPT_SUFFIXES["lean2sub"] + (
     "by the border, counts, key entries, shapes not seen) and say in one line how solve handles each difference; "
     "if your rule ignores some non-background cells of test_input, explain them before submitting. If any "
     "training pair still fails, or a test difference is unhandled, do not submit: fix the rule.")
-SUBMIT_PROMPTS = {"lean2sub", "lean2brief", "lean2subv", "lean2roles"}
+# E029: lean2sub plus "decide in code" (Flash-1017 traces spend most tokens on prose rule comparison and hand
+# reading of printed grids). Deliberately no brevity wording: E009 lean2brief lost 8-14 pp.
+PROMPT_SUFFIXES["lean2code"] = PROMPT_SUFFIXES["lean2sub"] + (
+    "\n\nLet code do the perceiving and the checking. Get coordinates, counts, object lists, distances, paths and "
+    "mismatches by printing them from code instead of reading them off the grids or working them out cell by cell "
+    "in your reasoning, and do not re-read grids that code has already analysed. When you are choosing between "
+    "candidate rules, implement each one and compare them on the training pairs in code rather than arguing it out "
+    "in prose.")
+SUBMIT_PROMPTS = {"lean2sub", "lean2brief", "lean2subv", "lean2roles", "lean2code"}
 HARNESS_VERSION = "persistent-v3"  # v3: submissions run on inputs only in a fresh session; host compares
 # v4 (E009) is recorded only when a new option below is active; defaults reproduce v3 exactly.
 HARNESS_VERSION_V4 = "persistent-v4"
@@ -78,6 +86,10 @@ V4_DEFAULTS = {"answer_tool": False, "final_mode": "turn", "budget_notes": 0.0, 
 HARNESS_VERSION_V5 = "persistent-v5"
 V5_DEFAULTS = {"task_summary": False, "helpers": False, "train_check": False}
 V5_PROMPTS = {"lean2roles"}
+# v6 (E029) is recorded when an E029 option or prompt is active; it adds the keys below to the config.
+HARNESS_VERSION_V6 = "persistent-v6"
+V6_DEFAULTS = {"turns_note": 0, "fallback_solve": False}
+V6_PROMPTS = {"lean2code"}
 HELPERS_SRC = (Path(__file__).resolve().parent / "arc_helpers.py").read_text()
 HELPERS_DOC = (
     " Also preloaded, numpy grid helpers (g = list or array; boxes (r0,c0,r1,c1) inclusive): "
@@ -105,6 +117,8 @@ def peak_multiplier(now=None):
 
 
 def harness_version(args):
+    if any(getattr(args, k, v) != v for k, v in V6_DEFAULTS.items()) or getattr(args, "prompt", "") in V6_PROMPTS:
+        return HARNESS_VERSION_V6
     if any(getattr(args, k, v) != v for k, v in V5_DEFAULTS.items()) or getattr(args, "prompt", "") in V5_PROMPTS:
         return HARNESS_VERSION_V5
     if any(getattr(args, k, v) != v for k, v in V4_DEFAULTS.items()):
@@ -450,6 +464,18 @@ def budget_note(args, used):
     return note
 
 
+def turns_note(args, index):
+    """E029 --turns-note N: after assistant turn `index` (0-based), warn once N or fewer turns remain."""
+    n = getattr(args, "turns_note", 0)
+    left = args.max_turns - index - 1
+    if not n or left > n:
+        return ""
+    if left <= 0:
+        return ""
+    return (f"\n[{left} turn{'s' if left != 1 else ''} left: call submit_answer with your best answer now, "
+            "or at least set `answer`.]")
+
+
 def solve(client, args, task, test_input, session_factory=SandboxSession):
     prompt = build_prompt(task["train"], test_input) + PROMPT_SUFFIXES[args.prompt]
     if args.mode == "code":
@@ -572,7 +598,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                     pred, content, stop, source = accepted, json.dumps(accepted), "submitted", "submit"
                     submit_code = code
                     break
-                note = budget_note(args, total["completion"])
+                note = budget_note(args, total["completion"]) + turns_note(args, index)
                 if note and messages[-1]["role"] == "tool":
                     messages[-1]["content"] += note
                 if final:
@@ -586,6 +612,12 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                 events.append({"fallback": "session_answer", "accepted": grid is not None, "output": output[:300]})
                 if grid is not None:
                     pred, content, source, submit_code = grid, json.dumps(grid), "session", "answer"
+                elif getattr(args, "fallback_solve", False):
+                    # E029: no valid `answer`; evaluate the session's solve on the test input, if defined.
+                    output, grid = submit_answer(session, "solve(test_input)")
+                    events.append({"fallback": "session_solve", "accepted": grid is not None, "output": output[:300]})
+                    if grid is not None:
+                        pred, content, source, submit_code = grid, json.dumps(grid), "session_solve", "solve(test_input)"
             if getattr(args, "train_check", False) and pred is not None:
                 # E017: label the answer program on the training pairs (no model tokens; host compares hashes).
                 try:
@@ -729,6 +761,10 @@ def parser():
     ap.add_argument("--extra-attempt-if-no-train-pass", action="store_true",
                     help="E017 policy: with --attempts 2 and --train-check, run attempt 2 for a pair when neither "
                          "attempt 0 nor 1 passes the train check (not part of the config, so files resume)")
+    ap.add_argument("--turns-note", type=int, default=0,
+                    help="E029: append a 'N turns left, submit now' note to tool output when N or fewer turns remain (0=off)")
+    ap.add_argument("--fallback-solve", action="store_true",
+                    help="E029: with --final-mode session, if `answer` is not a valid grid, try solve(test_input)")
     ap.add_argument("--auto-peak-price", action="store_true",
                     help="E017: price each turn at 2x inside weekday peak windows (UTC 01-04, 06-10), else 1x")
     ap.add_argument("--max-balance-stop", type=float, default=20.0,
@@ -756,6 +792,10 @@ def main():
         ap.error(f"--prompt {args.prompt} describes submit_answer; pass --answer-tool")
     if args.extra_attempt_if_no_train_pass and (args.attempts != 2 or not args.train_check):
         ap.error("--extra-attempt-if-no-train-pass needs --attempts 2 and --train-check")
+    if args.fallback_solve and args.final_mode != "session":
+        ap.error("--fallback-solve needs --final-mode session")
+    if args.turns_note < 0 or args.turns_note >= args.max_turns:
+        ap.error("--turns-note must be in [0, --max-turns)")
     if args.answer_tool and args.mode != "grid":
         ap.error("--answer-tool is for grid mode")
     if args.budget_soft and (not args.budget_notes or not 0 < args.budget_soft < args.max_total_output):
@@ -782,7 +822,8 @@ def main():
     config = {name: getattr(args, name) for name in (
         "model", "effort", "mode", "prompt", "max_tokens", "max_total_output", "final_tokens", "max_turns",
         "tool_timeout", "max_tool_output")}
-    v4 = {k: getattr(args, k) for k, v in {**V4_DEFAULTS, **V5_DEFAULTS}.items() if getattr(args, k) != v}
+    v4 = {k: getattr(args, k) for k, v in {**V4_DEFAULTS, **V5_DEFAULTS, **V6_DEFAULTS}.items()
+          if getattr(args, k) != v}
     if v4:  # only new-option runs carry the extra keys, so v3 configs (and resume of old files) are unchanged
         config.update(v4)
     config.update(harness_version=harness_version(args), challenges=str(args.challenges.resolve()),

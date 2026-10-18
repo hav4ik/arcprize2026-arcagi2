@@ -2,7 +2,8 @@
 
 Every score, token count and recorded cost is recomputed from `evals/results/*.jsonl` (latest record per
 task/pair/attempt, as the resume logic writes them) against the GitHub ground truth
-(`data/arc-agi-2-github/data/evaluation`). Kaggle numbers come from `kaggle/runs/`. Numbers that only exist in a
+(`data/arc-agi-2-github/data/evaluation`). Kaggle numbers and the 48-pair probes come from `kaggle/runs/` and
+`experiments/E027_l4_throughput/` (solver summary_local.json files, per-attempt flags). Numbers that only exist in a
 README (rental cost, ARC Prize's published scores, manual trace reviews) are footnoted as such.
 
 Outputs (all under reports/):
@@ -29,7 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RES = ROOT / "evals/results"
 OUT = ROOT / "reports"
-REPORT_DATE = "2026-10-12"
+REPORT_DATE = "2026-10-18"
 
 TASKS = {p.stem: json.loads(p.read_text()) for p in sorted((ROOT / "data/arc-agi-2-github/data/evaluation").glob("*.json"))}
 FULL = [(t, p) for t in sorted(TASKS) for p in range(len(TASKS[t]["test"]))]
@@ -73,19 +74,69 @@ AUDIT = {"files": {}, "flag_mismatch": 0, "records_checked": 0}
 _CACHE = {}
 
 
+def in_gh(t, p):
+    """(task, pair) exists in the GitHub public eval set (Kaggle's eval copy has 5 extra test pairs: 172 vs 167)."""
+    return t in TASKS and p < len(TASKS[t]["test"])
+
+
+def load_summary(name):
+    """Solver summary (kaggle/src/solver.py local mode: summary_local.json, or a box copy of it) as per-attempt records.
+
+    name = "@<path relative to ROOT>" (a run directory holding summary_local.json, or the .json itself). The solver stores
+    no eval predictions except in local_submission.json (Kaggle runs only); there the stored flag is re-checked."""
+    path = ROOT / name[1:]
+    if path.is_dir():
+        path = path / "summary_local.json"
+    s = json.loads(path.read_text())
+    sub_p = path.parent / "local_submission.json"
+    sub = json.loads(sub_p.read_text()) if sub_p.exists() else None
+    hv = ((s.get("phases_s") or {}).get("agent_config") or {}).get("harness_version") or s.get("agent")
+    lat, outside, checked, mism = {}, 0, 0, 0
+    for x in s["per_pair"]:
+        t, p, a = x["task"], int(x["pair"]), int(x.get("attempt") or 0)
+        if not in_gh(t, p):
+            outside += 1
+            continue
+        src = x.get("source")
+        r = {"task_id": t, "pair": p, "attempt": a, "_err": bool(x.get("error")), "_ok": bool(x.get("correct")),
+             "_tok": x.get("tokens") or 0, "pred": None if src in (None, "null", "none") else "(not stored)",
+             "answer_source": src or "none", "train_pass": x.get("train_pass"), "harness_version": hv}
+        if r["_err"]:
+            r["_ok"] = False
+        if sub is not None and t in sub and p < len(sub[t]):
+            g = TASKS[t]["test"][p]["output"]
+            checked += 1
+            mism += (sub[t][p].get("attempt_1") == g or sub[t][p].get("attempt_2") == g) != r["_ok"]
+        lat[(t, p, a)] = r
+    AUDIT["records_checked"] += checked
+    AUDIT["flag_mismatch"] += mism
+    AUDIT["files"][name] = {"lines": len(s["per_pair"]), "latest": len(lat), "bad_lines": 0, "outside_gh": outside,
+                            "errors": sum(r["_err"] for r in lat.values()), "rechecked": checked,
+                            "mtime": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
+    _CACHE[name] = (lat, list(lat.values()))
+    return _CACHE[name]
+
+
 def load(name):
-    """Latest record per (task, pair, attempt). NVIDIA-subset files use (task, 0, sample). Cached per file."""
+    """Latest record per (task, pair, attempt). NVIDIA-subset files use (task, 0, sample). Cached per file.
+    Records for test pairs outside the GitHub public eval set (the 5 extra pairs of Kaggle's eval copy) are dropped."""
     if name in _CACHE:
         return _CACHE[name]
+    if name.startswith("@"):
+        return load_summary(name)
     recs, bad = read_jsonl(name)
     lat = {}
+    nv = bool(recs) and "pair" not in recs[0]
+    outside = 0
     for r in recs:
         if "pair" in r:
             k = (r["task_id"], int(r["pair"]), int(r.get("attempt", 0)))
+            if not in_gh(k[0], k[1]):
+                outside += 1
+                continue
         else:
             k = (r["task_id"], 0, int(r.get("sample", 0)))
         lat[k] = r
-    nv = bool(recs) and "pair" not in recs[0]
     for (t, p, a), r in lat.items():
         r["_err"] = "error" in r
         if r["_err"]:
@@ -100,7 +151,7 @@ def load(name):
                 AUDIT["flag_mismatch"] += 1
             r["_ok"] = ok
         r["_tok"] = tokens(r)
-    AUDIT["files"][name] = {"lines": len(recs), "latest": len(lat), "bad_lines": bad,
+    AUDIT["files"][name] = {"lines": len(recs), "latest": len(lat), "bad_lines": bad, "outside_gh": outside,
                             "errors": sum(r["_err"] for r in lat.values()),
                             "mtime": datetime.fromtimestamp((RES / name).stat().st_mtime, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
     _CACHE[name] = (lat, recs)
@@ -191,6 +242,8 @@ def evaluate(spec):
     lat, allrecs = merged(spec["files"])
     if spec.get("attempts") is not None:
         lat = {k: r for k, r in lat.items() if k[2] in spec["attempts"]}
+    if spec.get("drop_errors"):  # crashed-server attempts that were never retried (E024 Bolt)
+        lat = {k: r for k, r in lat.items() if not r["_err"]}
     setname = spec["set"]
     if setname in SETS:
         universe = SETS[setname]
@@ -476,6 +529,24 @@ E020_BASE = "temp 1.0 / top_p 0.95 / top_k 20, budget notes on every output, har
 KAGGLE_PAIR_BUDGET = 44000
 T1_GROUP_KAGGLE = "Kaggle budget: Qwen3.8-27B configs where one attempt per test pair fits the 4×L4 / 12 h rerun (≤ ~44k tokens per pair)"
 E017_H = "low effort, sub80s40 budgets (80k hard / 40k soft, notes on every output, `submit_answer`), harness persistent-v5"
+OT = "Other open models"
+# DeepSeek retired V4.1-Flash on 2026-10-17: from then on the API name `deepseek-flash` serves V4.1-Flash-1017 (E029 README).
+FLASH1017 = "DeepSeek V4.1-Flash-1017 (DeepSeek API)"
+E024_BOX = "self-hosted vLLM nightly 0.32, 1 server per GPU (vast.ai 4×RTX PRO 6000 Max-Q)"
+MINICPM = f"MiniCPM-V-4.7-35B-A3B FP8, {E024_BOX}"
+LFM = f"LFM2.5-24B-A2B FP8, {E024_BOX}"
+BOLT = "Nemotron-3.5-Bolt-74B-A9B-24GB (2-bit experts), self-hosted vLLM nightly 0.32 + b12x, 1 seq per GPU (vast.ai 4×RTX PRO 6000)"
+E024_NT = "ARC Prize prompt and parser, one chat call, thinking on, max_tokens 120k (`evals/run_openai_arcprize.py`)"
+E024_T = "DeepSeek harness with E009 sub80s40 settings (lean2sub, `submit_answer`, session final, 80k hard / 40k soft, notes on every output), persistent-v4"
+QWEN_E027 = "Qwen3.8-27B FP8, self-hosted vLLM 0.31 (vast.ai 1×RTX PRO 6000 per run)"
+E027_V4B = ("Kaggle v4b solver in local mode (= E020 K3 recipe: xhigh, program answers, task summary, helpers, rich feedback, 8k "
+            "per-turn thinking cap, 48k hard / 24k soft) + free attempt_2; scored on attempt 1")
+QWEN_E028 = "Qwen3.8-27B ModelOpt FP8, self-hosted SGLang 0.5.20, 1 server per GPU (vast.ai 4×RTX PRO 6000)"
+E028_H = ("DeepSeek harness with E025's flags: lean2roles, task summary, helpers, `submit_answer`, 80k hard / 40k soft, "
+          "64k per turn, temp 1.0 / top_p 0.95 / top_k 20, xhigh")
+QWEN_KAGGLE = "Qwen3.8-27B FP8, vLLM 0.23 on Kaggle 4×L4"
+QWEN_L4BOX = "Qwen3.8-27B FP8, vLLM 0.23 on vast.ai 4×L4"
+PROBE_V4B = "v4b solver (K3 recipe: xhigh program agent, 48k hard / 24k soft), concurrency 24"
 
 
 def tool_file(prompt, effort, tag, mode="grid"):
@@ -543,6 +614,41 @@ T1_SPECS = [
               f"`--train-check`; conditional 3rd attempt when neither attempt passes the train check; {E017_H}",
          cost=REC_EST, ref="E004-GL", ref_extra=["E009 sub80s40"], e017=True, policy3=True,
          note="pass@1 / pass@2 use attempts 0–1 only; the conditional 3rd attempts (attempt index 2) are reported separately."),
+    dict(id="E029 sub80s40 (1017)", fam=DS, model=FLASH1017, harness="tools-grid", set="full",
+         files=["tools_persistent_grid_lean2sub_deepseek-flash_low_e029_flash1017_sub80s40.jsonl"],
+         desc=f"E009 sub80s40 unchanged (lean2sub, low effort, 80k hard / 40k soft, notes on every output; {SUB}; persistent-v4) on the new model",
+         cost=REC_EST, ref="E009 sub80s40", ref_extra=["E004-GL"],
+         note="New model, same harness: the paired Δ vs E009 sub80s40 is the model change (old model, 3 samples)."),
+    dict(id="E029 s20x60 (1017)", fam=DS, model=FLASH1017, harness="tools-grid", set="full",
+         files=["tools_persistent_grid_lean2sub_deepseek-flash_low_e029_flash1017_s20x60.jsonl"],
+         desc=f"E010 s20x60 unchanged (lean2sub, low effort, 60k hard / 20k soft with strong wording; {SUB}) on the new model",
+         cost=REC_EST, ref="E010 s20x60", ref_extra=["E004-GL"]),
+    dict(id="E029 lean2code (1017)", fam=DS, model=FLASH1017, harness="tools-grid", set="full",
+         files=["tools_persistent_grid_lean2code_deepseek-flash_low_e029_flash1017_sub80s40_code.jsonl"],
+         desc="sub80s40 + lean2code prompt (\"let code do the perceiving and the checking\": print coordinates/counts/mismatches "
+              "from code, compare candidate rules in code, not in prose) + `--turns-note 5` (turns-left note) + `--fallback-solve` "
+              "(submit solve(test_input) when `answer` is not a grid); harness persistent-v6",
+         cost=REC_EST, ref="E029 sub80s40 (1017)", ref_extra=["E004-GL"], running_tags=["e029_flash1017_sub80s40_code"],
+         note="A/B against E029 sub80s40 (same model, 1 run each), from the E029 close reading's ranked proposals."),
+    dict(id="E024 MiniCPM-V-4.7 no tools", fam=OT, model=MINICPM, harness="no tools", set="full", files=["e024_minicpm_notools.jsonl"],
+         desc=f"{E024_NT}; temp 1.0 / top_p 0.95 / top_k 20", cost=("text", "box time [^rent-e024]"),
+         note="Run on Kaggle's eval copy (172 pairs); scored on the 167 GitHub pairs."),
+    dict(id="E024 MiniCPM-V-4.7 tools", fam=OT, model=MINICPM, harness="tools-grid", set="full", files=["e024_minicpm_tools.jsonl"],
+         desc=f"{E024_T}; temp 1.0 / top_p 0.95 / top_k 20", cost=("text", "box time [^rent-e024]"), ref="E024 MiniCPM-V-4.7 no tools"),
+    dict(id="E024 LFM2.5 no tools", fam=OT, model=LFM, harness="no tools", set="full", files=["e024_lfm_notools.jsonl"],
+         desc=f"{E024_NT}; generation_config sampling (temp 0.1, top_k 50, repetition 1.05)", cost=("text", "box time [^rent-e024]"),
+         note="Run on Kaggle's eval copy (172 pairs); scored on the 167 GitHub pairs."),
+    dict(id="E027 vLLM 0.31 base", fam=QW, model=QWEN_E027, harness="tools-program", set="full", files=["@experiments/E027_l4_throughput/e6/e6_base"],
+         desc=f"{E027_V4B}; no MTP, concurrency 32", cost=("text", "box time [^rent-e027]"), ref="E020 K3 xhigh-48k (v4)", ref_match=True, e017=True,
+         note="Reference arm of the E027 accuracy evals. Scored from the solver's per-attempt flags (no eval predictions stored); run on Kaggle's eval copy (172 pairs), scored on the 167 GitHub pairs."),
+    dict(id="E027 vLLM 0.31 MTP2", fam=QW, model=QWEN_E027, harness="tools-program", set="full", files=["@experiments/E027_l4_throughput/e6/e6_mtp2"],
+         desc=f"{E027_V4B}; MTP 2 speculative tokens, concurrency 28", cost=("text", "box time [^rent-e027]"),
+         ref="E020 K3 xhigh-48k (v4)", ref_match=True, ref_extra=["E027 vLLM 0.31 base"], e017=True,
+         note="Box tok/s 334 vs 362 for base (README): MTP2 does not pay on tool traffic with 0.31's lower prefix reuse."),
+    dict(id="E027 vLLM 0.31 compaction", fam=QW, model=QWEN_E027, harness="tools-program", set="full", files=["@experiments/E027_l4_throughput/e6/e6_compact"],
+         desc=f"{E027_V4B}; transcript compaction at 24k (`ARC_COMPACT_AT=24000`, keep 2 turns, old tool outputs cut to 1,500 chars), concurrency 32",
+         cost=("text", "box time [^rent-e027]"), ref="E020 K3 xhigh-48k (v4)", ref_match=True, ref_extra=["E027 vLLM 0.31 base"], e017=True,
+         note="18% fewer prompt tokens but each compaction forces a re-prefill; rejected (README). The TurboQuant k8v4 arm stopped at 129/172 pairs without a summary file, so it is not scored here."),
     dict(id="E008 Qwen xhigh-240k", fam=QW, model=QWEN_NV, harness=GEN, set="full", files=["qwen_nvfp4_gen_xhigh_240k_t1.jsonl"],
          desc="ARC Prize prompt, tier xhigh, temp 1.0 / top_p 0.95 / top_k 20 (official), 240k budget in 32k chunks, mid-thought EOS continued, 4k forced final",
          cost=("text", "≈$27 rental [^rent-xhigh]"),
@@ -714,6 +820,65 @@ T2_SPECS = [
     dict(id="E020 x96pc8 2nd sample (partial)", fam=QW, model=QWEN_POOL, harness="tools-program", set="covered", attempts=[1],
          files=["qwen_tools_e020_x96pc8_all.jsonl"], desc="as E020 x96pc8, attempt index 1", cost=("none",), ref="E020 x96pc8",
          setlabel="full-167 (partial)", status="stopped", expected=167, note="Resumable."),
+    # E024: new open models (partial runs)
+    dict(id="E024 LFM2.5 tools (stopped)", fam=OT, model=LFM, harness="tools-grid", set="covered", files=["e024_lfm_tools.jsonl"],
+         desc=f"{E024_T}; generation_config sampling", cost=("none",), ref="E024 LFM2.5 no tools",
+         setlabel="full-167 (partial)", status="stopped", expected=167,
+         note="Stopped at 82 pairs to save box time: most attempts think to the 80k cap with 2–5 tool calls."),
+    dict(id="E024 Nemotron-3.5-Bolt no tools (stopped)", fam=NM, model=BOLT, harness="no tools", set="covered", files=["e024_bolt_notools.jsonl"],
+         drop_errors=True, desc=E024_NT + "; temp 1.0 / top_p 0.95", cost=("none",), ref="E008 Qwen xhigh-240k",
+         setlabel="full-167 (partial)", status="stopped", expected=167,
+         note="b12x kernels crash under batched serving; stable only at 1 seq per GPU (~140 tok/s), so stopped at 30 answered pairs "
+              "(the file's error records from crashed tries are left out). 9 of the first 25 hit the 120k cap."),
+    # E028: SFT Qwen3.8-27B vs base on dev-56
+    dict(id="E028 dev base", fam=QW, model=QWEN_E028 + "; base model", harness="tools-grid", set="dev",
+         files=["tools_persistent_grid_lean2roles_base_low_e028_dev56.jsonl"], desc=E028_H, cost=("text", "box time [^rent-e028]"),
+         ref="E017 V3 all", ref_match=True, setlabel="dev-56", expected=56, e017=True,
+         note="Reference arm for E028 SFT. Paired Δ vs E017 V3 all = vs the DeepSeek V4.1-Flash teacher in the same harness (attempt 0)."),
+    dict(id="E028 dev SFT", fam=QW, model=QWEN_E028 + "; E028 LoRA SFT (r128, 2,500 E025 DeepSeek rollouts, 64K context)",
+         harness="tools-grid", set="dev", files=["tools_persistent_grid_lean2roles_sft_low_e028_dev56.jsonl"], desc=E028_H,
+         cost=("text", "box time [^rent-e028]"), ref="E028 dev base", ref_extra=[("E017 V3 all", True)], setlabel="dev-56", expected=56, e017=True,
+         note="1 attempt hit SGLang's 131k context limit (error, scored wrong). The SFT model ignores the budget notes: the 64K "
+              "training cut removed every teacher wrap-up after the 60k note (README). Tinker training cost ~$336.5."),
+    # 48-pair throughput/accuracy probes (35 tasks, forced at server-ready + 120 min) [^probe]
+    dict(id="E021 probe v2 (Kaggle)", fam=QW, model=QWEN_KAGGLE, harness="tools-grid", set="probe48", files=["@kaggle/runs/probe-v2"],
+         desc="v2 agent (medium 48k / 24k, `submit_answer`, qwen-tools-4), concurrency 35", cost=("none",), ref="E021 probe v4b (Kaggle)",
+         setlabel="probe-48", status="done", note="KV peaked at 98% and the prefix-cache hit rate collapsed to ~0% after 60 min; 30 of 48 attempts forced at the deadline [^probe]."),
+    dict(id="E021 probe v4 (Kaggle)", fam=QW, model=QWEN_KAGGLE, harness="tools-program", set="probe48", files=["@kaggle/runs/probe-v4"],
+         desc="v4 agent (K3 recipe), concurrency 29", cost=("none",), ref="E021 probe v4b (Kaggle)", setlabel="probe-48", status="done", e017=True,
+         note="215 tok/s average; all 48 attempts finished before the force [^probe]."),
+    dict(id="E021 probe v4b (Kaggle)", fam=QW, model=QWEN_KAGGLE, harness="tools-program", set="probe48", files=["@kaggle/runs/probe-v4b"],
+         desc=PROBE_V4B + ", rate prior 250 (the submitted v4b config)", cost=("none",), ref="E020 K3 xhigh-48k (v4)", ref_match=True,
+         setlabel="probe-48", status="done", e017=True, note="Reference for the other probes. 224 tok/s average, KV 65%, cache hit 92–98% [^probe]."),
+    dict(id="E021 probe v4b + MTP2 (Kaggle)", fam=QW, model=QWEN_KAGGLE + " + MTP 2", harness="tools-program", set="probe48",
+         files=["@kaggle/runs/probe-v4b-mtp2"], desc=PROBE_V4B + " + MTP 2", cost=("none",), ref="E021 probe v4b (Kaggle)",
+         setlabel="probe-48", status="done", e017=True, note="KV capacity fell to 1.17M and the cache collapsed (E023)."),
+    dict(id="E023 A SGLang v4b (L4 box)", fam=QW, model="Qwen3.8-27B FP8, SGLang 0.5.20 on vast.ai 4×L4", harness="tools-program", set="probe48",
+         files=["@kaggle/runs/box/sgl_v4b.json"], desc=PROBE_V4B + "; tuned SGLang server (996k KV, FP8 KV, triton attention)", cost=("text", "box time [^rent-e023]"),
+         ref="E021 probe v4b (Kaggle)", setlabel="probe-48", status="done", e017=True, note="228 tok/s, ties vLLM on throughput; no reason to switch."),
+    dict(id="E023 B vLLM v4b (L4 box)", fam=QW, model=QWEN_L4BOX, harness="tools-program", set="probe48",
+         files=["@kaggle/runs/box/vllm_v4b_c24.json"], desc=PROBE_V4B + " (box calibration run; also E027's FP8 reference)", cost=("text", "box time [^rent-e023]"),
+         ref="E021 probe v4b (Kaggle)", setlabel="probe-48", status="done", e017=True, note="~201 tok/s, ~10% below Kaggle (thermal throttling)."),
+    dict(id="E023 C vLLM MTP2 (L4 box)", fam=QW, model=QWEN_L4BOX + " + MTP 2, --language-model-only", harness="tools-program", set="probe48",
+         files=["@kaggle/runs/box/vllm_mtp2_c20.json"], desc=PROBE_V4B.replace("concurrency 24", "concurrency 20") + " + MTP 2", cost=("text", "box time [^rent-e023]"),
+         ref="E021 probe v4b (Kaggle)", setlabel="probe-48", status="done", e017=True,
+         note="KV did not collapse (1.29M), yet 37 of 48 stopped at the output budget: MTP on vLLM 0.23 hurts output quality."),
+    dict(id="E023 K0 at 340-pair rate (L4 box)", fam=QW, model=QWEN_L4BOX, harness="tools-grid", set="probe48",
+         files=["@kaggle/runs/box/k0_340.json"], desc="K0 (v2 agent, medium 48k / 24k, `submit_answer`), concurrency 24, time window scaled to a 340-input pairs/hour rate",
+         cost=("text", "box time [^rent-e023]"), ref="E021 probe v4b (Kaggle)", setlabel="probe-48", status="done", e017=True),
+    dict(id="E023 K3 at 340-pair rate (L4 box)", fam=QW, model=QWEN_L4BOX, harness="tools-program", set="probe48",
+         files=["@kaggle/runs/box/k3_340.json"], desc="K3 (v4b agent), concurrency 24, time window scaled to a 340-input pairs/hour rate",
+         cost=("text", "box time [^rent-e023]"), ref="E021 probe v4b (Kaggle)", setlabel="probe-48", status="done", e017=True),
+    dict(id="E023 no tools + MTP2 (L4 box)", fam=QW, model=QWEN_L4BOX + " + MTP 2, --language-model-only", harness="no tools", set="probe48",
+         files=["@kaggle/runs/box/nt_mtp2_c16.json"], desc="plain agent (no tools, xhigh, 98k budget, 2nd sample from leftover capacity), concurrency 16",
+         cost=("text", "box time [^rent-e023]"), ref="E021 probe v4b (Kaggle)", setlabel="probe-48", status="done", note="167 tok/s. Not a candidate."),
+    dict(id="E027 probe INT4 GPTQ (L4 box)", fam=QW, model="Qwen3.8-27B INT4 GPTQ (RedHatAI), vLLM 0.23 on vast.ai 4×L4", harness="tools-program", set="probe48",
+         files=["@experiments/E027_l4_throughput/probes/p_int4_c24"], desc=PROBE_V4B, cost=("text", "box time [^rent-e027]"),
+         ref="E023 B vLLM v4b (L4 box)", setlabel="probe-48", status="done", e017=True,
+         note="232 tok/s (+15% vs FP8) but 34/48 hit the 48k cap; INT4 vs FP8 McNemar p = 0.039 (README). Rejected."),
+    dict(id="E027 probe AWQ (L4 box)", fam=QW, model="Qwen3.8-27B AWQ-INT4 (cyankiwi, DeltaNet BF16), vLLM 0.23 on vast.ai 4×L4", harness="tools-program", set="probe48",
+         files=["@experiments/E027_l4_throughput/probes/p_awq_c32"], desc=PROBE_V4B.replace("concurrency 24", "concurrency 32"), cost=("text", "box time [^rent-e027]"),
+         ref="E023 B vLLM v4b (L4 box)", setlabel="probe-48", status="done", e017=True, note="210 tok/s; 31/48 hit the 48k cap. Rejected (both 4-bit quants lose accuracy)."),
     # provider / harness probes
     dict(id="E008 Qwen Reka diag", fam=QW, model="Qwen3.8-27B fp8, OpenRouter (Reka)", harness="no tools", set="covered",
          files=["openrouter_qwen-qwen3.8-27b_high_reka_diag.jsonl"], desc="high effort; provider fixes thinking at ~2k tokens", cost=REC_OR,
@@ -796,6 +961,8 @@ def build():
     pilot_lat, _ = load("tools_persistent_grid_deepseek-flash_max_pilot.jsonl")
     E004_SUBSET = sorted({(t, p) for t, p, _ in pilot_lat})
     SETS["e004"] = E004_SUBSET
+    probe_lat, _ = load("@kaggle/runs/probe-v4b")  # the 48-pair Kaggle load probe (E021); every probe run uses the same pairs
+    SETS["probe48"] = sorted({(t, p) for t, p, _ in probe_lat})
 
     results = {}
     t1_rows, t2_rows = [], []
@@ -824,7 +991,8 @@ def build():
                 d = paired(res, results[ref], match_attempts=spec.get("ref_match", False), cap=spec["ref_cap"])
                 out.append(d)
         for r2 in spec.get("ref_extra", []):
-            out.append(paired(res, results[r2]))
+            r2, m2 = r2 if isinstance(r2, tuple) else (r2, False)  # (ref id, match attempt indices)
+            out.append(paired(res, results[r2], match_attempts=m2))
         return [d for d in out if d]
 
     for spec in all_specs:
@@ -842,7 +1010,7 @@ def build():
     nv = {s["id"]: nvidia_eval(s) for s in NVIDIA_SPECS}
 
     # ------------------------------------------------------------------ Table 1
-    fam_order = {DS: 0, QW: 1, NM: 2}
+    fam_order = {DS: 0, QW: 1, NM: 2, OT: 3}
     for spec in T1_SPECS:
         res = results[spec["id"]]
         if not (res["complete"] and spec["set"] == "full"):
@@ -883,7 +1051,7 @@ def build():
 
     # ------------------------------------------------------------------ derived findings
     F = findings(results, specs, nv, longtail, kag, e16)
-    chart = [{"id": r["id"], "fam": r["fam"], "tok_mean": r["raw"]["tok_mean"], "k_pass1": r["raw"]["k_pass1"], "k_pass2": r["raw"]["k_pass2"],
+    chart = [{"id": r["id"], "fam": r["fam"], "model": r["model"], "tok_mean": r["raw"]["tok_mean"], "k_pass1": r["raw"]["k_pass1"], "k_pass2": r["raw"]["k_pass2"],
               "pass1": r["raw"]["pass1"], "pass2": r["raw"]["pass2"], "samples": r["raw"]["samples"]} for r in t1_rows]
     metric_gap = [{"id": r["id"], "samples": r["raw"]["samples"],
                    "k_pass1": r["raw"]["k_pass1"], "tw_pass1": r["raw"]["pass1"], "k_pass2": r["raw"]["k_pass2"], "tw_pass2": r["raw"]["pass2"],
@@ -904,7 +1072,7 @@ def build():
                                 "unprefixed pass1/pass2 = ARC Prize benchmarking task-weighted score (arc-agi-benchmarking scoring.py). "
                                 "paired[].diff/lo/hi/run/ref_score are Kaggle (cluster bootstrap over tasks); paired[].tw_* are task-weighted.",
                  "running_tags": sorted(RUNNING), "audit": AUDIT, "longtail_pairs": len(longtail),
-                 "sets": {"full": len(FULL), "pilot": len(PILOT), "dev": len(DEV), "e004": len(E004_SUBSET)}},
+                 "sets": {"full": len(FULL), "pilot": len(PILOT), "dev": len(DEV), "e004": len(E004_SUBSET), "probe48": len(SETS["probe48"])}},
         "table1": t1_rows, "table2": t2_rows, "chart": chart, "metric_gap": metric_gap, "findings": F["findings"], "kaggle": kag, "caveats": F["caveats"], "arcprize_cmp": F["arcprize_cmp"], "e016": e16,
         "footnotes": FOOTNOTES, "crosscheck": crosscheck(results, nv), "scope": SCOPE, "scoring": scoring,
         "runs": {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in results.items()}, "nvidia_runs": nv,
@@ -928,18 +1096,24 @@ def pareto_front(pts):
 def pareto(chart, results):
     """Kaggle pass@2 Pareto front over the multi-sample Table 1 runs, and how E017 changed it."""
     front = pareto_front(chart)
-    before = pareto_front([p for p in chart if not p["id"].startswith("E017")])
-    ids, bids = [p["id"] for p in front], [p["id"] for p in before]
+    old_model = [p for p in chart if p.get("model") != FLASH1017]
+    front_old = pareto_front(old_model)
+    before = pareto_front([p for p in old_model if not p["id"].startswith("E017")])
+    ids, oids, bids = [p["id"] for p in front], [p["id"] for p in front_old], [p["id"] for p in before]
     txt = ("Kaggle pass@2 Pareto front over all multi-sample runs (fewer tokens per attempt, higher pass@2): "
            + " → ".join(f"{p['id']} ({fk(p['tok_mean'])}, {f1(p['k_pass2'])}%)" for p in front) + ".")
-    added, dropped = [i for i in ids if i not in bids], [i for i in bids if i not in ids]
+    new_ids = [i for i in ids if i not in oids]
+    if new_ids:
+        gone = [i for i in oids if i not in ids]
+        txt += (f" The new model's runs ({' and '.join(new_ids)}) took over the front" + (f", displacing {', '.join(gone)}" if gone else "") + ".")
+    added, dropped = [i for i in oids if i not in bids], [i for i in bids if i not in oids]
     if added:
-        txt += (f" {' and '.join(added)} joined the front" + (f", displacing {' and '.join(dropped)}" if dropped else "") + ".")
+        txt += (f" Among the old model's runs, {' and '.join(added)} joined the front" + (f", displacing {' and '.join(dropped)}" if dropped else "") + ".")
     pp = results.get("E017 V3 all", {}).get("policy3")
     if pp:
         txt += (f" Not plotted: with its conditional 3rd attempt E017 V3 reaches {f1(pp['k_pass2_policy'])}% Kaggle pass@2 at "
                 f"{fk(pp['tok_per_pair_policy'])} tokens per pair ({fk(pp['tok_per_pair_base'])} without), a per-pair rather than per-attempt cost.")
-    return {"front": ids, "front_before_e017": bids, "text": txt}
+    return {"front": ids, "front_old_model": oids, "front_before_e017": bids, "text": txt}
 
 
 def coverage_text(res):
@@ -1035,7 +1209,7 @@ def t1_row(spec, res):
 def kaggle_budget(spec, res):
     """Does one attempt per test pair fit the Kaggle rerun (4×L4, 12 h, 259 pairs, ~44k generated tokens per pair)?"""
     if not spec["model"].startswith("Qwen3.8-27B"):
-        why = "throughput on 4×L4 not measured" if spec["model"].startswith("Qwen") else "not runnable on Kaggle"
+        why = "not runnable on Kaggle" if spec["fam"] in (DS, NM) else "throughput on 4×L4 not measured"
         return "n/a", why, None, "kb-na"
     t = res["tok_mean"]
     ratio = t / KAGGLE_PAIR_BUDGET
@@ -1127,8 +1301,17 @@ def kaggle_data():
             out["bench"][name] = {"mtp": b["mtp"], "kv_tokens": b["kv_tokens"], "concurrency": b["concurrency"],
                                   "decode_tok_s": b["decode_long"]["steady_decode_tok_s"], "ctx_mean": b["decode_long"]["ctx_mean"],
                                   "prefill_s": b["decode_long"]["prefill_phase_s"], "e2e": b["e2e"]}
-    for name, label in (("v2-v2", "Kaggle v2 tools (commit run)"), ("plain-v1", "Kaggle plain v1 (commit run)"),
-                        ("v3-v3", "Kaggle v3 tools (commit run)")):
+    commit_runs = (("v2-v2", "Kaggle v2 tools (commit run)", None, None), ("plain-v1", "Kaggle plain v1 (commit run)", None, None),
+                   ("v3-v3", "Kaggle v3 tools (commit run)", None, None),
+                   ("v4c-p2p", "Kaggle v4c P2P (commit run)", None,
+                    "v4b + `NCCL_P2P_LEVEL=SYS`: Kaggle's P2P all-reduce is ~12× slower than its SHM path, so the window ended before any "
+                    "attempt finished (E027). Do not submit v4c"),
+                   ("v5-sft-commit", "Kaggle v5 SFT, ModelOpt FP8 (commit run)", "Qwen3.8-27B E028 SFT, ModelOpt FP8, vLLM on Kaggle 4×L4",
+                    "E028 SFT checkpoint, DeepSeek-harness interface (lean2roles, summary, helpers), 64k ceiling / 32k soft with adaptive share; "
+                    "CUTLASS W8A8 kernel (E028 REPORT.md)"),
+                   ("v5-sft-commit-v2", "Kaggle v5 SFT, block FP8 (commit run)", "Qwen3.8-27B E028 SFT, block FP8, vLLM on Kaggle 4×L4",
+                    "as v5 with the official block-FP8 layout; 198–207 tok/s at ~13 running (E028 REPORT.md)"))
+    for name, label, model, extra in commit_runs:
         p = kr / name / "summary_local.json"
         if not p.exists():
             continue
@@ -1147,12 +1330,13 @@ def kaggle_data():
         out[name]["k_score_txt"] = f"{n_ok}/{len(pp)}"
         out[name]["tw_score"] = tw_score
         out["local_tests"].append({
-            "id": label, "fam": QW, "model": "Qwen3.8-27B FP8, vLLM 0.23 on Kaggle 4×L4", "harness": "tools-grid" if s["agent"] == "tools" else "no tools",
+            "id": label, "fam": QW, "model": model or QWEN_KAGGLE, "harness": "tools-grid" if s["agent"] == "tools" else "no tools",
             "set": f"Kaggle local test ({len(tasks)} tasks / {len(pp)} pairs)", "coverage": f"1 × {len(pp)}/{len(pp)}",
             "k_pass1": f"{f1(k_score)} ({n_ok}/{len(pp)} outputs)", "k_pass2": "—", "pass1": f"{f1(tw_score)} ({s['score']})", "pass2": "—",
             "tok": f"{fk(st.mean(x['tokens'] for x in pp))} / {fk(st.median(x['tokens'] for x in pp))}",
             "paired": "—",
-            "status": f"done (deadline-forced ~6 min after server ready). {s['tool_calls']} tool calls, {s['tool_errors']} tool errors, "
+            "status": f"done (deadline-forced after {s.get('gen_minutes') or 6:.0f} min of generation). " + (extra + ". " if extra else "") +
+                      f"{s['tool_calls']} tool calls, {s['tool_errors']} tool errors, "
                       f"{s['parse_failures']} parse failures, peak KV {s['kv_usage_max_pct']}%; source kaggle/runs/{name}/summary_local.json",
             "raw": {"k_pass1": k_score, "k_pass2": None, "pass1": tw_score, "pass2": None, "tok_mean": st.mean(x["tokens"] for x in pp)}})
     p = kr / "submission_watch.jsonl"
@@ -1177,15 +1361,21 @@ def kaggle_data():
 
 # ----------------------------------------------------------------------------------------------- text
 
-SCOPE = ("This report collects every model and harness experiment we have run on ARC-AGI-2 so far. Models: DeepSeek V4.1-Flash and V4-Pro "
-         "(DeepSeek API); Qwen3.8-27B and Qwen3.6-35B-A3B (NVFP4 checkpoints on self-hosted SGLang, plus OpenRouter probes); Nemotron 3.5 "
-         "Lightning and Nemotron 3 Super 120B (OpenRouter). Harnesses: a no-tool single call with the ARC Prize prompt; a generation API "
+SCOPE = ("This report collects every model and harness experiment we have run on ARC-AGI-2 so far. Models: DeepSeek V4.1-Flash, its "
+         "replacement V4.1-Flash-1017 (served as `deepseek-flash` from 2026-10-17) and V4-Pro (DeepSeek API); Qwen3.8-27B (NVFP4 and FP8 "
+         "checkpoints on self-hosted SGLang/vLLM, on Kaggle 4×L4 and on rented boxes, INT4/AWQ variants, and a LoRA SFT on DeepSeek tool "
+         "rollouts) and Qwen3.6-35B-A3B; MiniCPM-V-4.7-35B-A3B and LFM2.5-24B-A2B (self-hosted); Nemotron 3.5 Lightning and Nemotron 3 Super "
+         "120B (OpenRouter) and Nemotron-3.5-Bolt (self-hosted, 2-bit experts). Harnesses: a no-tool single call with the ARC Prize prompt; a generation API "
          "harness for Qwen that continues the raw completion through mid-thought EOS and forces a final answer at the budget; Python tool "
          "use in grid mode (answer as a grid, later handed over with `submit_answer`) and code mode (`submit_solution`, checked on the "
          "train pairs); token-budget variants of the tool harness (hard caps, budget notes, soft targets, thinking-off turns); E017's "
          "additions to it (a host-computed task summary, a roles prompt, session helpers, a live train check and a conditional 3rd attempt); "
-         "and E016's \"time is up\" continuation of cut-off attempts. "
-         "Every number below is recomputed from `evals/results/*.jsonl` and `kaggle/runs/` by `reports/build_report.py`.")
+         "E016's \"time is up\" continuation of cut-off attempts; E029's \"decide in code\" prompt with a turns-left note; the Qwen program "
+         "agent (`submit_program`, train-checked, E019/E020) and the Kaggle solver itself, run as time-boxed 48-pair probes on Kaggle and "
+         "Kaggle-like boxes with serving variants (MTP, SGLang, vLLM 0.31, transcript compaction, 4-bit weights; E021/E023/E027). E025's "
+         "DeepSeek rollouts on training tasks (SFT data for E028) are not evaluations and are left out. "
+         "Every number below is recomputed from `evals/results/*.jsonl`, `kaggle/runs/` and E027's solver summaries "
+         "(`experiments/E027_l4_throughput/`) by `reports/build_report.py`.")
 
 SCORING = [
     "**Primary metric: Kaggle score (pair-weighted).** The ARC Prize 2026 ARC-AGI-2 competition page on Kaggle allows 2 attempts per test "
@@ -1238,6 +1428,18 @@ FOOTNOTES = {
     "e020": ("From experiments/E020_qwen_harness_80/README.md (offline policy simulations over the logged samples: gated 2nd attempt with the real "
              "attempt-1 sample as the retry, cross-mode pooling with votes); not recomputed here."),
     "contam": "From experiments/E004_tool_use/README.md (safety trace review): Flash listed real ARC-AGI-2 eval task ids while trying to recall answers.",
+    "rent-e024": ("Vast instance 56197430, 4× RTX PRO 6000 Max-Q at $5.33/h, ~6.3 h ≈ $34 for all E024 runs together "
+                  "(experiments/E024_new_models/README.md); not itemised per run. API cost $0."),
+    "rent-e027": ("vast.ai 1× RTX PRO 6000 boxes (one run per box at a time) and the 4×L4 box ($1.39/h); about $75 of Vast time for all "
+                  "of E027 (experiments.tsv), not itemised per run. API cost $0."),
+    "rent-e023": "vast.ai 4×L4 box 55889595 at $1.39/h, ~$70 for all of E023 including ~18 h idle (experiments.tsv); ~$3.2 per 2.3-h probe (README).",
+    "rent-e028": ("Rented 4× RTX PRO 6000 box, 20:12–23:20 UTC on 2026-10-17 for both arms (experiments/E028_qwen38_sft/README.md); box cost not "
+                  "itemised. The SFT itself cost ~$336.5 on Tinker (3 LR pilots + the full run)."),
+    "probe": ("48-pair load probe (experiments/E021_kaggle_v3/load_probe.md, E023, E027): 35 public-eval tasks / 48 test pairs, one attempt "
+              "per pair, the real Kaggle scheduler in local mode with answers forced at server-ready + 120 min (hard stop +15 min), so a "
+              "score measures accuracy at Kaggle's pairs-per-hour rate, not unlimited accuracy. Scored from the solver's per-attempt flags "
+              "in summary_local.json; for Kaggle runs the flags were re-checked against local_submission.json (no mismatches). Noise on 48 "
+              "pairs is about ±6–7 pp."),
 }
 
 
@@ -1304,6 +1506,33 @@ def findings(R, specs, nv, longtail, kag, e16=None):
         return f"{d['diff'] * 100:+.1f} pp [{d['lo'] * 100:+.1f}, {d['hi'] * 100:+.1f}]".replace("-", "−")
 
     F = []
+    n80, n2060, ncode = (R.get(k) for k in ("E029 sub80s40 (1017)", "E029 s20x60 (1017)", "E029 lean2code (1017)"))
+    if n80 and n2060 and n80["complete"] and n2060["complete"]:
+        def dref(res, ref):
+            return next((d for d in res["paired"] if d["ref"] == ref and not d["cap"]), None)
+        old_p2 = max((R[x["id"]]["k_pass2"], x["id"]) for x in specs.values() if x["fam"] == DS and x["model"] == FLASH and x["set"] == "full"
+                     and R[x["id"]]["complete"] and R[x["id"]].get("k_pass2") is not None)
+        body = [
+            f"Same harness (sub80s40, persistent-v4), new model: Kaggle pass@1 {f1(n80['k_pass1'])}% / pass@2 {f1(n80['k_pass2'])}% over "
+            f"{n80['samples']} samples against {f1(s80['k_pass1'])}% / {f1(s80['k_pass2'])}% for the old model's E009 sub80s40 "
+            f"(paired pass@1 {ci(dref(n80, 'E009 sub80s40'))}; task-weighted {f1(n80['pass1'])}% / {f1(n80['pass2'])}%), at "
+            f"{fk(n80['tok_mean'])} tokens/attempt ({sg((n80['tok_mean'] / s80['tok_mean'] - 1) * 100, 0)}%) and rec. "
+            f"{money(n80['cost_total'] / n80['samples'])} per sample. The old model's best pass@2 was {old_p2[1]}'s "
+            f"{f1(old_p2[0])}% at {fk(R[old_p2[1]]['tok_mean'])} tokens. On the {len(longtail)} long-tail pairs it solves "
+            f"{f1(n80.get('longtail_acc'))}% (old sub80s40 {f1(s80.get('longtail_acc'))}%).",
+            f"At the tighter s20x60 budget the gain is within noise: {f1(n2060['k_pass1'])}% / {f1(n2060['k_pass2'])}% vs "
+            f"{f1(s2060['k_pass1'])}% / {f1(s2060['k_pass2'])}% (paired {ci(dref(n2060, 'E010 s20x60'))}) at {fk(n2060['tok_mean'])} tokens "
+            f"({sg((n2060['tok_mean'] / s2060['tok_mean'] - 1) * 100, 0)}%). The 80k budget is what lets 1017 turn its efficiency into accuracy on hard pairs.",
+        ]
+        if ncode and ncode["complete"]:
+            body.append(f"A/B on the new model, lean2code (\"decide in code\" prompt + turns-left note + solve() fallback, persistent-v6): "
+                        f"{f1(ncode['k_pass1'])}% / {f1(ncode['k_pass2'])}% at {fk(ncode['tok_mean'])} tokens, "
+                        f"{ci(dref(ncode, 'E029 sub80s40 (1017)'))} vs plain sub80s40: a tie, so the prompt change buys nothing.")
+        body.append("Trace reading (E029 strategy_reading.md / strategy_quant.md, not recomputed here): 1017 searches the same way with fewer "
+                    "dead ends; it thinks less per turn (largest turn 12.5k → 9.1k tokens) rather than taking fewer turns, and reaches a "
+                    "runnable candidate early enough that the 60k \"submit now\" note finds something to submit.")
+        F.append(("DeepSeek's new V4.1-Flash-1017 (E029) is more accurate and ~20% cheaper on the same harness; sub80s40 is the new best DeepSeek config.",
+                  body))
     F.append(("Tools + lean2 prompt beat no tools for Flash; tools alone do not.",
               f"E004-GL (grid mode, lean2 prompt, low effort) scores pass@1 {f1(gl['k_pass1'])}% over {gl['samples']} samples against "
               f"{f1(e1['k_pass1'])}% for no-tool E001d ({e1['samples']} samples), paired {ci(d_gl)}, at {fk(gl['tok_mean'])} vs "
@@ -1434,10 +1663,58 @@ def findings(R, specs, nv, longtail, kag, e16=None):
                       f"On dev-56 (same gateway pool, 1 attempt each) A (submit_answer) scores Kaggle pass@1 {f1(ea['k_pass1'])}% and B (program-only) "
                       f"{f1(eb['k_pass1'])}% ({ci(dba)}). At medium-48k a train-passing program is right only {ebp} of the time "
                       "and 55% of B's attempts hit the cap before writing a solve(); the program recipe pays off once the budget or tier rises (E020)."))
+    pv = {k: R.get(k) for k in ("E021 probe v4b (Kaggle)", "E021 probe v4b + MTP2 (Kaggle)", "E021 probe v2 (Kaggle)", "E023 A SGLang v4b (L4 box)",
+                                "E023 B vLLM v4b (L4 box)", "E023 C vLLM MTP2 (L4 box)", "E027 probe INT4 GPTQ (L4 box)", "E027 probe AWQ (L4 box)",
+                                "E023 K3 at 340-pair rate (L4 box)", "E027 vLLM 0.31 base", "E027 vLLM 0.31 MTP2", "E027 vLLM 0.31 compaction")}
+    if all(pv.values()):
+        def pdv(k, ref):
+            return next((d for d in pv[k]["paired"] if d["ref"] == ref and not d["cap"]), None)
+        kb, bb = "E021 probe v4b (Kaggle)", "E023 B vLLM v4b (L4 box)"
+        eb = "E027 vLLM 0.31 base"
+        F.append(("Serving levers for Qwen3.8-27B on Kaggle-class hardware: none beats FP8 on vLLM 0.23 without MTP (E021, E023, E027).", [
+            f"On the 48-pair load probe (forced at server-ready + 120 min, Kaggle's pairs-per-hour) [^probe] the submitted v4b config scores "
+            f"{f1(pv[kb]['k_pass1'])}% on Kaggle 4×L4 and {f1(pv[bb]['k_pass1'])}% on the Vast 4×L4 box (same stack); the v2 config "
+            f"{f1(pv['E021 probe v2 (Kaggle)']['k_pass1'])}% (its prefix cache collapsed at concurrency 35).",
+            f"MTP2 on vLLM 0.23 hurts: {f1(pv['E021 probe v4b + MTP2 (Kaggle)']['k_pass1'])}% on Kaggle ({ci(pdv('E021 probe v4b + MTP2 (Kaggle)', kb))}) and "
+            f"{f1(pv['E023 C vLLM MTP2 (L4 box)']['k_pass1'])}% on the box, with most attempts running out of budget. 4-bit weights lose "
+            f"accuracy: INT4 GPTQ {f1(pv['E027 probe INT4 GPTQ (L4 box)']['k_pass1'])}% ({ci(pdv('E027 probe INT4 GPTQ (L4 box)', bb))} vs the FP8 box run), "
+            f"AWQ {f1(pv['E027 probe AWQ (L4 box)']['k_pass1'])}%. SGLang: {f1(pv['E023 A SGLang v4b (L4 box)']['k_pass1'])}% at equal throughput. "
+            f"At the hidden set's 340-input pairs-per-hour rate K3 falls to {f1(pv['E023 K3 at 340-pair rate (L4 box)']['k_pass1'])}%.",
+            f"Full public eval on vLLM 0.31 (1× RTX PRO 6000 per run, v4b agent, 1 attempt): base {f1(pv[eb]['k_pass1'])}% at "
+            f"{fk(pv[eb]['tok_mean'])} tokens ({ci(pdv(eb, 'E020 K3 xhigh-48k (v4)'))} vs E020 K3 attempt 0), MTP2 "
+            f"{f1(pv['E027 vLLM 0.31 MTP2']['k_pass1'])}% ({ci(pdv('E027 vLLM 0.31 MTP2', eb))} vs base: on 0.31 MTP no longer breaks accuracy, "
+            f"but it is 8% slower per box), transcript compaction {f1(pv['E027 vLLM 0.31 compaction']['k_pass1'])}% "
+            f"({ci(pdv('E027 vLLM 0.31 compaction', eb))}). vLLM 0.31 reuses less of the prefix cache on tool traffic (58% hits vs ~86% on "
+            "0.23), so the Kaggle notebook stays on 0.23; tuned FP8 GEMM configs won the decode bench (+7–25%) but were slower on a real-traffic probe (143 vs 201 tok/s, unresolved), so nothing from E027 changed the submitted v4b stack (E027 README).",
+        ]))
+    sf, sb = R.get("E028 dev SFT"), R.get("E028 dev base")
+    if sf and sb:
+        d_sb = next((d for d in sf["paired"] if d["ref"] == "E028 dev base"), None)
+        d_tb = next((d for d in sb["paired"] if d["ref"] == "E017 V3 all"), None)
+        if d_sb and d_tb:
+            F.append(("E028: LoRA SFT of Qwen3.8-27B on 2,500 DeepSeek tool rollouts does not beat the base model on dev-56.",
+                      f"In the DeepSeek harness with the training interface (lean2roles, summary, helpers, 80k / 40k), SFT scores Kaggle pass@1 "
+                      f"{f1(sf['k_pass1'])}% against {f1(sb['k_pass1'])}% for the base model ({ci(d_sb)}, 1 attempt each), both far below the "
+                      f"DeepSeek V4.1-Flash teacher in the same harness ({f1(d_tb['ref_score'])}%, {ci(d_tb)} for base). SFT spends more "
+                      f"({fk(sf['tok_mean'])} vs {fk(sb['tok_mean'])} tokens/attempt) and ignores the budget notes: the 64K training cut "
+                      "removed every teacher wrap-up after the 60k note (README). The commit runs of its Kaggle notebooks (Table 2) only validate the pipeline."))
     F.append(("Qwen3.6-35B-A3B and Nemotron are far behind.",
               f"Qwen3.6-35B-A3B: pass@1 {f1(q36['k_pass1'])}%, pass@2 {f1(q36['k_pass2'])}% at {fk(q36['tok_mean'])} tokens, a clean run with "
               f"every attempt closing its thinking on its own. Nemotron 3.5 Lightning: {f1(nemo['k_pass1'])}% ({nemo['n_correct']}/{nemo['n_good']}) at "
               f"{fk(nemo['tok_mean'])} tokens. Nemotron 3 Super 120B is inconclusive (provider stream failures on most pilot attempts)."))
+    e24 = {k: R.get(k) for k in ("E024 MiniCPM-V-4.7 no tools", "E024 MiniCPM-V-4.7 tools", "E024 LFM2.5 no tools", "E024 LFM2.5 tools (stopped)",
+                                 "E024 Nemotron-3.5-Bolt no tools (stopped)")}
+    if all(e24.values()):
+        bo = e24["E024 Nemotron-3.5-Bolt no tools (stopped)"]
+        dbo = next((d for d in bo["paired"] if d["ref"] == "E008 Qwen xhigh-240k"), None)
+        lt = e24["E024 LFM2.5 tools (stopped)"]
+        F.append(("E024: three new open models (MiniCPM-V-4.7, LFM2.5, Nemotron-3.5-Bolt) are at the floor.",
+                  f"MiniCPM-V-4.7-35B-A3B (a Qwen3.6-35B-A3B-like backbone): Kaggle pass@1 {f1(e24['E024 MiniCPM-V-4.7 no tools']['k_pass1'])}% "
+                  f"without tools and {f1(e24['E024 MiniCPM-V-4.7 tools']['k_pass1'])}% with the sub80s40 tool harness. LFM2.5-24B-A2B: "
+                  f"{f1(e24['E024 LFM2.5 no tools']['k_pass1'])}% without tools, {f1(lt['k_pass1'])}% with tools on {lt['covered_pairs']} pairs "
+                  f"(most attempts think to the 80k cap). Nemotron-3.5-Bolt (2-bit experts): 0/{bo['n_good']} answered pairs, against "
+                  + (f"{f1(dbo['ref_score'])}% for no-tool Qwen3.8-27B on the same pairs" if dbo else "Qwen3.8-27B's ~36%")
+                  + "; its b12x kernels were stable only at one sequence per GPU. Qwen3.8-27B stays the open model."))
     F.append(("Nemotron failure pattern (40 traces read).",
               "No trace finds the correct rule; every answer is an admitted guess or give-up (copy the test input, constant fill). "
               "It invents time pressure (\"given the time…\") although the prompt sets no limit and quits at 50–95k of 200k tokens; it misreads grid "
@@ -1494,12 +1771,20 @@ def findings(R, specs, nv, longtail, kag, e16=None):
         f"**Sample noise is a few pp.** E004-GL's {gl['samples']} samples span {f1(min(gl['k_pass1_each']))}–{f1(max(gl['k_pass1_each']))} "
         f"(sd {gl['k_pass1_sd'] * 100:.1f}); E001d's span {f1(min(e1['k_pass1_each']))}–{f1(max(e1['k_pass1_each']))} (sd {e1['k_pass1_sd'] * 100:.1f}); "
         f"across multi-sample DeepSeek runs the per-sample sd is {min(ds_sd):.1f}–{max(ds_sd):.1f} pp. Most paired CIs vs E004-GL "
-        "include zero; only the losses (sub64a, s20x40, plain prompt) are clearly significant.",
-        f"**Single samples.** Rows with 1 sample (grid-max, cap100, code mode, plain prompt, sub96s40, sub64a, E017 V1/V2, Nemotron) have no pass@2 and "
+        "include zero; only the losses (sub64a, s20x40, plain prompt) and the new model's gain (E029 sub80s40) are clearly significant.",
+        f"**Single samples.** Rows with 1 sample (grid-max, cap100, code mode, plain prompt, sub96s40, sub64a, E017 V1/V2, Nemotron, E024, E027) have no pass@2 and "
         f"carry the full sample noise. pilot-26 and dev-56 numbers are noisier still (one test output moves the pilot by "
         f"{100 / pilot_pairs:.1f} pp on the Kaggle metric; one task by {100 / pilot_tasks:.1f} pp task-weighted).",
         "**Budgets differ by harness.** No-tool DeepSeek runs use one 200k call; E004 tool runs a 120k total budget; E009–E011 80–96k; "
-        "Qwen gen runs 48k or 240k; E012 48k. Compare tokens/attempt, not caps.",
+        "Qwen gen runs 48k or 240k; E012 48k; E024 no-tool runs 120k. The 48-pair probes are time-boxed (answers forced 120 min after the "
+        "server is ready), so they measure accuracy at Kaggle's throughput, not at a token cap. Compare tokens/attempt, not caps.",
+        "**Two DeepSeek Flash models.** From 2026-10-17 the API name `deepseek-flash` serves DeepSeek V4.1-Flash-1017 and the old "
+        "V4.1-Flash is retired (E029 README); there is no separate model id. Only the E029 rows use 1017; every other DeepSeek Flash row, the "
+        "E025 distillation rollouts behind E028, and ARC Prize's published Flash numbers are for the old model.",
+        "**Kaggle's eval copy.** E024 and E027 ran on Kaggle's copy of the eval set (120 tasks / 172 test pairs). Its 5 extra test pairs "
+        "are dropped here, so those rows are scored on the same 167 GitHub pairs as everything else and differ slightly from their READMEs. "
+        "E027 and the 48-pair probes store no eval predictions (only the solver's per-attempt flags; Kaggle runs keep local_submission.json, "
+        "which re-checks them).",
     ]
     return {"findings": [{"title": t, "body": b} for t, b in F], "caveats": caveats, "arcprize_cmp": arc_cmp}
 
@@ -1563,13 +1848,49 @@ CLAIMS = [
     ("E017 V3 all", "pass1", 68.3, "E017 README"), ("E017 V3 all", "pass2", 76.0, "E017 README"),
     ("E017 V3 all", "k_pass1", 69.2, "E017 README (pair-weighted)"), ("E017 V3 all", "k_pass2", 77.2, "E017 README (pair-weighted)"),
     ("E017 V3 all", "tok_mean", 39.5e3, "E017 README"),
+    ("E029 sub80s40 (1017)", "pass1", 74.3, "E029 README"), ("E029 sub80s40 (1017)", "pass2", 82.4, "E029 README"),
+    ("E029 sub80s40 (1017)", "tok_mean", 31.7e3, "E029 README"), ("E029 sub80s40 (1017)", "tok_median", 27.5e3, "E029 README"),
+    ("E029 s20x60 (1017)", "pass1", 65.8, "E029 README"), ("E029 s20x60 (1017)", "pass2", 77.8, "E029 README"),
+    ("E029 s20x60 (1017)", "tok_mean", 26.7e3, "E029 README"), ("E029 s20x60 (1017)", "tok_median", 24.5e3, "E029 README"),
+    ("E029 lean2code (1017)", "pass1", 73.2, "E029 run log (log_e029_flash1017_sub80s40_code.txt)"),
+    ("E029 lean2code (1017)", "pass2", 81.8, "E029 run log (log_e029_flash1017_sub80s40_code.txt)"),
+    ("E024 MiniCPM-V-4.7 no tools", "k_pass1", 1.2, "E024 README (Kaggle metric)"), ("E024 MiniCPM-V-4.7 no tools", "tok_mean", 21.2e3, "E024 README"),
+    ("E024 MiniCPM-V-4.7 tools", "k_pass1", 3.6, "E024 README (Kaggle metric)"), ("E024 MiniCPM-V-4.7 tools", "tok_mean", 16.8e3, "E024 README"),
+    ("E024 LFM2.5 no tools", "k_pass1", 1.2, "E024 README (interim, 166/172 at check)"),
+    ("E024 LFM2.5 no tools", "tok_mean", 42.3e3, "E024 README (interim, 166/172 at check)"),
+    ("E024 LFM2.5 tools (stopped)", "k_pass1", 1.2, "E024 README (Kaggle metric)"), ("E024 LFM2.5 tools (stopped)", "tok_mean", 74.5e3, "E024 README"),
+    ("E024 Nemotron-3.5-Bolt no tools (stopped)", "k_pass1", 0.0, "E024 README"),
+    ("E027 vLLM 0.31 base", "pass1", 42.1, "E027 README (Kaggle eval copy, 172 pairs)"), ("E027 vLLM 0.31 base", "tok_mean", 37.0e3, "E027 README"),
+    ("E027 vLLM 0.31 MTP2", "pass1", 40.0, "E027 README (Kaggle eval copy, 172 pairs)"), ("E027 vLLM 0.31 MTP2", "tok_mean", 36.6e3, "E027 README"),
+    ("E027 vLLM 0.31 compaction", "pass1", 37.1, "E027 README (Kaggle eval copy, 172 pairs)"), ("E027 vLLM 0.31 compaction", "tok_mean", 37.8e3, "E027 README"),
+    ("E028 dev base", "k_pass1", 39.3, "E028 README (22/56)"), ("E028 dev base", "tok_mean", 55.0e3, "E028 README"),
+    ("E028 dev SFT", "k_pass1", 37.5, "E028 README (21/56)"), ("E028 dev SFT", "tok_mean", 60.0e3, "E028 README"),
+    ("E021 probe v2 (Kaggle)", "k_pass1", 10.4, "E021 load_probe.md"), ("E021 probe v2 (Kaggle)", "pass1", 14.3, "E021 load_probe.md"),
+    ("E021 probe v2 (Kaggle)", "tok_mean", 22.7e3, "E021 load_probe.md"),
+    ("E021 probe v4 (Kaggle)", "k_pass1", 29.2, "E021 load_probe.md"), ("E021 probe v4 (Kaggle)", "pass1", 32.9, "E021 load_probe.md"),
+    ("E021 probe v4 (Kaggle)", "tok_mean", 32.2e3, "E021 load_probe.md"),
+    ("E021 probe v4b (Kaggle)", "k_pass1", 39.6, "E023 README"), ("E021 probe v4b (Kaggle)", "tok_mean", 32.7e3, "E023 README"),
+    ("E021 probe v4b + MTP2 (Kaggle)", "k_pass1", 14.6, "E023 README"),
+    ("E023 A SGLang v4b (L4 box)", "k_pass1", 27.1, "E023 README"), ("E023 A SGLang v4b (L4 box)", "pass1", 31.4, "E023 README"),
+    ("E023 A SGLang v4b (L4 box)", "tok_mean", 31.0e3, "E023 README"),
+    ("E023 B vLLM v4b (L4 box)", "k_pass1", 33.3, "E023 README"), ("E023 B vLLM v4b (L4 box)", "pass1", 38.1, "E023 README"),
+    ("E023 B vLLM v4b (L4 box)", "tok_mean", 29.4e3, "E023 README"),
+    ("E023 C vLLM MTP2 (L4 box)", "k_pass1", 16.7, "E023 README"), ("E023 C vLLM MTP2 (L4 box)", "pass1", 18.6, "E023 README"),
+    ("E023 C vLLM MTP2 (L4 box)", "tok_mean", 31.6e3, "E023 README"),
+    ("E023 K3 at 340-pair rate (L4 box)", "k_pass1", 12.5, "E023 README"), ("E023 K3 at 340-pair rate (L4 box)", "tok_mean", 18.9e3, "E023 README"),
+    ("E023 K0 at 340-pair rate (L4 box)", "k_pass1", 6.2, "E023 README"), ("E023 no tools + MTP2 (L4 box)", "k_pass1", 14.6, "E023 README"),
+    ("E027 probe INT4 GPTQ (L4 box)", "k_pass1", 18.8, "E027 README (9/48)"), ("E027 probe INT4 GPTQ (L4 box)", "tok_mean", 34.9e3, "E027 README"),
+    ("E027 probe AWQ (L4 box)", "k_pass1", 20.8, "E027 README (10/48)"), ("E027 probe AWQ (L4 box)", "tok_mean", 31.6e3, "E027 README"),
     ("E001a", "pass1", 52.9, "E001 README"), ("E001a", "pass2", 60.8, "E001 README"), ("E001b", "pass1", 40.8, "E001 README"),
     ("E001b", "pass2", 56.7, "E001 README"), ("E001c", "pass1", 40.0, "E001 README"),
 ]
 STALE = {"experiments.tsv E001d headline (attempt 0, pre-retry)": "predates the 2026-10-03 retry of 17 errored attempts; compare attempt 0 = ",
          "experiments.tsv E001d headline (pre-retry)": "predates the 2026-10-03 retry",
          "results_summary.md (interim snapshot, 203/334)": "interim snapshot; the run has since finished",
-         "experiments.tsv E012 (interim snapshot)": "interim snapshot of a running job"}
+         "experiments.tsv E012 (interim snapshot)": "interim snapshot of a running job",
+         "E024 README (interim, 166/172 at check)": "interim count at 166 of 172 pairs; the run has since finished",
+         "E029 run log (log_e029_flash1017_sub80s40_code.txt)": "the run log's pass@1 is attempt 0 only; recomputed attempt 0 = ",
+         "E027 README (Kaggle eval copy, 172 pairs)": "the README scores Kaggle's 172-pair eval copy (120 tasks); recomputed on the 167 GitHub pairs"}
 
 
 def crosscheck(R, nv):
@@ -1592,14 +1913,21 @@ def crosscheck(R, nv):
         note = STALE.get(src, "")
         if src.startswith("experiments.tsv E001d headline (attempt 0"):
             note += f1(R["E001d"]["pass1_each"][0])
+        if src.startswith("E029 run log"):
+            note = note + f1(res["pass1_each"][0]) if metric == "pass1" else ""
         rows.append({"run": rid, "metric": metric, "claimed": cl, "computed": comp, "diff": df, "source": src, "flag": flag, "note": note})
     return rows
 
 
 # ----------------------------------------------------------------------------------------------- SVG chart
 
-FAM_CLASS = {DS: "ds", QW: "qw", NM: "nm"}
-FAM_SHAPE = {DS: "circle", QW: "square", NM: "triangle"}
+FAM_CLASS = {DS: "ds", QW: "qw", NM: "nm", OT: "ot"}
+FAM_SHAPE = {DS: "circle", QW: "square", NM: "triangle", OT: "tridown"}
+
+
+def point_shape(pnt):
+    """DeepSeek V4.1-Flash-1017 runs (E029) get a diamond so they stand apart from the old model's circles."""
+    return "diamond" if pnt.get("model") == FLASH1017 else FAM_SHAPE[pnt["fam"]]
 
 
 def marker(shape, x, y, r, cls, filled=True):
@@ -1608,13 +1936,18 @@ def marker(shape, x, y, r, cls, filled=True):
         return f'<circle {fill} cx="{x:.1f}" cy="{y:.1f}" r="{r}"/>'
     if shape == "square":
         return f'<rect {fill} x="{x - r:.1f}" y="{y - r:.1f}" width="{2 * r}" height="{2 * r}" rx="1.5"/>'
+    if shape == "diamond":
+        h = r * 1.35
+        return f'<path {fill} d="M{x:.1f},{y - h:.1f} L{x + h:.1f},{y:.1f} L{x:.1f},{y + h:.1f} L{x - h:.1f},{y:.1f} Z"/>'
     h = r * 1.15
+    if shape == "tridown":
+        return f'<path {fill} d="M{x:.1f},{y + h:.1f} L{x + h:.1f},{y - h * 0.8:.1f} L{x - h:.1f},{y - h * 0.8:.1f} Z"/>'
     return f'<path {fill} d="M{x:.1f},{y - h:.1f} L{x + h:.1f},{y + h * 0.8:.1f} L{x - h:.1f},{y + h * 0.8:.1f} Z"/>'
 
 
 def short_label(rid):
     return (rid.replace("E009/E011 ", "").replace("E009 ", "").replace("E010 ", "").replace("E011 ", "").replace("E004 ", "")
-            .replace("E008 ", "").replace("Qwen ", "Qwen ").replace("Nemotron Lightning", "Nemotron L."))
+            .replace("E008 ", "").replace("E029 ", "").replace("E024 ", "").replace("E027 ", "").replace("Qwen ", "Qwen ").replace("Nemotron Lightning", "Nemotron L."))
 
 
 def svg_chart(points, title, x_dom, y_dom, x_ticks, y_ticks, width=760, height=440, label_filter=None, box=None, fig_id="fig"):
@@ -1642,7 +1975,7 @@ def svg_chart(points, title, x_dom, y_dom, x_ticks, y_ticks, width=760, height=4
     marks = []
     for pnt in points:
         x = X(pnt["tok_mean"])
-        sh, cls = FAM_SHAPE[pnt["fam"]], FAM_CLASS[pnt["fam"]]
+        sh, cls = point_shape(pnt), FAM_CLASS[pnt["fam"]]
         y1 = Y(pnt["k_pass1"] * 100)
         tip = (f"{pnt['id']}: {fk(pnt['tok_mean'])} tokens/attempt, Kaggle pass@1 {f1(pnt['k_pass1'])}%"
                + (f", Kaggle pass@2 {f1(pnt['k_pass2'])}%" if pnt["k_pass2"] is not None else "") + f", {pnt['samples']} sample(s)"
@@ -1740,7 +2073,7 @@ CSS = r"""
 :root{
   --bg:#f6f7f8; --surface:#ffffff; --fg:#14181d; --fg2:#3f4852; --muted:#66707b; --rule:#d9dee3; --rule2:#eceff2;
   --zebra:#f3f5f7; --accent:#24557f; --accent-soft:#e3edf6; --best:#0f4c2e; --best-bg:#e2f2e8; --code-bg:#eef1f4;
-  --ds:#2a78d6; --qw:#eb6834; --nm:#1baf7a;
+  --ds:#2a78d6; --qw:#eb6834; --nm:#1baf7a; --ot:#8a56c9;
   --f-head:"Iowan Old Style","Palatino Linotype",Palatino,Charter,"Bitstream Charter","Sitka Text",Cambria,Georgia,serif;
   --f-body:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue","Noto Sans",Arial,sans-serif;
   --f-mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
@@ -1748,11 +2081,11 @@ CSS = r"""
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
   --bg:#111417; --surface:#171b1f; --fg:#e8ebee; --fg2:#c3cad1; --muted:#929ba5; --rule:#2c3238; --rule2:#22272c;
   --zebra:#1b2025; --accent:#8db8e0; --accent-soft:#1d2b38; --best:#9fe0b8; --best-bg:#16301f; --code-bg:#1f252b;
-  --ds:#3987e5; --qw:#d95926; --nm:#199e70; color-scheme:dark}}
+  --ds:#3987e5; --qw:#d95926; --nm:#199e70; --ot:#a27ddf; color-scheme:dark}}
 :root[data-theme="dark"]{
   --bg:#111417; --surface:#171b1f; --fg:#e8ebee; --fg2:#c3cad1; --muted:#929ba5; --rule:#2c3238; --rule2:#22272c;
   --zebra:#1b2025; --accent:#8db8e0; --accent-soft:#1d2b38; --best:#9fe0b8; --best-bg:#16301f; --code-bg:#1f252b;
-  --ds:#3987e5; --qw:#d95926; --nm:#199e70; color-scheme:dark}
+  --ds:#3987e5; --qw:#d95926; --nm:#199e70; --ot:#a27ddf; color-scheme:dark}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 var(--f-body);overflow-wrap:break-word}
@@ -1800,6 +2133,7 @@ td.sec .sub{font-size:.68rem}
 tr.fam-row td{background:var(--accent-soft)!important;font-weight:600;color:var(--fg2);font-size:.78rem;letter-spacing:.05em;text-transform:uppercase}
 .badge{display:inline-block;width:.62rem;height:.62rem;border-radius:50%;margin-right:.35rem;vertical-align:baseline}
 .badge.ds{background:var(--ds)} .badge.qw{background:var(--qw);border-radius:2px} .badge.nm{background:var(--nm);border-radius:0;clip-path:polygon(50% 0,100% 100%,0 100%)}
+.badge.ot{background:var(--ot);border-radius:0;clip-path:polygon(0 0,100% 0,50% 100%)}
 th button{all:unset;cursor:pointer;display:inline-flex;gap:.25rem;align-items:center}
 th button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 th button .arr{color:var(--muted);font-size:.7em}
@@ -1821,10 +2155,10 @@ figcaption{color:var(--muted);font-size:.86rem;margin-top:.4rem;max-width:80ch}
 .chart .leader{stroke:var(--muted);stroke-width:.8}
 .chart .zoombox{fill:none;stroke:var(--muted);stroke-dasharray:4 3}
 .chart .mk{stroke:var(--surface);stroke-width:1.5}
-.chart .mk.ds{fill:var(--ds)} .chart .mk.qw{fill:var(--qw)} .chart .mk.nm{fill:var(--nm)}
+.chart .mk.ds{fill:var(--ds)} .chart .mk.qw{fill:var(--qw)} .chart .mk.nm{fill:var(--nm)} .chart .mk.ot{fill:var(--ot)}
 .chart .mk.ring{fill:var(--surface);stroke-width:2}
-.chart .mk.ring.ds{stroke:var(--ds)} .chart .mk.ring.qw{stroke:var(--qw)} .chart .mk.ring.nm{stroke:var(--nm)}
-.chart .stem{stroke-width:1.5;opacity:.55} .chart .stem.ds{stroke:var(--ds)} .chart .stem.qw{stroke:var(--qw)} .chart .stem.nm{stroke:var(--nm)}
+.chart .mk.ring.ds{stroke:var(--ds)} .chart .mk.ring.qw{stroke:var(--qw)} .chart .mk.ring.nm{stroke:var(--nm)} .chart .mk.ring.ot{stroke:var(--ot)}
+.chart .stem{stroke-width:1.5;opacity:.55} .chart .stem.ds{stroke:var(--ds)} .chart .stem.qw{stroke:var(--qw)} .chart .stem.nm{stroke:var(--nm)} .chart .stem.ot{stroke:var(--ot)}
 .chart .hit{fill:transparent}
 .chart .pt:hover .mk{stroke:var(--fg)}
 .legend{display:flex;flex-wrap:wrap;gap:.4rem 1.2rem;font-size:.85rem;color:var(--fg2);margin:.5rem 0}
@@ -1901,7 +2235,8 @@ def render_html(data, wrapper=True):
     _FN_SEEN.clear()
     m = data["meta"]
     t1, t2 = data["table1"], data["table2"]
-    fam_name = {"kaggle": T1_GROUP_KAGGLE, DS: "DeepSeek (API; not runnable on Kaggle)", QW: "Qwen (over the Kaggle budget, or throughput not measured)", NM: "Nemotron"}
+    fam_name = {"kaggle": T1_GROUP_KAGGLE, DS: "DeepSeek (API; not runnable on Kaggle)", QW: "Qwen (over the Kaggle budget, or throughput not measured)", NM: "Nemotron",
+                OT: "Other open models (MiniCPM-V-4.7, LFM2.5; self-hosted)"}
     head = f"<title>{html.escape(m['title'])}</title>\n<style>{CSS}</style>"
     out = ['<div class="wrap">']
     out.append(f"<header><h1>{html.escape(m['title'])}</h1>")
@@ -1954,12 +2289,14 @@ def render_html(data, wrapper=True):
 
     # Table 2
     out.append('<h2 id="t2">Table 2 — smaller sets, probes and partial runs</h2>')
-    out.append('<p class="tbl-note">Pilot-26, dev-56, E004a-20, provider probes, stopped or running full-set runs, the NVIDIA-subset runs '
+    out.append('<p class="tbl-note">Pilot-26, dev-56, E004a-20, the time-boxed 48-pair load probes (probe-48: 35 tasks, answers forced at '
+               'server-ready + 120 min), provider probes, stopped or running full-set runs, the NVIDIA-subset runs '
                '(‡ different task set: 120 problems with one test input each, NVIDIA prompt) and the Kaggle commit-run local tests. '
                'Kaggle pass@1 / pass@2 = mean over the covered test outputs (primary); the muted columns are ARC Prize task-weighted over covered tasks. '
                'Paired diff = run minus reference on the test outputs the run covers (Kaggle pass@1, pp, 95% cluster-bootstrap CI over tasks). References: E004-GL (4-sample mean) for '
                'DeepSeek tool runs, E001d for DeepSeek no-tool runs, no-tool Qwen xhigh-240k on the same attempt indices for Qwen runs, '
-               'and the same Qwen run capped at the tool run\'s hard cap (simulated: correct and finished within the cap).</p>')
+               'and the same Qwen run capped at the tool run\'s hard cap (simulated: correct and finished within the cap); probe-48 runs '
+               'against the Kaggle v4b probe (or the FP8 box run for box quantisation probes), E028 against its base model and the DeepSeek teacher.</p>')
     out.append('<div class="tbl-wrap"><table class="sortable" id="table2"><thead><tr>')
     out += [th("Experiment ID"), th("Model"), th("Harness"), th("Set"), th("Samples / coverage"), th("Kaggle pass@1", True, extra="prim"),
             th("Kaggle pass@2", True, extra="prim"), th("ARC Prize pass@1 (task-wt.)", True, extra="sec first"),
@@ -1997,25 +2334,34 @@ def render_html(data, wrapper=True):
     out.append('<h2 id="chart">Tokens vs accuracy</h2>')
     out.append('<div class="legend" aria-label="Legend">'
                '<span><svg viewBox="0 0 14 14"><circle cx="7" cy="7" r="5" style="fill:var(--ds)"/></svg>DeepSeek V4.1-Flash</span>'
+               '<span><svg viewBox="0 0 14 14"><path d="M7,0.8 L13.2,7 L7,13.2 L0.8,7 Z" style="fill:var(--ds)"/></svg>DeepSeek V4.1-Flash-1017 (E029)</span>'
                '<span><svg viewBox="0 0 14 14"><rect x="2" y="2" width="10" height="10" rx="1.5" style="fill:var(--qw)"/></svg>Qwen</span>'
                '<span><svg viewBox="0 0 14 14"><path d="M7,1.5 L12.5,12 L1.5,12 Z" style="fill:var(--nm)"/></svg>Nemotron</span>'
+               '<span><svg viewBox="0 0 14 14"><path d="M7,12.5 L12.5,2 L1.5,2 Z" style="fill:var(--ot)"/></svg>Other open models</span>'
                '<span><svg viewBox="0 0 14 14"><circle cx="7" cy="7" r="4.5" style="fill:var(--surface);stroke:var(--fg2)" stroke-width="2"/></svg>Kaggle pass@2 (runs with ≥2 samples)</span>'
                '<span><svg viewBox="0 0 14 14"><circle cx="7" cy="7" r="5" style="fill:var(--fg2)"/></svg>Kaggle pass@1</span></div>')
     ds_pts = [p for p in pts if p["fam"] == DS]
     xmax = max(p["tok_mean"] for p in pts)
     xhi = 10000 * (int(xmax / 10000) + 1)
+    xlo = 10000 * int(min(p["tok_mean"] for p in pts) / 10000)
+    ymax = max(max(p["k_pass1"], p["k_pass2"] or 0) for p in pts) * 100
+    yhi1 = max(85, 5 * math.ceil((ymax + 1) / 5))
     svg1 = svg_chart(pts, "All Table 1 runs: Kaggle pass@1 (filled) and Kaggle pass@2 (ring) vs mean output tokens per attempt",
-                     (30000, xhi), (0, 85), list(range(30000, xhi + 1, 10000)), [0, 20, 40, 60, 80],
-                     label_filter=lambda p: p["fam"] != DS or p["id"] in ("E001d", "E004-GL", "E004 plain-max"), fig_id="fig1")
+                     (xlo, xhi), (0, yhi1), list(range(xlo, xhi + 1, 10000)), list(range(0, yhi1 + 1, 20)),
+                     label_filter=lambda p: p["fam"] != DS or p["id"] in ("E001d", "E004-GL", "E004 plain-max", "E029 sub80s40 (1017)"), fig_id="fig1")
     out.append(f'<figure><div class="chart-scroll">{svg1}</div><figcaption>Fig. 1. Every Table 1 run, y = Kaggle score (pair-weighted, '
-               'solved test outputs / 167). Filled marker = Kaggle pass@1 (mean over samples); ring = Kaggle pass@2 (mean over attempt pairs), joined by a stem. Hover a marker for its values. x and y are linear and start at 30k tokens / 0%. '
-               'The unlabelled DeepSeek cluster is enlarged in Fig. 2.</figcaption></figure>')
+               'solved test outputs / 167). Filled marker = Kaggle pass@1 (mean over samples); ring = Kaggle pass@2 (mean over attempt pairs), joined by a stem; '
+               'diamonds = DeepSeek V4.1-Flash-1017 (E029), circles = the retired V4.1-Flash. Hover a marker for its values. '
+               f'x and y are linear and start at {xlo // 1000}k tokens / 0%. The unlabelled DeepSeek cluster is enlarged in Fig. 2.</figcaption></figure>')
     dmin = min(p["k_pass1"] for p in ds_pts) * 100
     ylo = 5 * int((dmin - 2) / 5)
-    svg2 = svg_chart(ds_pts, "DeepSeek V4.1-Flash runs only, enlarged: Kaggle pass@1 and pass@2 vs tokens", (30000, xhi), (ylo, 82), list(range(30000, xhi + 1, 10000)),
-                     list(range(ylo, 81, 5)), height=520, fig_id="fig2")
-    out.append(f'<figure><div class="chart-scroll">{svg2}</div><figcaption>Fig. 2. DeepSeek runs only, y = Kaggle score from {ylo}%. '
-               f'{html.escape(data["pareto"]["text"])}</figcaption></figure>')
+    dmax = max(max(p["k_pass1"], p["k_pass2"] or 0) for p in ds_pts) * 100
+    yhi2 = max(82, 5 * math.ceil((dmax + 1) / 5))
+    dxlo = 10000 * int(min(p["tok_mean"] for p in ds_pts) / 10000)
+    svg2 = svg_chart(ds_pts, "DeepSeek runs only, enlarged: Kaggle pass@1 and pass@2 vs tokens", (dxlo, xhi), (ylo, yhi2), list(range(dxlo, xhi + 1, 10000)),
+                     list(range(ylo, yhi2 + 1, 5)), height=520, fig_id="fig2")
+    out.append(f'<figure><div class="chart-scroll">{svg2}</div><figcaption>Fig. 2. DeepSeek runs only, y = Kaggle score from {ylo}%; '
+               f'diamonds = V4.1-Flash-1017 (E029). {html.escape(data["pareto"]["text"])}</figcaption></figure>')
 
     # Kaggle
     k = data["kaggle"]
@@ -2102,13 +2448,13 @@ def kaggle_html(k, fo, kt):
                  f'<td class="num sec first">{f1(r["pass1"])}</td><td class="num sec">{f1(r["pass2"])}</td></tr>')
     s.append("</tbody></table></div>")
     s.append(f'<ul><li>{inline(kt["tools"], fo)}</li>')
-    subs = k.get("submissions") or []
-    for sub in subs:
+    subs = sorted(k.get("submissions") or [], key=lambda x: x["submitted_at"])
+    for i, sub in enumerate(subs):  # the README config text describes the first (v2 tools) submission only
         s.append(f'<li><strong>Submitted config:</strong> {html.escape(sub["description"])} — submission {sub["id"]}, submitted '
                  f'{sub["submitted_at"][:16].replace("T", " ")} UTC, status {sub["status"]} at {sub["observed_at"][:16].replace("T", " ")} UTC'
-                 f'{", public score " + str(sub["public_score"]) if sub.get("public_score") is not None else ""}. '
-                 f'{inline(kt["submitted"], fo)}</li>')
-    s.append(f'<li>{inline(kt["prefix"], fo)}</li><li>{inline(kt["local"], fo)}</li></ul>')
+                 f'{", public score " + str(sub["public_score"]) if sub.get("public_score") is not None else ""}.'
+                 + (f' {inline(kt["submitted"], fo)}' if i == 0 else "") + '</li>')
+    s.append(f'<li>{inline(kt["lb"], fo)}</li><li>{inline(kt["prefix"], fo)}</li><li>{inline(kt["local"], fo)}</li></ul>')
     return "".join(s)
 
 
@@ -2118,6 +2464,9 @@ KAGGLE_TEXT = {
     "submitted": "Config (kaggle/README.md, v2): E012 tool agent (`agent_qwen.solve`, qwen-tools-3), tier medium, 24k soft target, hard cap "
                  "min(48k, adaptive per-pair share), budget notes on every tool output, temp 1.0 / top_p 0.95 / top_k 20, LocalExecutor, vLLM 0.23 "
                  "from our own wheel source, force answers at 11h00m, hard stop 11h30m, emergency writer 11h42m, notebook guard 11h45m (all from the first cell).",
+    "lb": "**Leaderboard noise** (E023 README): v4b resubmitted unchanged scored 26 against 19.44 on its first run, so one submission "
+          "swings by about ±4.5–5 points; the K3 recipe's ~10 pp public-eval gain over the v2 agent did not show up on the hidden set. "
+          "The E028 SFT notebooks (v5) passed their commit runs (Table 2); no later submission is recorded in `kaggle/runs/submission_watch.jsonl`.",
     "prefix": "**Prefix-caching rule** (AGENTS.md): tool use re-sends the whole growing transcript each turn, so prefix caching (vLLM "
               "`--enable-prefix-caching` / SGLang radix cache) is mandatory; never benchmark, tune or submit a tool config with it off, size "
               "concurrency by cache health (hit rate, evictions, preemptions) and not only KV capacity, and log those metrics during real runs. "
@@ -2158,7 +2507,8 @@ def render_md(data):
           "| Experiment ID | LLM model | Harness | Description | Samples | Kaggle 4×L4 / 12 h | Kaggle pass@1 | Kaggle pass@2 | *ARC Prize pass@1 (task-wt.)* | *ARC Prize pass@2 (task-wt.)* | Tok mean | Tok median | Tok p90 | Correct tok median | Cost | Notes |",
           "|---|---|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|"]
     md_groups = {"kaggle": T1_GROUP_KAGGLE, "DeepSeek": "DeepSeek (API; not runnable on Kaggle)",
-                 "Qwen": "Qwen (over the Kaggle budget, or throughput not measured)", "Nemotron": "Nemotron"}
+                 "Qwen": "Qwen (over the Kaggle budget, or throughput not measured)", "Nemotron": "Nemotron",
+                 OT: "Other open models (MiniCPM-V-4.7, LFM2.5; self-hosted)"}
     cur_g = None
     for i, r in enumerate(data["table1"]):
         if r.get("group") != cur_g:
@@ -2185,7 +2535,8 @@ def render_md(data):
     L += ["", f"## Table 2 — smaller sets, probes and partial runs ({len(data['table2'])} runs)", "",
           "‡ = NVIDIA validation subset (different task set). Kaggle pass@1 / pass@2 = mean over covered test outputs (primary); *task-weighted* "
           "columns are secondary. Paired diff = run minus reference on the test outputs the run covers (Kaggle pass@1, pp, 95% cluster-bootstrap CI over tasks); "
-          "references: E004-GL for DeepSeek tools, E001d for DeepSeek no-tool, Qwen xhigh-240k (same attempt indices; also capped at the run's hard cap, simulated) for Qwen.", "",
+          "references: E004-GL for DeepSeek tools, E001d for DeepSeek no-tool, Qwen xhigh-240k (same attempt indices; also capped at the run's hard cap, simulated) for Qwen; "
+          "probe-48 (35 tasks / 48 pairs, answers forced at server-ready + 120 min) runs vs the Kaggle v4b probe.", "",
           "| Experiment ID | Model | Harness | Set | Samples / coverage | Kaggle pass@1 | Kaggle pass@2 | *ARC Prize pass@1 (task-wt.)* | *ARC Prize pass@2 (task-wt.)* | Tok mean / median | Paired diff vs reference | Status / notes |",
           "|---|---|---|---|---|--:|--:|--:|--:|--:|---|---|"]
     for i, r in enumerate(data["table2"]):
@@ -2236,10 +2587,12 @@ def render_md(data):
                  f"{f1(r['k_pass2'])} | *{f1(r['pass1'])}* | *{f1(r['pass2'])}* |")
     kt = data["kaggle_text"]
     L += ["", f"- {md(kt['tools'])}"]
-    for sub in k.get("submissions") or []:
+    for i, sub in enumerate(sorted(k.get("submissions") or [], key=lambda x: x["submitted_at"])):
         L.append(f"- **Submitted config:** {sub['description']} — submission {sub['id']}, submitted {sub['submitted_at'][:16].replace('T', ' ')} UTC, "
-                 f"status {sub['status']} at {sub['observed_at'][:16].replace('T', ' ')} UTC. {md(kt['submitted'])}")
-    L += [f"- {md(kt['prefix'])}", f"- {md(kt['local'])}", "", "## Caveats", ""]
+                 f"status {sub['status']} at {sub['observed_at'][:16].replace('T', ' ')} UTC"
+                 + (f", public score {sub['public_score']}" if sub.get("public_score") is not None else "") + "."
+                 + (f" {md(kt['submitted'])}" if i == 0 else ""))
+    L += [f"- {md(kt['lb'])}", f"- {md(kt['prefix'])}", f"- {md(kt['local'])}", "", "## Caveats", ""]
     L += [f"- {md(c)}" for c in data["caveats"]]
     ac = data["arcprize_cmp"]
     L += ["", f"### {ac['title']}", "", "| Source | Set | Setting | Score |", "|---|---|---|---|"]
