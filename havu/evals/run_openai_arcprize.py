@@ -19,7 +19,8 @@ from pathlib import Path
 from openai import OpenAI
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from arc_harness.arcprize import build_prompt, parse  # noqa: E402
+from arc_harness.arcprize import TEMPLATE, build_prompt, parse  # noqa: E402
+from arc_harness.grid_image import build_image_prompt  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -38,6 +39,10 @@ def main():
     ap.add_argument("--slots-per-server", type=int, default=0,
                     help="if >0, send each attempt to a server with a free slot (least-loaded) instead of hashing; "
                          "workers = servers * slots")
+    ap.add_argument("--grid-format", default="json", choices=["json", "image"],
+                    help="E033: image = every grid is a PNG (ARC palette, --image-cell px per cell) instead of JSON")
+    ap.add_argument("--image-cell", type=int, default=32, help="E033: pixels per cell (Qwen3.8: 32 = one LLM visual token per cell)")
+    ap.add_argument("--save-reasoning", action="store_true", help="E033: store the full reasoning text in each record")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -74,9 +79,14 @@ def main():
         slot = free.get() if args.slots_per_server else None
         client = clients[slot if slot is not None else
                          int(hashlib.md5(f"{t}:{p}:{a}".encode()).hexdigest(), 16) % len(clients)]
-        prompt = build_prompt(task["train"], task["test"][p]["input"])
+        if args.grid_format == "image":
+            prompt = build_image_prompt(TEMPLATE, task["train"], task["test"][p]["input"], args.image_cell)
+        else:
+            prompt = build_prompt(task["train"], task["test"][p]["input"])
         rec = {"task_id": t, "pair": p, "attempt": a, "model": args.model, "max_tokens": args.max_tokens,
-               "extra_body": extra, "base_url": str(client.base_url)}
+               "extra_body": extra, "base_url": str(client.base_url), "grid_format": args.grid_format}
+        if args.grid_format == "image":
+            rec["image_cell"] = args.image_cell
         t0 = time.time()
         try:
             r = client.chat.completions.create(model=args.model, messages=[{"role": "user", "content": prompt}],
@@ -85,6 +95,8 @@ def main():
             content = msg.content or ""
             reasoning = getattr(msg, "reasoning_content", None) or (msg.model_extra or {}).get("reasoning") or ""
             pred = parse(content) if content else None
+            if args.save_reasoning:
+                rec["reasoning"] = reasoning
             rec.update(content=content[-4000:], reasoning_chars=len(reasoning), finish_reason=r.choices[0].finish_reason,
                        usage={"prompt": r.usage.prompt_tokens, "completion": r.usage.completion_tokens},
                        pred=pred, seconds=round(time.time() - t0, 1))

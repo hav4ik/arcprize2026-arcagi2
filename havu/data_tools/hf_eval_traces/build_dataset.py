@@ -173,7 +173,14 @@ def arc_log_runs():
                      status="stopped", desc=B.E027_V4B + "; TurboQuant k8v4 KV cache; stopped at 129/172 pairs without a summary file")
         s.setdefault("exp", "E027")
         out.append((d, s))
-    out.append((str(ROOT / "experiments/E027_l4_throughput/sft_nb_kaggle/arc_logs"),
+    # Kaggle-pace runs on the 93 non-dev pairs (base v4b samples and variants): labels from the report's Table 2 specs
+    for d in sorted(glob.glob(str(ROOT / "experiments/E027_l4_throughput/base93_*/arc_logs"))):
+        rd = Path(d).parent.relative_to(ROOT).as_posix()
+        if rd in REPORT_AT:
+            s = dict(REPORT_AT[rd]); s.setdefault("exp", "E027"); s["set"] = "non-dev-93"
+            out.append((d, s))
+    sft_rd = "experiments/E027_l4_throughput/sft_nb_kaggle"
+    out.append((str(ROOT / sft_rd / "arc_logs"), dict(REPORT_AT[sft_rd], exp="E027", set="non-dev-93") if sft_rd in REPORT_AT else
                 dict(id="E027/E028 SFT Kaggle-paced (L4 box)", exp="E027", fam=B.QW, model=SFT_L4, harness="tools-grid", set="non-dev-93",
                      desc="exact Kaggle v5 SFT notebook solver (cad74873, kaggle_v5_sft_settings.json) in local mode at Kaggle's 11 h / 259-pair pace; "
                           "71 non-dev tasks / 93 pairs, 1 attempt each (E027 README 'Kaggle-paced run')")))

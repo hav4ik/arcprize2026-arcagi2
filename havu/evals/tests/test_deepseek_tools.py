@@ -358,6 +358,33 @@ class E009OptionTests(unittest.TestCase):
         self.assertTrue(first["content"].startswith("Reasoning Effort: Minimal."))
         self.assertEqual(client.requests[0]["messages"][1]["role"], "user")
 
+    def test_grid_image_cells_align_with_patches(self):
+        import io
+        from PIL import Image
+        from arc_harness.grid_image import PALETTE, render, visual_tokens
+        grid = [[0, 1, 2], [3, 4, 5]]
+        img = Image.open(io.BytesIO(render(grid, cell=32)))
+        self.assertEqual(img.size, (96, 64))
+        for r, row in enumerate(grid):
+            for c, v in enumerate(row):  # every pixel of a cell has the cell's colour, including its edges
+                for y, x in ((r * 32, c * 32), (r * 32 + 31, c * 32 + 31), (r * 32 + 16, c * 32 + 7)):
+                    self.assertEqual(img.getpixel((x, y)), PALETTE[v])
+        self.assertEqual(visual_tokens(grid, 32), 6)    # one LLM token (2x2 merged 16-px patches) per cell
+        self.assertEqual(visual_tokens([[0] * 30] * 30, 32), 900)
+
+    def test_image_prompt_replaces_every_grid(self):
+        self.args.grid_format, self.args.image_cell, self.args.base_url = "image", 32, "http://x"
+        client = FakeClient([[chunk(content="[[4,3]]", finish="stop", tokens=5)]])
+        self.solve(client)
+        content = client.requests[0]["messages"][0]["content"]
+        images = [p for p in content if p["type"] == "image_url"]
+        self.assertEqual(len(images), 2 * len(TASK["train"]) + 1)
+        text = "".join(p["text"] for p in content if p["type"] == "text")
+        self.assertNotIn("[[1, 2]]", text)                # no JSON grids left in the text
+        self.assertIn("Colour key", text)
+        self.assertIn("1 rows x 2 columns", text)
+        self.assertTrue(text.rstrip().endswith(PROMPT_SUFFIXES[self.args.prompt].strip()[-40:]))
+
     def test_lean2code_prompt_extends_lean2sub(self):
         self.assertTrue(PROMPT_SUFFIXES["lean2code"].startswith(PROMPT_SUFFIXES["lean2sub"]))
         self.assertIn("Let code do the perceiving", PROMPT_SUFFIXES["lean2code"])

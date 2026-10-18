@@ -19,6 +19,8 @@ from openai import OpenAI
 
 from run_deepseek_arc2 import api_key
 from run_deepseek_arcprize import TASKS, build_prompt, parse
+from arc_harness.arcprize import TEMPLATE as ARC_TEMPLATE
+from arc_harness.grid_image import build_image_prompt
 from sandbox_client import SandboxSession, check_health, tool_output
 from task_summary import task_summary
 from train_check import ranked_answers, train_check
@@ -88,7 +90,8 @@ V5_DEFAULTS = {"task_summary": False, "helpers": False, "train_check": False}
 V5_PROMPTS = {"lean2roles"}
 # v6 (E029) is recorded when an E029 option or prompt is active; it adds the keys below to the config.
 HARNESS_VERSION_V6 = "persistent-v6"
-V6_DEFAULTS = {"turns_note": 0, "fallback_solve": False, "cap_nudge": False, "effort_header": ""}
+V6_DEFAULTS = {"turns_note": 0, "fallback_solve": False, "cap_nudge": False, "effort_header": "", "grid_format": "json",
+               "image_cell": 32}
 V6_PROMPTS = {"lean2code"}
 HELPERS_SRC = (Path(__file__).resolve().parent / "arc_helpers.py").read_text()
 HELPERS_DOC = (
@@ -490,13 +493,18 @@ def turns_note(args, index):
 
 
 def solve(client, args, task, test_input, session_factory=SandboxSession):
-    prompt = build_prompt(task["train"], test_input) + PROMPT_SUFFIXES[args.prompt]
+    extra = PROMPT_SUFFIXES[args.prompt]
     if args.mode == "code":
-        prompt += "\n\nUse run_python to investigate; submit self-contained transform(grid) code with submit_solution."
+        extra += "\n\nUse run_python to investigate; submit self-contained transform(grid) code with submit_solution."
     if getattr(args, "helpers", False):
-        prompt += HELPERS_PROMPT
+        extra += HELPERS_PROMPT
     if getattr(args, "task_summary", False):
-        prompt += task_summary(task["train"], test_input)
+        extra += task_summary(task["train"], test_input)
+    if getattr(args, "grid_format", "json") == "image":
+        # E033: the same prompt with every JSON grid replaced by an image (one model patch token per cell).
+        prompt = build_image_prompt(ARC_TEMPLATE, task["train"], test_input, args.image_cell, suffix=extra)
+    else:
+        prompt = build_prompt(task["train"], test_input) + extra
     messages = [{"role": "user", "content": prompt}]
     if getattr(args, "effort_header", ""):
         messages.insert(0, {"role": "system", "content": EFFORT_HEADERS[args.effort_header]})
@@ -795,6 +803,11 @@ def parser():
                          "attempt 0 nor 1 passes the train check (not part of the config, so files resume)")
     ap.add_argument("--turns-note", type=int, default=0,
                     help="E029: append a 'N turns left, submit now' note to tool output when N or fewer turns remain (0=off)")
+    ap.add_argument("--grid-format", default="json", choices=["json", "image"],
+                    help="E033: image = every grid in the prompt is a PNG (ARC palette, --image-cell px per cell, no grid "
+                         "lines) instead of JSON; needs a vision model behind --base-url")
+    ap.add_argument("--image-cell", type=int, default=32,
+                    help="E033: pixels per grid cell (Qwen3.8: 32 = one LLM visual token per cell, 16 = one ViT patch)")
     ap.add_argument("--effort-header", default="", choices=["", *EFFORT_HEADERS],
                     help="E030: system message in DeepSeek's effort-prefix style (minimal = terse thinking)")
     ap.add_argument("--cap-nudge", action="store_true",
@@ -829,6 +842,8 @@ def main():
         ap.error(f"--prompt {args.prompt} describes submit_answer; pass --answer-tool")
     if args.extra_attempt_if_no_train_pass and (args.attempts != 2 or not args.train_check):
         ap.error("--extra-attempt-if-no-train-pass needs --attempts 2 and --train-check")
+    if args.grid_format == "image" and not args.base_url:
+        ap.error("--grid-format image needs a vision model behind --base-url")
     if args.cap_nudge and (args.final_mode != "session" or not args.answer_tool):
         ap.error("--cap-nudge needs --final-mode session and --answer-tool")
     if args.fallback_solve and args.final_mode != "session":

@@ -915,6 +915,10 @@ T2_SPECS = [
          files=["@experiments/E027_l4_throughput/base93_v4b_s3"], desc=PROBE_V4B + "; 93 non-dev pairs, forced at 225 min",
          cost=("text", "box time [^rent-e027]"), ref="E027 base v4b, Kaggle pace s1 (L4 box)", setlabel="nondev-93 (Kaggle pace)", status="done",
          note="Third sample. Base over 3 samples 38.7% (sd 1.9 pp)."),
+    dict(id="E027 base v4b tier low, Kaggle pace (L4 box)", fam=QW, model=QWEN_L4BOX, harness="tools-program", set="nondev93",
+         files=["@experiments/E027_l4_throughput/base93_v4b_low"], desc=PROBE_V4B.replace("xhigh", "low") + "; ARC_TOOLS_TIER=low; 93 non-dev pairs, forced at 225 min",
+         cost=("text", "box time [^rent-e027]"), ref="E027 base v4b, Kaggle pace s1 (L4 box)", setlabel="nondev-93 (Kaggle pace)", status="done",
+         note="Qwen's native low tier: same share of attempts finish (41 submitted), worse reasoning inside the budget; −8.6 pp [−16.3, −1.1] vs the 3-sample xhigh mean (E027 README)."),
     dict(id="E028 SFT v5 notebook, Kaggle pace (L4 box)", fam=QW, model="Qwen3.8-27B E028 SFT, ModelOpt FP8 (v1), vLLM 0.23 on vast.ai 4×L4",
          harness="tools-grid", set="nondev93", files=["@experiments/E027_l4_throughput/sft_nb_kaggle"],
          desc="nb_v5_sft solver (cad74873) with kaggle_v5_sft_settings.json (DeepSeek-harness interface, 64k ceiling / 32k soft, adaptive share), c24; 93 non-dev pairs, forced at 225 min",
@@ -1617,6 +1621,22 @@ def findings(R, specs, nv, longtail, kag, e16=None):
                     "runnable candidate early enough that the 60k \"submit now\" note finds something to submit.")
         F.append(("DeepSeek's new V4.1-Flash-1017 (E029) is more accurate and ~20% cheaper on the same harness; sub80s40 is the new best DeepSeek config.",
                   body))
+        hdr, h2060 = R.get("E030 sub80s40 + effort header (1017)"), R.get("E030 s20x60 + effort header (1017)")
+        b2080, cap16 = R.get("E030 s20x80 (1017)"), R.get("E030 cap16 nudge (1017)")
+        if hdr and h2060 and b2080 and cap16 and all(x["complete"] for x in (hdr, h2060, b2080, cap16)):
+            pct = lambda x: sg((x["tok_mean"] / n80["tok_mean"] - 1) * 100, 0)
+            F.append(("E030: a \"Reasoning Effort: Minimal\" header shortens Flash-1017 without losing accuracy; budget pressure, per-turn caps and prompt lines do not.",
+                      [f"DeepSeek implements its effort levels as a header at the start of the conversation (`high` and `max` prepend \"Reasoning Effort: …\" text, "
+                       f"`low` adds nothing). `--effort-header minimal` sends one in the same style as a system message (terse notes, no restating or re-verifying, "
+                       f"test ideas in code, submit once train passes). On sub80s40 it scores Kaggle pass@1 {f1(hdr['k_pass1'])}% / pass@2 {f1(hdr['k_pass2'])}% "
+                       f"at {fk(hdr['tok_mean'])} tokens/attempt ({pct(hdr)}% vs plain sub80s40, paired pass@1 {ci(dref(hdr, 'E029 sub80s40 (1017)'))}) and keeps "
+                       f"the long-tail pairs ({f1(hdr.get('longtail_acc'))}%).",
+                       f"With the s20x60 budget it stacks: {f1(h2060['k_pass1'])}% / {f1(h2060['k_pass2'])}% at {fk(h2060['tok_mean'])} tokens ({pct(h2060)}%), "
+                       f"against {f1(n2060['k_pass1'])}% / {f1(n2060['k_pass2'])}% at {fk(n2060['tok_mean'])} without the header.",
+                       f"Budget pressure alone (s20x80: {f1(b2080['k_pass1'])}% / {f1(b2080['k_pass2'])}% at {fk(b2080['tok_mean'])}, {pct(b2080)}%) trims the long tail "
+                       f"and loses hard pairs ({f1(b2080.get('longtail_acc'))}%). A per-turn thinking cap closed by a \"test it in code now\" nudge (`--cap-nudge`, 16k: "
+                       f"{fk(cap16['tok_mean'])} tokens) saves nothing: the model resumes the same deliberation in the next turn. Placement matters: the same brevity "
+                       f"request as a user-prompt suffix (E009 `lean2brief`, old model) cost up to 14 pp."]))
     F.append(("Tools + lean2 prompt beat no tools for Flash; tools alone do not.",
               f"E004-GL (grid mode, lean2 prompt, low effort) scores pass@1 {f1(gl['k_pass1'])}% over {gl['samples']} samples against "
               f"{f1(e1['k_pass1'])}% for no-tool E001d ({e1['samples']} samples), paired {ci(d_gl)}, at {fk(gl['tok_mean'])} vs "

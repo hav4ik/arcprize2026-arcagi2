@@ -364,4 +364,6 @@ Paired SFT − base: **−12.9 pp, 95% CI [−23.3, −2.2]** (task-cluster boot
 
 **Third base sample (2026-10-18 11:45–15:30 UTC, `base93_v4b_s3/`):** 35/93 = 37.6%. Base over 3 samples: 38.7% (sd 1.9 pp). **SFT − base mean: −14.0 pp [−21.8, −6.0].**
 
+**Tier `low` instead of `xhigh` (2026-10-18 15:40–19:25 UTC, `base93_v4b_low/`, `ARC_TOOLS_TIER=low`, otherwise the base v4b run):** 28/93 = 30.1%, **−8.6 pp [−16.3, −1.1] vs the 3-sample xhigh mean**. It submits as often (41 submitted, 52 out of budget) at about the same tokens (26.2k mean vs ~28.7k): at Kaggle pace the adaptive share, not the tier, sets the length, and `low` reasons worse inside it. Keep xhigh.
+
 **Reading:** the SFT model is accurate when it finishes (22/23 of its submissions are correct), but at Kaggle's pace it rarely finishes inside its ~29k share. This matches E028's finding that the 64K training cut removed the teacher's wrap-ups after the 60k note, so the model doesn't react to budget notes. At Kaggle pace it scores well below the base v4b agent.
