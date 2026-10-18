@@ -349,6 +349,15 @@ The two W8A8 kernels tie, and greedy outputs agree. The same day on this box, th
 - E027 vLLM 0.31 base (v4b solver, unpaced): 47.3% vs 24.7% on all 93.
 - E020 K3 attempt 0 (unpaced): 37.8% vs 24.4% on 90.
 
-A paired, same-pace base run (official FP8 + v4b solver, same 93 pairs, forced at 225 min) was queued on 2026-10-18 at 03:40 UTC; see below when done.
+**Paired base run (2026-10-18 03:40–07:25 UTC):** official Qwen3.8-27B-FP8 + the v4b solver, same 93 pairs, same pace (forced at 225 min), c24. Logs: `base93_v4b/`.
+
+| Same 93 pairs, Kaggle pace | Base (official FP8, v4b) | SFT (v1 ModelOpt, v5 notebook) |
+|---|---|---|
+| Pairs correct | **35/93 = 37.6%** (28.00/71 tasks) | 23/93 = 24.7% (17.00/71) |
+| Submitted (correct) / out of budget | 41 (32) / 52 | 23 (22) / 70 |
+| Output tokens per attempt (mean / median) | 27.9k / 31.0k | 22.5k / 25.0k |
+| Server | 192 tok/s, prefix hits 82.2%, KV 1.45M | 159 tok/s, prefix hits 75.3%, KV 1.59M |
+
+Paired SFT − base: **−12.9 pp, 95% CI [−23.3, −2.2]** (task-cluster bootstrap). Both solved 18 pairs; only base 17, only SFT 5.
 
 **Reading:** the SFT model is accurate when it finishes (22/23 of its submissions are correct), but at Kaggle's pace it rarely finishes inside its ~29k share. This matches E028's finding that the 64K training cut removed the teacher's wrap-ups after the 60k note, so the model doesn't react to budget notes. At Kaggle pace it scores well below the base v4b agent.

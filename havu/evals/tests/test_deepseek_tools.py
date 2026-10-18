@@ -325,6 +325,30 @@ class E009OptionTests(unittest.TestCase):
         self.assertEqual([c.args[1] for c in sub.call_args_list], ["answer"])
         self.assertIsNone(result["pred"])
 
+    def test_cap_nudge_closes_cut_turn_with_synthetic_call(self):
+        self.args.final_mode, self.args.answer_tool, self.args.cap_nudge = "session", True, True
+        self.args.max_tokens, self.args.max_total_output = 50, 1000
+        client = FakeClient([[chunk(reasoning="long thought", content="partial", finish="length", tokens=50)],
+                             [chunk(content="[[4,3]]", finish="stop", tokens=5)]])
+        trace, result = self.solve(client)
+        cut, note = trace["messages"][1], trace["messages"][2]
+        self.assertEqual((cut["content"], cut["reasoning_content"]), ("", "long thought"))
+        self.assertEqual(cut["tool_calls"][0]["function"]["name"], "run_python")
+        self.assertEqual((note["role"], note["tool_call_id"]), ("tool", cut["tool_calls"][0]["id"]))
+        self.assertIn("per-turn thinking limit", note["content"])
+        self.assertEqual(client.requests[1]["messages"][-1]["role"], "tool")
+        self.assertEqual(FakeSession.instances[0].calls, [])  # the synthetic call is not executed
+        self.assertEqual((result["cap_nudges"], result["pred"]), (1, [[4, 3]]))
+
+    def test_cap_nudge_not_used_when_total_budget_is_the_limit(self):
+        self.args.final_mode, self.args.answer_tool, self.args.cap_nudge = "session", True, True
+        self.args.max_tokens, self.args.max_total_output = 100, 60
+        client = FakeClient([[chunk(reasoning="long", finish="length", tokens=60)]])
+        with patch("run_deepseek_tools.submit_answer", return_value=("[answer not accepted]", None)):
+            trace, result = self.solve(client)
+        self.assertEqual(result["cap_nudges"], 0)
+        self.assertEqual(result["stop_reason"], "output_budget")
+
     def test_lean2code_prompt_extends_lean2sub(self):
         self.assertTrue(PROMPT_SUFFIXES["lean2code"].startswith(PROMPT_SUFFIXES["lean2sub"]))
         self.assertIn("Let code do the perceiving", PROMPT_SUFFIXES["lean2code"])

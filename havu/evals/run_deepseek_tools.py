@@ -88,7 +88,7 @@ V5_DEFAULTS = {"task_summary": False, "helpers": False, "train_check": False}
 V5_PROMPTS = {"lean2roles"}
 # v6 (E029) is recorded when an E029 option or prompt is active; it adds the keys below to the config.
 HARNESS_VERSION_V6 = "persistent-v6"
-V6_DEFAULTS = {"turns_note": 0, "fallback_solve": False}
+V6_DEFAULTS = {"turns_note": 0, "fallback_solve": False, "cap_nudge": False}
 V6_PROMPTS = {"lean2code"}
 HELPERS_SRC = (Path(__file__).resolve().parent / "arc_helpers.py").read_text()
 HELPERS_DOC = (
@@ -464,6 +464,11 @@ def budget_note(args, used):
     return note
 
 
+CAP_NOTE = ("[per-turn thinking limit: this turn reached {k}k tokens without running code, so it was stopped here. "
+            "Do not keep deliberating: write the smallest code experiment that tests your current best hypothesis on "
+            "the training pairs and run it now.]")
+
+
 def turns_note(args, index):
     """E029 --turns-note N: after assistant turn `index` (0-based), warn once N or fewer turns remain."""
     n = getattr(args, "turns_note", 0)
@@ -487,6 +492,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
     messages = [{"role": "user", "content": prompt}]
     total = {"prompt": 0, "cache_hit": 0, "completion": 0}
     n_tools, n_errors, n_turns, finish, stop, pred = 0, 0, 0, None, None, None
+    n_nudges = 0  # E030 --cap-nudge
     events, error, content, t0 = [], None, "", time.monotonic()
     session_final = getattr(args, "final_mode", "turn") == "session"
     source = None  # where the single scored grid came from
@@ -535,6 +541,20 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                     events[-1]["thinking"] = False
                 if finish not in {"stop", "tool_calls", "length"}:
                     raise RuntimeError(f"Provider interrupted generation: {finish}")
+                if finish == "length" and not final and getattr(args, "cap_nudge", False) and cap < remaining:
+                    # E030 --cap-nudge: the per-turn max_tokens cut this turn. Keep its reasoning, drop any partial
+                    # text or tool call, and close it with a synthetic run_python call whose output is the nudge.
+                    call_id = f"cap_{n_turns}"
+                    msg = {"role": "assistant", "content": "", "reasoning_content": msg.get("reasoning_content", ""),
+                           "tool_calls": [{"id": call_id, "type": "function", "function": {
+                               "name": "run_python", "arguments": json.dumps({"code": "pass  # per-turn thinking limit"})}}]}
+                    messages[-1] = msg
+                    note = (CAP_NOTE.format(k=round(cap / 1000)) + budget_note(args, total["completion"])
+                            + turns_note(args, index))
+                    messages.append({"role": "tool", "tool_call_id": call_id, "content": note})
+                    events.append({"turn": n_turns, "cap_nudge": True})
+                    n_nudges += 1
+                    continue
                 calls = msg.get("tool_calls", [])
                 if not calls:
                     content = msg["content"]
@@ -636,6 +656,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
               "seconds": round(time.monotonic() - t0, 1)}
     if auto_price:
         result.update(est_cost_peak_usd=round(cost["peak"], 6), peak_turns=cost["peak_turns"])
+    if getattr(args, "cap_nudge", False):
+        result["cap_nudges"] = n_nudges
     if getattr(args, "train_check", False):
         result.update({"train_pass": None, "train_frac": None, "train_trace": "no_answer"} if pred is None else labels)
     if any(getattr(args, k, v) != v for k, v in V4_DEFAULTS.items()):
@@ -763,6 +785,9 @@ def parser():
                          "attempt 0 nor 1 passes the train check (not part of the config, so files resume)")
     ap.add_argument("--turns-note", type=int, default=0,
                     help="E029: append a 'N turns left, submit now' note to tool output when N or fewer turns remain (0=off)")
+    ap.add_argument("--cap-nudge", action="store_true",
+                    help="E030: when a turn hits --max-tokens, keep its reasoning and close it with a synthetic run_python "
+                         "call whose output tells the model to test its hypothesis in code (per-turn thinking cap)")
     ap.add_argument("--fallback-solve", action="store_true",
                     help="E029: with --final-mode session, if `answer` is not a valid grid, try solve(test_input)")
     ap.add_argument("--auto-peak-price", action="store_true",
@@ -792,6 +817,8 @@ def main():
         ap.error(f"--prompt {args.prompt} describes submit_answer; pass --answer-tool")
     if args.extra_attempt_if_no_train_pass and (args.attempts != 2 or not args.train_check):
         ap.error("--extra-attempt-if-no-train-pass needs --attempts 2 and --train-check")
+    if args.cap_nudge and (args.final_mode != "session" or not args.answer_tool):
+        ap.error("--cap-nudge needs --final-mode session and --answer-tool")
     if args.fallback_solve and args.final_mode != "session":
         ap.error("--fallback-solve needs --final-mode session")
     if args.turns_note < 0 or args.turns_note >= args.max_turns:

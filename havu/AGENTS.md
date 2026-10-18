@@ -94,6 +94,9 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
   - Phase-2 comparison against sub80s40: `experiments/E017_reasoning_efficiency/scripts/phase2_compare.py`. Results: `experiments/E017_reasoning_efficiency/README.md`.
   - `evals/frontier.py`: accuracy/token frontier and mixed-config pass@2.
   - Other agents may share the sandbox container: check `docker stats` before restarting it.
+- **E029/E030 options (harness `persistent-v6`, opt-in):** `--prompt lean2code` ("decide in code"), `--turns-note N`, `--fallback-solve`, `--cap-nudge` (with `--max-tokens N`: a per-turn thinking cap closed by a synthetic `run_python` nudge).
+  - Since 2026-10-17 `deepseek-flash` serves V4.1-Flash-1017 (E029): sub80s40 is the best config (pass@2 82.4%, 31.7k tokens).
+  - None of these options shortens 1017's traces; only the budget does: s20x80 −10% tokens for −1.2 pp pass@2 (E030). `--turns-note 5` is a harmless safety net.
 - **Qwen tool harness (`evals/run_qwen_tools.py`, `evals/arc_harness/agent_qwen.py`, harness `qwen-tools-4`):** the defaults behave as `qwen-tools-3` (E012).
   - `--answer-mode program` (E019): the only answer tool is `submit_program(code defining solve(grid))`. It is checked host-side in a fresh process on every train pair before the test; no typed or forced answers, and the fallback is the best submitted program or the session's `solve`. Kaggle: `ARC_TOOLS_ANSWER_MODE=program`.
   - Other options: `--record-train-check` (submit mode, bookkeeping only), `--base-url` (unauthenticated server such as local SGLang), `--context`, `--out`.

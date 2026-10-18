@@ -56,6 +56,43 @@ BOOT = 10000
 # ----------------------------------------------------------------------------------------------- loading
 
 
+
+# Per-run links: traces in the public HF dataset (reports/hf_trace_runs.csv maps run_id -> dataset config, written by
+# data_tools/hf_eval_traces/build_dataset.py) and the experiment folder in the GitHub snapshot (private repo).
+HF_TRACES = "https://huggingface.co/datasets/livobereshka/arc-agi2-eval-traces"
+GH_EXPERIMENTS = "https://github.com/hav4ik/arcprize2026-arcagi2/tree/main/havu/experiments"
+
+
+def _trace_configs():
+    import csv
+    path = OUT / "hf_trace_runs.csv"
+    if not path.exists():
+        return {}
+    with open(path, newline="") as f:
+        return {row["run_id"]: row["config"] for row in csv.DictReader(f)}
+
+
+TRACE_CONFIGS = _trace_configs()
+# Report ids whose dataset run_id differs (E016 arms are named after their result-file arms in the dataset).
+TRACE_ALIASES = {"E016 toolnote (thinking off)": "E016 continuation toolnote",
+                 "E016 usermsg (thinking off)": "E016 continuation usermsg",
+                 "E016 toolnote (thinking on)": "E016 continuation toolnote_think"}
+EXP_DIRS = {d.name[:4]: d.name for d in sorted((ROOT / "experiments").glob("E[0-9][0-9][0-9]_*")) if d.is_dir()}
+
+
+def run_links(run_id):
+    """Small 'traces · docs' links under a run id (empty when neither is known)."""
+    import urllib.parse
+    links = []
+    trace_id = TRACE_ALIASES.get(run_id, run_id)
+    cfg = TRACE_CONFIGS.get(trace_id)
+    if cfg:
+        links.append(f'<a href="{HF_TRACES}/viewer/{cfg}/train?q={urllib.parse.quote(trace_id)}" target="_blank" rel="noopener">traces</a>')
+    m = re.match(r"E\d{3}", run_id)
+    if m and m.group(0) in EXP_DIRS:
+        links.append(f'<a href="{GH_EXPERIMENTS}/{EXP_DIRS[m.group(0)]}" target="_blank" rel="noopener">docs</a>')
+    return f'<span class="links">{" · ".join(links)}</span>' if links else ""
+
 def read_jsonl(name):
     recs, bad = [], 0
     path = RES / name
@@ -1375,7 +1412,9 @@ SCOPE = ("This report collects every model and harness experiment we have run on
          "Kaggle-like boxes with serving variants (MTP, SGLang, vLLM 0.31, transcript compaction, 4-bit weights; E021/E023/E027). E025's "
          "DeepSeek rollouts on training tasks (SFT data for E028) are not evaluations and are left out. "
          "Every number below is recomputed from `evals/results/*.jsonl`, `kaggle/runs/` and E027's solver summaries "
-         "(`experiments/E027_l4_throughput/`) by `reports/build_report.py`.")
+         "(`experiments/E027_l4_throughput/`) by `reports/build_report.py`. Under each run id, **traces** opens its attempts in the "
+         "public dataset [livobereshka/arc-agi2-eval-traces](https://huggingface.co/datasets/livobereshka/arc-agi2-eval-traces) "
+         "(every saved transcript on the 120 public-eval tasks) and **docs** its experiment folder in the GitHub snapshot (private repo).")
 
 SCORING = [
     "**Primary metric: Kaggle score (pair-weighted).** The ARC Prize 2026 ARC-AGI-2 competition page on Kaggle allows 2 attempts per test "
@@ -2056,6 +2095,7 @@ def inline(s, fn_order):
     s = html.escape(s, quote=False)
     s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
     s = re.sub(r"`(.+?)`", r"<code>\1</code>", s)
+    s = re.sub(r"\[([^\]]+)\]\((https://[^)\s]+)\)", r'<a href="\2" target="_blank" rel="noopener">\1</a>', s)
 
     def fn(m):
         k = m.group(1)
@@ -2124,6 +2164,7 @@ td.id,thead th:first-child{position:sticky;left:0;z-index:1;background:var(--sur
 thead th:first-child{z-index:3}
 td.id{max-width:24ch;white-space:normal}
 td .sub{display:block;color:var(--muted);font-size:.72rem;margin-top:.1rem}
+td .links{display:block;font-family:var(--f-body);font-weight:400;font-size:.7rem;margin-top:.15rem}
 td.best{color:var(--best);font-weight:700;background:var(--best-bg)!important}
 td.kb-ok{color:var(--best);font-weight:700}td.kb-over{color:var(--fg2)}td.kb-na{color:var(--fg2)}
 th.prim{color:var(--fg)} td.prim{font-size:.84rem;font-weight:600;color:var(--fg)}
@@ -2270,7 +2311,7 @@ def render_html(data, wrapper=True):
             out.append(f'<tr class="fam-row"><td colspan="16">{fam_name[cur]}</td></tr>')
         raw, b = r["raw"], r["best"]
         out.append("<tr>")
-        out.append(f'<td class="id" data-v="{html.escape(r["id"])}"><span class="badge {FAM_CLASS[r["fam"]]}" aria-hidden="true"></span>{html.escape(r["id"])}</td>')
+        out.append(f'<td class="id" data-v="{html.escape(r["id"])}"><span class="badge {FAM_CLASS[r["fam"]]}" aria-hidden="true"></span>{html.escape(r["id"])}{run_links(r["id"])}</td>')
         out.append(td(r["model"], "model"))
         out.append(td(r["harness"]))
         out.append(td(r["desc"], "desc", fn_order=fo))
@@ -2305,7 +2346,7 @@ def render_html(data, wrapper=True):
     for r in t2:
         raw = r["raw"]
         out.append("<tr>")
-        out.append(f'<td class="id" data-v="{html.escape(r["id"])}"><span class="badge {FAM_CLASS[r["fam"]]}" aria-hidden="true"></span>{html.escape(r["id"])}</td>')
+        out.append(f'<td class="id" data-v="{html.escape(r["id"])}"><span class="badge {FAM_CLASS[r["fam"]]}" aria-hidden="true"></span>{html.escape(r["id"])}{run_links(r["id"])}</td>')
         out.append(td(r["model"], "model"))
         out.append(td(r["harness"]))
         out.append(td(r["set"]))
