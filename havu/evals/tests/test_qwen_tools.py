@@ -160,6 +160,21 @@ class AgentTest(unittest.TestCase):
         _, r = run(llm, aq.AgentConfig(max_total_output=1000, budget_soft=0))
         self.assertEqual((r["pred"], r["answer_source"], r["stop_reason"]), (ANSWER, "forced", "output_budget"))
 
+    def test_force_submit_last_keeps_session_answer(self):
+        # force_submit_last: a set `answer` wins and the forced call is never made.
+        llm = FakeLLM([(call("run_python", "answer = [[9, 8, 7]]"), "stop"), ("long thinking", "length")], tokens=600)
+        _, r = run(llm, aq.AgentConfig(max_total_output=1000, budget_soft=0, force_submit_last=True))
+        self.assertEqual((r["pred"], r["answer_source"], r["stop_reason"]), (ANSWER, "session", "output_budget"))
+        self.assertEqual(len(llm.prompts), 2)
+
+    def test_force_submit_last_runs_when_fallbacks_fail(self):
+        def forced(prompt, max_tokens, stop):
+            self.assertTrue(prompt.endswith(aq.FORCE_THINK + aq.FORCE_CALL))
+            return "[[9, 8, 7]]\n", "stop"
+        llm = FakeLLM([(call("run_python", "x = 1"), "stop"), ("long thinking", "length"), forced], tokens=600)
+        _, r = run(llm, aq.AgentConfig(max_total_output=1000, budget_soft=0, force_submit_last=True))
+        self.assertEqual((r["pred"], r["answer_source"], r["stop_reason"]), (ANSWER, "forced", "output_budget"))
+
     def test_session_answer_fallback(self):
         llm = FakeLLM([(call("run_python", "answer = [[9, 8, 7]]"), "stop"), ("x", "length"), ("garbage", "stop")],
                       tokens=600)

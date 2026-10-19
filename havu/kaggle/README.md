@@ -206,3 +206,18 @@ mirror, which supplies the tokenizer). Check: `tests/check_notebook.py --variant
   `ARC_STRICT_FEATURES`, `ARC_LOCAL_WALL_MIN`.
 - The notebook adds an `INTERNET: OFF` cell, plus `MODEL IDENTITY` / `SERVER IDENTITY` log lines.
 - Settings, budget arithmetic and commands: `experiments/E028_qwen38_sft/KAGGLE_V5_SFT.md`.
+
+## v5_e032 (E032, 2026-10-18): the E032 SFT model with the e031 mode (built, not pushed)
+`build_notebook.py --variant v5_e032 --env JSON` builds `nb_v5_e032/` (slug `chankhavu/arc2-qwen38-e032-sft-submit`;
+models: `chankhavu/qwen3-8-27b-e032-sft/transformers/fp8block/1` and the official mirror for the tokenizer). The
+current build uses `experiments/E027_l4_throughput/e032_kaggle_settings.json` with v5_sft's commit window
+(`ARC_LOCAL_FORCE_MIN` 20 / `FORCE_CAP` 30 / `HARD` 5 / `WALL` 45). The file's own 225/235/5/250 window is for the
+4-hour L4 box run. Check: `tests/check_notebook.py --variant v5_e032 --extract-to DIR`.
+- New opt-in solver settings select the E031 training interface (`agent_qwen.E031_CONFIG`): `ARC_TOOLS_DESC=e031`,
+  `ARC_TOOLS_EFFORT_HEADER=minimal`, `ARC_TOOLS_TURNS_NOTE=5`, `ARC_TOOLS_NOTE_CAP=60000` (the budget notes state
+  20k / 60k whatever the attempt's real cap, and `budget_soft` = `ARC_TOOLS_SOFT` uncapped), and
+  `ARC_TOOLS_SOFT_WORDING=strong`. Add `ARC_TOOLS_PROMPT=lean2sub`, `ARC_EXEC_STYLE=ipython`, `ARC_TOOLS_SOFT=20000`,
+  `ARC_TOOLS_MAX_TURNS=40`, and no helpers or summary.
+- Same-interface base reference: `experiments/E027_l4_throughput/e031mode_base_settings.json` (official FP8).
+- Parity: `evals/tests/test_qwen_e031.py`. The full replay is `experiments/E027_l4_throughput/e031mode_replay.py`:
+  1900/1900 training sequences are token-identical.

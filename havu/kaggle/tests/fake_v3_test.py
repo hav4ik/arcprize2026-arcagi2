@@ -350,6 +350,31 @@ def test_memory_and_selftest():
     print("memory caps + self-test OK")
 
 
+def test_e031_mode_wiring():
+    """E032: the e031-mode settings reach the AgentConfig; notes keep the 20k / 60k training scale under a lower cap."""
+    e031 = dict(TOOLS_PROMPT="lean2sub", TOOLS_DESC="e031", EXEC_STYLE="ipython", TOOLS_SOFT=20000, TOOLS_SOFT_FRAC=0.0,
+                NOTE_CAP=60000, SOFT_WORDING="strong", EFFORT_HEADER="minimal", TURNS_NOTE=5, TOOLS_MAX_TURNS=40, TOOLS_TIER="xhigh")
+    saved = {k: ns[k] for k in e031}
+    try:
+        settings(**e031)
+        ns["v3_selftest"]()
+        assert not [d for d in ns["DROPPED"] if d.split(":")[0] in ("tool_desc", "effort_header", "turns_note",
+                                                                     "budget_note_cap", "exec_style")], ns["DROPPED"]
+        cfg = ns["PHASES"]["agent_config"]
+        want = {k: v for k, v in AQ.E031_CONFIG.items() if k not in ("max_total_output", "helpers", "task_summary", "tool_timeout")}
+        assert {k: cfg.get(k, getattr(AQ.AgentConfig(), k)) for k in want} == want, cfg
+        small = ns["build_agent_config"](AQ, 30000)
+        assert (small.max_total_output, small.budget_soft, small.budget_note_cap) == (30000, 20000, 60000)
+        assert AQ.budget_note(small, 21000).startswith("\n[budget: 21k output tokens used; aim to finish within 20k "
+                                                       "(hard limit 60k)] Past the target")
+        p = AQ.initial_prompt([{"input": [[1]], "output": [[2]]}], [[1]], small)
+        assert "</IMPORTANT>\n\n" + AQ.EFFORT_HEADERS["minimal"] + "<|im_end|>" in p
+    finally:
+        settings(**saved)
+    ns["v3_selftest"]()  # back to the defaults
+    print("e031 mode wiring OK")
+
+
 # ---------------------------------------------------------------- 4. end to end against the fake server
 
 async def test_e2e():
@@ -503,6 +528,7 @@ async def main():
     test_selection()
     test_gated_unit()
     test_memory_and_selftest()
+    test_e031_mode_wiring()
     app = web.Application()
     app.router.add_post("/v1/completions", completions)
     app.router.add_post("/tokenize", tokenize)

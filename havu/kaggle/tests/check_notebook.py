@@ -23,8 +23,12 @@ NBS = {"v2": ROOT / "kaggle/nb_v2/arc2-qwen38-tools-submit.ipynb",
        "v3": ROOT / "kaggle/nb_v3/arc2-qwen38-tools-submit.ipynb",
        "v4": ROOT / "kaggle/nb_v4/arc2-qwen38-tools-submit.ipynb",  # v4 = the v3 build with v4_settings.json
        # v5_sft = --variant v5_sft with experiments/E028_qwen38_sft/kaggle_v5_sft_settings.json (E028 SFT model)
-       "v5_sft": ROOT / "kaggle/nb_v5_sft/arc2-qwen38-e028-sft-submit.ipynb"}
-V3_FAMILY = ("v3", "v4", "v5_sft")
+       "v5_sft": ROOT / "kaggle/nb_v5_sft/arc2-qwen38-e028-sft-submit.ipynb",
+       # v5_e032 = --variant v5_e032 with experiments/E027_l4_throughput/e032_kaggle_settings.json (E032, e031 mode)
+       "v5_e032": ROOT / "kaggle/nb_v5_e032/arc2-qwen38-e032-sft-submit.ipynb",
+       # v5_e032_min = v5_e032 with ARC_TOOLS_TIER=minimal (experimental tier, not in Qwen3.8's chat template)
+       "v5_e032_min": ROOT / "kaggle/nb_v5_e032_min/arc2-qwen38-e032-sft-minimal.ipynb"}
+V3_FAMILY = ("v3", "v4", "v5_sft", "v5_e032", "v5_e032_min")
 DEST = "/kaggle/working/arc_solver"
 
 
@@ -66,7 +70,7 @@ def main():
     sys.path[:0] = [str(ROOT / "kaggle")]
     import build_notebook
     assert written["solver.py"] == build_notebook.solver_source(), "embedded solver differs from solver_source()"
-    modules = (build_notebook.V5_SFT_MODULES if a.variant == "v5_sft" else
+    modules = (build_notebook.V5_SFT_MODULES if a.variant in ("v5_sft", "v5_e032", "v5_e032_min") else
                build_notebook.V3_MODULES if a.variant in V3_FAMILY else build_notebook.V2_MODULES)
     for repo, rel in modules:
         assert written[rel] == (ROOT / repo).read_text(), f"{rel} differs from the repo"
@@ -88,6 +92,25 @@ def main():
                   "ARC_EXEC_STYLE", "ARC_STRICT_FEATURES"):
             assert settings.get(k) not in (None, ""), f"v5_sft setting {k} missing"
         print("v5_sft metadata and settings OK:", meta["id"], meta["model_sources"])
+    if a.variant in ("v5_e032", "v5_e032_min"):  # E032 model + the official mirror (tokenizer), e031-mode agent settings
+        meta = json.loads((NB.parent / "kernel-metadata.json").read_text())
+        want = "chankhavu/arc2-qwen38-e032-sft-minimal" if a.variant == "v5_e032_min" else "chankhavu/arc2-qwen38-e032-sft-submit"
+        assert meta["id"] == want and meta["is_private"], meta["id"]
+        assert meta["model_sources"] == [build_notebook.E032_MODEL, build_notebook.MODEL], meta["model_sources"]
+        assert meta["kernel_sources"] == [build_notebook.VLLM_SOURCE] and not meta["enable_internet"]
+        assert meta["dataset_sources"] == [build_notebook.LOCAL_DATA]
+        assert meta["competition_sources"] == ["arc-prize-2026-arc-agi-2"] and meta["machine_shape"] == "NvidiaL4"
+        cfg = next(c.source for c in nb.cells if c.cell_type == "code" and "SETTINGS = " in c.source)
+        settings = json.loads(cfg.split("SETTINGS = ", 1)[1].split("\nfor k, v in", 1)[0])
+        assert any(c.cell_type == "code" and c.source == build_notebook.NET_CELL for c in nb.cells), "no INTERNET cell"
+        want = {"ARC_TOOLS_DESC": "e031", "ARC_TOOLS_PROMPT": "lean2sub", "ARC_TOOLS_EFFORT_HEADER": "minimal",
+                "ARC_TOOLS_TURNS_NOTE": 5, "ARC_TOOLS_NOTE_CAP": 60000, "ARC_TOOLS_SOFT": 20000,
+                "ARC_TOOLS_SOFT_WORDING": "strong", "ARC_TOOLS_MAX_TURNS": 40, "ARC_EXEC_STYLE": "ipython",
+                "ARC_TOOLS_TIER": "minimal" if a.variant == "v5_e032_min" else "xhigh", "ARC_HELPERS": 0,
+                "ARC_TASK_SUMMARY": 0, "ARC_STRICT_FEATURES": 1,
+                "ARC_MODEL_SOURCE": "chankhavu/qwen3-8-27b-e032-sft", "ARC_TOKENIZER": "official"}
+        assert {k: settings.get(k) for k in want} == want, settings
+        print("v5_e032 metadata and settings OK:", meta["id"], meta["model_sources"])
     env = dict(os.environ, ARC_WORK=tempfile.mkdtemp())
     mods = [m[1][len("evals/"):-3].replace("/", ".") for m in modules
             if m[1].endswith(".py") and not m[1].endswith("__init__.py")] + ["solver"]

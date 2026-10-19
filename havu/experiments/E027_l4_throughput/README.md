@@ -367,3 +367,21 @@ Paired SFT − base: **−12.9 pp, 95% CI [−23.3, −2.2]** (task-cluster boot
 **Tier `low` instead of `xhigh` (2026-10-18 15:40–19:25 UTC, `base93_v4b_low/`, `ARC_TOOLS_TIER=low`, otherwise the base v4b run):** 28/93 = 30.1%, **−8.6 pp [−16.3, −1.1] vs the 3-sample xhigh mean**. It submits as often (41 submitted, 52 out of budget) at about the same tokens (26.2k mean vs ~28.7k): at Kaggle pace the adaptive share, not the tier, sets the length, and `low` reasons worse inside it. Keep xhigh.
 
 **Reading:** the SFT model is accurate when it finishes (22/23 of its submissions are correct), but at Kaggle's pace it rarely finishes inside its ~29k share. This matches E028's finding that the 64K training cut removed the teacher's wrap-ups after the 60k note, so the model doesn't react to budget notes. At Kaggle pace it scores well below the base v4b agent.
+
+## E036: why E032 ran slow on the L4 box — my server flags, not the harness (2026-10-19)
+The E032 probe-48 at Kaggle pace scored 5/48 at 118 gen tok/s and a 50% prefix-cache hit, against ~210 tok/s and 84–91% for base v4b. Diagnosis (scripts in the job's box folder; outputs copied to `e034_cache/` (folder name kept)):
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| Prompt-rendering bug in the E031-mode agent | re-tokenize every turn prompt of real transcripts; turn k must be a token prefix of turn k+1 | **ruled out**: 930/930 boundaries prefix-stable (E032 337/337, v4b 353/353, E028 240/240) |
+| KV pressure / eviction | idle vs 23 concurrent background generations; preemptions; KV usage | **ruled out**: identical cached counts, 0 preemptions, peak KV 59% in the probe |
+| Generated tokens not reused | generate 3–4k tokens, resend prompt + output + tool result, read `cached_tokens` (`--enable-prompt-tokens-details`) | **ruled out**: 11/12 cache exactly floor((prompt+generated)/1568)·1568 |
+| Re-tokenization drift | server-returned token ids vs `/tokenize` of prompt + text | **ruled out** for natural turns (one mismatch only after a forced generation past EOS) |
+| Cache granularity | cached counts | real but common to all runs: hybrid DeltaNet align mode, attention block size 1568 tokens; up to ~1.5k tokens re-prefilled per request |
+| **Server flags** | same E032 weights, same agent, with vs without `--enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3` | **the cause of most of the gap**: 143 vs 192 gen tok/s (first ~25 min at c24) |
+
+- My L4 scripts (`sft_restart_default.sh`, `e032_serve.sh`) passed those parser flags; the Kaggle notebooks (v4b, v5, v5_e032, v5_e032_min) never do. So the L4 E032 probe and the E028 SFT L4 runs (159 tok/s) were handicapped; base v4b runs used no parser flags.
+- Agent A/B on the same E032 server without the flags (25 min, c24): E031-mode agent 192 tok/s, 70% hit; v4b agent on E032 weights 194 tok/s, 50% hit. The hit rate is not what limits speed here; base weights under the v4b agent reach 255 tok/s, so a smaller gap remains between E032's and the base model's generation pattern (E032: 1.8k generated tokens per request vs 3.0k).
+- Rerun of the E032 probe-48 with Kaggle's exact server flags and the submitted FORCE_SUBMIT_LAST: `e032_probe48_kflags/`.
+
+**Rerun with Kaggle's exact server flags** (no parsers; FORCE_SUBMIT_LAST as submitted; 2026-10-19 02:53–04:55 UTC, `e032_probe48_kflags/`): **6/48 = 12.5%** (6.00/35 tasks). Generation 152 tok/s at ≥20 running (6.5 per stream) vs 118 with the parser flags, 21.8k tokens per attempt vs 16.0k, final prefix hit 65%. Still 37/48 out of budget and 11 submitted. Paired vs base v4b on Kaggle (19/48): both 6, E032 only 0, base only 13. **The flags explain part of the throughput, not the accuracy gap:** at Kaggle pace E032 rarely finishes. It is ~25% slower than base on the same box (152 vs ~210 tok/s) and needs more tokens per solved pair.

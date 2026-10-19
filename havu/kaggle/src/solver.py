@@ -101,6 +101,21 @@ EXEC_STYLE = os.environ.get("ARC_EXEC_STYLE", "plain")  # LocalExecutor output f
 LOCAL_WALL_MIN = envf("ARC_LOCAL_WALL_MIN", 0.0)    # > 0: local (commit) runs only: emergency exit at T0 + this
 TOOLS_SOFT_FRAC = envf("ARC_TOOLS_SOFT_FRAC", 0.0)  # > 0: budget_soft = this x the attempt's hard cap (E028 trained on
                                                     # 40k/80k = 0.5); 0 = min(ARC_TOOLS_SOFT, cap) as before
+# ---- E032 (e031 mode) toggles, all opt-in: the E031 interface the E032 SFT model was trained on, with
+# ARC_TOOLS_DESC=e031, ARC_TOOLS_PROMPT=lean2sub, ARC_EXEC_STYLE=ipython, ARC_TOOLS_SOFT=20000, ARC_TOOLS_MAX_TURNS=40,
+# ARC_TOOLS_SOFT_WORDING=strong (experiments/E027_l4_throughput/e032_kaggle_settings.json)
+EFFORT_HEADER = os.environ.get("ARC_TOOLS_EFFORT_HEADER", "")  # AgentConfig.effort_header ("minimal": E031's system
+                                                    # message, rendered after the tools block)
+TURNS_NOTE = envf("ARC_TOOLS_TURNS_NOTE", 0)        # AgentConfig.turns_note (E031: 5)
+SOFT_WORDING = os.environ.get("ARC_TOOLS_SOFT_WORDING", "gentle")  # AgentConfig.soft_wording past the soft target
+                                                    # (E031: strong = "submit now, unless one more experiment ...")
+FORCE_SUBMIT = envf("ARC_TOOLS_FORCE_SUBMIT", 256)  # tokens for the forced submit_answer at the cap (0 = off;
+                                                    # E031/E032: 0, as E031 never forced a submit)
+FORCE_SUBMIT_LAST = envf("ARC_TOOLS_FORCE_SUBMIT_LAST", 0)  # 1: force the submit only when the session answer,
+                                                    # solve() and salvage fallbacks all fail (E032 submission)
+NOTE_CAP = envf("ARC_TOOLS_NOTE_CAP", 0)            # AgentConfig.budget_note_cap: the hard limit the budget notes state
+                                                    # (E031: 60000) whatever the attempt's real cap; with it set,
+                                                    # budget_soft = ARC_TOOLS_SOFT unchanged (training wording)
 AGENT_EXTRA = os.environ.get("ARC_AGENT_EXTRA", "")  # JSON {AgentConfig field: value}, applied last (unknown fields
                                                     # are logged and skipped); hook for new harness options
 STRICT_FEATURES = envf("ARC_STRICT_FEATURES", 0)    # 1: a requested agent option the self-test switches off fails
@@ -135,6 +150,11 @@ TIER_SYSTEM = {
              "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final "
              "answer.",
     "medium": None,
+    # Undocumented (not in Qwen3.8's chat template, which accepts xhigh / medium / low): an experimental tier, the exact line of
+    # experiments/E032_qwen38_sft_e031/chat_template_minimal.jinja (E032 "minimal" eval and Kaggle candidate).
+    "minimal": "Reasoning effort is set to minimal. Keep your thinking short and terse: brief notes, not full sentences. "
+               "Test ideas with small code experiments instead of long deliberation, and submit as soon as the rule "
+               "reproduces every training pair.",
 }
 
 
@@ -892,13 +912,18 @@ def robust_executor_factory(timeout, prelude_extra=None):
 def build_agent_config(AQ, cap):
     """The AgentConfig every tool attempt runs with (hard cap `cap` = min(ARC_TOOLS_CAP, the attempt's budget))."""
     fields = AQ.AgentConfig.__dataclass_fields__
-    soft = int(TOOLS_SOFT_FRAC * cap) if TOOLS_SOFT_FRAC > 0 else min(TOOLS_SOFT, cap)
+    soft = int(TOOLS_SOFT_FRAC * cap) if TOOLS_SOFT_FRAC > 0 else int(TOOLS_SOFT) if NOTE_CAP else min(TOOLS_SOFT, cap)
     kw = dict(tier=TOOLS_TIER, max_total_output=cap, budget_soft=soft,
               budget_notes=0.01, budget_warn=0.75, verify_submit=False, max_turns=int(TOOLS_MAX_TURNS),
-              chunk_tokens=16384, force_submit_tokens=256, tool_timeout=TOOL_TIMEOUT,
+              chunk_tokens=16384, force_submit_tokens=int(FORCE_SUBMIT), tool_timeout=TOOL_TIMEOUT,
               temperature=TEMPERATURE, top_p=0.95, top_k=20)
     if "context" in fields:
         kw["context"] = MAX_MODEL_LEN
+    if FORCE_SUBMIT_LAST:
+        if "force_submit_last" in fields:
+            kw["force_submit_last"] = True
+        else:
+            log("SELF-TEST: bundled agent has no force_submit_last; ARC_TOOLS_FORCE_SUBMIT_LAST ignored")
     kw.update(agent_options(fields))
     return AQ.AgentConfig(**kw)
 
@@ -943,6 +968,14 @@ def agent_options(fields):
         opt["tool_desc"] = TOOLS_DESC
     if TOOLS_FALLBACK_SOLVE:  # E028: no answer at the end -> the session's solve(test_input)
         opt["solve_fallback"] = opt["fallback_solve"] = True  # the harness field is solve_fallback
+    if EFFORT_HEADER:  # E032: E031's system message after the tools block
+        opt["effort_header"] = EFFORT_HEADER
+    if SOFT_WORDING != "gentle":  # E032: E031's strong wording past the soft target
+        opt["soft_wording"] = SOFT_WORDING
+    if TURNS_NOTE:  # E032: "[N turns left: ...]" once N or fewer turns remain
+        opt["turns_note"] = int(TURNS_NOTE)
+    if NOTE_CAP:  # E032: budget notes keep the training scale (e.g. 20k / 60k) under a lower real cap
+        opt["budget_note_cap"] = int(NOTE_CAP)
     opt.update(agent_extra(fields)[0])
     return {k: v for k, v in opt.items() if k in fields}
 
@@ -1371,7 +1404,8 @@ def v3_selftest():
     """Check each enabled v3 feature on CPU before any GPU work; a broken one is switched off (v2 behaviour for
     that feature) and logged loudly. Sets agent_qwen.PROGRAM_MEMORY_MB from the session memory cap."""
     global SESSION_MEM_MB, HELPERS, TASK_SUMMARY, TOOLS_ANSWER_MODE, TOOLS_PROMPT, FREE_ATTEMPT2, TURN_THINK_CAP, \
-        THINK_CALL_RESCUE, TOOLS_DESC, TOOLS_FALLBACK_SOLVE, AGENT_EXTRA, EXEC_STYLE
+        THINK_CALL_RESCUE, TOOLS_DESC, TOOLS_FALLBACK_SOLVE, AGENT_EXTRA, EXEC_STYLE, EFFORT_HEADER, TURNS_NOTE, \
+        NOTE_CAP
     from arc_harness import agent_qwen as AQ
     from arc_harness import executor as EX
     fields = AQ.AgentConfig.__dataclass_fields__
@@ -1465,6 +1499,24 @@ def v3_selftest():
         log(f"SELF-TEST: bundled agent has no tool_desc; ARC_TOOLS_DESC={TOOLS_DESC!r} ignored")
         status["tool_desc"] = False
         DROPPED.append("tool_desc")
+    if TOOLS_DESC == "e031" and not hasattr(AQ, "E031_CONFIG"):  # an older agent would take it as the default
+        log("SELF-TEST: bundled agent has no e031 mode; ARC_TOOLS_DESC=e031 ignored")
+        status["tool_desc"] = False
+        DROPPED.append("tool_desc")
+        TOOLS_DESC = ""
+    # E032 options (e031 mode)
+    if EFFORT_HEADER and ("effort_header" not in fields or EFFORT_HEADER not in getattr(AQ, "EFFORT_HEADERS", {})):
+        log(f"SELF-TEST: bundled agent has no effort header {EFFORT_HEADER!r}; ARC_TOOLS_EFFORT_HEADER ignored")
+        status["effort_header"], EFFORT_HEADER = False, ""
+        DROPPED.append("effort_header")
+    if TURNS_NOTE and "turns_note" not in fields:
+        log("SELF-TEST: bundled agent has no turns_note; ARC_TOOLS_TURNS_NOTE ignored")
+        status["turns_note"], TURNS_NOTE = False, 0
+        DROPPED.append("turns_note")
+    if NOTE_CAP and "budget_note_cap" not in fields:
+        log("SELF-TEST: bundled agent has no budget_note_cap; ARC_TOOLS_NOTE_CAP ignored")
+        status["budget_note_cap"], NOTE_CAP = False, 0
+        DROPPED.append("budget_note_cap")
     if TOOLS_FALLBACK_SOLVE and "solve_fallback" not in fields and "fallback_solve" not in fields:
         log("SELF-TEST: bundled agent has no solve_fallback; ARC_TOOLS_FALLBACK_SOLVE ignored")
         status["fallback_solve"] = False
@@ -1496,7 +1548,8 @@ def v3_selftest():
     except Exception as exc:
         log(f"SELF-TEST: agent config/prompt error {exc!r}; dropping all v3 agent options")
         DROPPED.append("all_agent_options")
-        HELPERS = TASK_SUMMARY = TURN_THINK_CAP = FREE_ATTEMPT2 = TOOLS_FALLBACK_SOLVE = 0
+        HELPERS = TASK_SUMMARY = TURN_THINK_CAP = FREE_ATTEMPT2 = TOOLS_FALLBACK_SOLVE = TURNS_NOTE = NOTE_CAP = 0
+        EFFORT_HEADER = ""
         TOOLS_ANSWER_MODE, TOOLS_PROMPT, TOOLS_DESC, AGENT_EXTRA = "submit", "", "", ""
     PHASES["v3_selftest"] = status
     log(f"v3 self-test {status}; effective: answer_mode={TOOLS_ANSWER_MODE} prompt={TOOLS_PROMPT or 'default'} "
@@ -1504,7 +1557,8 @@ def v3_selftest():
         f"rescue={THINK_CALL_RESCUE} tier={TOOLS_TIER} feedback={FEEDBACK} "
         f"free_attempt2={FREE_ATTEMPT2} attempt2={ATTEMPT2} session_mem={SESSION_MEM_MB} MB "
         f"program_mem={AQ.PROGRAM_MEMORY_MB} MB tool_desc={TOOLS_DESC or 'default'} "
-        f"fallback_solve={TOOLS_FALLBACK_SOLVE} exec_style={EXEC_STYLE} extra={AGENT_EXTRA or '-'} dropped={DROPPED}")
+        f"fallback_solve={TOOLS_FALLBACK_SOLVE} exec_style={EXEC_STYLE} effort_header={EFFORT_HEADER or '-'} "
+        f"turns_note={TURNS_NOTE} note_cap={NOTE_CAP} soft_wording={SOFT_WORDING} extra={AGENT_EXTRA or '-'} dropped={DROPPED}")
 
 
 def is_rerun(test_path):
@@ -1752,7 +1806,8 @@ def main():
                           "free_attempt2": FREE_ATTEMPT2, "attempt2": ATTEMPT2, "session_mem_mb": SESSION_MEM_MB,
                           "tool_desc": TOOLS_DESC or "default", "fallback_solve": TOOLS_FALLBACK_SOLVE,
                           "model_source": MODEL_SOURCE or "official", "dropped": DROPPED, "exec_style": EXEC_STYLE,
-                          "strict_features": STRICT_FEATURES,
+                          "strict_features": STRICT_FEATURES, "effort_header": EFFORT_HEADER or "-",
+                          "turns_note": TURNS_NOTE, "note_cap": NOTE_CAP, "soft_wording": SOFT_WORDING,
                           "gated": sch.gated, "attempts_by_index": {str(i): sum(r["attempt"] == i for r in recs)
                                                                     for i in (0, 1)},
                           "think_nudges": sum(r.get("think_nudges") or 0 for r in recs),

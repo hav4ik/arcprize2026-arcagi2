@@ -45,7 +45,8 @@ HARNESS_VERSION_V5 = "qwen-tools-5"
 V5_DEFAULTS = {"task_summary": False, "helpers": False, "turn_think_cap": 0, "turn_think_grace": 2048,
                "feedback": "basic", "confirm_test": False, "test_audit": False, "lint": False,
                "worked_example": False, "record_alternatives": False,
-               "think_call_rescue": False, "tool_desc": "", "solve_fallback": False}
+               "think_call_rescue": False, "tool_desc": "", "solve_fallback": False,
+               "effort_header": "", "turns_note": 0, "budget_note_cap": 0}
 V5_PROMPTS = {"lean2progroles", "lean2roles"}
 CONTEXT = 262144
 PROGRAM_MEMORY_MB = 3072  # address-space limit of a submitted program's process (runner --session-mem-mb lowers it;
@@ -59,6 +60,11 @@ TIER_SYSTEM = {
     "medium": None,
     "low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion "
            "without unnecessary elaboration.",
+    # Undocumented (not in Qwen3.8's chat template, which accepts xhigh / medium / low): an experimental tier, the exact line of
+    # experiments/E032_qwen38_sft_e031/chat_template_minimal.jinja (E032 "minimal" eval and Kaggle candidate).
+    "minimal": "Reasoning effort is set to minimal. Keep your thinking short and terse: brief notes, not full sentences. "
+               "Test ideas with small code experiments instead of long deliberation, and submit as soon as the rule "
+               "reproduces every training pair.",
 }
 # E009 lean2sub: lean2 + the submit_answer hand-off (byte-identical to run_deepseek_tools.py).
 _SUBMIT = ("\n\nWhen your code reproduces every training output and its assumptions hold on test_input, call "
@@ -110,6 +116,14 @@ HELPERS_PROGRAM_DOC = " The grid helpers listed for run_python (objects, crop, d
 # a run_python call is opened (the model writes the code).
 THINK_NUDGE = ("\n\nI have been reasoning for a long time without running anything. I should stop here and test my "
                "current hypothesis with code now (and use code, not my head, for any counting or cell reading).\n")
+# E032 (e031 mode): run_deepseek_tools.py --effort-header texts (byte-identical), rendered as the system message after
+# the tools block in the system turn, as the HF chat template and the E032 training render place it.
+EFFORT_HEADERS = {
+    "minimal": ("Reasoning Effort: Minimal. Keep your thinking short and terse: write brief notes, not full sentences. "
+                "Do not restate the task, do not re-read or re-derive what code has already printed, and do not re-verify "
+                "what has already been checked. Test ideas with small code experiments instead of long deliberation, and "
+                "submit as soon as the rule reproduces every training pair."),
+}
 CONFIRM_TEXT = ("[program passes all {n} training pairs. Its output for test_input ({h}x{w}):\n{grid}\n"
                 "Check it critically against your rule and against what is different about test_input. If it is "
                 "right, call submit_program again with the same code: that makes it your answer. If not, fix solve "
@@ -179,6 +193,8 @@ class AgentConfig:
     max_tool_output: int = 16000
     verify_submit: bool = False     # E011: re-run the submitted expression on train inputs; reject once on mismatch
     force_submit_tokens: int = 256  # tokens for the forced submit_answer expression at the cap (0 = off)
+    force_submit_last: bool = False  # E032 Kaggle: force the submit only if the session `answer`, solve() and salvage
+    #                                  fallbacks all come up empty (so a forced answer never replaces them)
     temperature: float = 1.0
     top_p: float = 0.95
     top_k: int = 20
@@ -213,6 +229,24 @@ class AgentConfig:
     # style="ipython" (see experiments/E028_qwen38_sft/HARNESS_E025_MODE.md).
     tool_desc: str = ""
     solve_fallback: bool = False    # no answer at the end and no valid `answer`: try solve(test_input) before salvage
+    # E032 (opt-in): the E031 interface (experiments/E032_qwen38_sft_e031): tool_desc="e031" (the default run_python +
+    # submit_answer texts, run_deepseek_tools.py's error/skip/timeout strings as in e025), prompt lean2sub, no helpers
+    # or summary, effort_header="minimal", turns_note=5, max_turns=40, budget_soft=20000, soft_wording="strong",
+    # budget_note_cap=60000 and a LocalExecutor with style="ipython" (E031_CONFIG; tests: evals/tests/test_qwen_e031.py).
+    effort_header: str = ""         # EFFORT_HEADERS key: system message after the tools block ("" = none)
+    turns_note: int = 0             # once this many or fewer turns remain, a note on the last tool output (0 = off)
+    budget_note_cap: int = 0        # hard limit the budget notes state and scale with (0 = max_total_output); lets the
+    # notes keep the training wording (e.g. 20k / 60k) when the real per-attempt cap is lower
+
+
+# E032: AgentConfig fields that give the E031 interface (run_deepseek_tools.py E031 config: lean2sub, answer tool,
+# final-mode session, lenient parse, s20x60 notes with strong wording, --effort-header minimal, --turns-note 5,
+# 40 turns, 30 s tool timeout). The E032 model was trained on exactly this render (replay: evals/tests/test_qwen_e031.py).
+# On Kaggle, max_total_output may be lower than 60000: budget_note_cap keeps the notes' training wording.
+E031_CONFIG = {"tier": "xhigh", "prompt": "lean2sub", "tool_desc": "e031", "effort_header": "minimal", "turns_note": 5,
+               "max_turns": 40, "max_total_output": 60000, "budget_soft": 20000, "soft_wording": "strong",
+               "budget_notes": 0.01, "budget_warn": 0.75, "budget_note_cap": 60000, "tool_timeout": 30,
+               "max_tool_output": 16000, "answer_mode": "submit", "helpers": False, "task_summary": False}
 
 
 # ---------------------------------------------------------------- rendering (Qwen3.8 chat template, tools on)
@@ -268,11 +302,14 @@ def tool_specs(cfg):
     }} for name, description in descriptions.items()]
 
 
-def render_system(tier, tools):
+def render_system(tier, tools, system=None):
+    """system: a system message, placed after the tools block (where the Qwen3.8 chat template puts it)."""
     s = "<|im_start|>system\n"
     if TIER_SYSTEM[tier]:
         s += TIER_SYSTEM[tier] + "\n\n"
     s += TOOLS_HEADER + "".join("\n" + json.dumps(t, ensure_ascii=False) for t in tools) + TOOLS_FOOTER
+    if system:
+        s += "\n\n" + system.strip()
     return s + "<|im_end|>\n"
 
 
@@ -310,7 +347,8 @@ def user_content(train, test_input, prompt, helpers=False, summary=False, exampl
 
 def initial_prompt(train, test_input, cfg, note=None):
     """note (E020 --memory): extra text appended to the first user message (e.g. earlier attempts' failures)."""
-    return render_system(cfg.tier, tool_specs(cfg)) + render_user(
+    return render_system(cfg.tier, tool_specs(cfg), EFFORT_HEADERS[cfg.effort_header] if cfg.effort_header else None) \
+        + render_user(
         user_content(train, test_input, cfg.prompt, cfg.helpers, cfg.task_summary, cfg.worked_example)
         + (note or "")) + GEN_PROMPT
 
@@ -419,9 +457,9 @@ def lenient_parse(text):
 
 def budget_note(cfg, used):
     """Status line appended to the last tool output of a turn (E009 wording)."""
-    if not cfg.budget_notes or used < cfg.budget_notes * cfg.max_total_output:
+    hard = cfg.budget_note_cap or cfg.max_total_output  # E032: the stated limit may differ from the real cap
+    if not cfg.budget_notes or used < cfg.budget_notes * hard:
         return ""
-    hard = cfg.max_total_output
     tool = "submit_program" if cfg.answer_mode == "program" else "submit_answer"
     if cfg.budget_soft:
         note = (f"\n[budget: {used / 1000:.0f}k output tokens used; aim to finish within {cfg.budget_soft / 1000:.0f}k "
@@ -437,6 +475,19 @@ def budget_note(cfg, used):
                  + ("(or at least keep `solve` defined in your session)." if tool == "submit_program"
                     else "(or at least set `answer`)."))
     return note
+
+
+def turns_note(cfg, turn):
+    """run_deepseek_tools.py --turns-note N (E029/E031) after assistant turn `turn` (1-based): once N or fewer turns
+    remain, a reminder to answer now."""
+    left = cfg.max_turns - turn
+    if not cfg.turns_note or left > cfg.turns_note or left <= 0:
+        return ""
+    if cfg.answer_mode == "program":
+        return (f"\n[{left} turn{'s' if left != 1 else ''} left: call submit_program with your best program now, "
+                "or at least keep `solve` defined in your session.]")
+    return (f"\n[{left} turn{'s' if left != 1 else ''} left: call submit_answer with your best answer now, "
+            "or at least set `answer`.]")
 
 
 # ---------------------------------------------------------------- model backend
@@ -583,6 +634,7 @@ async def solve(llm, make_executor, train, test_input, cfg, note=None):
     prompt = initial_prompt(train, test_input, cfg, note)
     used, turns, n_calls, n_tool_err, n_parse_err, n_eos, n_chunks = 0, 0, 0, 0, 0, 0, 0
     pred = source = stop = error = salvage_info = None
+    deferred_force = deferred_entry = None  # force_submit_last
     max_prompt, content, submit_verified, forced_codes = 0, "", None, set()
     known_tokens, known_chars = 0, 0  # last measured prompt (tokens, chars) for the context estimate
     turn_log, t0 = [], time.monotonic()
@@ -653,7 +705,7 @@ async def solve(llm, make_executor, train, test_input, cfg, note=None):
                 rec["test"] = out["out"]
         return rec, rows
 
-    e025 = cfg.tool_desc == "e025"
+    e025 = cfg.tool_desc in ("e025", "e031")  # both: run_deepseek_tools.py's strings (E031 used the same harness)
     # E028 e025 mode: an executor-cap hit reads like the sandbox's killed-shell timeout (run_deepseek_tools.py)
     killed = {"process_status": "timeout", "stdout": "", "state_reset": True,
               "stderr": f"Execution timed out after {cfg.tool_timeout:g} seconds\n"}
@@ -750,7 +802,9 @@ async def solve(llm, make_executor, train, test_input, cfg, note=None):
                     forced = base + FORCE_CALL
                     fits = (estimate_tokens(known_tokens, known_chars, prompt + forced) + cfg.force_submit_tokens
                             + 64 <= cfg.context)
-                    if cfg.force_submit_tokens and fits:
+                    if cfg.force_submit_tokens and fits and cfg.force_submit_last:
+                        deferred_force, deferred_entry = prompt + forced, entry  # run after the fallbacks, if needed
+                    elif cfg.force_submit_tokens and fits:
                         c = await complete(prompt + forced, cfg.force_submit_tokens, ["</parameter>"])
                         expr = c.text.strip()
                         entry["forced_expr"] = expr[:200]
@@ -884,7 +938,7 @@ async def solve(llm, make_executor, train, test_input, cfg, note=None):
                     stop = "submission_cap"
                     prompt += text + "<|im_end|>\n" + render_tool_responses(outputs)
                     break
-                outputs[-1] += budget_note(cfg, used)
+                outputs[-1] += budget_note(cfg, used) + turns_note(cfg, turns)
                 prompt += text + "<|im_end|>\n" + render_tool_responses(outputs) + GEN_PROMPT
         except Exception as exc:
             error, stop = f"{type(exc).__name__}: {exc}"[:1000], "error"
@@ -912,6 +966,20 @@ async def solve(llm, make_executor, train, test_input, cfg, note=None):
                         pred, source = grid, "salvage"
             except Exception as exc:
                 salvage_info = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+        # force_submit_last: the forced submit_answer call only when every fallback came up empty.
+        if deferred_force is not None and pred is None and ex.session is not None:
+            try:
+                c = await complete(deferred_force, cfg.force_submit_tokens, ["</parameter>"])
+                expr = c.text.strip()
+                deferred_entry["forced_expr"] = expr[:200]
+                deferred_entry["forced_last"] = True
+                if expr:
+                    out, grid = await submit(expr)
+                    deferred_entry["forced_result"] = out[:200]
+                    if grid is not None:
+                        pred, source, answer_code = grid, "forced", expr
+            except Exception as exc:
+                deferred_entry["forced_error"] = f"{type(exc).__name__}: {exc}"[:200]
         train_check = None
         if cfg.record_train_check and not program_mode and pred is not None and ex.session is not None:
             train_check = await _submit_train_check(ex, answer_code if source in ("submit", "forced") else None, train)
