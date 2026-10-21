@@ -368,7 +368,7 @@ Paired SFT − base: **−12.9 pp, 95% CI [−23.3, −2.2]** (task-cluster boot
 
 **Reading:** the SFT model is accurate when it finishes (22/23 of its submissions are correct), but at Kaggle's pace it rarely finishes inside its ~29k share. This matches E028's finding that the 64K training cut removed the teacher's wrap-ups after the 60k note, so the model doesn't react to budget notes. At Kaggle pace it scores well below the base v4b agent.
 
-## E036: why E032 ran slow on the L4 box — my server flags, not the harness (2026-10-19)
+## E040: why E032 ran slow on the L4 box — my server flags, not the harness (2026-10-19)
 The E032 probe-48 at Kaggle pace scored 5/48 at 118 gen tok/s and a 50% prefix-cache hit, against ~210 tok/s and 84–91% for base v4b. Diagnosis (scripts in the job's box folder; outputs copied to `e034_cache/` (folder name kept)):
 
 | Hypothesis | Test | Result |
