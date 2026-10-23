@@ -61,6 +61,15 @@ REAP_IMPLEMENTATION_CONTRACT.md, TASKS_ENGRAM_FIRST.md, ...). Deployment counter
 
 Kaggle 4xL4 host RAM leaves ~122 GiB for the pinned table plus a 2.9 GiB int32 map (E042), so all observed rows fit.
 
+**Rows the eval uses but training never touched** (`engram_unseen.py`, all 2,004 Flash-1017 eval-task traces of the
+6 lean2sub runs, 82.6M tokens): 11.6% of the 164.6M distinct rows the eval touches per layer are absent from the
+census, but they carry only 1.7% of eval lookups (two-thirds of them are hit once). By token source
+(`engram_unseen_kinds.py`, 21M tokens): task prompt (system + grids) ~0% unseen; tool outputs 0.85% (7% of all unseen
+lookups: new digit runs from printed grids, ASCII renderings); model-generated text 2.4% (3-gram heads 4.1%; 93% of
+unseen lookups: novel phrasing and code identifiers such as `ates with vertical`, `_obj(m):`, ` grid.tol`). The
+census covers the task format completely; the gap is the open-ended tail of the model's own reasoning text.
+Hit rates of the masks on the 82.6M-token set: 64 GiB 93.6%, all observed 98.3% (same as on the 12.4M-token set).
+
 ### Data sufficiency (held-out eval hit rate, census on half vs all of the calibration rollouts)
 
 | budget | half data | all data |
@@ -231,7 +240,9 @@ E64 loses the idea more often, with garbled reasoning ("Weod=w?? Need."), typo l
 | full 384 experts + full Engram (server A) | 110 | 65.9% | 67.4% | `e043_full_a1` |
 | E64 + Engram 64 GiB (physical export) | 0 of 11 | | | stopped: no valid tool calls (see above) |
 | E48 + Engram 64 GiB (runtime masks) | 0 of 5 | | | stopped; also prefix-cache contaminated |
-| E72 + Engram 64 GiB | | | | queued |
+| E72 w30 + Engram 64 GiB + `--rescue-code` (runtime masks) | 49 | 29.3% | | complete |
+| E64 w30 + Engram 64 GiB + `--rescue-code` | | | | running |
+| E48 w30 + Engram 64 GiB + `--rescue-code` | | | | running |
 
 ## Artifacts (private HF, account chankhavu)
 
