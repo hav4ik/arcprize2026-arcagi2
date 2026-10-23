@@ -128,6 +128,8 @@ def scores(z, score, decoder_gen_only):
 def cmd_select(a):
     z = np.load(a.stats)
     sc = scores(z, a.score, a.decoder_gen_only)
+    if a.within:  # iterative pruning: only experts of the current keep set are eligible
+        sc = np.where(np.load(a.within).astype(bool), sc, -np.inf)
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     N = z["N"].sum(axis=(1, 2))
@@ -153,6 +155,7 @@ def main():
     ap.add_argument("--score", default="reap", choices=["reap", "freq", "contrib", "weight", "wsum", "contrib_sqrt"])
     ap.add_argument("--decoder-gen-only", action="store_true")
     ap.add_argument("--out-dir", default="")
+    ap.add_argument("--within", default=None, help="bool [40, 384] keep mask the selection must stay inside")
     a = ap.parse_args()
     {"aggregate": cmd_aggregate, "select": cmd_select}[a.cmd](a)
 

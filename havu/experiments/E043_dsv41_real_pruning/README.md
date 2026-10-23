@@ -102,6 +102,30 @@ keeping every observed row). 110 GiB is the fallback.
   layer); frequency keeps 72% (55%), contribution total (sum of amplitudes) 70% (53%), router-weight mass 72%.
   Keep-set overlap REAP/frequency is 33%. Candidates are compared by NLL rather than assuming REAP.
 
+- Main run: 377 more rollouts, 9.02M tokens (1,501 s). Pilot + main = 418 rollouts, **10.04M tokens**
+  (4.28M prompt/tool inputs, 5.76M generated-token inputs); the sparsest layer saw 375/384 experts. Keep sets are
+  stable: E64 sets from the 1M pilot and the 10M total overlap 96% for every rule.
+
+### E64 scoring rules (one-shot), teacher-forced NLL on held-out eval traces
+
+32 eval-task traces (a different 32-trace sample than the Engram table above: 419,452 generated target tokens),
+all with the frozen 64 GiB Engram mask unless noted.
+
+| model | rule | kept routing share (min layer) | NLL gen | top-1 |
+|---|---|---:|---:|---:|
+| full (384 experts, full Engram) | - | 100% | 0.6640 | 78.0% |
+| 384 experts + Engram 64 GiB | - | 100% | 0.6646 | 78.0% |
+| E64 | contribution total, decoder layers on generation targets | 66% | **0.857** | 73.6% |
+| E64 | contribution total (sum of native amplitudes) | 70% (54%) | 0.871 | 73.3% |
+| E64 | sqrt(freq) x mean amplitude | 64% | 0.873 | 73.3% |
+| E64 | plain REAP (conditional mean amplitude) | 32% (14%) | 0.922 | 72.1% |
+| E64 | router-weight mass | 72% (55%) | 1.006 | 70.5% |
+| E64 | frequency | 72% (56%) | 1.064 | 69.4% |
+
+Expert pruning to E64 costs ~+0.19 nats/token (+29%) with the best one-shot rule, while the Engram mask is free.
+Next (E042's suggestion): iterative pruning with re-observation, 384 -> 192 -> 128 -> 96 -> 72 -> 64 -> 48,
+1.5M fresh calibration tokens observed under each stage's mask (`scripts/iterative_prune.sh`).
+
 ## Status / next
 
 1. NLL of Engram masks vs full table on the eval traces (server B), ARC baseline of the full model (server A).

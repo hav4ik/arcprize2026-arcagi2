@@ -32,8 +32,8 @@ TEXT_ONLY_DROP = re.compile(r"^(mtp\.|vision\.|aligner\.|image_)")
 
 
 class Writer:
-    def __init__(self, out, shard_bytes):
-        self.out, self.shard_bytes = out, shard_bytes
+    def __init__(self, out, shard_bytes, prefix="model"):
+        self.out, self.shard_bytes, self.prefix = out, shard_bytes, prefix
         self.buf, self.size, self.n, self.weight_map, self.total = {}, 0, 0, {}, 0
 
     def add(self, name, t):
@@ -46,7 +46,7 @@ class Writer:
         if not self.buf:
             return
         self.n += 1
-        fn = f"model-{self.n:05d}.safetensors"
+        fn = f"{self.prefix}-{self.n:05d}.safetensors"
         save_file(self.buf, str(self.out / fn), metadata={"format": "pt"})
         for k in self.buf:
             self.weight_map[k] = fn
@@ -63,6 +63,8 @@ def main():
     ap.add_argument("--text-only", action="store_true")
     ap.add_argument("--shard-gb", type=float, default=5.0)
     ap.add_argument("--engram-chunk", type=int, default=8_000_000)
+    ap.add_argument("--engram-from", default=None,
+                    help="existing export whose model-engram-* files to hardlink instead of rebuilding the table")
     ap.add_argument("--geo", default="/workspace/dsv4/data/engram_geometry.npz",
                     help="engram_census.py geometry (per-column offsets/primes) for engram_compact_kept")
     a = ap.parse_args()
@@ -87,6 +89,8 @@ def main():
     for name, fn in wm.items():
         by_file[fn].append(name)
     w = Writer(out, int(a.shard_gb * 1e9))
+    # Engram tables/scales/maps in their own files so one Engram artifact can be shared by E48/E64/E72.
+    we = Writer(out, int(a.shard_gb * 1e9), prefix="model-engram")
     manifest = {"source": str(src), "experts_per_layer": E, "engram": {}, "dropped": 0}
     compact_kept = [None, None]
     for fn in sorted(by_file):
@@ -110,6 +114,8 @@ def main():
                     w.add(name, t.index_select(0, idx))
                     continue
                 m = ENGRAM_RE.match(name)
+                if m and a.engram_from:
+                    continue  # taken from the existing export below
                 if m and eng_bits is not None:
                     li = int(m.group(1))
                     hi = eng_layers.index(li)
@@ -123,12 +129,12 @@ def main():
                         if len(sel):
                             chunk = sl[s:e]  # fp8 / e8m0: select on the raw bytes, then view back
                             parts.append(chunk.view(torch.uint8).index_select(0, sel).view(chunk.dtype))
-                    w.add(name, torch.cat([p.view(torch.uint8) for p in parts]).view(parts[0].dtype))
+                    we.add(name, torch.cat([p.view(torch.uint8) for p in parts]).view(parts[0].dtype))
                     if m.group(2) == "weight":
                         rm = np.full(rows, -1, np.int32)
                         kept = np.flatnonzero(bits)
                         rm[kept] = np.arange(len(kept), dtype=np.int32)
-                        w.add(f"layers.{li}.engram.embed_tokens.row_map", torch.from_numpy(rm))
+                        we.add(f"layers.{li}.engram.embed_tokens.row_map", torch.from_numpy(rm))
                         geo = np.load(a.geo)
                         cols = [(int(geo["offsets"][hi, j]), int(geo["primes"][hi].reshape(-1)[j])) for j in range(24)]
                         compact_kept[hi] = [int(bits[o:o + n].sum()) for o, n in cols]
@@ -138,6 +144,21 @@ def main():
                     continue
                 w.add(name, f.get_tensor(name))
     w.flush()
+    we.flush()
+    if a.engram_from:  # share the Engram files of an earlier export (hardlinks on the same filesystem)
+        src_idx = json.load(open(Path(a.engram_from) / "model.safetensors.index.json"))["weight_map"]
+        for k, fn in src_idx.items():
+            if fn.startswith("model-engram-"):
+                if not (out / fn).exists():
+                    (out / fn).hardlink_to(Path(a.engram_from) / fn)
+                we.weight_map[k] = fn
+        src_cfg = json.load(open(Path(a.engram_from) / "config.json"))["text_config"]
+        compact_kept = src_cfg["engram_compact_kept"]
+        eng_bits = True
+        manifest["engram"] = json.load(open(Path(a.engram_from) / "e043_manifest.json"))["engram"]
+        manifest["engram_from"] = str(a.engram_from)
+    w.weight_map.update(we.weight_map)
+    w.total += we.total
     json.dump({"metadata": {"total_size": w.total}, "weight_map": w.weight_map},
               open(out / "model.safetensors.index.json", "w"), indent=1)
     cfg["text_config"]["n_routed_experts"] = E
