@@ -123,8 +123,45 @@ all with the frozen 64 GiB Engram mask unless noted.
 | E64 | frequency | 72% (56%) | 1.064 | 69.4% |
 
 Expert pruning to E64 costs ~+0.19 nats/token (+29%) with the best one-shot rule, while the Engram mask is free.
-Next (E042's suggestion): iterative pruning with re-observation, 384 -> 192 -> 128 -> 96 -> 72 -> 64 -> 48,
-1.5M fresh calibration tokens observed under each stage's mask (`scripts/iterative_prune.sh`).
+
+### Iterative pruning (E042's suggestion) and the E48 / E64 / E72 candidates
+
+`scripts/iterative_prune.sh`: 384 -> 192 -> 128 -> 96 -> 72 -> 64 -> 48 with the same rule, 1.5M fresh calibration
+tokens observed under each stage's mask (+ Engram 64 GiB), the next set chosen inside the current one. It is worse
+than one-shot at every size, so the candidates are **one-shot "contribution total, decoder layers on generation
+targets"** keep sets (`reap/keep_all/keep_contrib_dec_e{48,64,72}.npy`).
+
+| experts | one-shot NLL | top-1 | iterative NLL | iterative top-1 |
+|---:|---:|---:|---:|---:|
+| 384 (full) | 0.664 | 78.0% | - | - |
+| 72 | 0.822 | 74.3% | 0.879 | 73.1% |
+| 64 | 0.857 | 73.6% | 0.903 | 72.6% |
+| 48 | 0.962 | 71.5% | 1.037 | 69.9% |
+
+### Physical export and parity
+
+`scripts/export_pruned.py` -> `export/e64_oneshot_contribdec_eng64` (129.6 GB: backbone ~58 GB + compact Engram
+~71 GB in `model-engram-*` files shared by E48/E64/E72), loaded on the fork with `patches/apply_compact_engram.py`
+(TP4: **15.17 GiB weights per GPU**, KV 17.3M tokens on the RTX box). Teacher-forced NLL of the export on the same 32
+traces: 0.85694 vs 0.85723 with runtime masks on the full checkpoint (diff 0.0003 < run-to-run noise 0.0004),
+identical top-1 (73.63%).
+
+## ARC-AGI-2 eval (120 tasks / 167 pairs, 1 attempt, s20x60 + minimal header, self-hosted)
+
+| model | pairs correct | pass@1 pairs | pass@1 task-weighted | notes |
+|---|---:|---:|---:|---|
+| API Flash-1017 (E030 s20x60_hdrmin), attempt 0 / 1 | 112 / 115 | 67.1% / 68.9% | 68.6% / 71.3% | reference |
+| full 384 experts + full Engram (server A) | 110 | 65.9% | 67.4% | `e043_full_a1` |
+| E64 + Engram 64 GiB (physical export) | | | | running |
+| E48 + Engram 64 GiB (runtime masks) | | | | running |
+| E72 + Engram 64 GiB | | | | queued |
+
+## Artifacts (private HF, account chankhavu)
+
+- `chankhavu/dsv41-flash1017-e043-pruning-artifacts` (dataset): Engram counts/masks/geometry, REAP stats and keep
+  sets, token streams (calibration + eval traces), raw observer records (20 GB), NLL results, code snapshot.
+- `chankhavu/DeepSeek-V4.1-Flash-1017-arc-engram64`: shared compact Engram files + `engram_index.json`.
+- `chankhavu/DeepSeek-V4.1-Flash-1017-arc-E64` (uploading), `-arc-E48`, `-arc-E72`: backbone checkpoints.
 
 ## Status / next
 
