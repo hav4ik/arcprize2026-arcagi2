@@ -68,7 +68,8 @@ def main():
         (
             "_SUPPORTED_ROUTING_SHAPES = frozenset({(128, 3), (384, 6)})",
             "# E043: (48, 6), (64, 6), (72, 6) for physically pruned exports.\n"
-            "_SUPPORTED_ROUTING_SHAPES = frozenset({(128, 3), (384, 6), (64, 6), (72, 6), (48, 6), (96, 6)})",
+            "_SUPPORTED_ROUTING_SHAPES = frozenset({(128, 3), (384, 6), (64, 6), (72, 6), (48, 6), (96, 6),"
+            " (384, 7), (384, 8), (72, 8), (64, 8), (48, 8)})",
         ),
         (
             "        topk_weights, topk_ids = deepseek_v41_topk(\n            router_logits,\n"
