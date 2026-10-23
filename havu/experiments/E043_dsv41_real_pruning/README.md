@@ -175,6 +175,54 @@ identical top-1 (73.63%).
   10M-token records) used to protect experts or to up-weight those positions (w = 10, 30) in the contribution score;
   screened with tool-block NLL (`nll_eval.py` now reports `nll_blk` / `top1_blk`).
 
+### Tool-block screen (teacher-forced, 32 eval traces; `nll_blk`/`top1_blk` = targets inside tool-call blocks)
+
+| model (+ Engram 64 GiB) | NLL gen | top-1 | NLL tool block | top-1 tool block | first-turn probe |
+|---|---:|---:|---:|---:|---:|
+| full | 0.664 | 78.0% | 0.128 | 95.4% | 9/10 |
+| E72 contribution (decoder on gen) | 0.822 | 74.4% | 0.305 | 91.0% | 0/10 |
+| E72 protect 16 tool-block experts | 0.824 | 74.4% | 0.253 | 92.4% | 8/10 |
+| E72 tool-block weight w=10 | 0.878 | 73.2% | 0.205 | 93.5% | 2/10 |
+| **E72 w=30** | 0.946 | 71.9% | 0.184 | 94.0% | **10/10** |
+| E72 tool-block only | 1.069 | 69.5% | 0.185 | 93.9% | 9/10 |
+| **E64 w=30** | 1.013 | 70.6% | 0.199 | 93.5% | **10/10** |
+| E64 tool-block only | 1.127 | 68.5% | 0.193 | 93.6% | - |
+| E48 w=30 | 1.153 | 68.5% | 0.235 | 92.7% | 0/10 |
+| E48 tool-block only | 1.289 | 65.9% | 0.229 | 92.9% | - |
+
+w = weight of tool-call-block positions in the contribution score (`special_stats.py select --weight`).
+
+### Harness safety net `--rescue-code` (evals/run_deepseek_tools.py, opt-in)
+
+A non-final turn without a valid tool call but with code (garbled DSML `code` parameter, JSON `"code"` field,
+```python block, or plain code lines) becomes a `run_python` call; near-miss tool names (`run_ppython`) map to the real
+tools; a turn with no call, no code and no answer grid gets a short reminder to use the tools (max 3 per attempt).
+Evals on runtime masks send a per-run `cache_salt` (`eval_arc.sh` `SALT`).
+
+### What the failures are (Sonnet trace review of the early pruned evals)
+
+Not format-only. E64 shows semantic damage beyond the DSML syntax: hallucinated module names
+(`from scipy import nddfficiency`, `scscpy`), ungrammatical reasoning, and code that would not parse even when
+extracted. 57% of its tool calls return an error (full model: 1.7%), and garbled-word rates run ~80/1k words vs
+~10/1k. E72 is much milder: once it is calling tools, its analysis and code look like the full model's (terser), with
+a 19% tool-error rate. Its main problem was first-turn format failures, which the rescue fixes.
+
+### Do the pruned models still see the puzzle's idea? (Sonnet review of the w=30 + rescue evals, partial)
+
+Labels: A = main rule recognized, B = partial, C = wrong or none, D = garbled/no reasoning; judged against the full
+model's trace and the task file; partial runs (E72 41 rows, E64 35 rows); counts are a reviewer's calls.
+
+| run | outcome | read | A | B | C | D |
+|---|---|---:|---:|---:|---:|---:|
+| E72 w30 | correct | 12 | 11 | 1 | 0 | 0 |
+| E72 w30 | incorrect | 14 | 7 | 6 | 1 | 0 |
+| E64 w30 | correct | 9 | 9 | 0 | 0 | 0 |
+| E64 w30 | incorrect | 18 | 2 | 10 | 3 | 3 |
+
+E72's losses are mostly execution: half of its wrong answers state the right rule and miss by a few cells
+(e.g. 4/784 cells on 7ed72f31, 3/676 on cbebaa4b), sometimes after degenerate stretches ("Need Need Need").
+E64 loses the idea more often, with garbled reasoning ("Weod=w?? Need."), typo loops and turn-limit stops.
+
 ## ARC-AGI-2 eval (120 tasks / 167 pairs, 1 attempt, s20x60 + minimal header, self-hosted)
 
 | model | pairs correct | pass@1 pairs | pass@1 task-weighted | notes |
