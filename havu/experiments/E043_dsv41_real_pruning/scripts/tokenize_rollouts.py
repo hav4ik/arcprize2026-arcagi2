@@ -56,7 +56,8 @@ def render_with_roles(enc, messages, effort):
     messages = [dict(m) for m in messages]
     last_asst = max(i for i, m in enumerate(messages) if m["role"] == "assistant")
     messages = messages[: last_asst + 1]
-    assert messages[0]["role"] == "system"
+    if messages[0]["role"] != "system":  # runs without the effort header: tools go on an empty system message
+        messages.insert(0, {"role": "system", "content": ""})
     messages[0]["tools"] = harness_tools()
     merged = enc.merge_tool_messages(messages)
     merged = enc.sort_tool_results_by_call_order(merged)

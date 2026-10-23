@@ -65,7 +65,13 @@ def _load_ctrl(device):
     if mtime == _s["mtime"]:
         return
     _s["mtime"] = mtime
-    ctrl = json.load(open(_CTRL))
+    try:
+        _apply_ctrl(json.load(open(_CTRL)), device)
+    except Exception as e:  # a bad control file must never take the server down
+        print(f"[E043] ctrl NOT applied ({type(e).__name__}: {e}); keeping previous masks", flush=True)
+
+
+def _apply_ctrl(ctrl, device):
     _ensure_tensors(device)
     keep = ctrl.get("expert_keep")
     if keep:

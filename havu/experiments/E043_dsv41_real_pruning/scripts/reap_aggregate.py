@@ -10,7 +10,7 @@ select --stats stats.npz --experts 64 72 96 128 --out-dir DIR [--score reap|freq
        [--decoder-gen-only]
     Per-layer top-E keep masks (uniform budget per layer). reap = conditional mean amplitude A/N
     (reap_native_amp: ||native weighted expert output||, gate inside), freq = N, contrib = A,
-    weight = mean router weight. Unobserved experts score 0. --decoder-gen-only scores layers 20-39 on
+    weight = mean router weight, wsum = total router weight mass. Unobserved experts score 0. --decoder-gen-only scores layers 20-39 on
     positions whose target is a generated token (CED decoder-generation mask); default: all consumed inputs.
 """
 import argparse
@@ -118,6 +118,10 @@ def scores(z, score, decoder_gen_only):
             out[li] = s
         elif score == "weight":
             out[li] = np.where(n > 0, w / np.maximum(n, 1), 0.0)
+        elif score == "wsum":
+            out[li] = w
+        elif score == "contrib_sqrt":  # between REAP (A/N) and contribution total (A): A / sqrt(N)
+            out[li] = np.where(n > 0, s / np.sqrt(np.maximum(n, 1)), 0.0)
     return out
 
 
@@ -146,7 +150,7 @@ def main():
     ap.add_argument("--out", default="")
     ap.add_argument("--stats", default="")
     ap.add_argument("--experts", type=int, nargs="*", default=[64, 72])
-    ap.add_argument("--score", default="reap", choices=["reap", "freq", "contrib", "weight"])
+    ap.add_argument("--score", default="reap", choices=["reap", "freq", "contrib", "weight", "wsum", "contrib_sqrt"])
     ap.add_argument("--decoder-gen-only", action="store_true")
     ap.add_argument("--out-dir", default="")
     a = ap.parse_args()

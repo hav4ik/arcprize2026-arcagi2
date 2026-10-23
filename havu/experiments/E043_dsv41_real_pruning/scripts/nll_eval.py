@@ -39,7 +39,8 @@ def score(server, model, ids, roles):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tok", required=True)
+    ap.add_argument("--tok", nargs="+", required=True)
+    ap.add_argument("--per-task", action="store_true", help="one random trace per task_id, --n-seq tasks")
     ap.add_argument("--n-seq", type=int, default=40)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-len", type=int, default=60000)
@@ -49,19 +50,35 @@ def main():
     ap.add_argument("--tag", required=True)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    d = Path(a.tok)
-    toks = np.fromfile(d / "tokens.u32", dtype=np.uint32)
-    roles = np.fromfile(d / "roles.u8", dtype=np.uint8)
-    recs = [json.loads(l) for l in open(d / "index.jsonl")]
-    recs = [r for r in recs if r["length"] <= a.max_len]
-    random.Random(a.seed).shuffle(recs)
-    recs = recs[: a.n_seq]
+    data = {}
+    recs = []
+    for d in a.tok:
+        d = Path(d)
+        data[str(d)] = (np.fromfile(d / "tokens.u32", dtype=np.uint32), np.fromfile(d / "roles.u8", dtype=np.uint8))
+        for l in open(d / "index.jsonl"):
+            r = json.loads(l)
+            r["dir"] = str(d)
+            if r["length"] <= a.max_len:
+                recs.append(r)
+    recs.sort(key=lambda r: (r["task_id"], r["pair"], r["attempt"], r.get("batch") or "", r["dir"]))
+    rng = random.Random(a.seed)
+    if a.per_task:
+        by_task = {}
+        for r in recs:
+            by_task.setdefault(r["task_id"], []).append(r)
+        tasks = sorted(by_task)
+        rng.shuffle(tasks)
+        recs = [rng.choice(by_task[t]) for t in tasks[: a.n_seq]]
+    else:
+        rng.shuffle(recs)
+        recs = recs[: a.n_seq]
     t0 = time.time()
 
     def job(r):
         o, n = r["offset"], r["length"]
+        toks, roles = data[r["dir"]]
         res = score(a.server, a.model, toks[o:o + n], roles[o:o + n])
-        res.update({k: r[k] for k in ("task_id", "pair", "attempt", "correct")})
+        res.update({k: r.get(k) for k in ("task_id", "pair", "attempt", "correct", "batch")})
         return res
 
     with ThreadPoolExecutor(a.workers) as ex:

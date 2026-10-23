@@ -1,0 +1,121 @@
+# E043: real-weight pruning of DeepSeek-V4.1-Flash-1017 (Engram rows + MoE experts)
+
+**Goal (user, 2026-10-23):** implement the plan pack's Engram-first pruning on the rented 8x RTX PRO 6000 box:
+frequency-prune Engram rows, then REAP expert statistics with all 384 experts, E64 (primary) / E72 candidates.
+Calibration data: `livobereshka/arc-agi2-deepseek-flash1017-rollouts-e031-e036` (tool-use rollouts, E031/E036/E038).
+Quality: the 120 ARC-AGI-2 eval tasks with the same harness, full vs pruned on the same server.
+The plan pack (unzipped upload) is in the session scratchpad: `arc_deepseek_v41_plan/` (START_HERE.md,
+REAP_IMPLEMENTATION_CONTRACT.md, TASKS_ENGRAM_FIRST.md, ...). Deployment counterpart: E042 (session dsv4-infer).
+
+## Setup
+
+- **Box:** Vast 57370044, 8x RTX PRO 6000 Blackwell Server (96 GB, SM120), 1.5 TB RAM, 256 vCPU, 1 TB disk
+  (RAID1, only ~120 MB/s sustained writes), driver 580.105.08, $13.73/h.
+- **Checkpoint:** `deepseek-ai/DeepSeek-V4.1-Flash-1017` @ `1bae0e10`, 510.31 GB, downloaded into `/dev/shm`
+  (RAM; the disk was too slow) at ~400 MB/s. Model load from shm takes ~42 s.
+- **Runtime:** vLLM fork `0.28.1rc1.dev517+glm53.dsv41.vision11.sm89sm120.cu130` + flashinfer vision2 (E042's
+  `requirements.box.freeze`), venv `/workspace/dsv4/venv`. MXFP4 experts run on Marlin with native MXFP8
+  activations and the router weight applied before the fc2 quantization (`router_weight_before_fc2_quant`).
+- **E043 hooks** (`patches/apply_e043_patches.py`, `patches/e043_obs.py`), controlled by a JSON file `$E043_CTRL`
+  re-read at each eager forward:
+  - expert masks: pruned experts get selection bias -1e9 in the native top-6 kernel, so top-6 refills from kept
+    ids and weights renormalize over the selected set, exactly as in a physically pruned model;
+  - Engram row masks: dropped row ids are rewritten to -1, which the fork's owner-sharded lookup reads as a zero
+    row before Wkv (the plan's declared miss rule);
+  - REAP observer on `MarlinExperts.moe_sum`: per token and slot, ids, router weight and the L2 norm of the native
+    weighted expert output (`reap_native_amp`), all-reduced over the EP group (needs `--enable-expert-parallel`).
+- **Serving:** `scripts/serve.sh` (TP4 or TP8 + EP, fp8 KV, prefix caching, FULL_DECODE_ONLY graphs, Engram CPU
+  offload, `--reasoning-parser/--tool-call-parser deepseek_v41`). Two TP4+EP4 servers: A (GPUs 0-3, port 18000)
+  for ARC evals, B (GPUs 4-7, port 18001) for replay/NLL with its own control file.
+
+## Data and checks
+
+- `scripts/tokenize_rollouts.py`: rebuilds each rollout with the model's `encoding/encoding.py` (thinking mode,
+  tools on the system message so earlier reasoning is kept, numeric effort 50), cut after the last assistant
+  message; roles mark model-generated tokens.
+  - 10,001 rollouts, 251.8M consumed tokens (106.5M prompt/tool, 145.3M generated).
+  - Per-turn check against the API usage (`verify_tokenization.py`): prompt tokens equal the rebuilt prefix on
+    **all 78,992 turns**; completion tokens equal the span on 87% of turns and differ by +1 on 13% (the sampled
+    stream had one more token than the re-tokenized text, e.g. trimmed whitespace; the next turn's prompt still
+    matches), plus a few length-truncated turns.
+  - The server's chat template (`/tokenize`, tools + effort 50) gives identical ids on 12/12 sampled rollouts.
+- Held-out set: 334 eval-task traces from E030 `s20x60_hdrmin` (same harness, 120 eval tasks), 12.4M tokens.
+- Engram hash parity: the fork's GPU hash ids equal the CPU census hashes (`engram_census.py`, a numpy port of the
+  official `inference/engram.py`) on 2,188 x 24 ids in both layers.
+
+## Engram row census (report: `reports/engram_census.html`)
+
+- 6.04B lookups per Engram layer touch 223.6M distinct rows (58.2% of 384M); all observed rows = 110 GiB of the
+  188.8 GiB table. 22% of touched rows are hit once, 61% at most 4 times; rows hit > 64K times carry 39% of
+  lookups. 4-gram banks are 95% touched (saturated by collisions), 3-gram 67%, 2-gram 13%.
+- Global top-frequency masks (`engram_census.py select`), held-out eval-trace hit rates:
+
+| kept GiB | calib coverage | eval hit | eval generated | eval 2/3/4-gram | tokens with all 48 hit |
+|---:|---:|---:|---:|---|---:|
+| 8 | 85.6% | 81.2% | 71.7% | 95.9 / 81.6 / 66.0% | 62.3% |
+| 16 | 89.3% | 84.8% | 77.2% | 96.9 / 85.2 / 72.3% | 65.4% |
+| 32 | 93.3% | 88.9% | 83.3% | 97.6 / 88.6 / 80.5% | 68.3% |
+| 64 | 97.6% | 94.0% | 91.1% | 98.3 / 92.6 / 91.2% | 72.2% |
+| 96 | 99.5% | 97.3% | 95.9% | 98.9 / 96.0 / 97.0% | 77.3% |
+| 110 (all observed) | 100% | 98.4% | 97.7% | 99.1 / 97.3 / 98.9% | 84.3% |
+
+Kaggle 4xL4 host RAM leaves ~122 GiB for the pinned table plus a 2.9 GiB int32 map (E042), so all observed rows fit.
+
+### Data sufficiency (held-out eval hit rate, census on half vs all of the calibration rollouts)
+
+| budget | half data | all data |
+|---|---:|---:|
+| 16 GiB | 84.4% | 84.8% |
+| 32 GiB | 88.4% | 88.9% |
+| 64 GiB | 93.3% | 94.0% |
+| all observed rows | 96.4% (89 GiB) | 98.4% (110 GiB) |
+
+The frequency ranking has converged for a fixed budget (+0.5 pp from doubling the data); more data mostly adds
+rare rows, which only matters near the ~122 GiB cap.
+
+### Engram masks: teacher-forced NLL on held-out eval traces
+
+`scripts/nll_candidates.sh` on server B (runtime masks), 32 E030 `s20x60_hdrmin` eval-task traces (<= 40k tokens),
+514,113 model-generated target tokens, NLL in nats/token. Two runs of the full model differ by 0.0004
+(0.6671 vs 0.6667: request batching changes the reduction order), so that is the noise floor.
+
+| Engram | of table | NLL gen | vs full (mean of 2 runs) | top-1 agreement |
+|---|---:|---:|---:|---:|
+| full (2 runs) | 100% | 0.66705 / 0.66666 | - | 77.95% / 77.96% |
+| all observed, 110 GiB | 58% | 0.66724 | +0.04% | 77.91% |
+| 96 GiB | 51% | 0.66740 | +0.06% | 77.90% |
+| 64 GiB | 34% | 0.66760 | +0.09% | 77.94% |
+| 32 GiB | 17% | 0.66887 | +0.28% | 77.87% |
+| 16 GiB | 8.5% | 0.67194 | +0.74% | 77.83% |
+
+**Frozen Engram mask for REAP: `engram_top64gib`** (within noise of the full table, ~46 GiB less Kaggle RAM than
+keeping every observed row). 110 GiB is the fallback.
+
+## REAP statistics
+
+- Replay (`scripts/replay_reap.py`): calibration rollouts sent one at a time as token prompts (`max_tokens=1`,
+  unique `cache_salt`) to server B with the observer on and the frozen Engram mask; `reap_aggregate.py` checks that
+  the recorded `input_ids` equal the request streams and that selections = 6 x positions in every layer.
+- Pilot: 41 rollouts, 1.02M tokens, 169 s (6.0k tok/s). All checks pass; the least covered layer saw 367/384 experts.
+- At E64 the scoring rules disagree sharply (pilot): plain REAP (conditional mean amplitude) keeps experts that are
+  strong when chosen but rarely chosen, covering only 32% of the original routing selections (14% in the worst
+  layer); frequency keeps 72% (55%), contribution total (sum of amplitudes) 70% (53%), router-weight mass 72%.
+  Keep-set overlap REAP/frequency is 33%. Candidates are compared by NLL rather than assuming REAP.
+
+## Status / next
+
+1. NLL of Engram masks vs full table on the eval traces (server B), ARC baseline of the full model (server A).
+2. Freeze the Engram mask, REAP replay pilot (~1M tokens) with it, then E64/E72 keep sets, NLL + ARC evals.
+3. Export the chosen E64 (HF format, sliced router) + compact Engram (values/scales + int32 map) for E042.
+
+## Incidents
+
+- The image's auto-started SGLang service held GPU memory; stopped with `supervisorctl stop sglang model-ui`.
+- The first download went to the RAID1 disk (~120 MB/s flush) and stalled; switched to `/dev/shm`. A watchdog that
+  judged progress by file size killed healthy xet downloads (xet buffers in RAM); fixed to watch NIC bytes.
+- `pkill -f` patterns matched my own shells twice (remote and local); the local AGENTS.md rule forbids killing by
+  name on this host: use PIDs only.
+- Observer bug, fixed before any statistics: non-local rows of the EP `moe_sum` input are uninitialized; masking by
+  multiplication let NaN through (`where` now). Amplitudes are stored in fp32 (fp16 overflowed in deep layers).
+- The full-workspace GitHub sync is blocked by the secret scan on `.SECRETS.yaml.swp` (an open vim swap file);
+  E043 was pushed with only its own files.
