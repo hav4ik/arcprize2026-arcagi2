@@ -791,8 +791,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
         result.update(est_cost_peak_usd=round(cost["peak"], 6), peak_turns=cost["peak_turns"])
     if getattr(args, "cap_nudge", False):
         result["cap_nudges"] = n_nudges
-        if getattr(args, "rescue_code", False):
-            result["rescues"] = n_rescues
+    if getattr(args, "rescue_code", False):
+        result["rescues"] = n_rescues
     if getattr(args, "train_check", False):
         result.update({"train_pass": None, "train_frac": None, "train_trace": "no_answer"} if pred is None else labels)
     if any(getattr(args, k, v) != v for k, v in V4_DEFAULTS.items()):
