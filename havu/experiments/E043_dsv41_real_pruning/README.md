@@ -146,14 +146,43 @@ targets"** keep sets (`reap/keep_all/keep_contrib_dec_e{48,64,72}.npy`).
 traces: 0.85694 vs 0.85723 with runtime masks on the full checkpoint (diff 0.0003 < run-to-run noise 0.0004),
 identical top-1 (73.63%).
 
+### Free generation breaks below ~E96 (found by the first ARC evals)
+
+- The first pruned ARC runs (E64 physical export on A, E48 runtime masks on B) solved **0/11 and 0/5**: every attempt
+  ended after one turn without a valid tool call. Stopped after ~15 min.
+- `scripts/decode_consistency.py`: greedy decode agrees with the teacher-forced argmax except for a few near-ties
+  (full model too, fp8 KV numerics), so the decode path is fine.
+- **Artifact:** switching runtime masks on a server with prefix caching reuses KV computed under the previous mask
+  (shared system/tool-schema prefix) and corrupts generation. `gen_probe.py` therefore uses a per-config
+  `cache_salt`. (The stopped E48 eval on B was contaminated this way; the E64 export on A was not.)
+- Clean first-turn probes (1 simple tool prompt + 3 ARC prompts greedy + 2 T=1 samples each; valid = parsable
+  `run_python`/`submit_answer` call):
+
+| model (+ Engram 64 GiB) | valid tool calls | note |
+|---|---:|---|
+| full / Engram 64 GiB only | 9/10, 4/4 | |
+| E192 / E128 / E96 (contrib_dec) | 9/10, 8/10, 10/10 | |
+| E72 / E64 / E48 (contrib_dec) | 0/10, 0/10, 3/10 | reasoning fine, DSML block never closed |
+| E72 protect 16 / 32 tool-block experts | 8/10, 6/10 | |
+| E72 ranked by tool-block contribution only | 9/10 | |
+| E64 / E48 protect 32 | 2/10, 0/10 | |
+
+- Failure mode (E72, greedy, special tokens visible): the first `<｜DSML｜ invoke name="run_python">` is correct, but after
+  `</｜DSML｜ invoke>` the model opens another invoke (`run_p_python`) instead of `</｜DSML｜ calls>` and runs to
+  max tokens. The structural tokens are rare (tool-call blocks are ~6% of generated positions), so all-token NLL and
+  contribution totals underweight them.
+- Fix under test: expert statistics on tool-call-block targets (`scripts/special_stats.py`, 616k positions from the
+  10M-token records) used to protect experts or to up-weight those positions (w = 10, 30) in the contribution score;
+  screened with tool-block NLL (`nll_eval.py` now reports `nll_blk` / `top1_blk`).
+
 ## ARC-AGI-2 eval (120 tasks / 167 pairs, 1 attempt, s20x60 + minimal header, self-hosted)
 
 | model | pairs correct | pass@1 pairs | pass@1 task-weighted | notes |
 |---|---:|---:|---:|---|
 | API Flash-1017 (E030 s20x60_hdrmin), attempt 0 / 1 | 112 / 115 | 67.1% / 68.9% | 68.6% / 71.3% | reference |
 | full 384 experts + full Engram (server A) | 110 | 65.9% | 67.4% | `e043_full_a1` |
-| E64 + Engram 64 GiB (physical export) | | | | running |
-| E48 + Engram 64 GiB (runtime masks) | | | | running |
+| E64 + Engram 64 GiB (physical export) | 0 of 11 | | | stopped: no valid tool calls (see above) |
+| E48 + Engram 64 GiB (runtime masks) | 0 of 5 | | | stopped; also prefix-cache contaminated |
 | E72 + Engram 64 GiB | | | | queued |
 
 ## Artifacts (private HF, account chankhavu)

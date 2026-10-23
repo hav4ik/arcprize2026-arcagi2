@@ -33,8 +33,19 @@ def score(server, model, ids, roles):
         rank[t] = e.get("rank") or 0
     g = roles[1:] == 1
     nll = -lp[1:]
+    # Tool-call blocks: generated targets from </think> (128822) through EOS (1).
+    blk = np.zeros(len(ids), bool)
+    on = False
+    for t in range(1, len(ids)):
+        if roles[t] != 1:
+            on = False
+        elif on or ids[t] == 128822:
+            blk[t] = True
+            on = ids[t] != 1
+    b = blk[1:]
     return {"n_gen": int(g.sum()), "nll_gen": float(nll[g].sum()), "top1_gen": int((rank[1:][g] == 1).sum()),
-            "n_all": len(ids) - 1, "nll_all": float(nll.sum())}
+            "n_all": len(ids) - 1, "nll_all": float(nll.sum()),
+            "n_blk": int(b.sum()), "nll_blk": float(nll[b].sum()), "top1_blk": int((rank[1:][b] == 1).sum())}
 
 
 def main():
@@ -91,6 +102,8 @@ def main():
                       "nll_gen": sum(r["nll_gen"] for r in out) / ng,
                       "top1_gen": sum(r["top1_gen"] for r in out) / ng,
                       "nll_all": sum(r["nll_all"] for r in out) / sum(r["n_all"] for r in out),
+                      "nll_blk": sum(r["nll_blk"] for r in out) / max(1, sum(r["n_blk"] for r in out)),
+                      "top1_blk": sum(r["top1_blk"] for r in out) / max(1, sum(r["n_blk"] for r in out)),
                       "seconds": round(time.time() - t0, 1)}))
 
 
