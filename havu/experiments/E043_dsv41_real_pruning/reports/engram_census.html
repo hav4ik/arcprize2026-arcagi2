@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engram row census</title>
+<style>
+:root { color-scheme: light; --surface:#fcfcfb; --page:#f9f9f7; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --axis:#c3c2b7; --ring:rgba(11,11,11,0.10); --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { color-scheme: dark; --surface:#1a1a19;
+  --page:#0d0d0d; --ink:#f0efec; --ink2:#c3c2b7; --muted:#898781; --grid:#2c2c2a; --axis:#383835;
+  --ring:rgba(255,255,255,0.10); --s1:#3987e5; --s2:#d95926; --s3:#199e70; } }
+:root[data-theme="dark"] { color-scheme: dark; --surface:#1a1a19; --page:#0d0d0d; --ink:#f0efec; --ink2:#c3c2b7;
+  --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,0.10); --s1:#3987e5; --s2:#d95926; --s3:#199e70; }
+body { margin:0; background:var(--page); color:var(--ink); font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+main { max-width:960px; margin:0 auto; padding:24px 16px 48px; }
+h1 { font-size:26px; margin:0 0 4px; } h2 { font-size:18px; margin:32px 0 4px; }
+p, li { color:var(--ink2); } .sub { color:var(--ink2); margin:0 0 20px; }
+.card { background:var(--surface); border:1px solid var(--ring); border-radius:10px; padding:16px; margin:12px 0; }
+.tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
+.tile .lab { color:var(--ink2); font-size:13px; } .tile .val { font-size:28px; font-weight:600; }
+.tile .note { color:var(--muted); font-size:12px; }
+svg.chart { width:100%; height:auto; display:block; }
+.grid { stroke:var(--grid); stroke-width:1; } .axis { stroke:var(--axis); stroke-width:1; }
+.tick { fill:var(--muted); font-size:11px; font-variant-numeric:tabular-nums; }
+.axlabel { fill:var(--ink2); font-size:12px; } .endlabel { fill:var(--ink2); font-size:12px; }
+.mark.s1 { fill:var(--s1); } .hit:hover .mark, .hit:focus .mark { opacity:0.75; } .hit { outline:none; cursor:default; }
+.line { fill:none; stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
+.line.s1 { stroke:var(--s1); } .line.s2 { stroke:var(--s2); } .line.s3 { stroke:var(--s3); }
+.dot { stroke:var(--surface); stroke-width:2; } .dot.s1 { fill:var(--s1); } .dot.s2 { fill:var(--s2); } .dot.s3 { fill:var(--s3); }
+.hit:hover .dot, .hit:focus .dot { r:6; }
+.legend { display:flex; gap:16px; flex-wrap:wrap; font-size:13px; color:var(--ink2); margin:4px 0 8px; }
+.lg { display:inline-flex; align-items:center; gap:6px; }
+.key.line { width:16px; height:2px; border-radius:1px; } .key.s1 { background:var(--s1); }
+.key.s2 { background:var(--s2); } .key.s3 { background:var(--s3); }
+table { border-collapse:collapse; width:100%; font-size:13px; font-variant-numeric:tabular-nums; }
+th, td { text-align:right; padding:4px 8px; border-bottom:1px solid var(--grid); }
+th:first-child, td:first-child { text-align:left; } th { color:var(--ink2); font-weight:600; }
+details summary { cursor:pointer; color:var(--ink2); font-size:13px; margin-top:8px; }
+.scroll { overflow-x:auto; }
+#tip { position:fixed; pointer-events:none; background:var(--surface); border:1px solid var(--ring); border-radius:8px;
+  padding:6px 10px; font-size:13px; box-shadow:0 2px 8px rgba(0,0,0,0.12); display:none; max-width:280px; }
+#tip b { display:block; color:var(--ink); } #tip span { color:var(--ink2); }
+code { font-size:13px; }
+</style></head><body><main>
+<h1>Engram row census</h1>
+<p class="sub">DeepSeek-V4.1-Flash-1017 (revision 1bae0e10), experiment E043, 2026-10-23. Calibration: 10,001 tool-use
+rollouts (E031/E036/E038, s20x60 + minimal header). Held out: 334 eval-task traces (E030 s20x60 hdr, 120 ARC-AGI-2
+eval tasks). Addresses from the official <code>inference/engram.py</code>, recomputed on CPU.</p>
+
+<div class="tiles">
+ <div class="card tile"><div class="lab">Consumed input tokens</div><div class="val">251.8M</div>
+  <div class="note">106.5M prompt/tool, 145.3M generated</div></div>
+ <div class="card tile"><div class="lab">Lookups per Engram layer</div><div class="val">6.0B</div>
+  <div class="note">24 per token: 2/3/4-gram × 8 heads</div></div>
+ <div class="card tile"><div class="lab">Distinct rows touched</div><div class="val">58.2%</div>
+  <div class="note">223.6M of 384.0M per layer</div></div>
+ <div class="card tile"><div class="lab">All observed rows</div><div class="val">110 GiB</div>
+  <div class="note">of the 189 GiB table (264 B/row)</div></div>
+</div>
+
+<h2>How often each touched row is hit</h2>
+<p>Share of touched rows by lookup count (layer 1; layer 14 is identical to the first decimal). Most touched rows
+are hit a handful of times.</p>
+<div class="card"><svg id="hrows" class="chart" viewBox="0 0 720 260" role="img" aria-label="share of touched rows">
+<line class="grid" x1="64" x2="696" y1="216.0" y2="216.0"/>
+<text class="tick" x="56" y="220.0" text-anchor="end">0%</text>
+<line class="grid" x1="64" x2="696" y1="176.0" y2="176.0"/>
+<text class="tick" x="56" y="180.0" text-anchor="end">5%</text>
+<line class="grid" x1="64" x2="696" y1="136.0" y2="136.0"/>
+<text class="tick" x="56" y="140.0" text-anchor="end">10%</text>
+<line class="grid" x1="64" x2="696" y1="96.0" y2="96.0"/>
+<text class="tick" x="56" y="100.0" text-anchor="end">15%</text>
+<line class="grid" x1="64" x2="696" y1="56.0" y2="56.0"/>
+<text class="tick" x="56" y="60.0" text-anchor="end">20%</text>
+<line class="grid" x1="64" x2="696" y1="16.0" y2="16.0"/>
+<text class="tick" x="56" y="20.0" text-anchor="end">25%</text>
+<line class="axis" x1="64" x2="696" y1="216" y2="216"/>
+<g class="hit" tabindex="0" data-tip="22.3% of touched rows|50.0M rows hit 1 times (layer 1)"><rect x="64.0" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M73.1,216.0 V41.2 Q73.1,37.2 77.1,37.2 H93.1 Q97.1,37.2 97.1,41.2 V216.0 Z"/></g>
+<text class="tick" x="85.1" y="232" text-anchor="middle">1</text>
+<g class="hit" tabindex="0" data-tip="16.8% of touched rows|37.5M rows hit 2 times (layer 1)"><rect x="106.1" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M115.2,216.0 V85.8 Q115.2,81.8 119.2,81.8 H135.2 Q139.2,81.8 139.2,85.8 V216.0 Z"/></g>
+<text class="tick" x="127.2" y="232" text-anchor="middle">2</text>
+<g class="hit" tabindex="0" data-tip="22.9% of touched rows|51.2M rows hit 3-4 times (layer 1)"><rect x="148.3" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M157.3,216.0 V36.8 Q157.3,32.8 161.3,32.8 H177.3 Q181.3,32.8 181.3,36.8 V216.0 Z"/></g>
+<text class="tick" x="169.3" y="232" text-anchor="middle">3</text>
+<g class="hit" tabindex="0" data-tip="19.7% of touched rows|44.1M rows hit 5-8 times (layer 1)"><rect x="190.4" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M199.5,216.0 V62.1 Q199.5,58.1 203.5,58.1 H219.5 Q223.5,58.1 223.5,62.1 V216.0 Z"/></g>
+<text class="tick" x="211.5" y="232" text-anchor="middle">5</text>
+<g class="hit" tabindex="0" data-tip="9.8% of touched rows|22.0M rows hit 9-16 times (layer 1)"><rect x="232.5" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M241.6,216.0 V141.3 Q241.6,137.3 245.6,137.3 H261.6 Q265.6,137.3 265.6,141.3 V216.0 Z"/></g>
+<text class="tick" x="253.6" y="232" text-anchor="middle">9</text>
+<g class="hit" tabindex="0" data-tip="4.3% of touched rows|9.6M rows hit 17-32 times (layer 1)"><rect x="274.7" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M283.7,216.0 V185.6 Q283.7,181.6 287.7,181.6 H303.7 Q307.7,181.6 307.7,185.6 V216.0 Z"/></g>
+<text class="tick" x="295.7" y="232" text-anchor="middle">17</text>
+<g class="hit" tabindex="0" data-tip="2.0% of touched rows|4.5M rows hit 33-64 times (layer 1)"><rect x="316.8" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M325.9,216.0 V203.8 Q325.9,199.8 329.9,199.8 H345.9 Q349.9,199.8 349.9,203.8 V216.0 Z"/></g>
+<text class="tick" x="337.9" y="232" text-anchor="middle">33</text>
+<g class="hit" tabindex="0" data-tip="1.0% of touched rows|2.3M rows hit 65-128 times (layer 1)"><rect x="358.9" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M368.0,216.0 V211.9 Q368.0,207.9 372.0,207.9 H388.0 Q392.0,207.9 392.0,211.9 V216.0 Z"/></g>
+<text class="tick" x="380.0" y="232" text-anchor="middle">65</text>
+<g class="hit" tabindex="0" data-tip="0.5% of touched rows|1.2M rows hit 129-256 times (layer 1)"><rect x="401.1" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M410.1,216.0 V213.9 Q410.1,211.9 412.2,211.9 H432.1 Q434.1,211.9 434.1,213.9 V216.0 Z"/></g>
+<text class="tick" x="422.1" y="232" text-anchor="middle">129</text>
+<g class="hit" tabindex="0" data-tip="0.3% of touched rows|597.1K rows hit 257-512 times (layer 1)"><rect x="443.2" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M452.3,216.0 V214.9 Q452.3,213.9 453.3,213.9 H475.2 Q476.3,213.9 476.3,214.9 V216.0 Z"/></g>
+<text class="tick" x="464.3" y="232" text-anchor="middle">257</text>
+<g class="hit" tabindex="0" data-tip="0.1% of touched rows|309.9K rows hit 513-1K times (layer 1)"><rect x="485.3" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M494.4,216.0 V215.4 Q494.4,214.9 495.0,214.9 H517.8 Q518.4,214.9 518.4,215.4 V216.0 Z"/></g>
+<text class="tick" x="506.4" y="232" text-anchor="middle">513</text>
+<g class="hit" tabindex="0" data-tip="0.1% of touched rows|235.8K rows hit 1K-4K times (layer 1)"><rect x="527.5" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M536.5,216.0 V215.6 Q536.5,215.2 537.0,215.2 H560.1 Q560.5,215.2 560.5,215.6 V216.0 Z"/></g>
+<text class="tick" x="548.5" y="232" text-anchor="middle">1K</text>
+<g class="hit" tabindex="0" data-tip="0.0% of touched rows|74.6K rows hit 4K-16K times (layer 1)"><rect x="569.6" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M578.7,216.0 V215.9 Q578.7,215.7 578.8,215.7 H602.5 Q602.7,215.7 602.7,215.9 V216.0 Z"/></g>
+<text class="tick" x="590.7" y="232" text-anchor="middle">4K</text>
+<g class="hit" tabindex="0" data-tip="0.0% of touched rows|17.8K rows hit 16K-64K times (layer 1)"><rect x="611.7" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M620.8,216.0 V216.0 Q620.8,215.9 620.8,215.9 H644.8 Q644.8,215.9 644.8,216.0 V216.0 Z"/></g>
+<text class="tick" x="632.8" y="232" text-anchor="middle">16K</text>
+<g class="hit" tabindex="0" data-tip="0.0% of touched rows|5.5K rows hit &gt;64K times (layer 1)"><rect x="653.9" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M662.9,216.0 V216.0 Q662.9,216.0 662.9,216.0 H686.9 Q686.9,216.0 686.9,216.0 V216.0 Z"/></g>
+<text class="tick" x="674.9" y="232" text-anchor="middle">64K+</text>
+<text class="axlabel" x="380.0" y="254" text-anchor="middle">lookups per row (bin start; hover for the range)</text>
+</svg></div>
+<h2>Where the lookups go</h2>
+<p>Share of all lookups carried by rows in each count bin. A few very hot rows carry most of the traffic
+(2-gram banks concentrate hardest, see the bank table below); rows hit at most 4 times carry 5.0%.</p>
+<div class="card"><svg id="hmass" class="chart" viewBox="0 0 720 260" role="img" aria-label="share of all lookups">
+<line class="grid" x1="64" x2="696" y1="216.0" y2="216.0"/>
+<text class="tick" x="56" y="220.0" text-anchor="end">0%</text>
+<line class="grid" x1="64" x2="696" y1="176.0" y2="176.0"/>
+<text class="tick" x="56" y="180.0" text-anchor="end">8%</text>
+<line class="grid" x1="64" x2="696" y1="136.0" y2="136.0"/>
+<text class="tick" x="56" y="140.0" text-anchor="end">16%</text>
+<line class="grid" x1="64" x2="696" y1="96.0" y2="96.0"/>
+<text class="tick" x="56" y="100.0" text-anchor="end">24%</text>
+<line class="grid" x1="64" x2="696" y1="56.0" y2="56.0"/>
+<text class="tick" x="56" y="60.0" text-anchor="end">32%</text>
+<line class="grid" x1="64" x2="696" y1="16.0" y2="16.0"/>
+<text class="tick" x="56" y="20.0" text-anchor="end">40%</text>
+<line class="axis" x1="64" x2="696" y1="216" y2="216"/>
+<g class="hit" tabindex="0" data-tip="0.8% of lookups|rows hit 1 times carry 50.0M lookups"><rect x="64.0" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M73.1,216.0 V213.9 Q73.1,211.9 75.1,211.9 H95.0 Q97.1,211.9 97.1,213.9 V216.0 Z"/></g>
+<text class="tick" x="85.1" y="232" text-anchor="middle">1</text>
+<g class="hit" tabindex="0" data-tip="1.2% of lookups|rows hit 2 times carry 75.0M lookups"><rect x="106.1" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M115.2,216.0 V212.9 Q115.2,209.8 118.3,209.8 H136.1 Q139.2,209.8 139.2,212.9 V216.0 Z"/></g>
+<text class="tick" x="127.2" y="232" text-anchor="middle">2</text>
+<g class="hit" tabindex="0" data-tip="2.9% of lookups|rows hit 3-4 times carry 175.8M lookups"><rect x="148.3" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M157.3,216.0 V205.5 Q157.3,201.5 161.3,201.5 H177.3 Q181.3,201.5 181.3,205.5 V216.0 Z"/></g>
+<text class="tick" x="169.3" y="232" text-anchor="middle">3</text>
+<g class="hit" tabindex="0" data-tip="4.5% of lookups|rows hit 5-8 times carry 270.8M lookups"><rect x="190.4" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M199.5,216.0 V197.6 Q199.5,193.6 203.5,193.6 H219.5 Q223.5,193.6 223.5,197.6 V216.0 Z"/></g>
+<text class="tick" x="211.5" y="232" text-anchor="middle">5</text>
+<g class="hit" tabindex="0" data-tip="4.2% of lookups|rows hit 9-16 times carry 253.1M lookups"><rect x="232.5" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M241.6,216.0 V199.1 Q241.6,195.1 245.6,195.1 H261.6 Q265.6,195.1 265.6,199.1 V216.0 Z"/></g>
+<text class="tick" x="253.6" y="232" text-anchor="middle">9</text>
+<g class="hit" tabindex="0" data-tip="3.6% of lookups|rows hit 17-32 times carry 216.8M lookups"><rect x="274.7" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M283.7,216.0 V202.1 Q283.7,198.1 287.7,198.1 H303.7 Q307.7,198.1 307.7,202.1 V216.0 Z"/></g>
+<text class="tick" x="295.7" y="232" text-anchor="middle">17</text>
+<g class="hit" tabindex="0" data-tip="3.3% of lookups|rows hit 33-64 times carry 202.2M lookups"><rect x="316.8" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M325.9,216.0 V203.3 Q325.9,199.3 329.9,199.3 H345.9 Q349.9,199.3 349.9,203.3 V216.0 Z"/></g>
+<text class="tick" x="337.9" y="232" text-anchor="middle">33</text>
+<g class="hit" tabindex="0" data-tip="3.3% of lookups|rows hit 65-128 times carry 201.6M lookups"><rect x="358.9" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M368.0,216.0 V203.3 Q368.0,199.3 372.0,199.3 H388.0 Q392.0,199.3 392.0,203.3 V216.0 Z"/></g>
+<text class="tick" x="380.0" y="232" text-anchor="middle">65</text>
+<g class="hit" tabindex="0" data-tip="3.4% of lookups|rows hit 129-256 times carry 206.3M lookups"><rect x="401.1" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M410.1,216.0 V202.9 Q410.1,198.9 414.1,198.9 H430.1 Q434.1,198.9 434.1,202.9 V216.0 Z"/></g>
+<text class="tick" x="422.1" y="232" text-anchor="middle">129</text>
+<g class="hit" tabindex="0" data-tip="3.5% of lookups|rows hit 257-512 times carry 212.6M lookups"><rect x="443.2" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M452.3,216.0 V202.4 Q452.3,198.4 456.3,198.4 H472.3 Q476.3,198.4 476.3,202.4 V216.0 Z"/></g>
+<text class="tick" x="464.3" y="232" text-anchor="middle">257</text>
+<g class="hit" tabindex="0" data-tip="3.6% of lookups|rows hit 513-1K times carry 220.0M lookups"><rect x="485.3" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M494.4,216.0 V201.8 Q494.4,197.8 498.4,197.8 H514.4 Q518.4,197.8 518.4,201.8 V216.0 Z"/></g>
+<text class="tick" x="506.4" y="232" text-anchor="middle">513</text>
+<g class="hit" tabindex="0" data-tip="7.4% of lookups|rows hit 1K-4K times carry 445.1M lookups"><rect x="527.5" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M536.5,216.0 V183.2 Q536.5,179.2 540.5,179.2 H556.5 Q560.5,179.2 560.5,183.2 V216.0 Z"/></g>
+<text class="tick" x="548.5" y="232" text-anchor="middle">1K</text>
+<g class="hit" tabindex="0" data-tip="10.0% of lookups|rows hit 4K-16K times carry 604.0M lookups"><rect x="569.6" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M578.7,216.0 V170.0 Q578.7,166.0 582.7,166.0 H598.7 Q602.7,166.0 602.7,170.0 V216.0 Z"/></g>
+<text class="tick" x="590.7" y="232" text-anchor="middle">4K</text>
+<g class="hit" tabindex="0" data-tip="8.8% of lookups|rows hit 16K-64K times carry 532.3M lookups"><rect x="611.7" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M620.8,216.0 V176.0 Q620.8,172.0 624.8,172.0 H640.8 Q644.8,172.0 644.8,176.0 V216.0 Z"/></g>
+<text class="tick" x="632.8" y="232" text-anchor="middle">16K</text>
+<g class="hit" tabindex="0" data-tip="39.3% of lookups|rows hit &gt;64K times carry 2.4B lookups"><rect x="653.9" y="16" width="42.1" height="200" fill="transparent"/><path class="mark s1" d="M662.9,216.0 V23.3 Q662.9,19.3 666.9,19.3 H682.9 Q686.9,19.3 686.9,23.3 V216.0 Z"/></g>
+<text class="tick" x="674.9" y="232" text-anchor="middle">64K+</text>
+<text class="axlabel" x="380.0" y="254" text-anchor="middle">lookups per row (bin start; hover for the range)</text>
+</svg>
+<details><summary>Table view</summary><div class="scroll"><table><tr><th>lookups per row</th><th>rows</th>
+<th>share of rows</th><th>lookups</th><th>share of lookups</th></tr><tr><td>1</td><td>50.0M</td><td>22.3%</td><td>50.0M</td><td>0.8%</td></tr><tr><td>2</td><td>37.5M</td><td>16.8%</td><td>75.0M</td><td>1.2%</td></tr><tr><td>3-4</td><td>51.2M</td><td>22.9%</td><td>175.8M</td><td>2.9%</td></tr><tr><td>5-8</td><td>44.1M</td><td>19.7%</td><td>270.8M</td><td>4.5%</td></tr><tr><td>9-16</td><td>22.0M</td><td>9.8%</td><td>253.1M</td><td>4.2%</td></tr><tr><td>17-32</td><td>9.6M</td><td>4.3%</td><td>216.8M</td><td>3.6%</td></tr><tr><td>33-64</td><td>4.5M</td><td>2.0%</td><td>202.2M</td><td>3.3%</td></tr><tr><td>65-128</td><td>2.3M</td><td>1.0%</td><td>201.6M</td><td>3.3%</td></tr><tr><td>129-256</td><td>1.2M</td><td>0.5%</td><td>206.3M</td><td>3.4%</td></tr><tr><td>257-512</td><td>597.1K</td><td>0.3%</td><td>212.6M</td><td>3.5%</td></tr><tr><td>513-1K</td><td>309.9K</td><td>0.1%</td><td>220.0M</td><td>3.6%</td></tr><tr><td>1K-4K</td><td>235.8K</td><td>0.1%</td><td>445.1M</td><td>7.4%</td></tr><tr><td>4K-16K</td><td>74.6K</td><td>0.0%</td><td>604.0M</td><td>10.0%</td></tr><tr><td>16K-64K</td><td>17.8K</td><td>0.0%</td><td>532.3M</td><td>8.8%</td></tr><tr><td>>64K</td><td>5.5K</td><td>0.0%</td><td>2.4B</td><td>39.3%</td></tr></table></div></details></div>
+
+<h2>Coverage vs retained table size</h2>
+<p>Keep the most frequent rows (one global ranking over both layers, original hash geometry, a dropped row reads as
+a zero row before Wkv). In-sample coverage reaches 100% at 110 GiB, where every observed row is kept; the
+held-out eval traces still miss 1.6% of lookups there.</p>
+<div class="card"><div class="legend"><span class="lg"><span class="key line s1"></span>calibration (in-sample)</span><span class="lg"><span class="key line s2"></span>eval traces, all lookups</span><span class="lg"><span class="key line s3"></span>eval traces, generated tokens</span></div>
+<svg id="cov" class="chart" viewBox="0 0 720 300" role="img">
+<line class="grid" x1="64" x2="606" y1="256.0" y2="256.0"/>
+<text class="tick" x="56" y="260.0" text-anchor="end">60%</text>
+<line class="grid" x1="64" x2="606" y1="208.0" y2="208.0"/>
+<text class="tick" x="56" y="212.0" text-anchor="end">68%</text>
+<line class="grid" x1="64" x2="606" y1="160.0" y2="160.0"/>
+<text class="tick" x="56" y="164.0" text-anchor="end">76%</text>
+<line class="grid" x1="64" x2="606" y1="112.0" y2="112.0"/>
+<text class="tick" x="56" y="116.0" text-anchor="end">84%</text>
+<line class="grid" x1="64" x2="606" y1="64.0" y2="64.0"/>
+<text class="tick" x="56" y="68.0" text-anchor="end">92%</text>
+<line class="grid" x1="64" x2="606" y1="16.0" y2="16.0"/>
+<text class="tick" x="56" y="20.0" text-anchor="end">100%</text>
+<text class="tick" x="64.0" y="272" text-anchor="middle">0</text>
+<text class="tick" x="141.4" y="272" text-anchor="middle">16</text>
+<text class="tick" x="218.9" y="272" text-anchor="middle">32</text>
+<text class="tick" x="296.3" y="272" text-anchor="middle">48</text>
+<text class="tick" x="373.7" y="272" text-anchor="middle">64</text>
+<text class="tick" x="451.1" y="272" text-anchor="middle">80</text>
+<text class="tick" x="528.6" y="272" text-anchor="middle">96</text>
+<text class="tick" x="606.0" y="272" text-anchor="middle">112</text>
+<line class="axis" x1="64" x2="606" y1="256" y2="256"/>
+<path class="line s1" d="M64.3,253.0 L64.4,246.9 L64.5,240.9 L64.6,235.1 L64.7,229.3 L64.8,223.6 L64.9,218.0 L65.1,212.4 L65.3,206.8 L65.5,201.3 L65.8,195.9 L66.1,190.5 L66.5,185.1 L67.0,179.8 L67.5,174.5 L68.1,169.3 L68.9,164.2 L69.8,159.0 L70.9,153.9 L72.1,148.9 L73.6,143.8 L75.3,138.8 L77.4,133.8 L79.8,128.9 L82.7,124.0 L86.1,119.0 L90.2,114.0 L94.9,109.0 L100.6,104.0 L107.2,98.9 L115.1,93.7 L124.4,88.5 L135.4,83.1 L148.4,77.5 L163.8,71.8 L182.0,66.0 L203.5,59.9 L228.9,53.6 L258.9,47.4 L294.4,41.1 L336.4,34.9 L386.0,28.6 L444.7,23.7 L514.1,19.4 L596.1,16.0"/>
+<path class="line s2" d="M102.7,128.9 L141.4,107.1 L218.9,82.5 L296.3,65.4 L373.7,51.8 L528.6,32.4 L596.1,25.4"/>
+<g class="hit" tabindex="0" data-tip="81.2% hit rate|8 GiB kept, held-out eval traces"><circle cx="102.7" cy="128.9" r="12" fill="transparent"/><circle class="dot s2" cx="102.7" cy="128.9" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="84.8% hit rate|16 GiB kept, held-out eval traces"><circle cx="141.4" cy="107.1" r="12" fill="transparent"/><circle class="dot s2" cx="141.4" cy="107.1" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="88.9% hit rate|32 GiB kept, held-out eval traces"><circle cx="218.9" cy="82.5" r="12" fill="transparent"/><circle class="dot s2" cx="218.9" cy="82.5" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="91.8% hit rate|48 GiB kept, held-out eval traces"><circle cx="296.3" cy="65.4" r="12" fill="transparent"/><circle class="dot s2" cx="296.3" cy="65.4" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="94.0% hit rate|64 GiB kept, held-out eval traces"><circle cx="373.7" cy="51.8" r="12" fill="transparent"/><circle class="dot s2" cx="373.7" cy="51.8" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="97.3% hit rate|96 GiB kept, held-out eval traces"><circle cx="528.6" cy="32.4" r="12" fill="transparent"/><circle class="dot s2" cx="528.6" cy="32.4" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="98.4% hit rate|110 GiB kept, held-out eval traces"><circle cx="596.1" cy="25.4" r="12" fill="transparent"/><circle class="dot s2" cx="596.1" cy="25.4" r="4.5"/></g>
+<path class="line s3" d="M102.7,185.5 L141.4,152.9 L218.9,115.9 L296.3,90.2 L373.7,69.7 L528.6,40.5 L596.1,30.0"/>
+<g class="hit" tabindex="0" data-tip="71.7% hit rate|8 GiB kept, generated-token inputs"><circle cx="102.7" cy="185.5" r="12" fill="transparent"/><circle class="dot s3" cx="102.7" cy="185.5" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="77.2% hit rate|16 GiB kept, generated-token inputs"><circle cx="141.4" cy="152.9" r="12" fill="transparent"/><circle class="dot s3" cx="141.4" cy="152.9" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="83.3% hit rate|32 GiB kept, generated-token inputs"><circle cx="218.9" cy="115.9" r="12" fill="transparent"/><circle class="dot s3" cx="218.9" cy="115.9" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="87.6% hit rate|48 GiB kept, generated-token inputs"><circle cx="296.3" cy="90.2" r="12" fill="transparent"/><circle class="dot s3" cx="296.3" cy="90.2" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="91.1% hit rate|64 GiB kept, generated-token inputs"><circle cx="373.7" cy="69.7" r="12" fill="transparent"/><circle class="dot s3" cx="373.7" cy="69.7" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="95.9% hit rate|96 GiB kept, generated-token inputs"><circle cx="528.6" cy="40.5" r="12" fill="transparent"/><circle class="dot s3" cx="528.6" cy="40.5" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="97.7% hit rate|110 GiB kept, generated-token inputs"><circle cx="596.1" cy="30.0" r="12" fill="transparent"/><circle class="dot s3" cx="596.1" cy="30.0" r="4.5"/></g>
+<text class="endlabel" x="606.1" y="20.0">calibration</text>
+<text class="endlabel" x="606.1" y="34.0">all lookups</text>
+<text class="endlabel" x="606.1" y="48.0">generated tokens</text>
+<text class="axlabel" x="335.0" y="294" text-anchor="middle">retained Engram table (GiB, top-frequency rows over both layers)</text>
+</svg></div>
+
+<h2>Held-out hit rate by n-gram order</h2>
+<p>2-gram lookups are almost always covered; the misses are 3- and 4-grams of new reasoning text.</p>
+<div class="card"><div class="legend"><span class="lg"><span class="key line s1"></span>2-gram</span><span class="lg"><span class="key line s2"></span>3-gram</span><span class="lg"><span class="key line s3"></span>4-gram</span></div><svg id="ord" class="chart" viewBox="0 0 720 300" role="img">
+<line class="grid" x1="64" x2="606" y1="256.0" y2="256.0"/>
+<text class="tick" x="56" y="260.0" text-anchor="end">60%</text>
+<line class="grid" x1="64" x2="606" y1="208.0" y2="208.0"/>
+<text class="tick" x="56" y="212.0" text-anchor="end">68%</text>
+<line class="grid" x1="64" x2="606" y1="160.0" y2="160.0"/>
+<text class="tick" x="56" y="164.0" text-anchor="end">76%</text>
+<line class="grid" x1="64" x2="606" y1="112.0" y2="112.0"/>
+<text class="tick" x="56" y="116.0" text-anchor="end">84%</text>
+<line class="grid" x1="64" x2="606" y1="64.0" y2="64.0"/>
+<text class="tick" x="56" y="68.0" text-anchor="end">92%</text>
+<line class="grid" x1="64" x2="606" y1="16.0" y2="16.0"/>
+<text class="tick" x="56" y="20.0" text-anchor="end">100%</text>
+<text class="tick" x="64.0" y="272" text-anchor="middle">0</text>
+<text class="tick" x="141.4" y="272" text-anchor="middle">16</text>
+<text class="tick" x="218.9" y="272" text-anchor="middle">32</text>
+<text class="tick" x="296.3" y="272" text-anchor="middle">48</text>
+<text class="tick" x="373.7" y="272" text-anchor="middle">64</text>
+<text class="tick" x="451.1" y="272" text-anchor="middle">80</text>
+<text class="tick" x="528.6" y="272" text-anchor="middle">96</text>
+<text class="tick" x="606.0" y="272" text-anchor="middle">112</text>
+<line class="axis" x1="64" x2="606" y1="256" y2="256"/>
+<path class="line s1" d="M102.7,40.4 L141.4,34.6 L218.9,30.3 L296.3,27.7 L373.7,26.1 L528.6,22.9 L596.1,21.6"/>
+<g class="hit" tabindex="0" data-tip="95.9% hit rate|2-gram lookups, 8 GiB kept"><circle cx="102.7" cy="40.4" r="12" fill="transparent"/><circle class="dot s1" cx="102.7" cy="40.4" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="96.9% hit rate|2-gram lookups, 16 GiB kept"><circle cx="141.4" cy="34.6" r="12" fill="transparent"/><circle class="dot s1" cx="141.4" cy="34.6" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="97.6% hit rate|2-gram lookups, 32 GiB kept"><circle cx="218.9" cy="30.3" r="12" fill="transparent"/><circle class="dot s1" cx="218.9" cy="30.3" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="98.1% hit rate|2-gram lookups, 48 GiB kept"><circle cx="296.3" cy="27.7" r="12" fill="transparent"/><circle class="dot s1" cx="296.3" cy="27.7" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="98.3% hit rate|2-gram lookups, 64 GiB kept"><circle cx="373.7" cy="26.1" r="12" fill="transparent"/><circle class="dot s1" cx="373.7" cy="26.1" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="98.9% hit rate|2-gram lookups, 96 GiB kept"><circle cx="528.6" cy="22.9" r="12" fill="transparent"/><circle class="dot s1" cx="528.6" cy="22.9" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="99.1% hit rate|2-gram lookups, 110 GiB kept"><circle cx="596.1" cy="21.6" r="12" fill="transparent"/><circle class="dot s1" cx="596.1" cy="21.6" r="4.5"/></g>
+<path class="line s2" d="M102.7,126.3 L141.4,104.5 L218.9,84.3 L296.3,72.3 L373.7,60.3 L528.6,40.0 L596.1,32.1"/>
+<g class="hit" tabindex="0" data-tip="81.6% hit rate|3-gram lookups, 8 GiB kept"><circle cx="102.7" cy="126.3" r="12" fill="transparent"/><circle class="dot s2" cx="102.7" cy="126.3" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="85.2% hit rate|3-gram lookups, 16 GiB kept"><circle cx="141.4" cy="104.5" r="12" fill="transparent"/><circle class="dot s2" cx="141.4" cy="104.5" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="88.6% hit rate|3-gram lookups, 32 GiB kept"><circle cx="218.9" cy="84.3" r="12" fill="transparent"/><circle class="dot s2" cx="218.9" cy="84.3" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="90.6% hit rate|3-gram lookups, 48 GiB kept"><circle cx="296.3" cy="72.3" r="12" fill="transparent"/><circle class="dot s2" cx="296.3" cy="72.3" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="92.6% hit rate|3-gram lookups, 64 GiB kept"><circle cx="373.7" cy="60.3" r="12" fill="transparent"/><circle class="dot s2" cx="373.7" cy="60.3" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="96.0% hit rate|3-gram lookups, 96 GiB kept"><circle cx="528.6" cy="40.0" r="12" fill="transparent"/><circle class="dot s2" cx="528.6" cy="40.0" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="97.3% hit rate|3-gram lookups, 110 GiB kept"><circle cx="596.1" cy="32.1" r="12" fill="transparent"/><circle class="dot s2" cx="596.1" cy="32.1" r="4.5"/></g>
+<path class="line s3" d="M102.7,220.1 L141.4,182.2 L218.9,132.8 L296.3,96.3 L373.7,68.9 L528.6,34.3 L596.1,22.5"/>
+<g class="hit" tabindex="0" data-tip="66.0% hit rate|4-gram lookups, 8 GiB kept"><circle cx="102.7" cy="220.1" r="12" fill="transparent"/><circle class="dot s3" cx="102.7" cy="220.1" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="72.3% hit rate|4-gram lookups, 16 GiB kept"><circle cx="141.4" cy="182.2" r="12" fill="transparent"/><circle class="dot s3" cx="141.4" cy="182.2" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="80.5% hit rate|4-gram lookups, 32 GiB kept"><circle cx="218.9" cy="132.8" r="12" fill="transparent"/><circle class="dot s3" cx="218.9" cy="132.8" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="86.6% hit rate|4-gram lookups, 48 GiB kept"><circle cx="296.3" cy="96.3" r="12" fill="transparent"/><circle class="dot s3" cx="296.3" cy="96.3" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="91.2% hit rate|4-gram lookups, 64 GiB kept"><circle cx="373.7" cy="68.9" r="12" fill="transparent"/><circle class="dot s3" cx="373.7" cy="68.9" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="97.0% hit rate|4-gram lookups, 96 GiB kept"><circle cx="528.6" cy="34.3" r="12" fill="transparent"/><circle class="dot s3" cx="528.6" cy="34.3" r="4.5"/></g>
+<g class="hit" tabindex="0" data-tip="98.9% hit rate|4-gram lookups, 110 GiB kept"><circle cx="596.1" cy="22.5" r="12" fill="transparent"/><circle class="dot s3" cx="596.1" cy="22.5" r="4.5"/></g>
+<text class="endlabel" x="606.1" y="25.6">2-gram</text>
+<text class="endlabel" x="606.1" y="39.6">4-gram</text>
+<text class="endlabel" x="606.1" y="53.6">3-gram</text>
+<text class="axlabel" x="335.0" y="294" text-anchor="middle">retained Engram table (GiB)</text>
+</svg>
+<details open><summary>Table view: candidate masks</summary><div class="scroll"><table><tr><th>mask</th><th>kept GiB</th>
+<th>of table</th><th>calib coverage</th><th>eval hit</th><th>eval prompt</th><th>eval generated</th>
+<th>eval 2/3/4-gram</th><th>tokens with all 48 hit</th></tr><tr><td>top8gib</td><td>8.0</td><td>4.2%</td><td>85.6%</td><td>81.2%</td><td>97.0%</td><td>71.7%</td><td>95.9% / 81.6% / 66.0%</td><td>62.3%</td></tr><tr><td>top16gib</td><td>16.0</td><td>8.5%</td><td>89.3%</td><td>84.8%</td><td>97.6%</td><td>77.2%</td><td>96.9% / 85.2% / 72.3%</td><td>65.4%</td></tr><tr><td>top32gib</td><td>32.0</td><td>16.9%</td><td>93.3%</td><td>88.9%</td><td>98.3%</td><td>83.3%</td><td>97.6% / 88.6% / 80.5%</td><td>68.3%</td></tr><tr><td>top48gib</td><td>48.0</td><td>25.4%</td><td>95.9%</td><td>91.8%</td><td>98.7%</td><td>87.6%</td><td>98.1% / 90.6% / 86.6%</td><td>70.2%</td></tr><tr><td>top64gib</td><td>64.0</td><td>33.9%</td><td>97.6%</td><td>94.0%</td><td>99.0%</td><td>91.1%</td><td>98.3% / 92.6% / 91.2%</td><td>72.2%</td></tr><tr><td>top96gib</td><td>96.0</td><td>50.8%</td><td>99.5%</td><td>97.3%</td><td>99.5%</td><td>95.9%</td><td>98.9% / 96.0% / 97.0%</td><td>77.3%</td></tr><tr><td>top112gib</td><td>110.0</td><td>58.2%</td><td>100.0%</td><td>98.4%</td><td>99.7%</td><td>97.7%</td><td>99.1% / 97.3% / 98.9%</td><td>84.3%</td></tr></table></div></details></div>
+
+<h2>Bank occupancy by n-gram order</h2>
+<p>Each (order, head) bank is a prime-sized range of about 16M rows. 4-gram banks are nearly saturated (long
+reasoning makes most 4-grams new, so buckets collide), while 2-gram banks use a small, very concentrated set.</p>
+<div class="card scroll"><table><tr><th>layer</th><th>order</th><th>rows (8 heads)</th><th>touched</th><th>touched share</th>
+<th>lookups</th><th>top 10% rows' share</th></tr><tr><td>1</td><td>2-gram</td><td>128.0M</td><td>16.3M</td><td>12.7%</td><td>2.0B</td><td>96.7%</td></tr><tr><td>1</td><td>3-gram</td><td>128.0M</td><td>85.7M</td><td>66.9%</td><td>2.0B</td><td>88.4%</td></tr><tr><td>1</td><td>4-gram</td><td>128.0M</td><td>121.7M</td><td>95.1%</td><td>2.0B</td><td>76.2%</td></tr><tr><td>14</td><td>2-gram</td><td>128.0M</td><td>16.3M</td><td>12.7%</td><td>2.0B</td><td>96.7%</td></tr><tr><td>14</td><td>3-gram</td><td>128.0M</td><td>85.7M</td><td>66.9%</td><td>2.0B</td><td>88.4%</td></tr><tr><td>14</td><td>4-gram</td><td>128.0M</td><td>121.7M</td><td>95.1%</td><td>2.0B</td><td>76.2%</td></tr></table></div>
+<p>Touched rows by input role (layer 1): 204.9M only from generated tokens,
+2.2M only from prompt/tool tokens, 16.5M from both.</p>
+
+<h2>Notes</h2>
+<ul>
+<li>Counts use consumed inputs only (each rollout minus its final token), once per position, 48 lookups per token over
+both layers. Token sequences were rebuilt with the model's <code>encoding.py</code> and match the API's per-turn
+prompt token counts on all 78,992 turns.</li>
+<li>Hit rate is a selection diagnostic, not a quality result. Each candidate mask is checked next by teacher-forced
+NLL on the eval traces and by full ARC eval runs on the self-hosted model.</li>
+<li>Kaggle 4×L4 host RAM leaves about 122 GiB for the pinned table plus a 2.9 GiB original-to-compact map.</li>
+</ul>
+</main><div id="tip" role="tooltip"></div>
+<script>
+const tip = document.getElementById('tip');
+function show(e, g) {
+  const [a, b] = g.dataset.tip.split('|');
+  tip.replaceChildren();
+  const s = document.createElement('b'); s.textContent = a; const t = document.createElement('span'); t.textContent = b;
+  tip.append(s, t); tip.style.display = 'block';
+  const r = g.getBoundingClientRect(); const x = e && e.clientX !== undefined ? e.clientX : r.left + r.width / 2;
+  const y = e && e.clientY !== undefined ? e.clientY : r.top;
+  tip.style.left = Math.min(x + 12, window.innerWidth - tip.offsetWidth - 8) + 'px';
+  tip.style.top = Math.max(8, y - tip.offsetHeight - 12) + 'px';
+}
+document.querySelectorAll('.hit').forEach(g => {
+  g.addEventListener('pointermove', e => show(e, g)); g.addEventListener('focus', () => show(null, g));
+  g.addEventListener('pointerleave', () => tip.style.display = 'none'); g.addEventListener('blur', () => tip.style.display = 'none');
+});
+</script></body></html>
