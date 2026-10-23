@@ -327,17 +327,41 @@ finally:
 
 RESCUE_DSML_CODE = re.compile(r'parameter name="code"[^>]*>(.*?)(?:</[^>]*parameter>|$)', re.S)
 RESCUE_FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)(?:```|$)", re.S)
+RESCUE_JSON_CODE = re.compile(r'"code"\s*:\s*"((?:[^"\\]|\\.)*)"', re.S)
+RESCUE_TAG = re.compile(r"</?[^<>\n]*DSML[^<>\n]*>?|<br[^>]*>")
+RESCUE_CODE_LINE = re.compile(r"^\s*(import |from \w+ import |print\(|for |def |if |while |np\.|[A-Za-z_]\w*\s*(\[[^\]]*\])?\s*=[^=])")
+RESCUE_NUDGE = ("[harness] No valid tool call was found in your last message. To run code, call the run_python tool "
+                "(do not write code as plain text); to finish, call submit_answer.")
+
+
+def rescue_code(content):
+    """E043: code written outside a valid tool call, from (in order) a garbled DSML code parameter, a JSON
+    `"code": "..."` field, a ```python block, or plain code lines; None if there is none."""
+    text = content or ""
+    m = RESCUE_DSML_CODE.findall(text)
+    if m and m[-1].strip():
+        return RESCUE_TAG.sub("", m[-1])
+    m = RESCUE_JSON_CODE.findall(text)
+    if m:
+        try:
+            return json.loads('"' + m[-1] + '"')
+        except ValueError:
+            pass
+    f = [b for b in RESCUE_FENCE.findall(text) if b.strip()]
+    if f:
+        return RESCUE_TAG.sub("", f[-1])
+    lines = RESCUE_TAG.sub("", text).splitlines()
+    start = next((i for i, l in enumerate(lines) if RESCUE_CODE_LINE.match(l)), None)
+    if start is None:
+        return None
+    code = "\n".join(lines[start:]).strip()
+    return code or None
 
 
 def rescue_tool_call(content, n):
-    """E043 --rescue-code: turn code written outside a valid tool call (garbled DSML, a ```python block) into a
-    run_python call, or None. For pruned models that lose the tool-call format while still writing code."""
-    text = content or ""
-    m = RESCUE_DSML_CODE.findall(text)
-    code = m[-1] if m else None
-    if code is None:
-        f = [b for b in RESCUE_FENCE.findall(text) if b.strip()]
-        code = f[-1] if f else None
+    """E043 --rescue-code: turn code written outside a valid tool call into a run_python call, or None.
+    For pruned models that lose the DSML tool-call format while still writing code."""
+    code = rescue_code(content)
     if not code or not code.strip():
         return None
     return {"id": f"rescue_{n}", "type": "function",
@@ -578,6 +602,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
     n_tools, n_errors, n_turns, finish, stop, pred = 0, 0, 0, None, None, None
     n_nudges = 0  # E030 --cap-nudge
     n_rescues = 0  # E043 --rescue-code
+    n_nudge_rescues = 0
     events, error, content, t0 = [], None, "", time.monotonic()
     session_final = getattr(args, "final_mode", "turn") == "session"
     source = None  # where the single scored grid came from
@@ -649,6 +674,13 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                         calls = [rescued]
                         n_rescues += 1
                         events.append({"turn": n_turns, "rescued": "code"})
+                    elif n_nudge_rescues < 3 and not valid_grid(parse(msg.get("content") or "")):
+                        # No call, no code and no answer grid: remind the model to use the tools (at most 3x).
+                        messages.append({"role": "user", "content": RESCUE_NUDGE})
+                        n_rescues += 1
+                        n_nudge_rescues += 1
+                        events.append({"turn": n_turns, "rescued": "nudge"})
+                        continue
                 if not calls:
                     content = msg["content"]
                     candidate = parse(content)
