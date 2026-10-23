@@ -240,9 +240,10 @@ E64 loses the idea more often, with garbled reasoning ("Weod=w?? Need."), typo l
 | full 384 experts + full Engram (server A) | 110 | 65.9% | 67.4% | `e043_full_a1` |
 | E64 + Engram 64 GiB (physical export) | 0 of 11 | | | stopped: no valid tool calls (see above) |
 | E48 + Engram 64 GiB (runtime masks) | 0 of 5 | | | stopped; also prefix-cache contaminated |
-| E72 w30 + Engram 64 GiB + `--rescue-code` (runtime masks) | 49 | 29.3% | | complete |
-| E64 w30 + Engram 64 GiB + `--rescue-code` | | | | running |
-| E48 w30 + Engram 64 GiB + `--rescue-code` | | | | running |
+| E72 w30 + Engram 64 GiB + `--rescue-code` (runtime masks) | 49 | 29.3% | 28.6% | complete |
+| E64 w30 + Engram 64 GiB + `--rescue-code` | 30 | 18.0% | 17.5% | complete (44 output_budget, 17 max_turns) |
+| E48 w30 + Engram 64 GiB + `--rescue-code` | | | | running (long degenerate turns) |
+| 384 experts + Engram 64 GiB (control) | | | | running |
 
 ## Artifacts (private HF, account chankhavu)
 
