@@ -4,8 +4,41 @@
 frequency-prune Engram rows, then REAP expert statistics with all 384 experts, E64 (primary) / E72 candidates.
 Calibration data: `livobereshka/arc-agi2-deepseek-flash1017-rollouts-e031-e036` (tool-use rollouts, E031/E036/E038).
 Quality: the 120 ARC-AGI-2 eval tasks with the same harness, full vs pruned on the same server.
-The plan pack (unzipped upload) is in the session scratchpad: `arc_deepseek_v41_plan/` (START_HERE.md,
-REAP_IMPLEMENTATION_CONTRACT.md, TASKS_ENGRAM_FIRST.md, ...). Deployment counterpart: E042 (session dsv4-infer).
+The plan pack (the user's upload, unzipped) is in `plan/` (START_HERE.md, REAP_IMPLEMENTATION_CONTRACT.md,
+TASKS_ENGRAM_FIRST.md, ...). Deployment counterpart: E042 (session dsv4-infer).
+
+## Summary (2026-10-23)
+
+Reports: `reports/pruning_results.html` (ARC evals, routing statistics, NLL screens, probes, throughput) and
+`reports/engram_census.html` (Engram rows). The plan pack the work followed is in `plan/`.
+
+| model (ARC-AGI-2 eval, 167 pairs, 1 attempt, same tool harness, self-hosted) | pass@1 | task-weighted |
+|---|---:|---:|
+| full DeepSeek-V4.1-Flash-1017 (384 experts, full Engram) | 65.9% | 67.4% |
+| 384 experts + Engram 64 GiB (34% of rows) | 69.5% | 69.7% |
+| E72 w30 + Engram 64 GiB + `--rescue-code` | 29.3% | 28.6% |
+| E64 w30 + Engram 64 GiB + `--rescue-code` | 18.0% | 17.5% |
+| E48 w30 + Engram 64 GiB + `--rescue-code` | 0% (0/120) | 0% |
+
+- **Engram row pruning is free.** A 64 GiB top-frequency table, from a 252M-token census of the training rollouts,
+  scores like the full table on ARC, and its NLL is within run-to-run noise. 93% of the remaining misses come from
+  novel n-grams in the model's own reasoning text.
+- **Expert pruning to the sizes that fit 4xL4 (E48-E72) costs most of the accuracy.**
+  - Routing is spread over 83-196 *effective* experts per layer, so keeping 48-72 covers only 53-65% of the routing traffic.
+  - At these sizes the DSML tool-call format collapses first: 0/10 valid first-turn calls at E72, even though
+    teacher-forced NLL rose only ~24%.
+- **The tool-call format can be fixed; the reasoning damage cannot.** Weighting tool-call-block tokens x30 in the
+  expert score, plus a harness safety net, restores tool use.
+  - E72 then keeps the puzzle's main idea in most traces but makes execution errors: 45% of its tool calls fail
+    (full model: 2.4%) and many answers are near-misses.
+  - E64 shows semantic damage, e.g. hallucinated module names.
+  - E48 never leaves its first turn.
+- **Things that did not help.**
+  - Iterative pruning (re-observing under each mask) lost to one-shot statistics at every size.
+  - Plain REAP (mean amplitude when an expert is selected) keeps strong but rare experts, covering only 32% of the
+    routing traffic at E64.
+- **Next options (the user's call).** A healing fine-tune (distillation) of E72 toward the full model; top-8 routing
+  for the pruned models (whitelist prepared, untested); or a different model for Kaggle.
 
 ## Setup
 
@@ -243,20 +276,77 @@ E64 loses the idea more often, with garbled reasoning ("Weod=w?? Need."), typo l
 | E72 w30 + Engram 64 GiB + `--rescue-code` (runtime masks) | 49 | 29.3% | 28.6% | complete |
 | E64 w30 + Engram 64 GiB + `--rescue-code` | 30 | 18.0% | 17.5% | complete (44 output_budget, 17 max_turns) |
 | E48 w30 + Engram 64 GiB + `--rescue-code` | 0 of 120 | 0% | 0% | stopped after 120: 119 hit the 60k output budget in one turn, 4 tool calls total |
-| 384 experts + Engram 64 GiB (control) | | | | running |
+| 384 experts + Engram 64 GiB (control, all experts) | 116 | 69.5% | 69.7% | complete; Engram pruning is lossless on ARC |
 
 ## Artifacts (private HF, account chankhavu)
 
 - `chankhavu/dsv41-flash1017-e043-pruning-artifacts` (dataset): Engram counts/masks/geometry, REAP stats and keep
   sets, token streams (calibration + eval traces), raw observer records (20 GB), NLL results, code snapshot.
 - `chankhavu/DeepSeek-V4.1-Flash-1017-arc-engram64`: shared compact Engram files + `engram_index.json`.
-- `chankhavu/DeepSeek-V4.1-Flash-1017-arc-E64` (uploading), `-arc-E48`, `-arc-E72`: backbone checkpoints.
+- `chankhavu/DeepSeek-V4.1-Flash-1017-arc-E72`, `-arc-E64`, `-arc-E48`: backbone checkpoints with the w30 keep sets
+  (no Engram files; download the engram64 repo's `model-engram-*.safetensors` into the same folder).
+- The artifacts dataset also has `evals/` (all E043 ARC result jsonl and transcripts), `obs/iter_contrib_dec_e*`
+  (iterative-stage observer records), `reap/protect` (tool-block keep sets), `results/` (NLL, probes) and `code/`.
 
-## Status / next
+## Reproduce
 
-1. NLL of Engram masks vs full table on the eval traces (server B), ARC baseline of the full model (server A).
-2. Freeze the Engram mask, REAP replay pilot (~1M tokens) with it, then E64/E72 keep sets, NLL + ARC evals.
-3. Export the chosen E64 (HF format, sliced router) + compact Engram (values/scales + int32 map) for E042.
+Box: Vast 8x RTX PRO 6000 (SM120), >= 1 TB RAM (two servers each pin the full ~203 GB Engram table), 1 TB disk.
+Environment locks are in `locks/`: `venv_vllm.freeze` (the vLLM fork stack from E042's freeze), `tvenv.freeze`
+(numpy/pyarrow/tokenizers tools), and `nvidia-smi.txt`, `topology.txt`, `system.txt`.
+
+1. **Environment.** `uv venv --python 3.12 venv && uv pip install -r locks/venv_vllm.freeze --extra-index-url
+   https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match`. Then run
+   `python patches/apply_e043_patches.py venv/lib/python3.12/site-packages/vllm` and `python patches/apply_compact_engram.py <same>`.
+2. **Checkpoint.** `hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --revision 1bae0e1088993b9b82de08f59de5be5a34e42170
+   --local-dir /dev/shm/dsv4/DeepSeek-V4.1-Flash-1017`. Use RAM: the box's disk wrote only ~120 MB/s.
+   `scripts/dl_shm2.sh` is the watchdog.
+3. **Tokens.** `scripts/tokenize_rollouts.py --model-dir <ckpt> --parquet <e031/e036/e038 parquets> --out data/tok/shard$i
+   --shard $i/32`. Run the same on the eval-trace parquets from `scripts/make_eval_parquet.py`.
+   Check with `scripts/verify_tokenization.py --tok data/tok/shard*`.
+4. **Engram.**
+   - `scripts/engram_census.py count --tok data/tok/shard* --out data/engram/counts_calib.npz`.
+   - `select --counts ... --budget-gib 8 16 32 48 64 96 112 --out-dir data/engram/masks`.
+   - `coverage --masks ... --tok data/tok_eval`.
+   - Optional stats: `scripts/engram_unseen.py`, `engram_unseen_kinds.py`, `engram_report_stats.py`.
+5. **Serve.** `GPUS=0,1,2,3 TP=4 PORT=18000 CTRL=/dev/shm/e043/ctrlA.json bash scripts/serve.sh tp4A`, and the same on
+   GPUs 4-7 with port 18001. Stop with `scripts/stop.sh <run> <gpus>`.
+   - The JSON control file sets `expert_keep` / `engram_keep` / `observe`.
+   - Runtime masks need a fresh `cache_salt` per configuration.
+6. **NLL.** `scripts/nll_candidates.sh <out.jsonl> tag:<engram mask|none>:<expert keep|none> ...`, with `TOK`, `PERTASK`
+   and `NSEQ` as env vars.
+7. **REAP.**
+   - `scripts/replay_reap.py --tok data/tok/shard* --tokens 1000000 --seed 1 --obs-dir /dev/shm/e043/obs/pilot
+     --engram-keep <engram64>`, then `--tokens 9000000 --seed 2 --exclude <pilot manifest>`.
+   - `scripts/reap_aggregate.py aggregate --obs <dirs> --out data/reap/stats_all.npz`, then `select --score
+     contrib --decoder-gen-only --experts 48 64 72`.
+8. **Tool-block rule.**
+   - `PYTHONPATH=scripts python scripts/special_stats.py aggregate --region --obs <dirs> --out data/reap/toolblock_all.npz`.
+   - `select --stats data/reap/stats_all.npz --special data/reap/toolblock_all.npz --score contrib --decoder-gen-only
+     --protect 0 --weight 30 --experts 48 64 72 --out-dir data/reap/protect`.
+   - Iterative variant: `scripts/iterative_prune.sh contrib 1`.
+9. **Probes.** `scripts/gen_probe.py --samples 2 --out <jsonl> tag:<engram>:<keep> ...` and
+   `scripts/decode_consistency.py`.
+10. **Export.**
+    - `scripts/export_pruned.py --src <ckpt> --expert-keep <keep.npy> --engram-keep <engram64.npz> --out export/<name>
+      --text-only`. For more sizes, pass `--engram-from <first export>`, which hardlinks the shared Engram files.
+    - Upload with `scripts/upload_model.sh`.
+11. **ARC evals.** On the local machine, open an SSH tunnel to the ports and start a sandbox: `NAME=arc-sandbox-e043
+    evals/sandbox_docker/start.sh`. Then run `SALT=<cfg> WORKERS=167 BASE=http://127.0.0.1:1800x/v1 scripts/eval_arc.sh
+    <tag> --rescue-code`. Set the server's control file (masks) first.
+12. **Report.**
+    - `scripts/eval_report_stats.py evals/results results/eval_stats.json`.
+    - `scripts/expert_report_stats.py` (on the box).
+    - `scripts/make_results_report.py results reports/pruning_results.html` and
+      `scripts/make_engram_report.py results/engram_stats.json reports/engram_census.html`.
+
+## Cost and time
+
+Box rental 12:23-~20:30 UTC on 2026-10-23, ~8 h at $13.73/h, about $110 (the whole 8-GPU node, including idle and
+setup time). No API spend.
+- Checkpoint download into RAM: ~25 min.
+- Engram census: ~5 min on CPU.
+- REAP replay of 10M tokens: ~28 min on 4 GPUs.
+- ARC eval, 167 attempts: 1-1.5 h per model per 4-GPU server.
 
 ## Incidents
 
