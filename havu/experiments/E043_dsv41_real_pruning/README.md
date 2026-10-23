@@ -148,6 +148,22 @@ keeping every observed row). 110 GiB is the fallback.
   (4.28M prompt/tool inputs, 5.76M generated-token inputs); the sparsest layer saw 375/384 experts. Keep sets are
   stable: E64 sets from the 1M pilot and the 10M total overlap 96% for every rule.
 
+### How many experts are (nearly) inactive on ARC traffic
+
+`results/expert_activity.json`, from 10.04M scored positions (60.2M selections per layer; a uniform expert would get
+157k):
+
+| category | expert slots (of 15,360) | per layer |
+|---|---:|---|
+| never selected | 85 (0.55%) | 0-9, mostly the last layers (L39: 9, L38: 7, L35: 6) |
+| < 1% of a uniform share (< 1.6k selections) | 1,523 (9.9%) | up to 66 |
+| < 10% of a uniform share (< 16k selections) | 4,663 (30.4%) | 55-160 |
+
+- The least-used 192 experts of a layer carry 2.1-11.2% of its routing (mean 4.9%); the least-used 288 carry 12-32% (mean 18%).
+- The top 64 carry 56-80% (mean 72%). The busiest expert gets 10-41x its uniform share.
+- Pruning to ~E192 removes little traffic, matching the clean E192 probes. The cut to E64-E72 removes experts that
+  carry ~25-30% of the traffic.
+
 ### E64 scoring rules (one-shot), teacher-forced NLL on held-out eval traces
 
 32 eval-task traces (a different 32-trace sample than the Engram table above: 419,452 generated target tokens),
