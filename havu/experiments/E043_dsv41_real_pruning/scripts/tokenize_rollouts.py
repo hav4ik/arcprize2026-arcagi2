@@ -51,14 +51,15 @@ def load_encoding(model_dir):
     return mod
 
 
-def render_with_roles(enc, messages, effort):
+def render_with_roles(enc, messages, effort, tools=True):
     """Return (text, spans) with spans = [(start, end)] char ranges of assistant (generated) renderings."""
     messages = [dict(m) for m in messages]
     last_asst = max(i for i, m in enumerate(messages) if m["role"] == "assistant")
     messages = messages[: last_asst + 1]
-    if messages[0]["role"] != "system":  # runs without the effort header: tools go on an empty system message
-        messages.insert(0, {"role": "system", "content": ""})
-    messages[0]["tools"] = harness_tools()
+    if tools:
+        if messages[0]["role"] != "system":  # runs without the effort header: tools go on an empty system message
+            messages.insert(0, {"role": "system", "content": ""})
+        messages[0]["tools"] = harness_tools()
     merged = enc.merge_tool_messages(messages)
     merged = enc.sort_tool_results_by_call_order(merged)
     merged, _ = enc.process_image_messages(merged)
@@ -81,6 +82,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--effort", type=int, default=50, help="numeric reasoning effort prefix (API 'low' = 50)")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--no-tools", action="store_true", help="single-turn no-tool rollouts (E044): no tool schemas")
     ap.add_argument("--shard", default="0/1", help="i/n: keep rows with global row index % n == i")
     args = ap.parse_args()
 
@@ -104,7 +106,7 @@ def main():
             messages = json.loads(row["messages"])
             if not any(m["role"] == "assistant" for m in messages):
                 continue
-            text, spans = render_with_roles(enc, messages, args.effort)
+            text, spans = render_with_roles(enc, messages, args.effort, tools=not args.no_tools)
             encoded = tok.encode(text, add_special_tokens=False)
             ids = np.asarray(encoded.ids, dtype=np.uint32)
             starts = np.asarray([s for s, _ in encoded.offsets], dtype=np.int64)
@@ -112,8 +114,14 @@ def main():
             for s, e in spans:
                 roles[(starts >= s) & (starts < e)] = 1
             events = json.loads(row["events"]) if row.get("events") else []
+            row = {**row, "train_pass": row.get("train_pass")}
             usage = [(e["usage"].get("prompt_tokens"), e["usage"].get("completion_tokens"))
                      for e in events if isinstance(e, dict) and e.get("usage")]
+            if not usage and row.get("prompt_tokens") is not None:  # single-turn rows (E044 dataset)
+                usage = [(int(row["prompt_tokens"]), int(row["completion_tokens"]))]
+            elif not usage and row.get("usage"):  # single-turn eval rows (make_notool_eval_parquet.py)
+                u = json.loads(row["usage"]) if isinstance(row["usage"], str) else row["usage"]
+                usage = [(u.get("prompt_tokens"), u.get("completion_tokens"))]
             rec = {"split": split, "task_id": row["task_id"], "pair": row["pair"], "attempt": row["attempt"],
                    "batch": row.get("batch"), "parent": row.get("parent"), "correct": bool(row["correct"]),
                    "train_pass": row.get("train_pass"), "offset": offset, "length": int(len(ids)),

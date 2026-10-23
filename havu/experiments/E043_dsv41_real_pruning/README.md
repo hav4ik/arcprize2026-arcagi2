@@ -40,6 +40,49 @@ Reports: `reports/pruning_results.html` (ARC evals, routing statistics, NLL scre
 - **Next options (the user's call).** A healing fine-tune (distillation) of E72 toward the full model; top-8 routing
   for the pruned models (whitelist prepared, untested); or a different model for Kaggle.
 
+## Validation hygiene (user rule, 2026-10-23)
+
+The 120 ARC-AGI-2 eval tasks are never used in the pruning process; they only measure the result.
+
+- **Tool round:** all statistics (Engram census, REAP, keep sets) come from training rollouts only. The choice among
+  a few candidates (64 GiB Engram budget, the contribution/decoder rule, w=30) was informed by screens on eval-task
+  traces (NLL, probes). That is mild selection leakage. It cannot explain a 29% vs 66% gap, but it is not clean.
+- **No-tool round and later:** screening uses a family-disjoint dev split of the training rollouts
+  (`scripts/split_dev.py`: sha1(NVARC parent or ARC task id) % 10 == 0, about 10%); the eval set is touched only for
+  final metrics.
+
+## No-tool round (in progress, 2026-10-23)
+
+**Question (user):** without tools, the model does not need its coding skills, so maybe it routes over fewer experts
+and prunes better. Everything in this round is no-tool only: the statistics come only from no-tool training rollouts
+(no mixing with the tool round) and the targets are E72 and E64 (inference constraints), plus E48.
+
+- **Data:** the `notool_e044_*` configs of `livobereshka/arc-agi2-deepseek-flash1017-rollouts-e031-e036` (E044 = E035
+  arm D: effort low + minimal header + task summary, official ARC Prize prompt, one turn), snapshot of 2026-10-23
+  21:40 UTC: `arc2_train` 1,070 + `arc2_train_sample2` 1,076 + `nvarc_b0` 1,430 + `nvarc_b1` 1,803 = 5,379 rollouts,
+  118.6M tokens (`tokenize_rollouts.py --no-tools`). Prompt tokens match API usage on 5,379/5,379; completion counts
+  differ by 0-3 tokens (the usage convention for EOS and `</think>`).
+- **Dev split** (`split_dev.py`, family-disjoint, no eval data): calibration 4,931 rollouts / 109.2M tokens, dev
+  448 / 9.4M. Screens (NLL, probes) run on dev; the 120 eval tasks are used only for the final ARC scores.
+- **No-tool ARC baseline (full model, self-hosted, `scripts/eval_notool.sh`):** 108/167 = **64.7%** pass@1, mean 31.3k
+  output tokens, 1 cut at the context limit (`e043nt_full_a1`). Tool harness, same server: 65.9%.
+
+### Pilot on the first snapshot (1,778 calibration rollouts, 10M replayed tokens, dev NLL on 64 traces)
+
+- Engram: all 36 GiB of observed rows +0.16% NLL, 32 GiB +0.29%, 16 GiB +0.87%.
+- **Routing is somewhat more concentrated without tools, but not by much:**
+
+| | tool round (10M tokens) | no-tool pilot (10M tokens) |
+|---|---:|---:|
+| effective experts per layer, mean (exp of routing entropy) | 121.7 | 107.1 |
+| routing share kept by the top-48 / 64 / 72 (contribution ranking) | 59.3 / 66.3 / 69.0% | 64.7 / 71.2 / 73.9% |
+
+The two workloads' top-64 sets share 83% of their experts.
+
+- Dev NLL (no-tool, contribution / decoder-generation rule): E72 +19.6%, E64 +26.4%, E48 +40.9%, E40 +49.3%, E32
+  +71.4% (tool round on eval traces: E72 +23.8%, E64 +29.1%, E48 +44.9%; different text, so only roughly comparable).
+  Answer block (`</think>` to EOS, the grid): top-1 99.84% at E72 vs 99.97% full.
+
 ## Setup
 
 - **Box:** Vast 57370044, 8x RTX PRO 6000 Blackwell Server (96 GB, SM120), 1.5 TB RAM, 256 vCPU, 1 TB disk

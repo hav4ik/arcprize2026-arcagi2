@@ -194,8 +194,13 @@ def _flush():
             out[f"hash{li}"] = torch.cat(chunks).numpy()
         _s["hash_rec"] = {}
     path = os.path.join(_s["obs_dir"], f"step_{_s['step_no']:07d}.npz")
-    np.savez(path + ".tmp.npz", **out)
-    os.replace(path + ".tmp.npz", path)
+    try:
+        np.savez(path + ".tmp.npz", **out)
+        os.replace(path + ".tmp.npz", path)
+    except OSError as e:  # a missing/full output dir must never take the server down
+        print(f"[E043] observer write failed ({e}); observation disabled until the next ctrl change", flush=True)
+        _s["obs_dir"] = None
+        return
     _s["step_no"] += 1
 
 
