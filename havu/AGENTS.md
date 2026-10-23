@@ -29,7 +29,7 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
   - The findings and decisions are in `notes/2026-10-17_distillation_data_findings.md`.
   - Collect new DeepSeek batches without `--task-summary`, but keep `--helpers --train-check` (E026: the summary saves only 9% of tokens and its framing misleads the model).
   - The task pool and launcher are in `experiments/E025_train_rollouts/` (`build_dataset.py --batch nvarc_bN`, `launch.sh`).
-- E025 rollouts are also on Hugging Face as the private dataset `livobereshka/arc-agi2-deepseek-v3-rollouts-e025`. The org is `livobereshka`, spelled with an "s"; the token is `huggingface_api_key` in `SECRETS.yaml`.
+- E025 rollouts are also on Hugging Face as the private dataset `livobereshka/arc-agi2-deepseek-v3-rollouts-e025`. E031 + E036 + E038 (Flash-1017, s20x60 + header, 10,000 rollouts, E038 via DeepInfra; + E037 probe) are in the private dataset `livobereshka/arc-agi2-deepseek-flash1017-rollouts-e031-e036`. The org is `livobereshka`, spelled with an "s"; the token is `huggingface_api_key` in `SECRETS.yaml`.
 
 ## Environment
 
@@ -98,6 +98,7 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
   - Since 2026-10-17 `deepseek-flash` serves V4.1-Flash-1017 (E029): sub80s40 is the best config (pass@2 82.4%, 31.7k tokens).
   - `--effort-header minimal` (E030): a "Reasoning Effort: Minimal" system message, placed like DeepSeek's own effort prefixes. It is the one lever that shortens 1017 without losing accuracy: sub80s40 + header gives pass@2 84.9% at 27.4k tokens (−14%); s20x60 + header 80.3% at 23.3k (−27%).
   - Prompt suffixes (`lean2code`, E009 `lean2brief`) and `--cap-nudge` do not shorten 1017; budget pressure alone (s20x80) saves 10% but costs hard pairs. `--turns-note 5` is a harmless safety net.
+- **E043 option `--rescue-code` (opt-in, not in the config):** a non-final turn with no valid tool call but with code (a garbled DSML `code` parameter or a ```python block) becomes a `run_python` call. Near-miss tool names (`run_ppython`) are mapped to the real tools, and `rescues` is recorded per attempt. Built for expert-pruned DeepSeek-V4.1, which loses the DSML tool-call format. Self-hosted runs with runtime masks also need a per-run `cache_salt` in `--extra-body`, or prefixes cached under another mask get reused (`experiments/E043_dsv41_real_pruning`).
 - **Qwen tool harness (`evals/run_qwen_tools.py`, `evals/arc_harness/agent_qwen.py`, harness `qwen-tools-4`):** the defaults behave as `qwen-tools-3` (E012).
   - `--answer-mode program` (E019): the only answer tool is `submit_program(code defining solve(grid))`. It is checked host-side in a fresh process on every train pair before the test; no typed or forced answers, and the fallback is the best submitted program or the session's `solve`. Kaggle: `ARC_TOOLS_ANSWER_MODE=program`.
   - Other options: `--record-train-check` (submit mode, bookkeeping only), `--base-url` (unauthenticated server such as local SGLang), `--context`, `--out`.

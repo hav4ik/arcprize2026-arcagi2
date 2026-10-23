@@ -9,7 +9,8 @@ set -euo pipefail
 ROOT=/home/vu/Workspace/ARC-AGI-2
 TAG=$1; shift
 cd "$ROOT/evals"
-EXTRA='{"chat_template_kwargs":{"thinking":true,"reasoning_effort":50},"temperature":1.0,"top_p":1.0}'
+# SALT: per-run cache_salt so a runtime-mask server never reuses prefixes cached under another mask.
+EXTRA='{"chat_template_kwargs":{"thinking":true,"reasoning_effort":50},"temperature":1.0,"top_p":1.0,"cache_salt":"'"${SALT:-$TAG}"'"}'
 ../.venv/bin/python run_deepseek_tools.py --mode grid --effort low --prompt lean2sub --answer-tool \
   --final-mode session --lenient-parse --max-tokens 64000 --max-total-output 60000 --budget-notes 0.01 \
   --budget-warn 0.75 --budget-soft 20000 --soft-wording strong --effort-header minimal --turns-note 5 \

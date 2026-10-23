@@ -91,7 +91,8 @@ V5_PROMPTS = {"lean2roles"}
 # v6 (E029) is recorded when an E029 option or prompt is active; it adds the keys below to the config.
 HARNESS_VERSION_V6 = "persistent-v6"
 V6_DEFAULTS = {"turns_note": 0, "fallback_solve": False, "cap_nudge": False, "effort_header": "", "grid_format": "json",
-               "image_cell": 32}
+               "image_cell": 32, "openrouter_provider": "", "or_reasoning": ""}
+OPENROUTER_URL = "https://openrouter.ai/api/v1"
 V6_PROMPTS = {"lean2code"}
 HELPERS_SRC = (Path(__file__).resolve().parent / "arc_helpers.py").read_text()
 HELPERS_DOC = (
@@ -324,6 +325,35 @@ finally:
     return failed, "; ".join(notes)
 
 
+RESCUE_DSML_CODE = re.compile(r'parameter name="code"[^>]*>(.*?)(?:</[^>]*parameter>|$)', re.S)
+RESCUE_FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)(?:```|$)", re.S)
+
+
+def rescue_tool_call(content, n):
+    """E043 --rescue-code: turn code written outside a valid tool call (garbled DSML, a ```python block) into a
+    run_python call, or None. For pruned models that lose the tool-call format while still writing code."""
+    text = content or ""
+    m = RESCUE_DSML_CODE.findall(text)
+    code = m[-1] if m else None
+    if code is None:
+        f = [b for b in RESCUE_FENCE.findall(text) if b.strip()]
+        code = f[-1] if f else None
+    if not code or not code.strip():
+        return None
+    return {"id": f"rescue_{n}", "type": "function",
+            "function": {"name": "run_python", "arguments": json.dumps({"code": code})}}
+
+
+def rescue_name(name):
+    """E043 --rescue-code: map near-miss tool names (run_ppython, run_p_python) to the real tools."""
+    low = (name or "").lower()
+    if "submit" in low:
+        return "submit_answer"
+    if "python" in low or "run" in low:
+        return "run_python"
+    return name
+
+
 def lenient_parse(text):
     """Fallback for text answers the ARC Prize parser misses: the last valid JSON grid in the text, else the
     last block of consecutive lines that are each a JSON list of ints (one row per line). Returns one grid."""
@@ -365,6 +395,32 @@ def lenient_parse(text):
     return best
 
 
+def openrouter_key():
+    for line in (ROOT / "SECRETS.yaml").read_text().splitlines():
+        if line.startswith("openrouter_api_key:"):
+            return line.split(":", 1)[1].strip().strip("'\"")
+    raise KeyError("openrouter_api_key not found in SECRETS.yaml")
+
+
+def openrouter_balance(key):
+    """Remaining OpenRouter credit in USD (never logs the key)."""
+    import httpx
+    r = httpx.get(f"{OPENROUTER_URL}/credits", headers={"Authorization": f"Bearer {key}"}, timeout=30)
+    r.raise_for_status()
+    d = r.json()["data"]
+    return float(d["total_credits"]) - float(d["total_usage"])
+
+
+def openrouter_messages(messages):
+    """E037 --openrouter-provider: OpenRouter takes previous-turn thinking as `reasoning`, not `reasoning_content`."""
+    out = []
+    for m in messages:
+        if m.get("role") == "assistant" and "reasoning_content" in m:
+            m = {**{k: v for k, v in m.items() if k != "reasoning_content"}, "reasoning": m["reasoning_content"]}
+        out.append(m)
+    return out
+
+
 def compat_extra_body(args, think):
     """--base-url (OpenAI-compatible self-hosted server): request extras from --extra-body / --extra-body-nothink."""
     body = dict(json.loads(args.extra_body or "{}") if think else json.loads(args.extra_body_nothink or args.extra_body or "{}"))
@@ -382,13 +438,21 @@ def turn(client, args, messages, max_tokens, final=False, think=True):
     content, reasoning, calls, usage, finish = [], [], {}, None, None
     stream, failure = None, None
     try:
+        if getattr(args, "openrouter_provider", ""):
+            # E037: one pinned OpenRouter provider, no fallbacks; OpenRouter's own reasoning and usage parameters.
+            or_reason = json.loads(args.or_reasoning) if args.or_reasoning else {"effort": args.effort}
+            extra = {"provider": {"order": [args.openrouter_provider], "allow_fallbacks": False},
+                     "reasoning": or_reason if think else {"enabled": False}, "usage": {"include": True}}
+            send = openrouter_messages(messages)
+        else:
+            extra = (compat_extra_body(args, think) if getattr(args, "base_url", None) else
+                     ({"reasoning_effort": args.effort, "thinking": {"type": "enabled"}} if think
+                      else {"thinking": {"type": "disabled"}}))
+            send = messages
         stream = client.chat.completions.create(
-            model=args.model, messages=messages, tools=tools_for(args),
+            model=args.model, messages=send, tools=tools_for(args),
             tool_choice="none" if final else "auto", max_tokens=max_tokens, stream=True,
-            stream_options={"include_usage": True},
-            extra_body=(compat_extra_body(args, think) if getattr(args, "base_url", None) else
-                        ({"reasoning_effort": args.effort, "thinking": {"type": "enabled"}} if think
-                         else {"thinking": {"type": "disabled"}})),
+            stream_options={"include_usage": True}, extra_body=extra,
         )
         for chunk in stream:
             if chunk.usage is not None:
@@ -426,7 +490,8 @@ def turn(client, args, messages, max_tokens, final=False, think=True):
 
 def add_usage(total, usage):
     total["prompt"] += usage.get("prompt_tokens", 0) or 0
-    total["cache_hit"] += usage.get("prompt_cache_hit_tokens", 0) or 0
+    total["cache_hit"] += (usage.get("prompt_cache_hit_tokens")  # DeepSeek; OpenRouter reports cached_tokens
+                           or (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
     total["completion"] += usage.get("completion_tokens", 0) or 0
 
 
@@ -440,7 +505,8 @@ def add_cost(cost, usage, model, multiplier):
     """Accumulate one turn's cost at the multiplier in force when its request started (E017 --auto-peak-price)."""
     t = {"prompt": 0, "cache_hit": 0, "completion": 0}
     add_usage(t, usage)
-    c = estimated_cost(t, model, multiplier)
+    # OpenRouter (E037) reports the billed cost per request; DeepSeek runs are priced from the token counts.
+    c = float(usage["cost"]) if usage.get("cost") is not None else estimated_cost(t, model, multiplier)
     cost["total"] += c
     if multiplier > 1:
         cost["peak"] += c
@@ -511,6 +577,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
     total = {"prompt": 0, "cache_hit": 0, "completion": 0}
     n_tools, n_errors, n_turns, finish, stop, pred = 0, 0, 0, None, None, None
     n_nudges = 0  # E030 --cap-nudge
+    n_rescues = 0  # E043 --rescue-code
     events, error, content, t0 = [], None, "", time.monotonic()
     session_final = getattr(args, "final_mode", "turn") == "session"
     source = None  # where the single scored grid came from
@@ -574,6 +641,14 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                     n_nudges += 1
                     continue
                 calls = msg.get("tool_calls", [])
+                if not calls and getattr(args, "rescue_code", False) and not final and finish == "stop":
+                    rescued = rescue_tool_call(msg.get("content"), n_turns)
+                    if rescued is not None:
+                        msg = {**msg, "content": "", "tool_calls": [rescued]}
+                        messages[-1] = msg
+                        calls = [rescued]
+                        n_rescues += 1
+                        events.append({"turn": n_turns, "rescued": "code"})
                 if not calls:
                     content = msg["content"]
                     candidate = parse(content)
@@ -599,6 +674,14 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                         if not isinstance(arguments, dict) or not isinstance(arguments.get("code"), str):
                             raise ValueError("Expected an object with a string code field")
                         name, code = call["function"]["name"], arguments["code"]
+                        if getattr(args, "rescue_code", False) and name not in ("run_python", "submit_answer",
+                                                                                  "submit_solution"):
+                            fixed = rescue_name(name)
+                            if fixed != name:
+                                n_rescues += 1
+                                events.append({"turn": n_turns, "rescued": f"name {name}"})
+                                name = fixed
+                                call["function"]["name"] = fixed
                         if accepted is not None:
                             output = "[skipped: solution already accepted]"
                         elif name == "run_python":
@@ -676,6 +759,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
         result.update(est_cost_peak_usd=round(cost["peak"], 6), peak_turns=cost["peak_turns"])
     if getattr(args, "cap_nudge", False):
         result["cap_nudges"] = n_nudges
+        if getattr(args, "rescue_code", False):
+            result["rescues"] = n_rescues
     if getattr(args, "train_check", False):
         result.update({"train_pass": None, "train_frac": None, "train_trace": "no_answer"} if pred is None else labels)
     if any(getattr(args, k, v) != v for k, v in V4_DEFAULTS.items()):
@@ -789,6 +874,9 @@ def parser():
     ap.add_argument("--think-turns", type=int, default=-1,
                     help="E010: thinking only on the first N assistant turns, disabled after (-1 = always think)")
     ap.add_argument("--budget-warn", type=float, default=0.8, help="fraction at which the note says to answer now")
+    ap.add_argument("--rescue-code", action="store_true",
+                    help="E043: a non-final turn without a valid tool call but with code (garbled DSML or a ```python "
+                         "block) becomes a run_python call; near-miss tool names are mapped (pruned models)")
     ap.add_argument("--lenient-parse", action="store_true",
                     help="E009: if the ARC Prize parser finds no grid in the final text, take the last valid one")
     ap.add_argument("--task-summary", action="store_true",
@@ -808,6 +896,11 @@ def parser():
                          "lines) instead of JSON; needs a vision model behind --base-url")
     ap.add_argument("--image-cell", type=int, default=32,
                     help="E033: pixels per grid cell (Qwen3.8: 32 = one LLM visual token per cell, 16 = one ViT patch)")
+    ap.add_argument("--openrouter-provider", default="",
+                    help="E037: run through OpenRouter pinned to this provider (no fallbacks); --model is then an "
+                         "OpenRouter id such as deepseek/deepseek-v4.1-flash-1017; cost comes from OpenRouter usage")
+    ap.add_argument("--or-reasoning", default="",
+                    help='E037: OpenRouter reasoning object as JSON (default {"effort": <--effort>})')
     ap.add_argument("--effort-header", default="", choices=["", *EFFORT_HEADERS],
                     help="E030: system message in DeepSeek's effort-prefix style (minimal = terse thinking)")
     ap.add_argument("--cap-nudge", action="store_true",
@@ -923,9 +1016,12 @@ def main():
     check_health(args.sandbox_url)
     if args.base_url:
         return run_compat(args, tasks, jobs, records, latest, out, config, policy, needs_extra)
-    key = api_key()
-    balance = deepseek_balance(key)
-    print(f"DeepSeek balance ${balance:.2f}; stop launching below ${args.max_balance_stop:.2f}", flush=True)
+    if args.openrouter_provider:
+        key, base_url, balance_of, who = openrouter_key(), OPENROUTER_URL, openrouter_balance, "OpenRouter"
+    else:
+        key, base_url, balance_of, who = api_key(), "https://api.deepseek.com", deepseek_balance, "DeepSeek"
+    balance = balance_of(key)
+    print(f"{who} balance ${balance:.2f}; stop launching below ${args.max_balance_stop:.2f}", flush=True)
     if balance < args.max_balance_stop:
         ap.error("Balance below --max-balance-stop")
     low_balance = threading.Event()
@@ -933,7 +1029,7 @@ def main():
     def guard():  # kill-guard: re-check the balance every 5 min; when low, no new attempts start
         while not low_balance.wait(300):
             try:
-                if deepseek_balance(key) < args.max_balance_stop:
+                if balance_of(key) < args.max_balance_stop:
                     print("Balance below --max-balance-stop: not starting new attempts", flush=True)
                     low_balance.set()
             except Exception as exc:
@@ -950,7 +1046,7 @@ def main():
                 f.write("\n")  # valid JSON without a final newline
     lock = threading.Lock()
     # No automatic API retries: preserve partial traces and retry failed attempts on resume.
-    with OpenAI(api_key=key, base_url="https://api.deepseek.com", timeout=3600, max_retries=0) as client:
+    with OpenAI(api_key=key, base_url=base_url, timeout=3600, max_retries=0) as client:
         def work(t, p, a):
             if low_balance.is_set():
                 return None
