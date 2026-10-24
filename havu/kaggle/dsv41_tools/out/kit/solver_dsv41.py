@@ -84,7 +84,7 @@ LOOP_CONFIRM = int(E("ARC_LOOP_CONFIRM", "10"))
 EXEC_MEM_MB = int(E("ARC_EXEC_MEM_MB", "4096"))
 SALT = E("ARC_CACHE_SALT", "kaggle")
 WRAPUP_S = float(E("ARC_WRAPUP_S", "900"))  # wall-clock note in tool outputs this long before the force deadline
-MIN_ATTEMPT_TOKENS = float(E("ARC_MIN_ATTEMPT_TOKENS", "30000"))  # admission: time left x per-stream rate
+MIN_ATTEMPT_TOKENS = float(E("ARC_MIN_ATTEMPT_TOKENS", "15000"))  # admission: time left x per-stream rate
 STAGE_DONE = E("ARC_STAGE_DONE", "")  # marker file written by the notebook's model-staging copy
 STAGE_WAIT_S = float(E("ARC_STAGE_WAIT_S", "2400"))
 BIG = 10 ** 9  # completion tokens reported for a cut stream: the harness then stops on its output budget
@@ -95,6 +95,7 @@ HARNESS = [
     "--lenient-parse", "--max-tokens", "64000", "--max-total-output", "80000", "--budget-soft", "40000",
     "--budget-notes", "0.01", "--budget-warn", "0.75", "--effort-header", "minimal", "--turns-note", "5",
     "--train-check", "--rescue-code", "--token-exact", "--model", "dsv41",
+    "--fallback-solve",  # only when `answer` is not a valid grid at the end (e.g. after a cut): can only add answers
 ]
 EXTRA_BODY = {"chat_template_kwargs": {"thinking": True, "reasoning_effort": 50}, "temperature": 1.0, "top_p": 1.0,
               "cache_salt": SALT}
@@ -194,6 +195,7 @@ def server_env():
                                   '"weight_scale_dtype": "bfloat16", "group_size": 128, "has_zero_point": true}'),
         "DSV41_EXPERT_HUMMING_W2": E("ARC_HUMMING_W2", '{"group_size": 64}'),
         "E043_GPTQ_DIR": str(Path(model) / "gptq"), "VLLM_NO_USAGE_STATS": "1", "TOKENIZERS_PARALLELISM": "false",
+        "MAX_JOBS": E("MAX_JOBS", "8"),  # JIT compiles at the first forward, after ~90 GiB is pinned
     })
     for k in ("NCCL_P2P_LEVEL", "VLLM_MARLIN_INPUT_DTYPE"):  # never on Kaggle (E027: P2P there is ~12x slower)
         env.pop(k, None)
@@ -224,13 +226,6 @@ def server_alive():
 def start_server():
     """Start vLLM in its own session; True once /v1/models answers, False if it died or timed out."""
     n = STATE["restarts"]
-    try:
-        apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader"],
-                              capture_output=True, text=True, timeout=30).stdout.strip()
-        if apps:
-            log(f"warning: GPU processes before server start: {apps[:300]}")
-    except Exception as exc:
-        log(f"nvidia-smi check failed: {exc}")
     if server_alive():
         log(f"warning: something already answers on port {PORT}")
     path = LOG / (f"server.log" if n == 0 else f"server_restart{n}.log")
@@ -241,7 +236,7 @@ def start_server():
                                                                  "CUDA", "NCCL", "HF_"))}}, f, indent=1)
     fh = open(path, "ab")
     proc = subprocess.Popen(server_cmd(), stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                            env=server_env(), start_new_session=True, cwd=str(LOG))
+                            env=server_env(), start_new_session=True, cwd=E("ARC_SCRATCH", "/tmp"))
     STATE["server"] = proc
     t = time.time()
     while time.time() - t < UP_TIMEOUT_S and elapsed() < STOP_NEW_S:
@@ -259,20 +254,40 @@ def start_server():
 
 
 def stop_server():
+    """Stop the server's whole process group (also when its leader already exited: TP workers or the engine core
+    can outlive it and hold GPU memory), then wait up to 120 s for the GPUs to free."""
     proc = STATE.get("server")
     STATE["server_ok"] = False
-    if proc is None or proc.poll() is not None:
+    if proc is None:
         return
     for sig, wait_s in ((signal.SIGTERM, 30), (signal.SIGKILL, 15)):
         try:
-            os.killpg(proc.pid, sig)  # the server leads its own session: this reaches its TP workers too
+            os.killpg(proc.pid, sig)  # the group id outlives its leader
         except (ProcessLookupError, PermissionError):
-            return
+            break
         try:
             proc.wait(timeout=wait_s)
-            return
         except subprocess.TimeoutExpired:
-            continue
+            pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    t = time.time()
+    while time.time() - t < 120:
+        try:
+            out = subprocess.Popen(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            used, _ = out.communicate(timeout=20)
+            if used and max(int(x) for x in used.split()) < 1500:
+                return
+        except Exception:
+            try:
+                out.kill()  # no wait(): nvidia-smi can hang in D state after a GPU fault
+            except Exception:
+                pass
+        time.sleep(5)
+    log("warning: GPU memory not freed 120 s after stopping the server")
 
 
 def tail(path, n=600):
@@ -334,6 +349,7 @@ class GuardedStream:
         self.stats, self.real, self.cut = stats, None, None
         self.text, self.ids, self.ntok, self.next_check, self.hits = [], [], 0, LOOP_WINDOW, 0
         self.thinking = True  # loop checks stop once the turn leaves its thinking block
+        self.finished = False  # a choice carried finish_reason: the turn is complete, never cut it
         if STATE["forced"]:
             self.cut = "deadline"
         else:
@@ -357,7 +373,7 @@ class GuardedStream:
         if self.cut is None:
             try:
                 for chunk in self.real:
-                    if STATE["forced"]:
+                    if STATE["forced"] and not self.finished:
                         self.cut = "deadline"
                         break
                     for ch in chunk.choices or []:
@@ -367,6 +383,8 @@ class GuardedStream:
                             piece = (d.content or "") + (getattr(d, "reasoning_content", None)
                                                          or (d.model_extra or {}).get("reasoning") or "")
                         ids = (ch.model_extra or {}).get("token_ids")
+                        if getattr(ch, "finish_reason", None):
+                            self.finished = True
                         if getattr(ch, "delta", None) is not None and (ch.delta.content or ch.delta.tool_calls):
                             self.thinking = False  # chat path: content or a tool call means the thinking ended
                         if piece and "</think>" in piece:
@@ -376,18 +394,22 @@ class GuardedStream:
                         elif ids:
                             self.ids.extend(ids)
                             self.ntok += len(ids)
+                            if piece:
+                                self.text.append(piece)  # used if the tokenizer is unavailable
                         else:
                             self.ntok += max(1, len(piece or "") // 3)
                             if piece:
                                 self.text.append(piece)
                     yield chunk
-                    if self.thinking and LOOP_RATIO > 0 and self.ntok >= self.next_check:
+                    if self.thinking and not self.finished and LOOP_RATIO > 0 and self.ntok >= self.next_check:
                         self.next_check = self.ntok + LOOP_EVERY
                         if self._loop():
                             self.cut = "loop"
                             break
+                if self.cut is None and STATE["forced"] and not self.finished:
+                    self.cut = "deadline"  # closed by the force sweep and ended without an exception
             except Exception:
-                if not STATE["forced"]:
+                if not STATE["forced"] or self.finished:
                     raise
                 self.cut = "deadline"  # the stream was closed under us by the force-deadline sweep
             finally:
@@ -453,6 +475,14 @@ def make_args():
                      "with submit_answer, or at least set `answer`.]")
         return note
     h.budget_note = budget_note
+    # After the force deadline, skip the train check (no model tokens, but up to minutes of probes per attempt).
+    orig_tc = h.train_check
+
+    def train_check(*a, **kw):
+        if STATE["forced"]:
+            return {"train_pass": None, "train_frac": None, "train_trace": "skipped_deadline"}
+        return orig_tc(*a, **kw)
+    h.train_check = train_check
     return h.parser().parse_args(HARNESS + ["--max-turns", str(MAX_TURNS), "--base-url", URL + "/v1",
                                             "--extra-body", json.dumps(EXTRA_BODY), "--sandbox-url", "local",
                                             "--attempts", str(ATTEMPTS)])
@@ -461,7 +491,7 @@ def make_args():
 def session_factory(url, train, test_input, timeout=30, max_output=16000, prelude_extra=""):
     from arc_harness.executor import LocalExecutor
     return LocalExecutor(train, test_input, timeout, max_output, memory_mb=EXEC_MEM_MB, python=TOOL_PYTHON,
-                         prelude_extra=prelude_extra, style="ipython")
+                         prelude_extra=prelude_extra, style="ipython", cpu_seconds=7200)
 
 
 def run_attempt(args, task, t, p, a):
@@ -469,7 +499,7 @@ def run_attempt(args, task, t, p, a):
     from openai import OpenAI
     import httpx
     client = GuardedClient(OpenAI(api_key="none", base_url=URL + "/v1", max_retries=0,
-                                  timeout=httpx.Timeout(7200, connect=30, read=1800)))
+                                  timeout=httpx.Timeout(7200, connect=30, read=900)))
     t1 = time.time()
     trace, result = h.solve(client, args, task, task["test"][p]["input"], session_factory=session_factory)
     result.update({"task_id": t, "pair": p, "attempt": a, "wall_s": round(time.time() - t1, 1),
@@ -582,6 +612,11 @@ def status(tasks, queue, running, done, errors):
 
 
 def main():
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))  # inherited by the server and executors
+    except Exception:
+        pass
     LOG.mkdir(parents=True, exist_ok=True)
     (LOG / "traces").mkdir(exist_ok=True)
     sys.path[:0] = [str(KIT / "repo" / "evals")]
@@ -684,7 +719,8 @@ def main():
                 continue
             finished, _ = wait(list(running), timeout=10, return_when=FIRST_COMPLETED)
             for fut in finished:
-                t, p, a, tries = running.pop(fut)
+              t, p, a, tries = running.pop(fut)
+              try:
                 try:
                     rec = fut.result()
                 except Exception as exc:
@@ -715,6 +751,8 @@ def main():
                 log(f"[{done}] {t}.{p}#{a} pred={'yes' if rec.get('pred') else 'no'} stop={rec.get('stop_reason')} "
                     f"turns={rec.get('turns')} out={rec.get('usage', {}).get('completion')} "
                     f"train_pass={rec.get('train_pass')} cuts={rec.get('cuts')} {rec.get('wall_s')}s")
+              except Exception as exc:  # one bad record (disk, encoding) must not end the run
+                log(f"result handling failed for {t}.{p}#{a}: {type(exc).__name__}: {exc}"[:400])
             if time.time() - last_status > 60:
                 last_status = time.time()
                 status(tasks, queue, running, done, errors)

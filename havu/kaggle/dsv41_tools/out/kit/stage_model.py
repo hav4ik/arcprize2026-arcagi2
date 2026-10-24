@@ -75,6 +75,8 @@ def preflight(d):
     layers = cfg.get("num_hidden_layers") or (cfg.get("text_config") or {}).get("num_hidden_layers") or 0
     if not layers:
         return "config.json has no num_hidden_layers (top level or text_config)"
+    if os.path.isfile(os.path.join(d, "e043_manifest.json")) and not os.path.isdir(os.path.join(d, "gptq")):
+        return "gptq/ missing (an E043 export needs it; the experts would load uninitialized)"
     if os.path.isdir(os.path.join(d, "gptq")):
         files += [f"gptq/layer_{i:02d}.safetensors" for i in range(layers)]
     bad = []
@@ -102,6 +104,13 @@ def main():
             return
         fl = files(src)
         total = sum(s for _, s in fl)
+        if mode == "warm":
+            # Pre-flight first and release the solver at once; the warm-up then runs alongside the server load.
+            bad = preflight(src)
+            open(marker, "w").write(f"fail preflight: {bad}\n" if bad else f"ok {src}\n")
+            print(f"preflight {'FAILED: ' + bad if bad else 'ok'}; warming {total / 2**30:.1f} GiB", flush=True)
+            if bad:
+                return
         if mode == "copy":
             os.makedirs(dst, exist_ok=True)
             free = shutil.disk_usage(dst).free
@@ -120,6 +129,8 @@ def main():
                 raise RuntimeError(f"size mismatch: {bad[:3]}")
         el = time.time() - t0
         print(f"{mode} done: {total / 2**30:.1f} GiB in {el:.0f}s ({total / 2**20 / max(el, 1):.0f} MiB/s)", flush=True)
+        if mode == "warm":
+            return  # marker already written before the warm-up
         target = dst if mode == "copy" else src
         bad = preflight(target)
         if bad:

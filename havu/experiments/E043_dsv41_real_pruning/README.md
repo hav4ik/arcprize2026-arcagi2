@@ -9,6 +9,17 @@ TASKS_ENGRAM_FIRST.md, ...). Deployment counterpart: E042 (session dsv4-infer).
 
 ## Wrap-up (2026-10-24 22:45 UTC)
 
+The 8x box (Vast 57370044) was destroyed at the user's request after the wrap-up (23:09 UTC). Everything needed
+was saved first:
+- `results/box/` (757 files, 46 MB): logs, server runs, small data;
+- `box_code/`: 20 scripts and notes that existed only on the box;
+- `results/lnp_*.jsonl`: the load probes;
+- the Kaggle manifest;
+- every checkpoint on HF or Kaggle.
+
+Discarded: the E192 2-bit GPTQ layers 20-39 (user: not needed), the box's tokenized data and census copies (on
+HF artifacts), and the unsloth GGUF (public).
+
 | deliverable | where | checks |
 |---|---|---|
 | tool E128 2-bit, **Kaggle Model** (for today's submission) | `chankhavu/dsv41-flash-1017-arc-tool-e128-2bit/pyTorch/default/1`, private | see below |
@@ -510,7 +521,7 @@ GPTQ tensors only.
 E160 92%, E192 95%, E256 98%; a decode batch of 48 tokens touches ~110 distinct experts per layer (max layer 140).
 E192 2-bit GPTQ (quality probe; does not fit 4xL4 at 2 bits): dev NLL 0.59729, +5.5% vs the full model; paused by the
 user (it would need the teammate's CPU+GPU expert offload). Its layers 0-19 are in the GPTQ artifacts dataset; HF's
-storage cap stopped the upload of layers 20-39, which were lost with the box's RAM disk.
+storage cap stopped the upload of layers 20-39. A full copy of all 40 layers had in fact survived on the box's disk (`/workspace/dsv4/gptq_store/gptq_e192_u2`, 70 GB); it was discarded with the box on 2026-10-24 by the user's decision (E192 not needed: tool E128 is close to the full model).
 
 **unsloth UD-IQ2_XXS comparison.** Our engine cannot read GGUF IQ codebooks, so `gguf_to_humming.py` decodes each
 expert exactly (gguf-py) and re-stores it as uint6 g32 (+0.04% of the weight norm, ~0.5% of IQ2's own error; uint4

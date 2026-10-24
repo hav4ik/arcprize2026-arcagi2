@@ -15,6 +15,14 @@ def find_one(pattern):
     hits = sorted(glob.glob(pattern, recursive=True))
     return hits[0] if hits else None
 
+# Every cache under SCRATCH: /root/.cache was read-only in smoke v2 (uv could not unpack wheels there).
+_C = f"{SCRATCH}/cache"
+for _k, _v in (("UV_CACHE_DIR", f"{_C}/uv"), ("XDG_CACHE_HOME", _C), ("VLLM_CACHE_ROOT", f"{_C}/vllm"),
+               ("TRITON_CACHE_DIR", f"{_C}/triton"), ("TORCHINDUCTOR_CACHE_DIR", f"{_C}/inductor"),
+               ("FLASHINFER_WORKSPACE_BASE", _C), ("TORCH_EXTENSIONS_DIR", f"{_C}/torch_ext"),
+               ("HF_HOME", f"{_C}/hf"), ("CUDA_CACHE_PATH", f"{_C}/nv")):
+    os.environ.setdefault(_k, _v)
+    os.makedirs(os.environ[_k], exist_ok=True)
 CHALLENGES = os.environ.get("ARC_CHALLENGES") or find_one(f"{INPUT}/**/arc-agi_test_challenges.json")
 os.environ["ARC_CHALLENGES"] = CHALLENGES
 _tasks = json.load(open(CHALLENGES))
@@ -26,22 +34,29 @@ print(f"mode {MODE}; fallback submission for {len(_tasks)} tasks written at +{ti
 # The kit dataset is one tarball (Kaggle datasets do not keep nested folders reliably): unpack and check sha256.
 KIT = os.environ.get("ARC_KIT")
 if not KIT:
-    import hashlib, tarfile
-    _tgz = find_one(f"{INPUT}/**/dsv41_kit.tgz")
-    KIT = f"{SCRATCH}/kit"
-    with tarfile.open(_tgz) as tf:
-        tf.extractall(KIT)
-    _man = json.load(open(f"{KIT}/MANIFEST.json"))
-    _bad = [f for f, h in _man.items() if hashlib.sha256(open(f"{KIT}/{f}", "rb").read()).hexdigest() != h]
-    assert not _bad, f"kit files differ from MANIFEST: {_bad[:5]}"
-    print(f"kit unpacked from {_tgz}: {len(_man)} files, sha256 ok", flush=True)
+    try:
+        import hashlib, tarfile
+        _tgz = find_one(f"{INPUT}/**/dsv41_kit.tgz")
+        KIT = f"{SCRATCH}/kit"
+        with tarfile.open(_tgz) as tf:
+            tf.extractall(KIT)
+        _man = json.load(open(f"{KIT}/MANIFEST.json"))
+        _bad = [f for f, h in _man.items() if hashlib.sha256(open(f"{KIT}/{f}", "rb").read()).hexdigest() != h]
+        assert not _bad, f"kit files differ from MANIFEST: {_bad[:5]}"
+        print(f"kit unpacked from {_tgz}: {len(_man)} files, sha256 ok", flush=True)
+    except Exception as exc:  # without the kit nothing else can run: keep the fallback submission
+        print("kit unavailable, fallback only:", type(exc).__name__, exc, flush=True)
+        MODE = "fallback"
 MODEL_SRC = os.environ.get("ARC_MODEL_SRC") or (os.path.dirname(find_one(f"{INPUT}/**/e043_manifest.json") or "") or None)
 print("kit", KIT, "| model", MODEL_SRC, flush=True)
 
 # Cell 1: stage the checkpoint to local disk in the background (stage_model.py), while vLLM installs.
-STAGE_MODE = os.environ.get("ARC_STAGE_MODE", "copy")
+# "warm" (read the mount once, no writes): smoke v2 (2026-10-24) with "copy" hit "Read-only file system" on the
+# root overlay during the install while 131 GB were being written to /tmp.
+STAGE_MODE = os.environ.get("ARC_STAGE_MODE", "warm")
 STAGE_DONE = f"{SCRATCH}/stage_done"
 if MODE != "fallback" and MODEL_SRC:
+  try:
     if os.path.exists(STAGE_DONE):
         os.remove(STAGE_DONE)
     _stage = subprocess.Popen([sys.executable, "-I", f"{KIT}/stage_model.py", MODEL_SRC, f"{SCRATCH}/model", STAGE_DONE,
@@ -49,15 +64,19 @@ if MODE != "fallback" and MODEL_SRC:
                               stdout=open(f"{SCRATCH}/stage.log", "w"), stderr=subprocess.STDOUT,
                               stdin=subprocess.DEVNULL, start_new_session=True)
     print(f"staging ({STAGE_MODE}) started, pid {_stage.pid}", flush=True)
+  except Exception as exc:  # the solver then loads from MODEL_SRC (no staging marker)
+    STAGE_DONE = ""
+    print("staging failed to start:", type(exc).__name__, exc, flush=True)
 
 # Cell 2: offline install of the fork wheel set, the vLLM overlay, the CUDA 13 shim (E042's Kaggle recipe).
 import hashlib, shutil, tarfile
 V = os.environ.get("ARC_VENV", f"{SCRATCH}/venv"); PY = f"{V}/bin/python"; SP = f"{V}/lib/python3.12/site-packages"
 BASE_ENV = dict(os.environ)
+def sh(cmd, timeout=None, env=None):
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, errors="replace", timeout=timeout, env=env)
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
 if MODE != "fallback" and not os.environ.get("ARC_SKIP_INSTALL"):
-    def sh(cmd, timeout=None, env=None):
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, env=env)
-        return r.returncode, (r.stdout or "") + (r.stderr or "")
+  try:
     real = "/usr/local/nvidia/lib64"  # host driver libcuda first (the image also has an older compat libcuda)
     if os.path.exists(real + "/libcuda.so"):
         os.environ["LD_LIBRARY_PATH"] = real + ":" + os.environ.get("LD_LIBRARY_PATH", "")
@@ -101,28 +120,60 @@ if MODE != "fallback" and not os.environ.get("ARC_SKIP_INSTALL"):
                  f'print(torch.__version__, torch.cuda.device_count(), vllm.__version__, flashinfer.__version__, '
                  f'm.version(\'humming-kernels\'))"', timeout=900, env=BASE_ENV)
     print("toolchain / imports:", rc, out[-600:], flush=True)
-    rc, out = sh("free -g | head -2; df -h /tmp /kaggle/working | tail -2; nproc; "
-                 "cat /sys/fs/cgroup/memory.max 2>/dev/null; grep -m1 'model name' /proc/cpuinfo", timeout=60)
+    rc, out = sh("free -g | head -2; df -h /tmp /kaggle/working | tail -2; nproc; cat /sys/fs/cgroup/memory.max "
+                 "/sys/fs/cgroup/memory.oom.group 2>/dev/null; grep -m1 'model name' /proc/cpuinfo", timeout=60)
     print(out, flush=True)
+  except Exception as exc:  # no working vLLM: keep the fallback submission
+    print("install failed, fallback only:", type(exc).__name__, exc, flush=True)
+    MODE = "fallback"
+# The tool code runs on the image's Python (scipy etc.); if that cannot import numpy/scipy in the executor's
+# environment (-I, PATH only), use the venv's Python instead (numpy only).
+TOOL_PY = os.environ.get("ARC_TOOL_PYTHON", sys.executable)
+if MODE != "fallback":
+    try:
+        r = subprocess.run([TOOL_PY, "-I", "-c", "import numpy, scipy.ndimage; print(numpy.__version__)"],
+                           env={"PATH": os.environ.get("PATH", ""), "OMP_NUM_THREADS": "1"}, capture_output=True,
+                           text=True, timeout=300)
+        print("tool python", TOOL_PY, "->", r.returncode, (r.stdout + r.stderr).strip()[-300:], flush=True)
+        if r.returncode != 0 and os.path.exists(PY):
+            TOOL_PY = PY
+    except Exception as exc:
+        print("tool python check failed:", exc, flush=True)
 BASE_ENV.pop("DSV41_SYNTH_INIT", None)  # the overlay's synthetic init must stay off for real weights
 # FlashInfer's sampling module cannot JIT on the Kaggle image (E042 K-runs); vLLM's PyTorch sampler instead.
 BASE_ENV["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
 
 # Cell 3: the solver (vLLM server, tool harness, deadlines, watchdog, incremental submission).
 if MODE != "fallback" and MODEL_SRC:
+  try:
+    import signal, threading
     env = dict(BASE_ENV)
     env.update(ARC_KIT=KIT, ARC_MODEL_DIR=MODEL_SRC, ARC_STAGE_DONE=STAGE_DONE, ARC_VLLM=f"{V}/bin/vllm",
-               ARC_TOOL_PYTHON=os.environ.get("ARC_TOOL_PYTHON", sys.executable))
+               ARC_TOOL_PYTHON=TOOL_PY, ARC_SCRATCH=SCRATCH)
     if MODE == "smoke":
         env.setdefault("ARC_TASK_LIMIT", "8")
         for k, v in (("ARC_STOP_NEW_S", "4800"), ("ARC_FORCE_AT_S", "5400"), ("ARC_HARD_STOP_S", "5700")):
             env.setdefault(k, v)
     p = subprocess.Popen([PY, "-u", f"{KIT}/solver_dsv41.py"], env=env, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                         stderr=subprocess.STDOUT, text=True, errors="replace", start_new_session=True)
+    # Independent kill switch: whatever hangs inside the solver, its whole session dies at T0 + ARC_KILL_AT_S
+    # (default 11h45; the solver's own hard stop is 11h30), so cell 4 and the notebook end before Kaggle's 12 h.
+    def _kill():
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+            print("kill switch: solver session killed", flush=True)
+        except Exception:
+            pass
+    _timer = threading.Timer(max(0.0, T0 + float(os.environ.get("ARC_KILL_AT_S", 42300)) - time.time()), _kill)
+    _timer.daemon = True
+    _timer.start()
     for line in p.stdout:
         print(line, end="", flush=True)
     p.wait()
+    _timer.cancel()
     print("solver exit code", p.returncode, flush=True)
+  except Exception as exc:
+    print("solver cell failed:", type(exc).__name__, exc, flush=True)
 
 # Cell 4: final check of submission.json; log archive.
 import tarfile
@@ -139,12 +190,15 @@ try:
 except Exception as exc:
     print("submission.json invalid, writing the fallback:", exc, flush=True)
     json.dump(_fb, open(f"{WORK}/submission.json", "w"))
-logs = f"{WORK}/dsv41_logs"
-if os.path.isdir(f"{logs}/traces"):
-    with tarfile.open(f"{WORK}/dsv41_traces.tar.gz", "w:gz") as tf:
-        tf.add(f"{logs}/traces", arcname="traces")
-    shutil.rmtree(f"{logs}/traces", ignore_errors=True)
-for f in ("stage.log",):
-    if os.path.exists(f"{SCRATCH}/{f}"):
-        shutil.copy(f"{SCRATCH}/{f}", f"{logs}/{f}" if os.path.isdir(logs) else f"{WORK}/{f}")
+try:
+    logs = f"{WORK}/dsv41_logs"
+    if os.path.isdir(f"{logs}/traces"):
+        with tarfile.open(f"{WORK}/dsv41_traces.tar.gz", "w:gz") as tf:
+            tf.add(f"{logs}/traces", arcname="traces")
+        shutil.rmtree(f"{logs}/traces", ignore_errors=True)
+    for f in ("stage.log",):
+        if os.path.exists(f"{SCRATCH}/{f}"):
+            shutil.copy(f"{SCRATCH}/{f}", f"{logs}/{f}" if os.path.isdir(logs) else f"{WORK}/{f}")
+except Exception as exc:
+    print("log archive failed:", exc, flush=True)
 print(f"done at +{(time.time() - T0) / 3600:.2f}h", flush=True)
