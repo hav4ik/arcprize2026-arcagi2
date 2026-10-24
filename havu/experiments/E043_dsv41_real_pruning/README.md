@@ -67,6 +67,19 @@ runs are not resumed.
     re-tokenization.
   - So on at least ~1 turn in 8, the cached prefix ends inside the last assistant turn. Resuming there needs
     sliding-window state from early in that decode. The 8x box never evicts it; L4 does.
+  - **Fix (user, 2026-10-24 ~19:30: "a problem for both runs, fix it and continue"):** harness option `--token-exact`
+    in `evals/run_deepseek_tools.py`.
+    - Each attempt keeps its exact token history.
+    - Only the new messages are rendered: server `/tokenize` of the full conversation minus the render through the
+      last assistant turn, after a prefix check.
+    - Generation goes to `/v1/completions` with token ids. The output is parsed with a port of the encoding's
+      `parse_message_from_completion_text`. A format error keeps the text as content, so `--rescue-code` still works.
+    - Tested:
+      - live: the history equals the server's own render whenever re-tokenizing reproduces it;
+      - 2 end-to-end harness attempts;
+      - unit tests: 2 new parser tests, 62 existing harness tests pass.
+    - The E112 eval was restarted with it at 19:43 UTC. 69 attempt-0 results were kept, and 98 in-flight attempts
+      were re-run. Per-attempt counters: `token_exact`.
   - Fix options sent to dsv4-infer:
     - token-exact continuation in the harness: keep the token ids and send `/v1/completions` with the previous ids
       plus the rendered tool result;

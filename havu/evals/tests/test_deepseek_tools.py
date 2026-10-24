@@ -452,6 +452,36 @@ class E009OptionTests(unittest.TestCase):
         self.assertNotIn("submit_answer", PROMPT_SUFFIXES["lean2"])
 
 
+class TokenExactParseTests(unittest.TestCase):
+    """E043 --token-exact: raw V4.1 completions parse like the model's encoding.parse_message_from_completion_text."""
+
+    @staticmethod
+    def call(name, params):
+        body = "".join(f'<｜DSML｜ parameter name="{k}" string="{s}">{v}</｜DSML｜ parameter>\n' for k, (v, s) in params)
+        return f'<｜DSML｜ invoke name="{name}">\n{body}</｜DSML｜ invoke>\n'
+
+    def test_tool_calls_and_answer(self):
+        from run_deepseek_tools import DS_EOS, parse_ds_completion
+        text = ("look at rows</think>" + "\n\n<｜DSML｜ calls>\n"
+                + self.call("run_python", [("code", ("print(1)\nx = '<a>'", "true"))])
+                + self.call("submit_answer", [("code", ("answer", "true")), ("n", ("3", "false"))])
+                + "</｜DSML｜ calls>" + DS_EOS)
+        reasoning, content, calls = parse_ds_completion(text)
+        self.assertEqual((reasoning, content), ("look at rows", ""))
+        self.assertEqual([c["function"]["name"] for c in calls], ["run_python", "submit_answer"])
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"code": "print(1)\nx = '<a>'"})
+        self.assertEqual(json.loads(calls[1]["function"]["arguments"]), {"code": "answer", "n": 3})
+        self.assertEqual(parse_ds_completion("ok</think>[[1]]" + DS_EOS), ("ok", "[[1]]", []))
+
+    def test_format_errors_raise(self):
+        from run_deepseek_tools import DS_EOS, parse_ds_completion
+        for bad in ["no think end" + DS_EOS, "r</think>text without eos",
+                    "r</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"run_python\">\ncode</｜DSML｜ invoke>\n"
+                    "</｜DSML｜ calls>" + DS_EOS]:
+            with self.assertRaises(ValueError):
+                parse_ds_completion(bad)
+
+
 class SandboxClientTests(unittest.TestCase):
     def test_reset_restores_only_prelude_and_cleanup(self):
         requests = []

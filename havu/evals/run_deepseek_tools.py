@@ -457,8 +457,10 @@ class TurnError(RuntimeError):
         self.assistant, self.usage, self.finish = assistant, usage, finish
 
 
-def turn(client, args, messages, max_tokens, final=False, think=True):
+def turn(client, args, messages, max_tokens, final=False, think=True, tok=None):
     """Assemble streamed reasoning/content and indexed, fragmented tool calls."""
+    if tok is not None and think and not final:
+        return turn_token_exact(client, args, messages, max_tokens, tok)
     content, reasoning, calls, usage, finish = [], [], {}, None, None
     stream, failure = None, None
     try:
@@ -509,6 +511,137 @@ def turn(client, args, messages, max_tokens, final=False, think=True):
         raise TurnError(failure or "Incomplete stream: missing finish reason or usage", assistant, usage, finish)
     if any(not c["id"] or not c["function"]["name"] for c in calls.values()):
         raise TurnError("Incomplete streamed tool call", assistant, usage, finish)
+    return assistant, usage, finish
+
+
+# E043 --token-exact: DeepSeek-V4.1 completion format (the model's encoding/encoding.py, V4.1 DSML).
+DS_EOS, DS_THINK_END, DSML = "<｜end▁of▁sentence｜>", "</think>", "｜DSML｜"
+DS_CALLS_START, DS_CALLS_END = f"\n\n<{DSML} calls", f"</{DSML} calls>"
+DS_INVOKE, DS_INVOKE_END = f"<{DSML} invoke", f"</{DSML} invoke"
+DS_PARAM, DS_PARAM_END = f"<{DSML} parameter", f"/{DSML} parameter"
+
+
+def _read_until(text, index, stops):
+    hits = [(text.find(s, index), s) for s in stops]
+    hits = [(p, s) for p, s in hits if p != -1]
+    if not hits:
+        return len(text), text[index:], None
+    p, s = min(hits)
+    return p + len(s), text[index:p], s
+
+
+def parse_ds_completion(text):
+    """Raw V4.1 thinking-mode completion (after the prompt's `<think>`) -> (reasoning, content, tool_calls), like the
+    model's parse_message_from_completion_text. Raises ValueError on any format error."""
+    i, reasoning, stop = _read_until(text, 0, [DS_THINK_END, DS_CALLS_START])
+    if stop != DS_THINK_END:
+        raise ValueError("missing </think>")
+    i, content, stop = _read_until(text, i, [DS_EOS, DS_CALLS_START])
+    calls = []
+    if stop == DS_CALLS_START:
+        while True:
+            i, gap, stop = _read_until(text, i, [DS_INVOKE, DS_CALLS_END])
+            if gap != ">\n" or stop is None:
+                raise ValueError("tool call block format")
+            if stop == DS_CALLS_END:
+                break
+            i, head, stop = _read_until(text, i, [DS_PARAM, DS_INVOKE_END])
+            name = re.findall(r'^\s*name="(.*?)">\n$', head, flags=re.DOTALL)
+            if len(name) != 1:
+                raise ValueError("tool name format")
+            args = {}
+            while stop == DS_PARAM:
+                i, body, stop = _read_until(text, i, [DS_PARAM_END])
+                kv = re.findall(r'^ name="(.*?)" string="(true|false)">(.*?)<$', body, flags=re.DOTALL)
+                if len(kv) != 1 or kv[0][0] in args:
+                    raise ValueError("parameter format")
+                key, is_str, value = kv[0]
+                args[key] = value if is_str == "true" else json.loads(value)
+                i, gap, stop = _read_until(text, i, [DS_PARAM, DS_INVOKE_END])
+                if gap != ">\n":
+                    raise ValueError("parameter end format")
+            calls.append({"id": f"call_{uuid4().hex[:24]}", "type": "function",
+                          "function": {"name": name[0], "arguments": json.dumps(args, ensure_ascii=False)}})
+        i, tail, stop = _read_until(text, i, [DS_EOS])
+        if tail:
+            raise ValueError("text after tool calls")
+    elif stop != DS_EOS:
+        raise ValueError("missing EOS")
+    if i != len(text):
+        raise ValueError("text after EOS")
+    if any(t in s for s in (reasoning, content) for t in (DS_EOS, DS_THINK_END, DSML)):
+        raise ValueError("special token inside text")
+    return reasoning, content, calls
+
+
+def turn_token_exact(client, args, messages, max_tokens, tok):
+    """E043 --token-exact (--base-url only): continue the attempt's exact token history instead of letting the server
+    re-render earlier assistant turns. Re-tokenizing sampled text does not always give back the sampled ids (the
+    model sometimes samples a non-canonical split; ~13% of turns), which ends the cached prefix inside that turn; on a
+    small KV pool (4xL4) the state needed to resume there is evicted. Only the messages appended since the last turn
+    are rendered (server /tokenize: full render minus the render through the last assistant turn), and generation
+    goes to /v1/completions with the token ids. The output is parsed like the model's encoding; a format error keeps
+    the text as content (so --rescue-code still sees garbled calls). If the render is not prefix-stable (e.g. a new
+    user message drops earlier reasoning), the turn uses the full render."""
+    import httpx
+    root = str(client.base_url).rstrip("/").removesuffix("/v1")
+    body = dict(json.loads(args.extra_body or "{}"))
+    kw = body.pop("chat_template_kwargs", {})
+    tools = tools_for(args)
+
+    def render(msgs, gen):
+        r = httpx.post(f"{root}/tokenize", json={"model": args.model, "messages": msgs, "tools": tools,
+                                                 "chat_template_kwargs": kw, "add_generation_prompt": gen},
+                       timeout=600)
+        r.raise_for_status()
+        return r.json()["tokens"]
+
+    full = render(messages, True)
+    if tok["ids"] is None:
+        ids = full
+    else:
+        upto = render(messages[:tok["n"]], False)
+        if full[:len(upto)] == upto:
+            ids = tok["ids"] + full[len(upto):]
+            tok["breaks"] += upto != tok["ids"]  # turns where a re-render would have changed the cached history
+        else:
+            ids = full
+            tok["rerenders"] += 1
+    text, sampled, usage, finish, failure, stream = [], [], None, None, None, None
+    try:
+        stream = client.completions.create(
+            model=args.model, prompt=ids, max_tokens=max_tokens, stream=True, stream_options={"include_usage": True},
+            extra_body={**body, "return_token_ids": True, "skip_special_tokens": False,
+                        "spaces_between_special_tokens": False})
+        for chunk in stream:
+            if chunk.usage is not None:
+                usage = chunk.usage.model_dump()
+            for ch in chunk.choices or []:
+                text.append(ch.text or "")
+                sampled += (ch.model_extra or {}).get("token_ids") or []
+                finish = ch.finish_reason or finish
+    except Exception as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+    finally:
+        if stream is not None:
+            stream.close()
+    text = "".join(text)
+    try:
+        reasoning, content, calls = parse_ds_completion(text if text.endswith(DS_EOS) or finish != "stop"
+                                                        else text + DS_EOS)
+    except ValueError:
+        tok["parse_fallbacks"] += finish != "length"
+        reasoning, sep, rest = text.partition(DS_THINK_END)
+        reasoning, content, calls = (reasoning, rest, []) if sep else (text, "", [])
+        content = content.removesuffix(DS_EOS)
+    assistant = {"role": "assistant", "content": content, "reasoning_content": reasoning}
+    if calls:
+        assistant["tool_calls"] = calls
+        finish = "tool_calls" if finish == "stop" else finish
+    if failure or finish is None or usage is None:
+        raise TurnError(failure or "Incomplete stream: missing finish reason or usage", assistant, usage, finish)
+    tok["ids"], tok["n"] = ids + sampled, len(messages) + 1
+    tok["turns"] += 1
     return assistant, usage, finish
 
 
@@ -603,6 +736,9 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
     n_nudges = 0  # E030 --cap-nudge
     n_rescues = 0  # E043 --rescue-code
     n_nudge_rescues = 0
+    # E043 --token-exact: the attempt's exact token history (prompt + sampled ids) and counters
+    tok = ({"ids": None, "n": 0, "turns": 0, "breaks": 0, "rerenders": 0, "parse_fallbacks": 0}
+           if getattr(args, "token_exact", False) and getattr(args, "base_url", None) else None)
     events, error, content, t0 = [], None, "", time.monotonic()
     session_final = getattr(args, "final_mode", "turn") == "session"
     source = None  # where the single scored grid came from
@@ -634,7 +770,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                 mult = peak_multiplier() if auto_price else args.price_multiplier
                 try:
                     think = args.think_turns < 0 or index < args.think_turns
-                    msg, usage, finish = turn(client, args, messages, cap, final, think)
+                    msg, usage, finish = turn(client, args, messages, cap, final, think, tok)
                 except TurnError as exc:
                     messages.append(exc.assistant)
                     if exc.usage:
@@ -793,6 +929,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
         result["cap_nudges"] = n_nudges
     if getattr(args, "rescue_code", False):
         result["rescues"] = n_rescues
+    if tok is not None:
+        result["token_exact"] = {k: v for k, v in tok.items() if k not in ("ids", "n")}
     if getattr(args, "train_check", False):
         result.update({"train_pass": None, "train_frac": None, "train_trace": "no_answer"} if pred is None else labels)
     if any(getattr(args, k, v) != v for k, v in V4_DEFAULTS.items()):
@@ -906,6 +1044,10 @@ def parser():
     ap.add_argument("--think-turns", type=int, default=-1,
                     help="E010: thinking only on the first N assistant turns, disabled after (-1 = always think)")
     ap.add_argument("--budget-warn", type=float, default=0.8, help="fraction at which the note says to answer now")
+    ap.add_argument("--token-exact", action="store_true",
+                    help="E043 (--base-url): send each turn as the attempt's exact token ids (prompt + sampled ids + "
+                         "rendered new messages) to /v1/completions, so re-tokenizing sampled text never breaks the "
+                         "server's cached prefix")
     ap.add_argument("--rescue-code", action="store_true",
                     help="E043: a non-final turn without a valid tool call but with code (garbled DSML or a ```python "
                          "block) becomes a run_python call; near-miss tool names are mapped (pruned models)")
