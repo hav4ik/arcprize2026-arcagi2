@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """E043: self-contained HTML report of the expert-pruning results (ARC evals, routing statistics, NLL screens,
-probes, throughput). Inputs are the small JSON/JSONL files in results/ (eval_stats.json from eval_report_stats.py,
-expert_stats.json from expert_report_stats.py, nll_*.jsonl, gen_probe*.jsonl, throughput_series.json).
+probes, throughput, no-tool round). Inputs are the small JSON/JSONL files in results/ (eval_stats.json from eval_report_stats.py,
+expert_stats.json from expert_report_stats.py, nll_*.jsonl, gen_probe*.jsonl, throughput_series.json; no-tool:
+notool_eval_stats.json from eval_notool_stats.py, compare_tool_notool.json, notool_nll_*.jsonl, notool_copy_probe_*.jsonl).
 
   make_results_report.py <e043_results_dir> <out.html>
 """
@@ -37,12 +38,12 @@ def hbar(cid, rows, vmax=1.0, fmt=pct, label_w=250):
         x = label_w + iw * k / 5
         s.append(f'<line class="grid" x1="{x:.1f}" x2="{x:.1f}" y1="8" y2="{h - 26}"/>')
         s.append(f'<text class="tick" x="{x:.1f}" y="{h - 10}" text-anchor="middle">{fmt(vmax * k / 5) if fmt is not pct else f"{100 * vmax * k / 5:.0f}%"}</text>')
-    for i, (lab, v, tip) in enumerate(rows):
+    for i, (lab, v, tip, *slot) in enumerate(rows):
         y = 14 + i * row_h
         w = max(2, iw * v / vmax)
         s.append(f'<text class="lab" x="{label_w - 10}" y="{y + 15}" text-anchor="end">{esc(lab)}</text>')
         s.append(f'<g class="hit" tabindex="0" data-tip="{esc(tip)}"><rect x="{label_w}" y="{y}" width="{iw}" height="22" '
-                 f'fill="transparent"/><path class="bar s1f" d="M{label_w},{y} H{label_w + w - 4} Q{label_w + w},{y} '
+                 f'fill="transparent"/><path class="bar s{slot[0] if slot else 1}f" d="M{label_w},{y} H{label_w + w - 4} Q{label_w + w},{y} '
                  f'{label_w + w},{y + 4} V{y + 18} Q{label_w + w},{y + 22} {label_w + w - 4},{y + 22} H{label_w} Z"/></g>')
         s.append(f'<text class="val" x="{label_w + w + 8}" y="{y + 15}">{esc(fmt(v))}</text>')
     s.append("</svg>")
@@ -145,9 +146,10 @@ def columns(cid, vals, labels, ymax, yfmt, slot=1, h=240, xlabel="", hl=None):
     return "\n".join(s)
 
 
-def scatter(cid, pts, xlabel, ylabel, xr, yr, h=320):
-    """pts: [(label, x, y, slot)] with direct labels."""
-    padl, padr, padt, padb = 64, 30, 14, 44
+def scatter(cid, pts, xlabel, ylabel, xr, yr, h=320, tipname="NLL generated / NLL tool block", xfmt=lambda v: f"{v:.2f}",
+            yfmt=lambda v: f"{v:.2f}"):
+    """pts: [(label, x, y, slot[, label dy])] with direct labels."""
+    padl, padr, padt, padb = 64, 30, 24, 44
     iw, ih = W - padl - padr, h - padt - padb
     sx = lambda v: padl + iw * (v - xr[0]) / (xr[1] - xr[0])
     sy = lambda v: padt + ih * (1 - (v - yr[0]) / (yr[1] - yr[0]))
@@ -155,14 +157,14 @@ def scatter(cid, pts, xlabel, ylabel, xr, yr, h=320):
     for k in range(6):
         v = yr[0] + (yr[1] - yr[0]) * k / 5
         s.append(f'<line class="grid" x1="{padl}" x2="{padl + iw}" y1="{sy(v):.1f}" y2="{sy(v):.1f}"/>')
-        s.append(f'<text class="tick" x="{padl - 8}" y="{sy(v) + 4:.1f}" text-anchor="end">{v:.2f}</text>')
+        s.append(f'<text class="tick" x="{padl - 8}" y="{sy(v) + 4:.1f}" text-anchor="end">{yfmt(v)}</text>')
         v = xr[0] + (xr[1] - xr[0]) * k / 5
-        s.append(f'<text class="tick" x="{sx(v):.1f}" y="{padt + ih + 16}" text-anchor="middle">{v:.2f}</text>')
-    for lab, x, y, slot in pts:
-        tip = f"{x:.3f} / {y:.3f}|{lab}: NLL generated / NLL tool block"
+        s.append(f'<text class="tick" x="{sx(v):.1f}" y="{padt + ih + 16}" text-anchor="middle">{xfmt(v)}</text>')
+    for lab, x, y, slot, *dy in pts:
+        tip = f"{xfmt(x)} / {yfmt(y)}|{lab}: {tipname}"
         s.append(f'<g class="hit" tabindex="0" data-tip="{esc(tip)}"><circle cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="12" '
                  f'fill="transparent"/><circle class="dot s{slot}" cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="5"/></g>')
-        s.append(f'<text class="lab" x="{sx(x) + 8:.1f}" y="{sy(y) - 6:.1f}">{esc(lab)}</text>')
+        s.append(f'<text class="lab" x="{sx(x) + 8:.1f}" y="{sy(y) + (dy[0] if dy else -6):.1f}">{esc(lab)}</text>')
     s.append(f'<text class="axlabel" x="{padl + iw / 2:.1f}" y="{h - 6}" text-anchor="middle">{esc(xlabel)}</text>')
     s.append(f'<text class="axlabel" x="14" y="{padt + ih / 2:.1f}" transform="rotate(-90 14 {padt + ih / 2:.1f})" '
              f'text-anchor="middle">{esc(ylabel)}</text>')
@@ -299,6 +301,77 @@ for lab, run, t0, t1 in [("E64 physical export", "tp4A_e64x", "15:16:00", "15:40
         thr_rows.append([esc(lab), f"{w[0]:,.0f}", f"{w[1]:,.0f}", f"{w[2]:,.0f}", str(w[3])])
 thr_tab = table(["model (4 GPUs, TP4+EP4)", "mean gen tok/s", "mean at >=100 streams", "peak", "median running"], thr_rows)
 
+# ---------------------------------------------------------------- no-tool round
+NTS = json.load(open(RES / "notool_eval_stats.json")) if (RES / "notool_eval_stats.json").exists() else {}
+NT_MAIN = [("full_a1", "Full: 384 experts, full Engram", "full", None), ("e72_w10_eng48", "E72 answer x10 + Engram 48 GiB", "E72", "E72"),
+           ("e64_w10_eng48", "E64 answer x10 + Engram 48 GiB", "E64", None),
+           ("e64_w20_eng48", "E64 answer x20 + Engram 48 GiB", "E64", "E64")]
+nts_all = [(t, n, tk) for t, n, tk, _ in NT_MAIN if t in NTS]
+nts = [(t, n, tk) for t, n, tk in nts_all if len(NTS[t]["pairs"]) >= 160]  # charts: complete runs only
+c_nt_pass = hbar("ntpass", [r for t, n, tk in nts for r in
+                            ([(f"tool harness: {tk}", EVS[tk]["pass1"], f"{pct(EVS[tk]['pass1'])} pass@1|tool round, {EVS[tk]['correct']}/{EVS[tk]['attempts']} pairs", 2)]
+                             if tk in EVS and t in ("full_a1", "e72_w10_eng48", "e64_w20_eng48") else [])
+                            + [(f"no-tool: {n.split(' + ')[0].replace('Full: 384 experts, full Engram', 'full')}", NTS[t]["pass1"],
+                                f"{pct(NTS[t]['pass1'])} pass@1|no-tool, {NTS[t]['correct']}/{len(NTS[t]['pairs'])} pairs", 1)]])
+c_nt_pair = stacked("ntpair", [(n.split(" + ")[0], [NTS[t]["vs_full"][c] for c in ("both", "full_only", "pruned_only", "neither")])
+                              for t, n, tk in nts if "vs_full" in NTS[t]],
+                    [("solved by both", 1), ("full model only", 2), ("this model only", 3), ("neither", 4)])
+nt_tab = table(["model (no-tool; partial runs are table-only)", "pairs correct", "pass@1", "task-weighted", "pass@2 (task-weighted)", "mean output tokens",
+                "unparsed", "finish"],
+               [[esc(n), f"{NTS[t]['correct']}/{len(NTS[t]['pairs'])}", pct(NTS[t]["pass1"]), pct(NTS[t]["task_weighted"]),
+                 (f"{pct(NTS[t]['pass2_task_weighted'])} ({NTS[t]['pairs_with_2']} pairs)" if NTS[t].get("pairs_with_2") else "-"),
+                 f"{NTS[t]['tokens_mean']:,.0f}", str(NTS[t]["unparsed"]), esc(", ".join(f"{a} {b}" for a, b in NTS[t]["finish"].items()))]
+                for t, n, tk in nts_all])
+CMP = json.load(open(RES / "compare_tool_notool.json")) if (RES / "compare_tool_notool.json").exists() else None
+c_nt_cov = c_nt_eff = ""
+if CMP:
+    ce = sorted(int(e) for e in CMP["coverage"])
+    c_nt_cov = lines("ntcov", [("tool-use traffic", 2, [(e, CMP["coverage"][str(e)]["tool_contrib"]) for e in ce]),
+                               ("no-tool traffic", 1, [(e, CMP["coverage"][str(e)]["notool_contrib"]) for e in ce]),
+                               ("no-tool traffic, tool-round set", 3,
+                                [(e, CMP["cross"][str(e)]["notool_traffic_kept_by_tool_set"]) for e in ce])],
+                     16, 192, 0.0, 1.0, "routed experts kept per layer (log scale; contribution ranking)",
+                     lambda v: f"{100 * v:.0f}%", [16, 24, 32, 48, 64, 96, 128, 192], logx=True, h=300, endlabels=False)
+    c_nt_eff = lines("nteff", [("tool-use", 2, list(enumerate(CMP["effective_experts"]["tool"]))),
+                               ("no-tool", 1, list(enumerate(CMP["effective_experts"]["notool"])))],
+                     0, 39, 0, 200, "backbone layer (20-39: decoder half); effective experts = exp(routing entropy)",
+                     lambda v: f"{v:.0f}",
+                     [0, 5, 10, 15, 20, 25, 30, 35, 39], h=280, markers=False)
+nt_nll = {}
+for f in sorted(RES.glob("notool_nll_nt2_dev*.jsonl")):
+    for l in open(f):
+        r = json.loads(l)
+        a = nt_nll.setdefault(r["tag"], collections.Counter())
+        for k in ("n_gen", "nll_gen"):
+            a[k] += r[k]
+nt_nll = {t: a["nll_gen"] / a["n_gen"] for t, a in nt_nll.items()}
+nt_copy = collections.defaultdict(lambda: [0, 0, 0])
+for f in sorted(RES.glob("notool_copy_probe_nt2*.jsonl")):
+    for l in open(f):
+        r = json.loads(l)
+        for x in r["samples"]:
+            if x["temperature"] == 1.0:
+                nt_copy[r["config"]][0] += x["exact"]
+                nt_copy[r["config"]][1] += 1
+                nt_copy[r["config"]][2] += not x["parsed"]
+NT_SETS = [("full", "full", 1), ("eng48", "384 experts", 1), ("e96", "E96", 1), ("e72", "E72", 2), ("e72_w10", "E72 x10", 2),
+           ("e72_w30", "E72 x30", 2), ("toolset_e72_w30", "E72 tool-round set", 5), ("e64", "E64", 3), ("e64_w10", "E64 x10", 3),
+           ("e64_w20", "E64 x20", 3), ("e64_w30", "E64 x30", 3), ("toolset_e64_w30", "E64 tool-round set", 5),
+           ("e48_w30", "E48 x30", 4)]
+base = nt_nll.get("full")
+BELOW = {"e64_w20", "toolset_e64_w30"}  # label under the point where labels would collide
+nt_pts = [(lab, nt_nll[t] / base - 1, nt_copy[t][0] / nt_copy[t][1], slot, 18 if t in BELOW else -6) for t, lab, slot in NT_SETS
+          if base and t in nt_nll and nt_copy[t][1] and t != "full"]
+c_nt_sc = scatter("ntsc", nt_pts, "teacher-forced NLL of generated tokens on dev, vs full model (lower = better reasoning text)",
+                  "answer written correctly (T=1)", (0, 0.7), (0.75, 1.0), h=340, tipname="NLL vs full / answer correct",
+                  xfmt=lambda v: f"+{100 * v:.0f}%", yfmt=lambda v: f"{100 * v:.0f}%")
+nt_dev_tab = table(["keep set (+ Engram 48 GiB)", "dev NLL gen", "vs full", "answer correct (T=1)", "unparsed"],
+                   [[esc(lab), f"{nt_nll[t]:.4f}" if t in nt_nll else "-",
+                     (f"+{100 * (nt_nll[t] / base - 1):.1f}%" if t in nt_nll and base else "-"),
+                     (f"{nt_copy[t][0]}/{nt_copy[t][1]}" if nt_copy[t][1] else "-"), (str(nt_copy[t][2]) if nt_copy[t][1] else "-")]
+                    for t, lab, slot in NT_SETS + [("e80", "E80", 1), ("e56", "E56", 4), ("e48", "E48", 4)]
+                    if t in nt_nll or nt_copy[t][1]])
+
 CSS = open(Path(__file__).with_name("make_engram_report.py")).read().split("<style>")[1].split("</style>")[0]
 CSS = CSS.replace("{{", "{").replace("}}", "}")
 EXTRA = """
@@ -306,7 +379,7 @@ EXTRA = """
 .s1f { fill:var(--s1); } .s2f { fill:var(--s2); } .s3f { fill:var(--s3); } .s4f { fill:var(--s4); } .s5f { fill:var(--s5); }
 .hit:hover .s1f, .hit:hover .s2f, .hit:hover .s3f, .hit:hover .s4f { opacity:0.75; }
 .line.s4 { stroke:var(--s4); } .line.s5 { stroke:var(--s5); } .dot.s4 { fill:var(--s4); } .dot.s5 { fill:var(--s5); }
-.key.s4, .key.s4f { background:var(--s4); } .key.s5 { background:var(--s5); } .key.s1f { background:var(--s1); }
+.key.s4, .key.s4f { background:var(--s4); } .key.s5, .key.s5f { background:var(--s5); } .key.s1f { background:var(--s1); }
 .key.s2f { background:var(--s2); } .key.s3f { background:var(--s3); }
 .key.box { width:12px; height:12px; border-radius:2px; }
 .ref { stroke:var(--axis); stroke-width:2; } .inbar { fill:#fff; font-size:11px; font-weight:600; }
@@ -370,6 +443,26 @@ cache-salted per configuration.</p><div class="card">{probe_tab}</div>
 is CPU-bound on eager mixed prefill/decode steps; the pure-decode ceiling is ~2.5-2.7K tok/s at ~128 streams. Not L4
 numbers.</p><div class="card">{thr_tab}</div>
 
+<h2 id="notool">No-tool round: pruning without the tool harness</h2>
+<p>Same model and servers; the E044 no-tool harness (official ARC Prize prompt, task summary, effort low + minimal header,
+one turn, answer parsed from the text). Statistics come only from no-tool training rollouts (5,379 rollouts; family-disjoint
+dev split for all screens, the 120 eval tasks only for these scores). "answer xW" keep sets weight the generated answer
+block (<code>&lt;/think&gt;</code> to EOS) xW in the expert score.</p>
+<div class="card">{legend([("no-tool harness", 1), ("tool harness (earlier round)", 2)], "box")}{c_nt_pass}<details><summary>Table view</summary>{nt_tab}</details></div>
+<h2>No-tool: same pairs, paired with the full model</h2>
+<div class="card">{legend([("solved by both", 1), ("full model only", 2), ("this model only", 3), ("neither", 4)], "box")}{c_nt_pair}</div>
+<h2>No-tool routing is more concentrated</h2>
+<p>Share of routing selections kept by the top-E experts per layer (contribution ranking), tool-use vs no-tool traffic,
+and how much no-tool traffic the tool round's keep set would keep. Effective experts per layer (exp of routing entropy):
+no-tool is lower in 39 of 40 layers.</p>
+<div class="card">{legend([("tool-use traffic", 2), ("no-tool traffic", 1), ("no-tool traffic, tool-round set", 3)])}{c_nt_cov}</div>
+<div class="card">{legend([("tool-use", 2), ("no-tool", 1)])}{c_nt_eff}</div>
+<h2>No-tool dev screen: reasoning text vs answer writing</h2>
+<p>x: teacher-forced NLL of generated tokens on 64 dev traces. y: share of answers the masked model writes correctly
+when handed the teacher's reasoning up to <code>&lt;/think&gt;</code> (48 teacher-correct dev traces x 4 samples at T=1,
+harness parser). Plain pruning loses ~1 in 5 answers here; a small answer weight fixes it at a modest NLL cost.</p>
+<div class="card">{legend([("384 experts / E96", 1), ("E72", 2), ("E64", 3), ("E48", 4), ("tool-round sets", 5)], "box")}{c_nt_sc}<details><summary>Table view</summary>{nt_dev_tab}</details></div>
+
 <h2>Findings</h2><ul>
 <li>Engram rows: a 64 GiB top-frequency table (34% of rows) is lossless on ARC (control {pi('eng64', lambda e: pct(e['pass1']))} vs full {pi('full', lambda e: pct(e['pass1']))}).</li>
 <li>Expert pruning to E72/E64/E48 costs most of the accuracy even after fixing the tool-call format: routing is spread
@@ -377,6 +470,9 @@ over 83-196 effective experts per layer, and the kept sets cover 53-65% of the r
 <li>E72 mostly keeps the puzzle's main idea and loses on execution (near-miss answers, 45% tool-call errors); E64 has
 semantic damage (hallucinated module names); E48 never leaves its first turn.</li>
 <li>Teacher-forced NLL understates the damage: the format collapse and the looping only show up in free generation.</li>
+<li>No-tool round: routing is more concentrated without tools (108 vs 122 effective experts per layer), and E72 keeps
+most of the no-tool accuracy ({pct(NTS['e72_w10_eng48']['pass1']) if 'e72_w10_eng48' in NTS else '-'} vs {pct(NTS['full_a1']['pass1']) if 'full_a1' in NTS else '-'} pass@1), against 29% vs 66% in the
+tool harness. The answer block needs a small weight in the expert score, or ~1 in 5 answers comes out unparsable.</li>
 </ul></main><div id="tip" role="tooltip"></div>
 <script>
 const tip=document.getElementById('tip');

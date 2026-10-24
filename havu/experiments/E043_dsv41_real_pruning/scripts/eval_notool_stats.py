@@ -2,8 +2,9 @@
 """E043 no-tool round: ARC eval statistics from evals/results/e043nt_<tag>.jsonl (small JSON for the report).
 
   eval_notool_stats.py <evals_results_dir> <out.json>
-Per run: pass@1 over pairs and task-weighted, finish reasons, unparsed answers, output-token distribution, and the
-pair-level comparison with the full model (both / full only / pruned only / neither).
+Per run: pass@1 (attempt 0) over pairs and task-weighted, pass@2 (attempts 0+1, ARC scoring) where both exist,
+finish reasons, unparsed answers, output-token distribution, and the pair-level comparison with the full model
+(both / full only / pruned only / neither).
 """
 import collections
 import json
@@ -32,16 +33,28 @@ def main():
         ok = lambda r: r.get("correct") in (True, "True")
         tw = collections.defaultdict(list)
         for r in rows:
-            tw[r["task_id"]].append(ok(r))
+            if str(r.get("attempt", 0)) == "0":
+                tw[r["task_id"]].append(ok(r))
+        by_pair = collections.defaultdict(dict)
+        for r in rows:
+            by_pair[(r["task_id"], str(r["pair"]))][int(r.get("attempt", 0))] = ok(r)
+        two = {k: v for k, v in by_pair.items() if len(v) >= 2}
+        tw2 = collections.defaultdict(list)
+        for (tid, _), v in two.items():
+            tw2[tid].append(v.get(0, False) or v.get(1, False))
+        a0 = [r for r in rows if str(r.get("attempt", 0)) == "0"]
         toks = sorted(tokens(r) for r in rows)
-        out[tag] = {"attempts": len(rows), "correct": sum(map(ok, rows)), "pass1": sum(map(ok, rows)) / len(rows),
+        out[tag] = {"attempts": len(rows), "correct": sum(map(ok, a0)), "pass1": sum(map(ok, a0)) / len(a0),
                     "task_weighted": sum(sum(v) / len(v) for v in tw.values()) / len(tw),
+                    "pairs_with_2": len(two), "pass2_pairs": sum(v[0] or v[1] for v in two.values()) / max(1, len(two)),
+                    "pass2_task_weighted": sum(sum(v) / len(v) for v in tw2.values()) / max(1, len(tw2)),
+                    "attempt1_correct": sum(v[1] for v in two.values()),
                     "finish": dict(collections.Counter(r.get("finish_reason") for r in rows)),
                     "unparsed": sum(r.get("pred") in (None, "", "None") for r in rows),
                     "tokens_mean": statistics.mean(toks), "tokens_median": statistics.median(toks),
                     "tokens_p90": toks[int(0.9 * (len(toks) - 1))], "tokens": toks}
-        solved[tag] = {(r["task_id"], str(r["pair"])) for r in rows if ok(r)}
-        out[tag]["pairs"] = sorted(f"{r['task_id']}:{r['pair']}" for r in rows)
+        solved[tag] = {(r["task_id"], str(r["pair"])) for r in a0 if ok(r)}
+        out[tag]["pairs"] = sorted(f"{r['task_id']}:{r['pair']}" for r in a0)
     if "full_a1" in solved:
         for tag in out:
             if tag == "full_a1":
@@ -53,7 +66,8 @@ def main():
                                    "neither": len(pairs) - len(full | solved[tag])}
     json.dump(out, open(OUT, "w"))
     for k, v in out.items():
-        print(f"{k:24s} {v['correct']}/{v['attempts']} pass@1={v['pass1']:.3f} tw={v['task_weighted']:.3f} "
+        p2 = f" pass@2({v['pairs_with_2']} pairs)={v['pass2_pairs']:.3f} tw={v['pass2_task_weighted']:.3f}" if v["pairs_with_2"] else ""
+        print(f"{k:24s} {v['correct']}/{len(v['pairs'])} pass@1={v['pass1']:.3f} tw={v['task_weighted']:.3f}{p2} "
               f"finish={v['finish']} unparsed={v['unparsed']} tok mean={v['tokens_mean']:.0f} p90={v['tokens_p90']} "
               f"{v.get('vs_full', '')}")
 
