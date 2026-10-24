@@ -108,6 +108,25 @@ backbone + compact Engram, 107.8M / 87.4M rows kept on layers 1 / 14). Served on
 
 The answer-writing probe below gives 192/192 with Engram 48 GiB alone.
 
+Lookup hit rates (`results/notool_engram_stats_{dev,eval}.json`, `results/notool_engram_sufficiency.json`; eval = full-model
+no-tool traces on the 120 eval tasks, metric only):
+
+| mask | dev hit | eval-trace hit | same budget from half the calibration data: dev / eval |
+|---|---:|---:|---:|
+| 16 GiB | 91.1% | 88.0% | 90.5% / 87.3% |
+| 32 GiB | 93.7% | 91.3% | 93.0% / 90.4% |
+| **48 GiB** | **95.3%** | **93.4%** | 94.8% / 92.8% |
+| 64 GiB | 96.6% | 95.1% | |
+| all observed (73.2 GiB; half data: 51.8 GiB) | 97.5% | 96.3% | 95.3% / 93.5% |
+| tool-round 64 GiB mask | 95.0% | 93.7% | |
+
+- Prompt lookups are ~99.9% covered at every budget; the misses are in generated text (eval traces at 48 GiB:
+  2-gram 98.9%, 3-gram 93.7%, 4-gram 87.6% hit).
+- Doubling the calibration data (55M -> 109M tokens) adds only 0.5-0.6 points at 48 GiB: the long tail grows (all
+  observed rows 51.8 -> 73.2 GiB) but carries little traffic.
+- Eval traces vs the calibration census: 23.9% of the distinct rows they touch were never seen in calibration, carrying
+  3.7% of lookups; 99.8% of those come from generated text (`results/notool_unseen_*`).
+
 ### Routing: fewer effective experts without tools (REAP replay, 20M calibration tokens, `compare_routing.py`)
 
 | | tool round (10M tokens) | no-tool (20M tokens) |
