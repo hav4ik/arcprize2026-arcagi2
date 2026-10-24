@@ -101,7 +101,21 @@ runs are not resumed.
       plus the rendered tool result;
     - E112's larger KV;
     - fewer streams.
-- **Expected 4xL4 footprint (from the shapes; not measured):** about 15.4 GiB of weights per GPU and ~2.5M KV tokens
+- **Real 4xL4 with `--token-exact` (dsv4-infer / E042, 2026-10-24 ~19:28-20:15 UTC):**
+
+  | real weights, sub80s40 + header | streams | gen tok/s (min 4-16) | prefix hits | KV max | preemptions | attempts/h (early estimate) |
+  |---|---:|---:|---:|---:|---:|---:|
+  | E128, before the fix | 40 | 263 at the same run age; 177 steady | 85%, falling to 64% | 0.69 | 0 | ~18 |
+  | **E128, `--token-exact`** | 40 | 337-353 | 91.8-95.6% | 0.32 | 0 | ~35 |
+  | **E112, `--token-exact`** | 60 | 395-425 | 91.8-94.8% | 0.18 | 0 | ~48 |
+
+  - The fix restores the replay-level throughput on real L4: the prefix-cache loss was the re-tokenization breaks.
+    In dsv4-infer's E128 hitlog under load, 21% of turns broke, and evictions came mostly after the breaks.
+  - **First real-server load of the chunked E112 HF export:** the row-chunk loader loaded it with no assert.
+    15.29 GiB/GPU (estimate 15.43), KV 2,571,147 tokens per GPU (+78% vs E128), smoke test OK, GPUs <= 73 C.
+  - dsv4-infer's recommendation to the user: E112 for Kaggle, on the throughput margin (~48 vs ~35 attempts/h,
+    early-phase estimates). Caveat: the late-run regime, which the E112 L4 run measures until ~21:00.
+- **Expected 4xL4 footprint (from the shapes, before measurement):** about 15.4 GiB of weights per GPU and ~2.5M KV tokens
   at util 0.93. That is about the same as E96 u2/u3 (15.18 GiB, 2.72M tokens) and 1.44 GiB/GPU less than E128.
 - **HF upload rule (user, 2026-10-24): every safetensors file is at most 5 GB.** Before this, exports carried the
   Engram tables as single tensors: the tool E128 repo has 35.9 GB and 34.3 GB Engram files and a 5.03 GB backbone

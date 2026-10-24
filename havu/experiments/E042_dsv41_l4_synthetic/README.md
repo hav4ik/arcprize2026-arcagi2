@@ -1334,6 +1334,54 @@ would need a real quantization (GPTQ/AutoRound-style calibration) and an eval.
     - Fix (E043, 19:43): `--token-exact` in `evals/run_deepseek_tools.py` (opt-in, `--base-url` only). Each attempt
       keeps its exact token history; only newly appended messages are rendered, through the server's
       `/tokenize`, and the turn is generated via `/v1/completions` with the ids.
+  - **E128 with `--token-exact`** (`eval_rw.sh rw_e128t_te --token-exact`, 40 workers, 19:28–19:44 UTC, server
+    `rw_e128t3`; stopped for E112):
+
+    | window | gen tok/s | hits | uncached tok/s | KV p50 / max |
+    |---|---:|---:|---:|---:|
+    | 19:28–19:32 (first prompts) | 196.9 | 83.4% | 665 | 0.14 / 0.18 |
+    | 19:32–19:36 | 337.5 | 91.8% | 194 | 0.19 / 0.21 |
+    | 19:36–19:40 | 353.0 | 93.0% | 146 | 0.23 / 0.25 |
+    | 19:40–19:44 | 347.1 | 95.6% | 140 | 0.26 / 0.32 |
+
+    - At the same run age (0–15 min), the unfixed run made 263.5 tok/s at 84.7%.
+    - 0 preemptions; GPUs max 71–73 °C.
+    - 5 attempts finished, all correct; 0 re-renders, 0 parse fallbacks. Their `breaks` counter (6 in 19 turns) is
+      the old cumulative one: it counts every turn after an attempt's first break (E043 fixed it at ~20:10).
+    - Caveat: only the early phase (KV ≤ 0.32) was seen. The unfixed run lost most of its speed after 35 min, when
+      KV passed 0.5.
+  - **E112** (the user, 19:25: "please continue with E112. We want to have a decision which model to use on Kaggle
+    within the next 1 hour"; `scripts/run_rw112.sh`):
+    - Setup: deleted the E128 files, then downloaded `chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-E112-2bit`
+      19:44–19:54 (124.9 GB). Same split as E128: 90 GiB in /dev/shm, 28 GiB on disk, 6.5 GiB disk free afterwards.
+    - E043's row-chunk Engram loader (`apply_compact_engram.py` v2, which only adds the `nvidia/model.py` edit) was
+      applied over the E128 patches. Its first real-server load passed the full-coverage asserts.
+    - Server `rw_e112t` (E128 flags plus `--enable-prompt-tokens-details`): up in 160 s, **15.29 GiB/GPU, KV
+      2,571,147 tokens** (+78% over E128). The smoke chat answers correctly.
+    - Pod memory (cgroup v1) after load: 219 of 233 GiB used (180 GiB shmem), failcnt 0.
+    - **ARC run with `--token-exact`, 60 workers** (`eval_rw.sh rw_e112t_te --token-exact`, from 19:57 UTC):
+
+      | window | gen tok/s | hits | uncached tok/s | KV p50 / max |
+      |---|---:|---:|---:|---:|
+      | 19:57–20:01 (first prompts) | 223.3 | 85.1% | 705 | 0.10 / 0.13 |
+      | 20:01–20:05 | 395.4 | 91.8% | 245 | 0.13 / 0.15 |
+      | 20:05–20:10 | 425.3 | 94.8% | 158 | 0.17 / 0.18 |
+
+      0 preemptions; GPUs max 71–73 °C; 3 attempts finished, all correct (old cumulative `breaks` counter: 3 in 12 turns).
+  - **Decision inputs at 20:10** (E128 vs E112, both on 4×L4 with `--token-exact`, minutes 4–15 of a run):
+
+    | | E128 × 40 | E112 × 60 |
+    |---|---:|---:|
+    | gen tok/s | ~345 | ~410–425 |
+    | KV max so far | 0.32 | 0.18 |
+    | tokens/attempt (E043, same 190 attempts) | 22.0K (all 334: 35.2K) | 19.3K (0.88× E128) |
+    | ≈ attempts/h at the full-run mean | ≈ 35 (35.2K) | ≈ 48 (≈ 31K est.) |
+    | E043 ARC on the same 190 attempts | 163 correct | 157 correct (one-sided 5 vs 11) |
+    | E043 pass@2, 74 pairs with both attempts | 69 | 68 |
+    | Python tool errors | 12.7% | 27.6% |
+
+    - E043's E112 run finished the easier attempts first, so its 190 are biased toward short ones.
+    - The late-run speed with the fix is not yet measured.
 - **E043 follow-ups (09:00):**
   - E96 2/3-bit GPTQ ARC now goes first, from a GPTQ-only E96 export. E043's user wants E96 only if it is much
     faster. Partial (51 easy-first pairs): pass@1 31 vs full 37, mean output 26.8K (1.12× full).
