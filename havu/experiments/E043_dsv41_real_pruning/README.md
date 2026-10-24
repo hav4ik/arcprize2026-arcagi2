@@ -25,6 +25,27 @@ runs are not resumed.
   both. Run 1 is attempt 0 only (pass@1). Run 2 resumes the same tag with `--attempts 2` (pass@2).
 - **Expected 4xL4 footprint (from the shapes; not measured):** about 15.4 GiB of weights per GPU and ~2.5M KV tokens
   at util 0.93. That is about the same as E96 u2/u3 (15.18 GiB, 2.72M tokens) and 1.44 GiB/GPU less than E128.
+- **HF upload rule (user, 2026-10-24): every safetensors file is at most 5 GB.** Before this, exports carried the
+  Engram tables as single tensors: the tool E128 repo has 35.9 GB and 34.3 GB Engram files and a 5.03 GB backbone
+  shard. DeepSeek's own checkpoint has two 101.5 GB files.
+  - `scripts/reshard_safetensors.py <dir>`: byte-level resharder (pure Python, any dtype).
+    - Tensors above the cap are split along rows into `<name>.rows_<start>` chunks. Only the Engram tables may be
+      split.
+    - Every source tensor is re-read from the new files and checked by sha256 before the old files are unlinked.
+    - Tested on a synthetic export (uneven chunks, mixed dtypes, alignment) and opened with the official
+      `safetensors` library.
+  - `patches/apply_compact_engram.py` now also patches `nvidia/model.py`. `load_weights` copies each row chunk's
+    overlap into the rank's slice of the Engram table and asserts full coverage. Checkpoints without chunks are
+    unchanged. Unit-tested on CPU: 4 uneven TP slices, chunks in any order, e8m0 scales, a missing chunk fails.
+  - `export_pruned.py`: the shard writer now flushes *before* a tensor would pass `--shard-gb` (default 4.9), so a
+    shard can no longer overshoot.
+  - `scripts/export_tool_e112.sh` builds the E112 export in `/dev/shm`:
+    - the tool Engram re-sharded into row chunks, read through symlinks to the E128 export's files;
+    - `export_pruned.py --engram-from` that dir;
+    - `make_lowbit_export.py`;
+    - a size check: every file must be at most 5 GB.
+  - HF storage is at its cap (the E192 upload stopped with "set up automatic credit recharge"). The E112 upload
+    (~125 GB) needs the user to enable recharge or delete a repo.
 - **Recovery after the stop:** the checkpoint was re-downloaded into `/dev/shm`; the image's SGLang service was stopped
   again.
 - **False start (fixed):** the chain's download wait matched the old `DONE` line in the appended `download.log`. It

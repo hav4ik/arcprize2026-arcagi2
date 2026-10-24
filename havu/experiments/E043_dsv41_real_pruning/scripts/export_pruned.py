@@ -12,7 +12,7 @@ DSpark (mtp.*) and vision tensors are dropped with --text-only (served with --la
 checkpoint, without the ~96 GB of MXFP4 E128 experts on disk.
 
   export_pruned.py --src /dev/shm/dsv4/DeepSeek-V4.1-Flash-1017 --expert-keep keep.npy \
-      [--engram-keep engram.npz] --out /dev/shm/dsv4/export/e64 [--text-only] [--shard-gb 5]
+      [--engram-keep engram.npz] --out /dev/shm/dsv4/export/e64 [--text-only] [--shard-gb 4.9]
 """
 import argparse
 import hashlib
@@ -39,10 +39,13 @@ class Writer:
         self.buf, self.size, self.n, self.weight_map, self.total = {}, 0, 0, {}, 0
 
     def add(self, name, t):
-        self.buf[name] = t.contiguous()
-        self.size += t.numel() * t.element_size()
-        if self.size >= self.shard_bytes:
+        # A cap: flush before a tensor would push the shard past shard_bytes (only a single larger tensor, i.e. an
+        # Engram table not taken from --engram-from, gets its own bigger file; reshard_safetensors.py splits those).
+        n = t.numel() * t.element_size()
+        if self.buf and self.size + n > self.shard_bytes:
             self.flush()
+        self.buf[name] = t.contiguous()
+        self.size += n
 
     def flush(self):
         if not self.buf:
@@ -64,7 +67,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--text-only", action="store_true")
     ap.add_argument("--no-routed-experts", action="store_true")
-    ap.add_argument("--shard-gb", type=float, default=5.0)
+    ap.add_argument("--shard-gb", type=float, default=4.9, help="tensor bytes per shard (cap; files stay < 5 GB)")
     ap.add_argument("--engram-chunk", type=int, default=8_000_000)
     ap.add_argument("--engram-from", default=None,
                     help="existing export whose model-engram-* files to hardlink instead of rebuilding the table")

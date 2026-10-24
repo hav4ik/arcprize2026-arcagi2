@@ -11,6 +11,10 @@ Each TP rank owns complete hash columns, i.e. a contiguous original-id range and
 slice. The rank keeps its slice of the table and of the map (converted to rank-local rows) in pinned host memory
 (with cpu_offload) and the lookup kernel reads the map: a dropped row is not "owned", so it reads as a zero row
 before Wkv, the same as an id outside the rank's range. Without `engram_compact_kept` nothing changes.
+
+Row-chunked tables (any Engram table, compact or not; `reshard_safetensors.py`, for <= 5 GB files): a table may
+instead arrive as `layers.{L}.engram.embed.{weight,scale}.rows_<start>` tensors. The model's load_weights copies
+each chunk's overlap with the rank's rows into the parameter and checks that every row of the rank was covered.
 """
 import sys
 from pathlib import Path
@@ -145,6 +149,46 @@ def main():
             "                tuple(config.engram_compact_kept[layer_hash_index])\n"
             "                if getattr(config, \"engram_compact_kept\", None) else None\n"
             "            ),  # E043C\n        )\n",
+        ),
+    ])
+    edit(vllm / "models/deepseek_v4_1/nvidia/model.py", [
+        # Row-chunked Engram tables: route each chunk into the rank's slice of the table parameter.
+        (
+            "def _make_deepseek_v4_weights_mapper(",
+            "_E043_ENGRAM_ROWS = re.compile(r\"^(.*\\.engram)\\.embed\\.(weight|scale)\\.rows_(\\d+)$\")\n\n\n"
+            "def _e043_engram_row_chunks(weights, params_dict, loaded_params):\n"
+            "    \"\"\"E043C: Engram tables stored as row chunks `<L>.engram.embed.{weight,scale}.rows_<start>` (<= 5 GB\n"
+            "    files). Copy each chunk's overlap with this rank's rows; other weights pass through unchanged.\"\"\"\n"
+            "    covered: dict[str, int] = {}\n"
+            "    for name, loaded_weight in weights:\n"
+            "        m = _E043_ENGRAM_ROWS.match(name)\n"
+            "        if m is None:\n"
+            "            yield name, loaded_weight\n"
+            "            continue\n"
+            "        leaf = \"weight\" if m.group(2) == \"weight\" else \"weight_scale_inv\"\n"
+            "        pname = f\"{m.group(1)}.embed_tokens.{leaf}\"\n"
+            "        param = params_dict[pname]\n"
+            "        if loaded_weight.dtype == torch.float8_e8m0fnu:\n"
+            "            loaded_weight = loaded_weight.view(torch.uint8)\n"
+            "        start, lo = int(m.group(3)), param.engram_vocab_start\n"
+            "        a = max(start, lo)\n"
+            "        b = min(start + loaded_weight.shape[0], lo + param.shape[0])\n"
+            "        if a < b:\n"
+            "            param.data[a - lo:b - lo].copy_(loaded_weight[a - start:b - start])\n"
+            "            covered[pname] = covered.get(pname, 0) + (b - a)\n"
+            "        loaded_params.add(pname)\n"
+            "    for pname, rows in covered.items():\n"
+            "        assert rows == params_dict[pname].shape[0], (\n"
+            "            f\"engram row chunks cover {rows} of {params_dict[pname].shape[0]} rows of {pname}\"\n"
+            "        )\n\n\n"
+            "def _make_deepseek_v4_weights_mapper(",
+        ),
+        (
+            "        params_dict = dict(self.named_parameters())\n        loaded_params: set[str] = set()\n\n"
+            "        # TP for attention\n",
+            "        params_dict = dict(self.named_parameters())\n        loaded_params: set[str] = set()\n"
+            "        weights = _e043_engram_row_chunks(weights, params_dict, loaded_params)  # E043C: row chunks\n\n"
+            "        # TP for attention\n",
         ),
     ])
 
