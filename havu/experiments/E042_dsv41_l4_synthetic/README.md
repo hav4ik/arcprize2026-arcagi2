@@ -1382,6 +1382,29 @@ would need a real quantization (GPTQ/AutoRound-style calibration) and an eval.
 
     - E043's E112 run finished the easier attempts first, so its 190 are biased toward short ones.
     - The late-run speed with the fix is not yet measured.
+  - **Later the same evening:**
+    - **E112 steady state:** E112 × 60 with the fix held 416–422 tok/s for 42 min.
+    - **E112 accuracy:** E043's final E112 run gave pass@2 75.6%, but its attempt-1 process was anomalous.
+      - The clean rerun r2 was ≈ E128 per attempt.
+      - The deficit is specific to that process, not to concurrency or a server. A paired split by time window,
+        server and co-location shows this, and preemptions were 0.
+    - **FP4 KV:** not available. The fork rejects `nvfp4_ds_mla` because fp8 already is V4.1's native mixed
+      FP8/FP4 KV.
+    - **Pod B (2nd Runpod 4×L4):** AMD EPYC 7542 at 2.9 GHz, against pod A's EPYC 9254 at 4.15 GHz. Its GPUs sit
+      below their power cap, so the CPU is suspect.
+  - **Kaggle notebook** (`kaggle/dsv41_tools/`, see its README): kit dataset `chankhavu/dsv41-tools-kit`, notebooks
+    `dsv41-tools-submit` and `dsv41-tools-smoke`, model `chankhavu/dsv41-flash-1017-arc-tool-e128-2bit` (E043's
+    resharded E128).
+    - **Full notebook run on pod B** (E128 × 56, eval set as the test file): 330–363 tok/s, 94–96% hits, 0
+      preemptions. KV levels off at 0.73–0.78 after 75 min, so the submission uses 48 workers.
+    - **Accuracy:** 38/49 attempt-0 correct on the first pairs, against E043's E128 39 / 41 on the same pairs.
+    - **Failure tests on pod A** (`fail_tests.sh`):
+      - never-up → fallback kept;
+      - SIGTERM → final write, no vLLM left;
+      - server SIGKILL → restart and re-queue. This test found a bug: attempts relaunched before the death was
+        noticed and burned their retry; now fixed.
+    - **Kaggle smoke v1** (install only): 198 wheels offline, overlay sha256 OK, imports OK in 4 min. Kaggle
+      machine: 173 GiB cgroup, 1.1 TB /tmp, 46 CPUs (Xeon 2.2 GHz).
 - **E043 follow-ups (09:00):**
   - E96 2/3-bit GPTQ ARC now goes first, from a GPTQ-only E96 export. E043's user wants E96 only if it is much
     faster. Partial (51 easy-first pairs): pass@1 31 vs full 37, mean output 26.8K (1.12× full).

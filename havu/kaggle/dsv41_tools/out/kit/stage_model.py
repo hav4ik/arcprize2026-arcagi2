@@ -9,10 +9,17 @@ Usage: stage_model.py <src dir> <dst dir> <marker file> <mode: copy | warm | non
   load. The local disk (/tmp, ~1 TB free) keeps the copy. Falls back to `warm` if the disk lacks space.
 - warm: read every file once (64 MiB chunks) with N threads, to fetch the mount's blocks before the load.
 - none: nothing.
-The marker gets one line: "ok <dir to load from>" or "fail <reason>" (the solver then loads from <src>).
+Before writing "ok", a pre-flight checks the directory the server will load (E043 audit: vLLM skips index files
+missing on disk and the fp8 path has no "weights not initialized" check, so a partial checkpoint loads silently):
+config.json and tokenizer.json exist; every file named in model.safetensors.index.json and every gptq/layer_XX
+(XX < num_hidden_layers) exists with exactly the size its safetensors header implies (8 + header + last data offset).
+The marker gets one line: "ok <dir to load from>", "fail preflight: <what>" (the solver then keeps the fallback
+submission), or "fail <reason>" (copy failed; the solver loads from <src>).
 """
+import json
 import os
 import shutil
+import struct
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -49,13 +56,49 @@ def warm_one(src, _dst, rel):
             pass
 
 
+def expected_size(path):
+    """File size implied by a safetensors header: 8 + header length + the largest tensor end offset."""
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n))
+    ends = [v["data_offsets"][1] for k, v in hdr.items() if k != "__metadata__"]
+    return 8 + n + (max(ends) if ends else 0)
+
+
+def preflight(d):
+    """None if the checkpoint at d looks complete, else a short description of what is wrong."""
+    for name in ("config.json", "tokenizer.json", "model.safetensors.index.json"):
+        if not os.path.isfile(os.path.join(d, name)):
+            return f"missing {name}"
+    files = sorted(set(json.load(open(os.path.join(d, "model.safetensors.index.json")))["weight_map"].values()))
+    cfg = json.load(open(os.path.join(d, "config.json")))
+    layers = cfg.get("num_hidden_layers") or (cfg.get("text_config") or {}).get("num_hidden_layers") or 0
+    if not layers:
+        return "config.json has no num_hidden_layers (top level or text_config)"
+    if os.path.isdir(os.path.join(d, "gptq")):
+        files += [f"gptq/layer_{i:02d}.safetensors" for i in range(layers)]
+    bad = []
+    for rel in files:
+        p = os.path.join(d, rel)
+        try:
+            if not os.path.isfile(p):
+                bad.append(f"{rel} missing")
+            elif os.path.getsize(p) != expected_size(p):
+                bad.append(f"{rel} size {os.path.getsize(p)} != {expected_size(p)}")
+        except Exception as exc:
+            bad.append(f"{rel} unreadable ({type(exc).__name__})")
+    return None if not bad else f"{len(bad)} of {len(files)} files bad: {'; '.join(bad[:4])}"
+
+
 def main():
     src, dst, marker, mode = sys.argv[1:5]
     threads = int(sys.argv[5]) if len(sys.argv) > 5 else 16
     t0 = time.time()
     try:
         if mode == "none":
-            open(marker, "w").write(f"ok {src}\n")
+            bad = preflight(src)
+            open(marker, "w").write(f"fail preflight: {bad}\n" if bad else f"ok {src}\n")
+            print(f"preflight {'FAILED: ' + bad if bad else 'ok'}", flush=True)
             return
         fl = files(src)
         total = sum(s for _, s in fl)
@@ -77,7 +120,14 @@ def main():
                 raise RuntimeError(f"size mismatch: {bad[:3]}")
         el = time.time() - t0
         print(f"{mode} done: {total / 2**30:.1f} GiB in {el:.0f}s ({total / 2**20 / max(el, 1):.0f} MiB/s)", flush=True)
-        open(marker, "w").write(f"ok {dst if mode == 'copy' else src}\n")
+        target = dst if mode == "copy" else src
+        bad = preflight(target)
+        if bad:
+            print(f"preflight FAILED: {bad}", flush=True)
+            open(marker, "w").write(f"fail preflight: {bad}\n")
+            return
+        print(f"preflight ok: {target}", flush=True)
+        open(marker, "w").write(f"ok {target}\n")
     except Exception as exc:
         open(marker, "w").write(f"fail {type(exc).__name__}: {exc}\n")
         raise

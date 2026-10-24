@@ -7,7 +7,47 @@ Quality: the 120 ARC-AGI-2 eval tasks with the same harness, full vs pruned on t
 The plan pack (the user's upload, unzipped) is in `plan/` (START_HERE.md, REAP_IMPLEMENTATION_CONTRACT.md,
 TASKS_ENGRAM_FIRST.md, ...). Deployment counterpart: E042 (session dsv4-infer).
 
-## E112 2-bit tool round (2026-10-24 18:00 UTC, running)
+## Wrap-up (2026-10-24 22:45 UTC)
+
+| deliverable | where | checks |
+|---|---|---|
+| tool E128 2-bit, **Kaggle Model** (for today's submission) | `chankhavu/dsv41-flash-1017-arc-tool-e128-2bit/pyTorch/default/1`, private | see below |
+| tool E112 2-bit, HF | `chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-E112-2bit`, private, 124.9 GB, files <= 5 GB | see below |
+| tool E128 2-bit, HF (unchanged, older layout with 35 GB Engram files) | `chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-E128-2bit` | verified earlier |
+
+- **E128 Kaggle Model:** 136 files, 131,090,956,542 bytes; every safetensors file is at most 5 GB (largest
+  4,998,951,584).
+  - Built by `scripts/build_kaggle_e128.sh`:
+    - backbone resharded;
+    - Engram as the E112 export's row-chunk files, which were split from this export's Engram;
+    - `gptq/` uploaded as a tar archive, which Kaggle unpacks;
+    - serving patches and model card added.
+  - Before upload, `scripts/verify_reshard_equiv.py` sha256-matched every original tensor of the HF E128 export.
+  - After upload, `scripts/kaggle_verify_model.py` matched all 136 paths and sizes on Kaggle (22:38 UTC). The two
+    `__pycache__/*.pyc` files are skipped by the kaggle CLI.
+  - sha256 manifest: `results/kaggle_e128_manifest.json`, which dsv4-infer uses to verify its download.
+  - Upload ran 21:53-22:21 UTC at 65-100 MB/s; Kaggle processing took ~16 min.
+- **Serving parity of both row-chunked layouts** (`scripts/chain_parity_chunked.sh`; real vLLM TP4 with the v3
+  row-chunk loader; 64 tool dev traces):
+
+  | checkpoint | dev NLL | reference | tool-block NLL |
+  |---|---:|---:|---:|
+  | E112 HF export | 0.82336 | 0.82330 (runtime masks) | 0.1573 (0.1577) |
+  | E128 Kaggle copy | 0.79650 | 0.79640 (HF export) / 0.79652 (runtime masks) | 0.1493 (0.1490) |
+
+  First-turn probe (25 tool calls): 24/25 valid for both, the same as runtime masks.
+
+- **Final model choice for today (user decision input):** E128.
+  - Single-process E112 is 70.2% pass@1 / 78.1% pass@2, against E128's 72.8% / 82.5%.
+  - E112's ~17% higher L4 rate (~41 vs ~35 attempts/h at its own attempt length) roughly offsets that, so the
+    trade is a wash.
+  - E112 also carries the unexplained second-process drop.
+- **Not done:**
+  - a rerun of the failed attempt-1 pairs under the old vs a fresh salt (the salt is mostly ruled out by r3);
+  - an E112 single-process accuracy run on real L4;
+  - healing the identifier typos.
+
+## E112 2-bit tool round (2026-10-24 18:00-22:45 UTC, done)
 
 The user restarted the 8x box (~17:55 UTC). New plan: find the best Kaggle serving configuration. First step: a
 tool E112 2-bit model built like tool E128, then its pass@1 and pass@2. The partial full-reference and E96 64-turn
@@ -140,6 +180,42 @@ runs are not resumed.
     - The remaining difference: attempt 1 ran entirely in a second process beside attempt 0's tail.
     - **Clean rerun:** `e112t_w10_u2_gptq_eng64_sub80_r2`, started 20:47 UTC: one process, current code, a third
       independent attempt.
+- **E112 reruns and the second-process effect (2026-10-24 20:47-22:30 UTC):**
+
+  | single attempt, 167 pairs | started | harness | correct | pass@1 |
+  |---|---|---|---:|---:|
+  | E112 attempt 0 | servers quiet (19:24) | `--token-exact`, pre-audit (69 attempts on the chat path) | 116 | 70.7% |
+  | E112 r2 | servers quiet (20:47), fresh salt | pre-audit `--token-exact` | 114 | 69.7% |
+  | E112 attempt 1 | beside a running E112 process (19:32), old salt | pre-audit `--token-exact` | 95 | 58.9% |
+  | E112 r3 | beside a running E112 process (21:32), fresh salt | post-audit `--token-exact` | 101 | 62.5% |
+  | E128 attempt 0 / 1 | normal | chat path | 119 / 121 | 73.6% / 72.1% |
+
+  - **Clean E112** (attempt 0 + r2): pass@1 70.2%, pass@2 78.1% (128/167). E128 is 72.8% / 82.5% (136/167) and
+    E96 is 64.9% / 75.8%. r2 vs attempt 0, one-sided: 12 vs 14.
+  - **Both weak runs were the second harness process, started while another E112 run was busy** (~105-130
+    streams per server).
+    - The code version (pre / post audit) and the cache salt (old / fresh) are not the common factor.
+    - dsv4-infer's split of attempt 1: attempt-0 jobs that ran in the same overlap window stayed near E128. So it
+      is not a plain "everything under load is worse".
+    - Every recorded setting, launch command, environment and harness model path is identical. vLLM did not log
+      request parameters.
+    - **The mechanism is open.** Single-process runs are the reliable measurements.
+  - **Load numerics probe** (`scripts/load_numerics_probe.py`): greedy-decode 256 tokens at a given server load,
+    then score the same ids in one idle prefill.
+
+    | decoded at | median gap (nats) | mean | p99 |
+    |---|---:|---:|---:|
+    | idle | 0.0001 | 0.030 | 0.32 |
+    | ~85 streams | 0.0002 | 0.030 | 0.33 |
+    | ~110 streams (130 concurrent) | 0.0008 | 0.034 | 0.34 |
+
+    The decode numbers barely move with load: no evidence for a load-dependent kernel bug.
+  - **r3 confirms the post-audit harness at scale:**
+    - 0 errors and 2 rescues, against r2's 84;
+    - 12 non-canonical turns re-rendered;
+    - the same Python-error share (29.7% vs 30.3%).
+  - **Breaks avoided by `--token-exact`** (fixed counter, r2): 1,248 of 3,309 turns (38%) re-tokenized
+    differently from what was sampled.
 - **Code audit (user request, 2026-10-24 ~21:00 UTC; two independent read-only sub-agents):**
   - **Harness:** no code cause for E112's attempt-1 gap.
     - Both processes sent identical first prompts and sampling (temperature, top_p, salt, max_tokens).

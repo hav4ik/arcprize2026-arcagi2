@@ -23,7 +23,18 @@ with open(f"{WORK}/submission.json.tmp", "w") as f:
     json.dump(_fb, f)
 os.replace(f"{WORK}/submission.json.tmp", f"{WORK}/submission.json")
 print(f"mode {MODE}; fallback submission for {len(_tasks)} tasks written at +{time.time() - T0:.0f}s", flush=True)
-KIT = os.environ.get("ARC_KIT") or os.path.dirname(find_one(f"{INPUT}/**/solver_dsv41.py"))
+# The kit dataset is one tarball (Kaggle datasets do not keep nested folders reliably): unpack and check sha256.
+KIT = os.environ.get("ARC_KIT")
+if not KIT:
+    import hashlib, tarfile
+    _tgz = find_one(f"{INPUT}/**/dsv41_kit.tgz")
+    KIT = f"{SCRATCH}/kit"
+    with tarfile.open(_tgz) as tf:
+        tf.extractall(KIT)
+    _man = json.load(open(f"{KIT}/MANIFEST.json"))
+    _bad = [f for f, h in _man.items() if hashlib.sha256(open(f"{KIT}/{f}", "rb").read()).hexdigest() != h]
+    assert not _bad, f"kit files differ from MANIFEST: {_bad[:5]}"
+    print(f"kit unpacked from {_tgz}: {len(_man)} files, sha256 ok", flush=True)
 MODEL_SRC = os.environ.get("ARC_MODEL_SRC") or (os.path.dirname(find_one(f"{INPUT}/**/e043_manifest.json") or "") or None)
 print("kit", KIT, "| model", MODEL_SRC, flush=True)
 
@@ -86,6 +97,13 @@ if MODE != "fallback" and not os.environ.get("ARC_SKIP_INSTALL"):
     BASE_ENV = dict(os.environ)
     BASE_ENV.update(CUDA_HOME=shim, CUDA_PATH=shim, PATH=f"{V}/bin:{shim}/bin:" + os.environ["PATH"],
                     LD_LIBRARY_PATH=os.environ.get("LD_LIBRARY_PATH", "") + f":{shim}/lib64")
+    rc, out = sh(f'nvcc --version | tail -1; {PY} -c "import torch, vllm, flashinfer, importlib.metadata as m; '
+                 f'print(torch.__version__, torch.cuda.device_count(), vllm.__version__, flashinfer.__version__, '
+                 f'm.version(\'humming-kernels\'))"', timeout=900, env=BASE_ENV)
+    print("toolchain / imports:", rc, out[-600:], flush=True)
+    rc, out = sh("free -g | head -2; df -h /tmp /kaggle/working | tail -2; nproc; "
+                 "cat /sys/fs/cgroup/memory.max 2>/dev/null; grep -m1 'model name' /proc/cpuinfo", timeout=60)
+    print(out, flush=True)
 BASE_ENV.pop("DSV41_SYNTH_INIT", None)  # the overlay's synthetic init must stay off for real weights
 # FlashInfer's sampling module cannot JIT on the Kaggle image (E042 K-runs); vLLM's PyTorch sampler instead.
 BASE_ENV["VLLM_USE_FLASHINFER_SAMPLER"] = "0"

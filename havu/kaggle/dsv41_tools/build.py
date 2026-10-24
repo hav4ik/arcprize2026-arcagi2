@@ -61,7 +61,18 @@ with open(f"{WORK}/submission.json.tmp", "w") as f:
     json.dump(_fb, f)
 os.replace(f"{WORK}/submission.json.tmp", f"{WORK}/submission.json")
 print(f"mode {MODE}; fallback submission for {len(_tasks)} tasks written at +{time.time() - T0:.0f}s", flush=True)
-KIT = os.environ.get("ARC_KIT") or os.path.dirname(find_one(f"{INPUT}/**/solver_dsv41.py"))
+# The kit dataset is one tarball (Kaggle datasets do not keep nested folders reliably): unpack and check sha256.
+KIT = os.environ.get("ARC_KIT")
+if not KIT:
+    import hashlib, tarfile
+    _tgz = find_one(f"{INPUT}/**/dsv41_kit.tgz")
+    KIT = f"{SCRATCH}/kit"
+    with tarfile.open(_tgz) as tf:
+        tf.extractall(KIT)
+    _man = json.load(open(f"{KIT}/MANIFEST.json"))
+    _bad = [f for f, h in _man.items() if hashlib.sha256(open(f"{KIT}/{f}", "rb").read()).hexdigest() != h]
+    assert not _bad, f"kit files differ from MANIFEST: {_bad[:5]}"
+    print(f"kit unpacked from {_tgz}: {len(_man)} files, sha256 ok", flush=True)
 MODEL_SRC = os.environ.get("ARC_MODEL_SRC") or (os.path.dirname(find_one(f"{INPUT}/**/e043_manifest.json") or "") or None)
 print("kit", KIT, "| model", MODEL_SRC, flush=True)
 '''
@@ -128,6 +139,13 @@ if MODE != "fallback" and not os.environ.get("ARC_SKIP_INSTALL"):
     BASE_ENV = dict(os.environ)
     BASE_ENV.update(CUDA_HOME=shim, CUDA_PATH=shim, PATH=f"{V}/bin:{shim}/bin:" + os.environ["PATH"],
                     LD_LIBRARY_PATH=os.environ.get("LD_LIBRARY_PATH", "") + f":{shim}/lib64")
+    rc, out = sh(f'nvcc --version | tail -1; {PY} -c "import torch, vllm, flashinfer, importlib.metadata as m; '
+                 f'print(torch.__version__, torch.cuda.device_count(), vllm.__version__, flashinfer.__version__, '
+                 f'm.version(\'humming-kernels\'))"', timeout=900, env=BASE_ENV)
+    print("toolchain / imports:", rc, out[-600:], flush=True)
+    rc, out = sh("free -g | head -2; df -h /tmp /kaggle/working | tail -2; nproc; "
+                 "cat /sys/fs/cgroup/memory.max 2>/dev/null; grep -m1 'model name' /proc/cpuinfo", timeout=60)
+    print(out, flush=True)
 BASE_ENV.pop("DSV41_SYNTH_INIT", None)  # the overlay's synthetic init must stay off for real weights
 # FlashInfer's sampling module cannot JIT on the Kaggle image (E042 K-runs); vLLM's PyTorch sampler instead.
 BASE_ENV["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
@@ -179,6 +197,14 @@ print(f"done at +{(time.time() - T0) / 3600:.2f}h", flush=True)
 '''
 
 CELLS = [CELL_SETUP, CELL_STAGE, CELL_INSTALL, CELL_RUN, CELL_FINISH]
+# The smoke variant runs the whole pipeline on its commit: 6 tasks, deadlines at 60 / 75 / 85 min.
+SMOKE_ENV = r'''
+import os
+for _k, _v in (("ARC_COMMIT_MODE", "smoke"), ("ARC_TASK_LIMIT", "6"), ("ARC_STOP_NEW_S", "3600"),
+               ("ARC_FORCE_AT_S", "4500"), ("ARC_HARD_STOP_S", "5100"), ("ARC_RESTART_MIN_LEFT_S", "1200")):
+    os.environ.setdefault(_k, _v)
+'''
+MODEL_SOURCES = ["chankhavu/dsv41-flash-1017-arc-tool-e128-2bit/pyTorch/default/1"]
 
 
 def sha(p):
@@ -198,25 +224,38 @@ def build_kit():
         shutil.copy2(HERE / "kit" / name, kit / name)
     manifest = {str(p.relative_to(kit)): sha(p) for p in sorted(kit.rglob("*")) if p.is_file()}
     (kit / "MANIFEST.json").write_text(json.dumps(manifest, indent=1))
-    (kit / "dataset-metadata.json").write_text(json.dumps({
+    # Kaggle dataset dir: the kit as one tarball (+ the manifest beside it for inspection).
+    ds = OUT / "kit_ds"
+    shutil.rmtree(ds, ignore_errors=True)
+    ds.mkdir(parents=True)
+    import tarfile
+    with tarfile.open(ds / "dsv41_kit.tgz", "w:gz") as tf:
+        for p in sorted(kit.rglob("*")):
+            if p.is_file():
+                tf.add(p, arcname=str(p.relative_to(kit)))
+    shutil.copy2(kit / "MANIFEST.json", ds / "MANIFEST.json")
+    (ds / "dataset-metadata.json").write_text(json.dumps({
         "title": KIT_SLUG, "id": f"{USER}/{KIT_SLUG}", "licenses": [{"name": "other"}]}, indent=1))
     return manifest
 
 
-def build_notebook():
-    nb = OUT / "nb"
+def build_notebook(variant="submit", with_model=True):
+    slug = NB_SLUG if variant == "submit" else "dsv41-tools-smoke"
+    nb = OUT / f"nb_{variant}"
     shutil.rmtree(nb, ignore_errors=True)
     nb.mkdir(parents=True)
+    cells_src = ([SMOKE_ENV] if variant == "smoke" else []) + CELLS
     cells = [{"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
-              "source": c.strip("\n").splitlines(keepends=True)} for c in CELLS]
-    (nb / f"{NB_SLUG}.ipynb").write_text(json.dumps({
+              "source": c.strip("\n").splitlines(keepends=True)} for c in cells_src]
+    (nb / f"{slug}.ipynb").write_text(json.dumps({
         "cells": cells, "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
                                      "language_info": {"name": "python"}}, "nbformat": 4, "nbformat_minor": 5}, indent=1))
     (nb / "kernel-metadata.json").write_text(json.dumps({
-        "id": f"{USER}/{NB_SLUG}", "title": NB_SLUG, "code_file": f"{NB_SLUG}.ipynb", "language": "python",
+        "id": f"{USER}/{slug}", "title": slug, "code_file": f"{slug}.ipynb", "language": "python",
         "kernel_type": "notebook", "is_private": True, "enable_gpu": True, "enable_tpu": False,
         "enable_internet": False, "dataset_sources": [f"{USER}/{KIT_SLUG}"], "kernel_sources": [WHEELS_KERNEL],
-        "competition_sources": [COMPETITION], "model_sources": [], "docker_image": DOCKER,
+        "competition_sources": [COMPETITION], "model_sources": MODEL_SOURCES if with_model else [],
+        "docker_image": DOCKER,
         "docker_image_pinning_type": "original", "machine_shape": "NvidiaL4"}, indent=1))
     (OUT / "local_run.py").write_text(
         '"""The notebook cells as one script, for the Runpod pods (ARC_* environment variables set the paths)."""\n'
@@ -224,10 +263,13 @@ def build_notebook():
 
 
 def main():
+    import sys
+    with_model = "--no-model" not in sys.argv
     manifest = build_kit()
-    build_notebook()
+    build_notebook("submit", with_model)
+    build_notebook("smoke", with_model)
     print(f"kit: {len(manifest)} files -> {OUT / 'kit'}; notebook -> {OUT / 'nb'}; local runner -> {OUT / 'local_run.py'}")
-    print("NOTE: the model dataset is not attached yet (not uploaded); add it to kernel-metadata model/dataset sources.")
+    print(f"model sources: {MODEL_SOURCES if with_model else 'none (--no-model)'}")
 
 
 if __name__ == "__main__":

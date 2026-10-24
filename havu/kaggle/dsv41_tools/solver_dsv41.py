@@ -23,6 +23,7 @@ One process does everything after the vLLM install (the notebook installs the fo
    ARC_MAX_SERVER_RESTARTS times, if enough time is left) and errored attempts are queued again (each job at most
    ARC_JOB_TRIES times).
 7. SIGTERM / SIGINT: write the submission, stop the server, exit.
+7b. Wrap-up: within ARC_WRAPUP_S of the force deadline, tool outputs carry a "N min left: submit now" note.
 8. Second attempts: once every pair's attempt 0 has started, attempt-1 jobs go to pairs without a train-passing
    answer first and to train-passed pairs last (`pick`).
 9. Admission (Nguyen's min-request-tokens): a new attempt starts only if (force deadline - now) x the median
@@ -59,7 +60,7 @@ SOLUTIONS = E("ARC_SOLUTIONS", "")
 VLLM = E("ARC_VLLM", "/tmp/dsv41/venv/bin/vllm")
 TOOL_PYTHON = E("ARC_TOOL_PYTHON", sys.executable)
 PORT = int(E("ARC_PORT", "8100"))
-WORKERS = int(E("ARC_WORKERS", "40"))
+WORKERS = int(E("ARC_WORKERS", "48"))  # E128 x 56 on pod B: KV 0.64 after 57 min and rising; 48 keeps headroom
 MAX_TURNS = int(E("ARC_MAX_TURNS", "40"))
 STOP_NEW_S = float(E("ARC_STOP_NEW_S", 10 * 3600 + 50 * 60))
 FORCE_AT_S = float(E("ARC_FORCE_AT_S", 11 * 3600 + 10 * 60))
@@ -68,6 +69,9 @@ UP_TIMEOUT_S = float(E("ARC_SERVER_UP_TIMEOUT_S", 3000))
 MAX_RESTARTS = int(E("ARC_MAX_SERVER_RESTARTS", "1"))
 RESTART_MIN_LEFT_S = float(E("ARC_RESTART_MIN_LEFT_S", 2700))
 JOB_TRIES = int(E("ARC_JOB_TRIES", "2"))
+CONN_TRIES = int(E("ARC_CONN_TRIES", "4"))  # extra re-queues for attempts lost to a server outage (not counted above)
+CONN_ERRORS = ("Connection", "ConnectError", "RemoteProtocolError", "ReadError", "Server disconnected",
+               "Incomplete stream", "Connection refused", "ReadTimeout")
 TASK_LIMIT = int(E("ARC_TASK_LIMIT", "0"))
 ATTEMPTS = int(E("ARC_ATTEMPTS", "2"))
 LOOP_WINDOW = int(E("ARC_LOOP_WINDOW", "1000"))
@@ -79,6 +83,7 @@ LOOP_RATIO = float(E("ARC_LOOP_RATIO", "8"))
 LOOP_CONFIRM = int(E("ARC_LOOP_CONFIRM", "10"))
 EXEC_MEM_MB = int(E("ARC_EXEC_MEM_MB", "4096"))
 SALT = E("ARC_CACHE_SALT", "kaggle")
+WRAPUP_S = float(E("ARC_WRAPUP_S", "900"))  # wall-clock note in tool outputs this long before the force deadline
 MIN_ATTEMPT_TOKENS = float(E("ARC_MIN_ATTEMPT_TOKENS", "30000"))  # admission: time left x per-stream rate
 STAGE_DONE = E("ARC_STAGE_DONE", "")  # marker file written by the notebook's model-staging copy
 STAGE_WAIT_S = float(E("ARC_STAGE_WAIT_S", "2400"))
@@ -436,6 +441,18 @@ def force_sweep():
 
 def make_args():
     import run_deepseek_tools as h
+    # Wall-clock wrap-up (Nguyen's finalization window): within WRAPUP_S of the force deadline, every tool output
+    # also says how long is left, so running attempts submit before the cut instead of falling back to `answer`.
+    orig = h.budget_note
+
+    def budget_note(args, used):
+        note = orig(args, used)
+        left = FORCE_AT_S - elapsed()
+        if 0 < left < WRAPUP_S:
+            note += (f"\n[time: about {max(1, round(left / 60))} min left for this task: submit your best answer now "
+                     "with submit_answer, or at least set `answer`.]")
+        return note
+    h.budget_note = budget_note
     return h.parser().parse_args(HARNESS + ["--max-turns", str(MAX_TURNS), "--base-url", URL + "/v1",
                                             "--extra-body", json.dumps(EXTRA_BODY), "--sandbox-url", "local",
                                             "--attempts", str(ATTEMPTS)])
@@ -499,13 +516,67 @@ def score(tasks):
     return hit, pairs
 
 
+METRIC_KEYS = ("generation_tokens_total", "prefix_cache_hits_total", "prefix_cache_queries_total",
+               "kv_cache_usage_perc", "num_requests_running", "num_requests_waiting", "num_preemptions_total")
+METRICS_EVERY_S = float(E("ARC_METRICS_EVERY_S", "300"))
+
+
+def server_metrics():
+    """The server's Prometheus counters we track (first sample of each name), or None if unreachable."""
+    try:
+        with urllib.request.urlopen(URL + "/metrics", timeout=5) as r:
+            text = r.read().decode(errors="replace")
+    except Exception:
+        return None
+    m = {"t": time.time()}
+    for line in text.splitlines():
+        if line.startswith("vllm:"):
+            name = line.split("{", 1)[0].split(" ", 1)[0][5:]
+            if name in METRIC_KEYS and name not in m:
+                try:
+                    m[name] = float(line.rsplit(" ", 1)[1])
+                except ValueError:
+                    pass
+    return m
+
+
+def throughput():
+    """Generated tok/s and prefix-cache hit rate since the previous call (TPS log every METRICS_EVERY_S)."""
+    cur = server_metrics()
+    if cur is None:
+        return None
+    prev, STATE["metrics"] = STATE.get("metrics"), cur
+    if prev is None or cur["t"] - prev["t"] < 1:
+        return None
+    dt = cur["t"] - prev["t"]
+    d = lambda k: cur.get(k, 0.0) - prev.get(k, 0.0)
+    q = d("prefix_cache_queries_total")
+    return {"window_s": round(dt), "gen_tok_s": round(d("generation_tokens_total") / dt, 1),
+            "prefix_hit": round(d("prefix_cache_hits_total") / q, 3) if q > 0 else None,
+            "uncached_tok_s": round((q - d("prefix_cache_hits_total")) / dt, 1),
+            "kv": round(cur.get("kv_cache_usage_perc", 0.0), 3), "srv_running": cur.get("num_requests_running"),
+            "srv_waiting": cur.get("num_requests_waiting"), "preemptions": cur.get("num_preemptions_total")}
+
+
 def status(tasks, queue, running, done, errors):
     try:
-        atomic_json(LOG / "status.json", {
-            "elapsed_h": round(elapsed() / 3600, 3), "phase": STATE["phase"], "server_ok": STATE["server_ok"],
-            "restarts": STATE["restarts"], "queued": len(queue), "running": len(running), "done": done,
-            "errors": errors, "pairs_with_answer": sum(1 for v in RECORDS.values() if any(r.get("pred") for r in v)),
-            "pairs": sum(len(x["test"]) for x in tasks.values())})
+        st = {"elapsed_h": round(elapsed() / 3600, 3), "phase": STATE["phase"], "server_ok": STATE["server_ok"],
+              "restarts": STATE["restarts"], "queued": len(queue), "running": len(running), "done": done,
+              "errors": errors, "pairs_with_answer": sum(1 for v in RECORDS.values() if any(r.get("pred") for r in v)),
+              "pairs": sum(len(x["test"]) for x in tasks.values())}
+        if STATE["server_ok"] and time.time() - STATE.get("metrics_logged", 0) >= METRICS_EVERY_S:
+            tp = throughput()
+            if tp:
+                STATE["metrics_logged"] = time.time()
+                STATE["last_tp"] = tp
+                tp["elapsed_h"], tp["done"], tp["running"] = st["elapsed_h"], done, len(running)
+                with open(LOG / "metrics.jsonl", "a") as f:
+                    f.write(json.dumps(tp) + "\n")
+                log(f"server: {tp['gen_tok_s']} gen tok/s, prefix hits {tp['prefix_hit']}, uncached "
+                    f"{tp['uncached_tok_s']} tok/s, KV {tp['kv']}, running {tp['srv_running']}, waiting "
+                    f"{tp['srv_waiting']}, preemptions {tp['preemptions']} (last {tp['window_s']} s); {done} attempts done")
+        st["server"] = STATE.get("last_tp")
+        atomic_json(LOG / "status.json", st)
     except Exception:
         pass
 
@@ -545,6 +616,9 @@ def main():
         log(f"model staging: {staged or 'not finished'} after {time.time() - t:.0f}s wait")
         if staged.startswith("ok "):
             model = staged.split(" ", 1)[1]
+        elif staged.startswith("fail preflight"):
+            log("checkpoint pre-flight failed; not starting the server, keeping the fallback submission")
+            return
     STATE["model"] = model
     args = make_args()
 
@@ -563,6 +637,7 @@ def main():
     order = sorted(tasks, key=lambda t: size[t])
     queue = [(t, p, a, 0) for a in range(ATTEMPTS) for t in order for p in range(len(tasks[t]["test"]))]
     running, done, errors = {}, 0, 0
+    conn_retries = {}  # (task, pair, attempt) -> re-queues after server-side connection errors
     rates = []  # completion tokens per wall second of finished, uncut attempts
     STATE["phase"] = "attempts"
     pool = ThreadPoolExecutor(WORKERS)
@@ -595,7 +670,10 @@ def main():
                     STATE["admission_closed"] = True
                     log(f"admission closed: {(FORCE_AT_S - elapsed()) / 60:.0f} min x {rate:.1f} tok/s per stream "
                         f"< {MIN_ATTEMPT_TOKENS:.0f} tokens; {len(queue)} jobs left unstarted")
+            # Only while the server process is alive: an attempt started against a dead server fails in 0.2 s with
+            # "connection refused" (T2, 2026-10-24).
             while (queue and len(running) < WORKERS and STATE["server_ok"] and not STATE["forced"]
+                   and STATE["server"] is not None and STATE["server"].poll() is None
                    and elapsed() < STOP_NEW_S and not STATE.get("admission_closed")):
                 t, p, a, tries = queue.pop(pick(queue))
                 running[pool.submit(run_attempt, args, tasks[t], t, p, a)] = (t, p, a, tries)
@@ -614,6 +692,15 @@ def main():
                            "pred": None, "tb": traceback.format_exc()[-1500:]}
                 with open(LOG / "attempts.jsonl", "a") as f:
                     f.write(json.dumps({k: v for k, v in rec.items() if k != "content"}) + "\n")
+                key = (t, p, a)
+                if (rec.get("error") and rec.get("pred") is None and not STATE["forced"]
+                        and any(c in rec["error"] for c in CONN_ERRORS) and conn_retries.get(key, 0) < CONN_TRIES):
+                    # Lost to the server (died, restarting, or dropped the stream): re-queue without using a try.
+                    conn_retries[key] = conn_retries.get(key, 0) + 1
+                    errors += 1
+                    queue.insert(0, (t, p, a, tries))
+                    log(f"re-queue {t}.{p}#{a} after a server-side error ({conn_retries[key]}): {rec['error'][:120]}")
+                    continue
                 if rec.get("error") and rec.get("pred") is None and tries + 1 < JOB_TRIES and not STATE["forced"]:
                     errors += 1
                     queue.insert(0, (t, p, a, tries + 1))

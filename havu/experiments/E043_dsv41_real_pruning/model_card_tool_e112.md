@@ -54,16 +54,29 @@ Run each patch script with `<site-packages>/vllm` as its argument; both are idem
   rows equal the original checkpoint's rows at the kept ids.
 - **Dev NLL** with runtime masks on the full checkpoint (64 family-disjoint dev tool traces, generated tokens): **0.8233 (+15.5% vs the full model)**; tool-block NLL 0.158, tool-block top-1 94.5%.
   - For reference: full model 0.7130; tool E128 2-bit 0.7965 (+11.7%); tool E96 2/3-bit 0.8318 (+16.7%).
-- **Parity:** the serving-parity check of this export (NLL from this file layout vs the runtime masks) runs after the
-  ARC eval, and its result will be added here.
+- **Serving parity of this file layout** (row-chunked Engram through the `serving/` loader, vLLM TP4, 2026-10-24):
+  dev NLL 0.82336 vs 0.82330 with runtime masks on the full checkpoint; tool-block NLL 0.1573 vs 0.1577.
 
 ## Quality
 
-ARC-AGI-2 eval with the tool harness (120 tasks / 167 pairs, 2 attempts): **running**. Results will be added here.
-- Harness: `persistent-v6` with sub80s40 + minimal effort header: 80k total output, 40k soft budget, 64k per turn,
-  40 turns, `--rescue-code`, temperature 1.0.
-- The same harness gave: full model (DeepSeek API) pass@1 74.5%, pass@2 84.9%; tool E128 2-bit 72.8% / 82.5%.
-- The 120 eval tasks are used only for scores, never for pruning choices.
+ARC-AGI-2 eval, 120 tasks / 167 pairs, tool harness `persistent-v6` with sub80s40 + minimal effort header (80k total
+output, 40k soft budget, 64k per turn, 40 turns, `--rescue-code`, `--token-exact`, temperature 1.0). The 120 eval
+tasks were used only for scores, never for pruning choices.
+
+| model | pass@1 | pass@2 | correct attempts | Python-error tool calls |
+|---|---:|---:|---:|---:|
+| full model (DeepSeek API) | 74.5% | 84.9% (142/167) | 247/334 | 2.3% |
+| tool E128 2-bit | 72.8% | 82.5% (136/167) | 240/334 | 14% |
+| **this checkpoint, single-process runs** (attempt 0 + rerun r2) | **70.2%** | **78.1% (128/167)** | 230/334 | 29% |
+| this checkpoint, official file (attempt 0 + attempt 1) | 64.8% | 75.6% (124/167) | 211/334 | 29% |
+
+- Single attempts: 116 and 114 of 167 when the eval process ran alone; 95 and 101 when the process was started next
+  to another running E112 eval on the same two servers (attempt 1, rerun r3). Every recorded setting was identical;
+  the cause is not found (not the masks, the code version, the cache salt, the sandbox, or measurable load numerics).
+  The single-process numbers are the reliable ones.
+- About 29% of tool calls raise Python errors (identifier typos such as `coms` for `comps`), about twice the E128
+  model's rate. The model recovers from them, at about 3 extra tool calls per attempt, and hits the 40-turn cap more
+  often on hard tasks.
 
 ## 4xL4 footprint (estimate from the shapes, not measured)
 
