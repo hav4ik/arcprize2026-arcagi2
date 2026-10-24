@@ -6,6 +6,7 @@
 #   env: WORKERS (48), SANDBOX (http://172.18.0.4:6000), BASE (http://127.0.0.1:18000/v1),
 #        PRESET: s20x60 (default; 60k total, 20k soft, strong wording) or sub80s40 (80k total, 40k soft; E030
 #        "sub80s40 + header", the best-accuracy API config: pass@2 84.9% vs 80.3%). Both use the minimal effort header.
+#        SAMPLING: sampler JSON fields (default "temperature":1.0,"top_p":1.0), e.g. '"temperature":1.0,"min_p":0.05'.
 # Effort: integer 50 (= encoding.py's "low"), the same prefix the calibration rollouts were tokenized with.
 set -euo pipefail
 ROOT=/home/vu/Workspace/ARC-AGI-2
@@ -17,7 +18,7 @@ case "${PRESET:-s20x60}" in
   *) echo "unknown PRESET ${PRESET}" >&2; exit 2 ;;
 esac
 # SALT: per-run cache_salt so a runtime-mask server never reuses prefixes cached under another mask.
-EXTRA='{"chat_template_kwargs":{"thinking":true,"reasoning_effort":50},"temperature":1.0,"top_p":1.0,"cache_salt":"'"${SALT:-$TAG}"'"}'
+EXTRA='{"chat_template_kwargs":{"thinking":true,"reasoning_effort":50},'"${SAMPLING:-\"temperature\":1.0,\"top_p\":1.0}"',"cache_salt":"'"${SALT:-$TAG}"'"}'
 ../.venv/bin/python run_deepseek_tools.py --mode grid --effort low --prompt lean2sub --answer-tool \
   --final-mode session --lenient-parse --max-tokens 64000 $BUDGET --budget-notes 0.01 \
   --budget-warn 0.75 --effort-header minimal --turns-note 5 \

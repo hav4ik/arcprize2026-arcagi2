@@ -1,0 +1,269 @@
+{
+  "schema_kind": "adaptive_experiment_specification_not_benchmark_program",
+  "source_contract": "synthetic_contract.json",
+  "first_rental_gpu_count": 4,
+  "wall_hours_core_cap": 4,
+  "wall_hours_optional_extension_cap": 2,
+  "gpu_hours_core_cap": 16,
+  "gpu_hours_total_cap": 24,
+  "time_caps_are_runtime_predictions": false,
+  "entry_requirement": "custom_path_and_environment_prepared_for_device_validation",
+  "priority_order": [
+    "G0",
+    "G1",
+    "S0",
+    "S1",
+    "S2",
+    "S3",
+    "S6",
+    "S4",
+    "S5",
+    "C1_or_C2_or_one_remaining_capacity_question"
+  ],
+  "global_controls": {
+    "primary_experts": 64,
+    "layers": 40,
+    "tp": 4,
+    "ep": false,
+    "pp": 1,
+    "top_k": 6,
+    "scheduled_token_cap": 2048,
+    "language_only": true,
+    "dspark": false,
+    "ced": false,
+    "prefix_cache": false,
+    "initial_gpu_utilization": 0.85,
+    "later_gpu_utilization_ceiling": 0.9,
+    "steady_state_initializer_seed": 20261020,
+    "full_checkpoint_download": false
+  },
+  "timing_protocol": {
+    "real_prefill_required_for_system_cases": true,
+    "warmup_decode_tokens": 64,
+    "tokens_per_timed_window": 256,
+    "exploratory_windows": 1,
+    "selected_comparison_windows": 3,
+    "initial_prompt_formula": "target_final_context - warmup_decode_tokens - timed_windows * tokens_per_timed_window",
+    "example_64k_one_window_initial_prompt": 65216,
+    "example_64k_three_windows_initial_prompt": 64704,
+    "consecutive_windows_are_independent_seed_replicates": false,
+    "fixed_output_count_and_declared_EOS_policy": true,
+    "same_actual_context_intervals_for_paired_comparison": true
+  },
+  "cases": [
+    {
+      "id": "G0",
+      "depends_on": [],
+      "status": "planned_not_run",
+      "priority": "core",
+      "kind": "inventory_and_native_launch",
+      "gpu_count_reserved": 4
+    },
+    {
+      "id": "G1",
+      "depends_on": [
+        "G0"
+      ],
+      "status": "planned_not_run",
+      "priority": "core",
+      "kind": "operator_correctness",
+      "shapes": {
+        "local_query_heads": 16,
+        "experts": 64,
+        "hidden": 5120,
+        "local_tp_intermediate": 576,
+        "top_k": 6
+      },
+      "engram_mode": "E1"
+    },
+    {
+      "id": "S0",
+      "depends_on": [
+        "G1"
+      ],
+      "status": "planned_not_run",
+      "priority": "core",
+      "kind": "full_depth_init_and_short_eager",
+      "experts": 64,
+      "batch_progression": [
+        1,
+        8
+      ],
+      "target_context_progression": [
+        2048,
+        8192
+      ],
+      "engram_mode_progression": [
+        "E0",
+        "E1",
+        "E2"
+      ],
+      "execution": "eager"
+    },
+    {
+      "id": "S1",
+      "depends_on": [
+        "S0"
+      ],
+      "status": "planned_not_run",
+      "priority": "core",
+      "kind": "eager_32k_baseline",
+      "experts": 64,
+      "batch": 8,
+      "target_final_context": 32768,
+      "engram_mode": "E2",
+      "execution": "eager"
+    },
+    {
+      "id": "S2",
+      "depends_on": [
+        "S1"
+      ],
+      "status": "planned_not_run",
+      "priority": "core",
+      "kind": "long_prefill_and_decode",
+      "experts": 64,
+      "batch": 8,
+      "target_final_context": 65536,
+      "engram_mode": "E2",
+      "execution": "eager"
+    },
+    {
+      "id": "S3",
+      "depends_on": [
+        "S1"
+      ],
+      "status": "planned_not_run",
+      "priority": "core",
+      "kind": "paired_eager_graph",
+      "experts": 64,
+      "batch": 16,
+      "target_final_context": 32768,
+      "engram_mode": "E2",
+      "execution_variants": [
+        "eager",
+        "validated_supported_graph_mode"
+      ],
+      "extra_gate": "G1_changed_input_graph_state_fixtures_pass"
+    },
+    {
+      "id": "S4",
+      "depends_on": [
+        "S3"
+      ],
+      "status": "planned_not_run",
+      "priority": "conditional",
+      "kind": "larger_batch",
+      "experts": 64,
+      "batch": 32,
+      "target_final_context": 32768,
+      "engram_mode": "E2",
+      "execution": "accepted_mode",
+      "extra_gate": "measured_worst_rank_margin_and_time",
+      "boundary_batch_if_needed": 24
+    },
+    {
+      "id": "S5",
+      "depends_on": [
+        "S2"
+      ],
+      "status": "planned_not_run",
+      "priority": "conditional",
+      "kind": "selected_batch_long_context",
+      "experts": 64,
+      "batch": null,
+      "batch_selection": "best_already_passed_8_16_or_32_from_S1_S3_S4",
+      "target_final_context": 65536,
+      "engram_mode": "E2",
+      "execution": "accepted_mode",
+      "extra_gate": "selected_setting_already_passed"
+    },
+    {
+      "id": "S6",
+      "depends_on": [
+        "S1"
+      ],
+      "status": "planned_not_run",
+      "priority": "core_before_optional_sweep",
+      "kind": "continuous_mixed_queue",
+      "experts": 64,
+      "batch": null,
+      "batch_selection": "highest_completed_safe_8_16_or_32",
+      "target_total_context_buckets": [
+        8192,
+        32768,
+        65536
+      ],
+      "output_budget_choices": [
+        128,
+        256,
+        512,
+        1024
+      ],
+      "minimum_requests_multiplier_of_B": 3,
+      "minimum_replacement_waves": 2,
+      "new_prefill_during_existing_decode_required": true,
+      "engram_mode": "E2",
+      "execution": "accepted_mode"
+    },
+    {
+      "id": "C1",
+      "depends_on": [
+        "S6"
+      ],
+      "status": "planned_not_run",
+      "priority": "conditional_extension_choose_one_question",
+      "kind": "paired_expert_parallel",
+      "experts": 64,
+      "batch": null,
+      "context": null,
+      "engram_mode": "E2",
+      "expert_parallel_variants": [
+        false,
+        true
+      ],
+      "same_logical_tensors_required": true,
+      "extra_gate": "EP_kernel_dispatch_and_state_correctness",
+      "fixed_parallelism": {
+        "attention_and_dense_TP": 4,
+        "PP": 1,
+        "DP": 1,
+        "local_attention_heads": 16
+      },
+      "EP_enabled_local_routed_experts": 16,
+      "EP_enabled_local_intermediate": 2304
+    },
+    {
+      "id": "C2",
+      "depends_on": [
+        "S6"
+      ],
+      "status": "planned_not_run",
+      "priority": "conditional_extension_choose_one_question",
+      "kind": "larger_candidate_one_point",
+      "experts": 72,
+      "batch_choices": [
+        8,
+        16
+      ],
+      "context_choices": [
+        32768,
+        65536
+      ],
+      "engram_mode": "E2",
+      "extra_gate": "E72_router_MoE_G1_pass_and_measured_headroom"
+    }
+  ],
+  "do_not_expand_initially": [
+    "batch64",
+    "PP4",
+    "new_cache_layout",
+    "DSpark",
+    "CED",
+    "prefix_cache",
+    "independent_SGLang_port",
+    "DeepInfer_SM89_kernel_port"
+  ],
+  "conditional_extension_policy": "Choose one concrete unresolved decision; skip rather than expand a Cartesian sweep.",
+  "stop_rule": "On failed prerequisites record minimal reproducer and skip dependent cases; never substitute a checkpoint download for unfinished synthetic infrastructure."
+}

@@ -1,7 +1,7 @@
 # E028 report: LoRA SFT of Qwen3.8-27B on DeepSeek-V4.1-Flash tool-use rollouts
 
-**Dates:** 2026-10-16 to 2026-10-17. **Status:** trained, exported, quantized, evaluated and audited. A Kaggle
-notebook (v2) is ready as a submission experiment. **Detailed lab notes:** `README.md` in this folder.
+**Dates:** 2026-10-16 to 2026-10-18. **Status:** trained, exported, quantized, evaluated and audited. A Kaggle
+notebook (v2) is ready as a submission experiment, but a submission-pace test (§6.3) puts it well below base. **Detailed lab notes:** `README.md` in this folder.
 
 ## TL;DR
 
@@ -22,6 +22,16 @@ incorrect rollouts both included.
 - SFT − base = −1.8 pp, 95% CI [−16, +12.5], so the difference is inconclusive.
 - The reasoning is healthy and teacher-like, but the model uses more tokens (60k vs 55k for base and 39k for the
   teacher) and often runs to the cap without answering.
+
+**At Kaggle pace it is clearly worse than base** (§6.3). The exact v1 submission setup on our 4×L4, paced like Kaggle,
+scored **23/93 pairs (24.7%)** on the 93 non-dev eval pairs. Base with the v4b solver, run the same way, scored
+**35/93 (37.6%)** and **38/93 (40.9%)** in two samples: paired SFT − mean base = **−14.5 pp, 95% CI [−22.7, −6.5]**. The adaptive per-attempt budget was a
+median 28.8k: 70 of 93 SFT attempts hit it, and only 1 of those was correct. When the model does submit, it is right
+(22/23).
+
+**Caveat (2026-10-19, E040):** the SFT run's vLLM server had `--enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3`. The Kaggle notebooks don't pass these
+flags, and the base v4b runs didn't use them. On the same weights and agent they cut throughput from about 192 to
+143 tok/s, so the SFT attempts got fewer tokens than they would on Kaggle. Treat −14.5 pp as an upper bound on the gap.
 
 **Main cause: our data.**
 - The 64K training context cut every teacher wrap-up. DeepSeek submitted after the 60k "Budget nearly spent" note in
@@ -181,7 +191,14 @@ decimals, and SFT matches step 251 within 0.0003.
 | LoRA adapter | `Qwen3.8-27B-e028-sft-lora` | `lora` |
 | merged BF16 | `Qwen3.8-27B-e028-sft` | `bf16` |
 | ModelOpt FP8 | `Qwen3.8-27B-e028-sft-FP8` | `fp8` |
-| block FP8 (official layout) | `Qwen3.8-27B-e028-sft-FP8block` | `fp8block` |
+| block FP8 (official layout) | `Qwen3.8-27B-e028-sft-FP8block` **(incomplete, see below)** | `fp8block` (complete) |
+
+> **HF block-FP8 upload failed (found 2026-10-18).** The repo holds only 8 of the 18 shards (9.95 GB of ~31 GB). The
+> upload stopped with "Private storage limit reached for org livobereshka": the org's private repos now total exactly
+> 100 GB. The failure was in `box_artifacts/e028/up_fp8block_hf.log` but was missed at the time. The Kaggle `fp8block`
+> variation is complete (all 18 shards) and is what notebook v2 uses. **vLLM 0.23 loads the 8-shard directory without
+> any error**, so a missing shard won't fail loudly anywhere: check every shard in `model.safetensors.index.json`
+> before serving a downloaded model.
 
 ## 5. Evaluation (dev56)
 
@@ -258,8 +275,9 @@ The notebook is `chankhavu/arc2-qwen38-e028-sft-submit`, private.
   1.49M KV tokens, 88–95% cache hits.
 - **Box run of the v2 solver** on its submit path with ~60k budgets: 4/6 on random non-dev eval tasks. Not
   representative: no scipy or IPython in that executor, and a 65k server context.
-- **Recommendation:** submit v2 as an experiment. The leaderboard keeps the best score (v4b scored 19 / 26 / 23).
-  Expect SFT at or below v4b, because at a ~30k cap SFT finished only 8 of 56 dev56 attempts.
+- **Recommendation (made before §6.3):** submit v2 as an experiment. The leaderboard keeps the best score (v4b scored
+  19 / 26 / 23). Expect SFT at or below v4b, because at a ~30k cap SFT finished only 8 of 56 dev56 attempts. The
+  paced 4×L4 test in §6.3 makes "below v4b" the likely outcome.
 
 ### 6.2 Adversarial audit findings (no blockers)
 
@@ -275,6 +293,63 @@ The notebook is `chankhavu/arc2-qwen38-e028-sft-submit`, private.
    - late attempts get budgets they can't finish;
    - the 2-chars-per-token estimate undercounts digit-heavy grids;
    - the self-test should check that scipy and IPython are installed.
+
+### 6.3 Submission-pace test on 4×L4 (E027 session, finished 2026-10-18 03:25 UTC)
+
+**Setup:**
+- Run by the E027 session on the Vast 4×L4 box: notebook v5_sft solver (md5 cad74873) with
+  `kaggle_v5_sft_settings.json`, v1 ModelOpt FP8 on CUTLASS, concurrency 24.
+- All 71 non-dev eval tasks (93 pairs), 1 attempt each.
+- Only the local window was changed, to FORCE 225 / CAP 235 / WALL 250 min, which matches Kaggle's 11 h / 259 pairs.
+- Logs: `experiments/E027_l4_throughput/sft_nb_kaggle/`. The numbers below were re-checked against
+  `arc_logs/attempts_local.jsonl` and the eval solutions.
+
+**Result:** 23/93 pairs = **24.7%** (17.00/71 tasks = 23.9%).
+
+| stop / answer source | attempts | correct |
+|---|---|---|
+| submitted (`submit`) | 23 | **22** |
+| hit the output budget | 70 | 1 |
+| ↳ forced final answer | 31 | 1 |
+| ↳ no answer | 37 | 0 |
+| ↳ salvage / session `solve` | 1 / 1 | 0 / 0 |
+
+- **Budget:**
+  - The adaptive per-attempt share was a median 28.8k tokens, not the 64k ceiling.
+  - Tokens per attempt: median 25.0k, p95 31.9k, max 39.5k.
+  - Wall time per attempt: median 52 min.
+- **Serving:** 159 gen tok/s at ≥20 running (6.65 tok/s per stream), 75% prefix-cache hits, 0 preemptions.
+  - **Caveat (2026-10-19, E040):** this server had `--enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3`, which the Kaggle notebooks don't pass and the base
+    runs below didn't use. On E032 weights with the same agent, they cut throughput from 192 to 143 tok/s. The SFT
+    arm was therefore slower than on Kaggle, and its gap to base is an upper bound.
+**Paired base run** (same box, pairs, pace and concurrency): official Qwen3.8-27B-FP8 with the v4b solver,
+`experiments/E027_l4_throughput/base93_v4b/`, re-checked the same way.
+
+| | score | submitted (correct) | output budget (correct) | mean tokens | gen tok/s | cache hits |
+|---|---|---|---|---|---|---|
+| base (v4b), sample 1 | **35/93 = 37.6%** (28.00/71 tasks) | 41 (32) | 52 (3) | 27.9k | 192 | 82% |
+| base (v4b), sample 2 | **38/93 = 40.9%** (30.50/71 tasks) | 39 (35) | 54 (3) | 29.2k | n/a | 88% |
+| SFT (v5_sft v1) | **23/93 = 24.7%** (17.00/71 tasks) | 23 (22) | 70 (1) | 22.5k | 159 | 75% |
+
+Paired differences, 95% CIs from a task-cluster bootstrap:
+
+| comparison | difference |
+|---|---|
+| base sample 2 − sample 1 (run-to-run noise) | +3.2 pp [−7.1, +13.0] |
+| SFT − base sample 1 | −12.9 pp [−23.3, −2.2] |
+| SFT − base sample 2 | −16.1 pp [−25.0, −7.9] |
+| **SFT − mean of both base samples** | **−14.5 pp [−22.7, −6.5]** |
+
+- Against base sample 1, both solved 18 pairs; base alone 17, SFT alone 5.
+- Base sample 2 is in `experiments/E027_l4_throughput/base93_v4b_s2/`. The score, tokens and CIs were re-checked here.
+- **Other base references** on these pairs, unpaced: E027 base on vLLM 0.31, 47.3%; E020 K3 attempt 0, 37.8% vs SFT
+  24.4% on 90 pairs.
+- **Kaggle v4b probe** (paced, base FP8): 14/29 vs SFT 4/29 on the common pairs.
+
+**Reading:** the model's answers are accurate when it finishes, but at Kaggle pace it rarely finishes inside ~29k. This
+matches §5.3: the 64K training cut removed the teacher wrap-ups, so the model ignores budget notes. v2 (block FP8)
+runs ~25% faster, so its budget would be about 36k, still well short of where this model finishes. **Expect v5
+(either build) below v4b on the leaderboard,** unless the per-attempt share grows a lot.
 
 ## 7. Costs and compute
 
@@ -306,7 +381,9 @@ The notebook is `chankhavu/arc2-qwen38-e028-sft-submit`, private.
   epoch.
 - Harness: no forced submit, budget notes on the training scale, the executor salvage fix (which helps v4b too),
   scipy/IPython in the self-test, exclude `b7999b51`.
-- Evaluate at the Kaggle budget (~30k) with 2+ samples per arm, and compare against K3/v4b, not only base.
+- Evaluate at the Kaggle budget (~30k) with 2+ samples per arm, and compare against K3/v4b, not only base. §6.3 is the
+  first such test, and SFT lost clearly. Budget-aware finishing has to come from the data (full rollouts, wrap-ups
+  after the budget notes), not from the harness.
 
 ## Files
 

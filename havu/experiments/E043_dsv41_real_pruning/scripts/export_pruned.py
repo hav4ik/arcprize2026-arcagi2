@@ -8,6 +8,8 @@ Engram (--engram-keep, packbits per layer): `layers.{1,14}.engram.embed.weight` 
 kept rows in original-id order, plus `layers.{1,14}.engram.embed_tokens.row_map` int32 [num_embeddings] mapping each
 original hashed row id to its compact row (-1 = dropped: read as a zero row before Wkv). Hash geometry unchanged.
 DSpark (mtp.*) and vision tensors are dropped with --text-only (served with --language-model-only, no DSpark).
+--no-routed-experts writes everything but the routed-expert tensors: the base of a GPTQ-only make_lowbit_export.py
+checkpoint, without the ~96 GB of MXFP4 E128 experts on disk.
 
   export_pruned.py --src /dev/shm/dsv4/DeepSeek-V4.1-Flash-1017 --expert-keep keep.npy \
       [--engram-keep engram.npz] --out /dev/shm/dsv4/export/e64 [--text-only] [--shard-gb 5]
@@ -61,6 +63,7 @@ def main():
     ap.add_argument("--engram-keep", default=None)
     ap.add_argument("--out", required=True)
     ap.add_argument("--text-only", action="store_true")
+    ap.add_argument("--no-routed-experts", action="store_true")
     ap.add_argument("--shard-gb", type=float, default=5.0)
     ap.add_argument("--engram-chunk", type=int, default=8_000_000)
     ap.add_argument("--engram-from", default=None,
@@ -103,7 +106,7 @@ def main():
                 if m:
                     li, ei = int(m.group(1)), int(m.group(2))
                     if li < n_layers:
-                        if keep[li, ei]:
+                        if keep[li, ei] and not a.no_routed_experts:
                             w.add(f"layers.{li}.ffn.experts.{newid[li, ei]}.{m.group(3)}", f.get_tensor(name))
                         continue
                 m = GATE_RE.match(name)
@@ -165,7 +168,8 @@ def main():
     if eng_bits is not None:
         cfg["text_config"]["engram_compact_kept"] = compact_kept  # per Engram layer, kept rows per hash column
     cfg["e043_pruning"] = {"experts_per_layer": E, "expert_keep_sha256": hashlib.sha256(keep.tobytes()).hexdigest(),
-                           "engram_compact": bool(eng_bits is not None), "text_only": a.text_only}
+                           "engram_compact": bool(eng_bits is not None), "text_only": a.text_only,
+                           **({"routed_experts": "none (GPTQ-only base)"} if a.no_routed_experts else {})}
     json.dump(cfg, open(out / "config.json", "w"), indent=2)
     for extra in ("tokenizer.json", "tokenizer_config.json", "generation_config.json", "README.md", "LICENSE"):
         if (src / extra).exists():

@@ -12,6 +12,11 @@ Puzzles are skipped when any grid matches an ARC-AGI-2 eval grid (D8 + colour in
 data_tools/contamination_check.py), a grid is larger than 30x30, or the chosen pairs repeat an input.
 
 Usage: .venv/bin/python experiments/E025_train_rollouts/build_dataset.py --batch nvarc_b0 --n 4000
+
+`--balance-parents` (E036): instead of taking the next puzzles in order, fill the batch parent by parent: each pick
+goes to the parent rule with the fewest tasks so far (ties broken by the parent's first rank in nvarc_order.txt),
+taking that parent's next unused eligible puzzle in order. `--count-pairs FILE` (comma-separated task_id:pair, e.g.
+an E031 pair list) seeds the per-parent counts with tasks already in the dataset being built.
 """
 import argparse
 import hashlib
@@ -71,6 +76,86 @@ def build_arc2(rows):
     return out
 
 
+def candidate(stem, idx, ks, ws, skipped):
+    """Pair split for one puzzle, or None when it is ineligible (reason counted in `skipped`)."""
+    parent = stem.split("_")[0]
+    path = NV_DIR / parent / f"{stem}.json"
+    pairs = json.loads(path.read_text())
+    rng = random.Random(f"{SEED}:{stem}")
+    n_train = rng.choices(ks, ws)[0]
+    perm = list(range(len(pairs)))
+    rng.shuffle(perm)
+    if len(pairs) < n_train + 1:
+        skipped["too_few_pairs"] += 1
+        return None
+    train_idx, test_idx, unused = perm[:n_train], perm[n_train:n_train + 1], perm[n_train + 1:]
+    chosen = [pairs[i] for i in train_idx + test_idx]
+    grids = [g for p in pairs for g in (p["input"], p["output"])]
+    if any(len(g) > 30 or len(g[0]) > 30 or len(g) == 0 for g in grids):
+        skipped["too_large"] += 1
+        return None
+    if len({json.dumps(p["input"]) for p in chosen}) < len(chosen):
+        skipped["repeated_input"] += 1
+        return None
+    if any(canon(g) in idx for g in grids if canon(g) is not None):
+        skipped["eval_grid_match"] += 1
+        return None
+    return parent, path, pairs, n_train, train_idx, test_idx, unused
+
+
+def build_nvarc_balanced(rows, batch, n, count_pairs):
+    if any(r["batch"] == batch for r in rows):
+        sys.exit(f"batch {batch} already in manifest")
+    used = {r["task_id"] for r in rows if r["source"] == "nvarc_training"}
+    order = write_order()
+    idx = eval_index()
+    ks, ws = train_count_dist()
+    queues, first = {}, {}
+    for rank, stem in enumerate(order):
+        if stem in used:
+            continue
+        parent = stem.split("_")[0]
+        queues.setdefault(parent, []).append(rank)
+        first.setdefault(parent, rank)
+    counts = Counter({p: 0 for p in queues})
+    if count_pairs:
+        for item in Path(count_pairs).read_text().strip().split(","):
+            counts[item.split(":")[0].split("_")[0]] += 1
+    challenges, solutions, out, skipped = {}, {}, [], Counter()
+    import heapq
+    heap = [(counts[p], first[p], p) for p in queues]
+    heapq.heapify(heap)
+    pos = Counter()
+    while heap and len(out) < n:
+        c, f, parent = heapq.heappop(heap)
+        q = queues[parent]
+        while pos[parent] < len(q):
+            rank = q[pos[parent]]
+            pos[parent] += 1
+            cand = candidate(order[rank], idx, ks, ws, skipped)
+            if cand is None:
+                continue
+            stem = order[rank]
+            _, path, pairs, n_train, train_idx, test_idx, unused = cand
+            challenges[stem] = {"train": [pairs[i] for i in train_idx],
+                                "test": [{"input": pairs[i]["input"]} for i in test_idx]}
+            solutions[stem] = [pairs[i]["output"] for i in test_idx]
+            out.append(dict(task_id=stem, batch=batch, source="nvarc_training", parent=parent,
+                            source_file=str(path.relative_to(ROOT)), source_sha1=sha1(path), order_rank=rank,
+                            n_pairs=len(pairs), n_train=n_train, train_idx=train_idx, test_idx=test_idx,
+                            unused_idx=unused, test_pairs=[0], sampling="balance_parents"))
+            heapq.heappush(heap, (c + 1, f, parent))
+            break
+    final = Counter(counts)
+    final.update(r["parent"] for r in out)
+    v = sorted(final.values())
+    print(f"{batch}: {len(out)} tasks from {len({r['parent'] for r in out})} parents; per-parent total incl. "
+          f"--count-pairs min {v[0]} median {v[len(v) // 2]} max {v[-1]}; skipped {dict(skipped)}")
+    (OUT / f"{batch}_challenges.json").write_text(json.dumps(challenges))
+    (OUT / f"{batch}_solutions.json").write_text(json.dumps(solutions))
+    return out
+
+
 def build_nvarc(rows, batch, n):
     if any(r["batch"] == batch for r in rows):
         sys.exit(f"batch {batch} already in manifest")
@@ -125,10 +210,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch", required=True, help="arc2_train, or a new NVARC batch name such as nvarc_b0")
     ap.add_argument("--n", type=int, default=4000)
+    ap.add_argument("--balance-parents", action="store_true", help="E036: parent-balanced sampling (see docstring)")
+    ap.add_argument("--count-pairs", help="E036: task_id:pair list whose parents seed the balance counts")
     args = ap.parse_args()
     OUT.mkdir(exist_ok=True)
     rows = manifest_rows()
-    new = build_arc2(rows) if args.batch == "arc2_train" else build_nvarc(rows, args.batch, args.n)
+    if args.batch == "arc2_train":
+        new = build_arc2(rows)
+    elif args.balance_parents:
+        new = build_nvarc_balanced(rows, args.batch, args.n, args.count_pairs)
+    else:
+        new = build_nvarc(rows, args.batch, args.n)
     with open(OUT / "manifest.jsonl", "a") as f:
         for r in new:
             f.write(json.dumps(r) + "\n")

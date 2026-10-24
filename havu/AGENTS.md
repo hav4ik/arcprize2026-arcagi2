@@ -94,6 +94,7 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
   - Phase-2 comparison against sub80s40: `experiments/E017_reasoning_efficiency/scripts/phase2_compare.py`. Results: `experiments/E017_reasoning_efficiency/README.md`.
   - `evals/frontier.py`: accuracy/token frontier and mixed-config pass@2.
   - Other agents may share the sandbox container: check `docker stats` before restarting it.
+- **E044 no-tool rollouts:** `evals/run_deepseek_arcprize.py` takes `--challenges/--solutions/--pairs/--out` and `--openrouter-provider` (opt-in); see `experiments/E044_notool_rollouts/README.md`. OpenRouter DeepInfra bills ~$0.44/M output, not the listed price.
 - **E029/E030 options (harness `persistent-v6`, opt-in):** `--prompt lean2code` ("decide in code"), `--turns-note N`, `--fallback-solve`, `--cap-nudge` (with `--max-tokens N`: a per-turn thinking cap closed by a synthetic `run_python` nudge).
   - Since 2026-10-17 `deepseek-flash` serves V4.1-Flash-1017 (E029): sub80s40 is the best config (pass@2 82.4%, 31.7k tokens).
   - `--effort-header minimal` (E030): a "Reasoning Effort: Minimal" system message, placed like DeepSeek's own effort prefixes. It is the one lever that shortens 1017 without losing accuracy: sub80s40 + header gives pass@2 84.9% at 27.4k tokens (−14%); s20x60 + header 80.3% at 23.3k (−27%).

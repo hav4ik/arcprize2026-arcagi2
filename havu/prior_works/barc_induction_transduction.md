@@ -36,7 +36,7 @@ Source tag: [P] = paper.
 
 ## Caveats for ARC-AGI-2
 - The data is ARC-1-flavoured.
-- NVARC tested BARC data and dropped it, because it was not useful for their model. NVARC did reuse BARC's 160 seed descriptions.
+- NVARC tested BARC data and dropped it. Their paper (`nvarc_2025.pdf`, Results) gives one reason: "in last year's competition, we found that BARC was not useful for the 2D transformer we developed", so they "used real puzzles with our synthetic puzzles only". No ablation is shown for their 2025 models. NVARC did reuse BARC's 160 human-written seed descriptions, together with H-ARC descriptions, as seeds for its own 716-puzzle generation.
 
 ## Reusable for us
 - **Template for our generator pipeline and sandbox helpers:** Python, a shared helper library, and seeds with NL descriptions plus input generators.

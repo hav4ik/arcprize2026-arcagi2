@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--schema-w2", default=None)
     ap.add_argument("--name", required=True)
     ap.add_argument("--quantizer", default="E043 GPTQ (gptq_experts.py)")
+    ap.add_argument("--keep-desc", default="no-tool keep set", help="model-card wording for the keep set")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     base, out = Path(a.base), Path(a.out)
@@ -100,7 +101,7 @@ def main():
     json.dump(cfg, open(out / "config.json", "w"), indent=2)
     readme = f"""# DeepSeek-V4.1-Flash-1017, {a.name} (E043 low-bit, GPTQ-only layout)
 
-Routed experts: {n_exp} per backbone layer (no-tool keep set, original ids in e043_manifest.json), stored only as
+Routed experts: {n_exp} per backbone layer ({a.keep_desc}, original ids in e043_manifest.json), stored only as
 low-bit Humming tensors in `gptq/` (no MXFP4 copies): {a.quantizer}. Schema (gate/up): `{a.schema}`;
 down: `{a.schema_w2 or a.schema}`. Attention, router (sliced to the kept experts), shared expert, norms and mHC as
 released; Engram compact as in the base export (`text_config.engram_compact_kept`).

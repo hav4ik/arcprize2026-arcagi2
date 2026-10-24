@@ -1,0 +1,457 @@
+<title>E032 Qwen Distillation</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one readable column of lab-notebook sections; wide tables and charts scroll in their own boxes. */
+:root {
+  --bg: #f5f7f8;
+  --surface: #ffffff;
+  --fg: #17222b;
+  --muted: #5b6b77;
+  --rule: #d8e0e5;
+  --accent: #0a6f6b;      /* E032 / fine-tuned */
+  --accent-soft: #d7efec;
+  --base: #b0581c;        /* base Qwen */
+  --base-soft: #f6e3d4;
+  --good: #1d7a3a;
+  --warn: #9a6400;
+  --bad: #b3261e;
+  --code-bg: #eef2f4;
+  --f-display: "IBM Plex Sans Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+  --f-body: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #10171c; --surface: #172128; --fg: #e3eaee; --muted: #93a4b0; --rule: #2a3843;
+    --accent: #45c2b8; --accent-soft: #163a38; --base: #e59a5f; --base-soft: #3b2718;
+    --good: #5cc27a; --warn: #e0b04f; --bad: #ef7b72; --code-bg: #1d2a33; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #10171c; --surface: #172128; --fg: #e3eaee; --muted: #93a4b0; --rule: #2a3843;
+  --accent: #45c2b8; --accent-soft: #163a38; --base: #e59a5f; --base-soft: #3b2718;
+  --good: #5cc27a; --warn: #e0b04f; --bad: #ef7b72; --code-bg: #1d2a33; color-scheme: dark;
+}
+body { background: var(--bg); color: var(--fg); font-family: var(--f-body); font-size: 15.5px; line-height: 1.6; }
+.wrap { max-width: 980px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 40px 72px; display: grid; gap: 44px; }
+header { display: grid; gap: 14px; border-bottom: 1px solid var(--rule); padding-bottom: 28px; }
+.eyebrow { font-family: var(--f-mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+h1 { font-family: var(--f-display); font-weight: 700; font-size: clamp(30px, 5vw, 44px); line-height: 1.1; margin: 0; text-wrap: balance; }
+h2 { font-family: var(--f-display); font-weight: 600; font-size: 25px; line-height: 1.2; margin: 0; text-wrap: balance; }
+h3 { font-family: var(--f-display); font-weight: 600; font-size: 18px; margin: 0; }
+p { margin: 0; max-width: 72ch; }
+.lede { font-size: 17px; color: var(--fg); max-width: 70ch; }
+.meta { display: flex; flex-wrap: wrap; gap: 8px 18px; font-family: var(--f-mono); font-size: 12.5px; color: var(--muted); }
+section { display: grid; gap: 16px; }
+.sec-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.sec-no { font-family: var(--f-mono); font-size: 13px; color: var(--accent); }
+ul { margin: 0; padding-left: 20px; display: grid; gap: 6px; max-width: 74ch; }
+code, .mono { font-family: var(--f-mono); font-size: .88em; }
+code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+.verdict { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+.vcard { background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 14px 16px; display: grid; gap: 6px; align-content: start; min-width: 0; }
+.vcard .k { font-family: var(--f-mono); font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.vcard .v { font-family: var(--f-display); font-size: 21px; font-weight: 600; line-height: 1.25; }
+.vcard .n { font-size: 13.5px; color: var(--muted); }
+.pill { display: inline-block; font-family: var(--f-mono); font-size: 11.5px; padding: 1px 8px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+.pill.good { color: var(--good); } .pill.warn { color: var(--warn); } .pill.bad { color: var(--bad); } .pill.info { color: var(--accent); }
+.tbl { overflow-x: auto; border: 1px solid var(--rule); border-radius: 8px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-family: var(--f-mono); font-weight: 500; font-size: 11.5px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); background: var(--bg); white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; white-space: nowrap; }
+td.e032 { color: var(--accent); font-weight: 600; }
+td.base { color: var(--base); font-weight: 600; }
+tr.total td { font-weight: 600; background: var(--bg); }
+.note { font-size: 13.5px; color: var(--muted); max-width: 76ch; }
+.chart { background: var(--surface); border: 1px solid var(--rule); border-radius: 8px; padding: 12px; overflow-x: auto; }
+.chart svg { display: block; width: 100%; min-width: 560px; height: auto; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--muted); padding: 4px 4px 0; }
+.sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: -1px; margin-right: 6px; }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.two > * { min-width: 0; }
+.callout { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 12px 16px; border-radius: 0 8px 8px 0; display: grid; gap: 6px; max-width: 80ch; }
+.callout.warn { border-left-color: var(--warn); background: var(--base-soft); }
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; margin: 0; font-size: 14px; }
+dl.kv dt { font-family: var(--f-mono); font-size: 12.5px; color: var(--muted); }
+dl.kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 560px) { dl.kv { grid-template-columns: 1fr; } dl.kv dd { margin-bottom: 6px; } }
+footer { border-top: 1px solid var(--rule); padding-top: 18px; font-size: 13px; color: var(--muted); display: grid; gap: 6px; }
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">ARC Prize 2026 · ARC-AGI-2 · experiment E032 (“E028b”)</div>
+  <h1>E032: Qwen3.8-27B distilled from DeepSeek-Flash-1017 tool traces</h1>
+  <p class="lede">A second LoRA SFT of Qwen3.8-27B, this time on <b>1,900 complete, correct and train-verified</b> multi-turn tool rollouts from DeepSeek-V4.1-Flash-1017 (E031). It fixes E028’s main flaw: those sequences were cut at 64K, so the model never saw a teacher finish under budget pressure. This report covers the data, training, export, serving checks, Kaggle candidates, and the evaluation so far.</p>
+  <div class="meta"><span>Updated 2026-10-19 04:59 UTC</span><span>RTX evals complete (pass@2 partial); Kaggle-pace 4×L4 test done: below base’s own solver</span><span>Lab notes: experiments/E032_qwen38_sft_e031/README.md</span></div>
+</header>
+
+<section aria-labelledby="s0">
+  <div class="sec-head"><h2 id="s0">Where it stands</h2></div>
+  <div class="verdict">
+    <div class="vcard"><span class="k">Kaggle pace, 4×L4 (submitted config)</span><span class="v">6 vs 19 of 48 <span class="pill bad">well below base</span></span><span class="n">E032 in its E031-mode notebook vs base with its own v4b solver, same 48 pairs. 37 of 48 E032 attempts ran out of their ~29k share; E032 solved nothing that base missed.</span></div>
+    <div class="vcard"><span class="k">vs base, same harness (xhigh)</span><span class="v">69 vs 62 <span class="pill info">slight edge</span></span><span class="n">Correct first attempts on all 172 public eval pairs at a 60k cap: 40.1% vs 36.0%, +4.1 pp, 95% CI [−3.9, +12.0].</span></div>
+    <div class="vcard"><span class="k">correct within 29k, same harness</span><span class="v">47 vs 35 <span class="pill warn">only vs E031-harness base</span></span><span class="n">+7.0 pp [0.0, +13.8] against base in the E031 harness. Base’s own Kaggle solver does far better at this budget: 35–38 of the 93-pair set at Kaggle pace, where E032 has 25 within 29k.</span></div>
+    <div class="vcard"><span class="k">“minimal” tier vs xhigh (E032)</span><span class="v">53 vs 60 <span class="pill warn">worse at 60k</span></span><span class="n">Final, 149 pairs. Tied within 29k (41 vs 41); xhigh solves more long pairs. Fewer 60k cap hits (19 vs 28), only 4% fewer tokens.</span></div>
+    <div class="vcard"><span class="k">vs E028 (previous SFT)</span><span class="v">clear improvement</span><span class="n">E028 was 13–16 pp below base at Kaggle pace, on a slower server setup than Kaggle’s, so that gap is an upper bound. E032 beats base in the same harness, but at Kaggle pace it is also far below base’s v4b solver.</span></div>
+  </div>
+  <div class="callout">
+    <p><b>Leaderboard outlook:</b> E032 is not expected to beat base’s v4b submission. At Kaggle pace it solved 6 of 48 pairs against 19 for base v4b. The RTX numbers predict the same thing: within 29k tokens E032 solves 25 of the 93-pair set, against 35–38 for base v4b at Kaggle pace. The leaderboard keeps the best score, so an E032 submission costs only GPU quota.</p>
+    <p><b>Correction:</b> the earlier recommendation (submit xhigh v1) compared E032 only with base in the E031 harness. The base that matters on Kaggle is the v4b solver, which is far more token-efficient at a ~29k budget. Of the two E032 notebooks, xhigh v1 is still the better choice: minimal ties it within 29k and has a lower ceiling.</p>
+    <p><b>Kaggle:</b> two candidates passed their commit runs. <code>arc2-qwen38-e032-sft-submit</code> v1 runs the xhigh tier, and <code>arc2-qwen38-e032-sft-minimal</code> v2 runs the custom minimal tier. Minimal v1 used different wording and should not be submitted. The paced 4×L4 test (§6) is the most direct predictor of the leaderboard score.</p>
+  </div>
+</section>
+
+<section aria-labelledby="sd">
+  <div class="sec-head"><span class="sec-no">1</span><h2 id="sd">DeepSeek inference experiments: choosing the teacher config (E029, E030)</h2></div>
+  <p>DeepSeek replaced its <code>deepseek-flash</code> model with V4.1-Flash-1017 around 2026-10-17. Before collecting new teacher traces, the E027/E029 session re-ran the tool harness on the new model and searched for shorter traces. All runs: public ARC-AGI-2 eval (120 tasks / 167 pairs), 2 attempts, low effort, <code>lean2sub</code> prompt, answer tool, session fallback; pass@ values task-weighted.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Config (cap / soft target)</th><th>Model</th><th class="num">pass@1</th><th class="num">pass@2</th><th class="num">tokens mean / median</th><th class="num">hard pairs*</th><th>Experiment</th></tr></thead>
+    <tbody>
+      <tr><td>sub80s40 (80k / 40k)</td><td>old V4.1-Flash</td><td class="num">67.8%</td><td class="num">77.5%</td><td class="num">40.7k / 37.6k</td><td class="num">n/a</td><td>E009 (3 samples)</td></tr>
+      <tr><td>sub80s40 (80k / 40k)</td><td>Flash-1017</td><td class="num">74.3%</td><td class="num">82.4%</td><td class="num">31.7k / 27.5k</td><td class="num">81.8%</td><td>E029</td></tr>
+      <tr><td>s20x60 (60k / 20k, strong)</td><td>Flash-1017</td><td class="num">65.8%</td><td class="num">77.8%</td><td class="num">26.7k / 24.5k</td><td class="num">47.7%</td><td>E029</td></tr>
+      <tr><td>s20x80 (80k / 20k, strong)</td><td>Flash-1017</td><td class="num">68.8%</td><td class="num">81.1%</td><td class="num">28.7k / 24.5k</td><td class="num">52.3%</td><td>E030</td></tr>
+      <tr><td>sub80s40 + per-turn cap 16k + code nudge</td><td>Flash-1017</td><td class="num">71.6%</td><td class="num">81.5%</td><td class="num">31.9k / 29.1k</td><td class="num">65.9%</td><td>E030</td></tr>
+      <tr><td><b>sub80s40 + Minimal header</b></td><td>Flash-1017</td><td class="num">74.5%</td><td class="num"><b>84.9%</b></td><td class="num">27.4k / 22.8k</td><td class="num">84.1%</td><td>E030</td></tr>
+      <tr><td><b>s20x60 + Minimal header</b> (E031’s config)</td><td>Flash-1017</td><td class="num">69.9%</td><td class="num">80.3%</td><td class="num"><b>23.3k / 20.6k</b></td><td class="num">52%</td><td>E030</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">* Pairs whose baseline correct rollouts needed more than 40k tokens. Costs: E029 $20.72, E030 $38.92.</p>
+  <ul>
+    <li><b>Flash-1017 is better and cheaper than the old model:</b> +6.5 pp pass@1 [+1.9, +11.3] and +4.9 pp pass@2 at 22% fewer tokens (sub80s40).</li>
+    <li><b>Budget pressure saturates:</b> soft targets of 15k or 20k all land near a 24.5k median. They save tokens only in the upper half and cost the hard pairs (82% → about 50%). A per-turn thinking cap did not shorten DeepSeek.</li>
+    <li><b>The Minimal effort header works:</b> placed at the start of the conversation, like DeepSeek’s own effort prefixes, it shortens correct rollouts (median 17.4k vs 22.0k) without the hard-pair penalty. The same request as a suffix at the end of the prompt did not work (E009). Header and budget stack: s20x60 + header is −27% tokens at −2.1 pp pass@2.</li>
+    <li><b>Teacher config for E031:</b> s20x60 + header, the fewest tokens within 5 pp of the best pass@2. That is the interface E032 learned.</li>
+  </ul>
+  <h3>Cross-model comparison on the Kaggle-pace pair set (87 pairs, from E030)</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Model</th><th>Harness</th><th>Time limit</th><th class="num">samples</th><th class="num">pass@1</th><th class="num">pass@2</th><th class="num">tokens mean / median</th></tr></thead>
+    <tbody>
+      <tr><td>DeepSeek old V4.1-Flash</td><td>E017 V3 (E025 data setting)</td><td>none</td><td class="num">2</td><td class="num">66.9%</td><td class="num">74.3%</td><td class="num">37.2k / 30.3k</td></tr>
+      <tr><td>DeepSeek Flash-1017</td><td>sub80s40 + header</td><td>none</td><td class="num">2</td><td class="num">73.5%</td><td class="num">84.6%</td><td class="num">26.7k / 20.3k</td></tr>
+      <tr><td>DeepSeek Flash-1017</td><td>s20x60 + header</td><td>none</td><td class="num">2</td><td class="num">68.4%</td><td class="num">79.4%</td><td class="num">23.3k / 20.4k</td></tr>
+      <tr><td>Qwen3.8-27B base (NVFP4)</td><td>E020 K3 (v4 recipe, 48k)</td><td>none</td><td class="num">2</td><td class="num">40.1%</td><td class="num">46.3%</td><td class="num">36.8k / 47.7k</td></tr>
+      <tr><td>Qwen3.8-27B base (FP8)</td><td>v4b solver</td><td>Kaggle pace</td><td class="num">3</td><td class="num">41.2%</td><td class="num">51.5%</td><td class="num">28.4k / 33.4k</td></tr>
+      <tr><td>Qwen3.8-27B E028 SFT (FP8)</td><td>v5 notebook solver</td><td>Kaggle pace</td><td class="num">1</td><td class="num">24.3%‡</td><td class="num">n/a</td><td class="num">22.5k / 25.1k</td></tr>
+      <tr><td><b>Qwen3.8-27B E032 SFT (block FP8)</b></td><td>E031 harness, xhigh, 60k (this report)</td><td>none</td><td class="num">1</td><td class="num"><b>42.3%</b>†</td><td class="num">n/a</td><td class="num">37.2k mean</td></tr>
+      <tr><td>Qwen3.8-27B base (FP8)</td><td>E031 harness, xhigh, 60k (this report)</td><td>none</td><td class="num">1</td><td class="num">38.7%†</td><td class="num">n/a</td><td class="num">37.3k mean</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">† On the 90 pairs of the 93-pair set that are in the public eval, task-weighted. The teacher solves about 70–74% of these pairs per attempt, against about 40% for Qwen base. That gap is what distillation is trying to close; E032 closes a few points of it. The Kaggle-pace pass@2 for base combines two independent paced samples; Kaggle has time for only one attempt per pair at this pace. Details: <code>experiments/E029_deepseek_flash_1017/README.md</code> and <code>experiments/E030_flash1017_shorter/README.md</code>.</p>
+  <p class="note">‡ The E028 paced run’s vLLM server had <code>--enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3</code>. The Kaggle notebooks don’t pass these flags, and the base v4b runs didn’t use them. On the same weights and agent they cut throughput from about 192 to 143 tok/s (E040), so each paced attempt got fewer tokens than it would on Kaggle. Treat E028’s gap to base as an upper bound.</p>
+</section>
+
+<section aria-labelledby="s1">
+  <div class="sec-head"><span class="sec-no">2</span><h2 id="s1">Teacher data: E031 rollouts</h2></div>
+  <p>The same 2,500 pairs as E028’s training set (1,070 official ARC-AGI-2 training pairs plus 1,430 NVARC synthetic <code>nvarc_b0</code> pairs), re-collected with the new DeepSeek model. DeepSeek’s API name <code>deepseek-flash</code> has served V4.1-Flash-1017 since about 2026-10-17, and the original V4.1-Flash that produced E025 is retired. The config is E030’s cheapest one within 5 pp of the best on eval:</p>
+  <ul>
+    <li><b>Harness:</b> <code>run_deepseek_tools.py</code> (persistent-v6), grid mode, low effort, prompt <code>lean2sub</code>, tools <code>run_python</code> and <code>submit_answer</code>, session fallback, lenient parse.</li>
+    <li><b>Budget:</b> soft target 20k with the “strong” wording past it, hard limit 60k, notes on every tool output, “Budget nearly spent” at 45k, and a turns-left note at 5 turns.</li>
+    <li><b>System message:</b> <code>--effort-header minimal</code>, a custom header we wrote, since DeepSeek has no such tier: “Reasoning Effort: Minimal. Keep your thinking short and terse… submit as soon as the rule reproduces every training pair.”</li>
+    <li><b>Left out:</b> no task summary and no helpers. <code>--train-check</code> records whether the answer program reproduces every training pair, host-side and without model tokens.</li>
+  </ul>
+  <div class="tbl"><table>
+    <thead><tr><th>Batch</th><th class="num">pairs</th><th class="num">pass@1</th><th class="num">train_pass</th><th class="num">out tokens mean / median / p90</th><th class="num">cost</th></tr></thead>
+    <tbody>
+      <tr><td>arc2_train</td><td class="num">1,070</td><td class="num">95.8%</td><td class="num">93.5%</td><td class="num">6.0k / 3.0k / 15.6k</td><td class="num">$5.02</td></tr>
+      <tr><td>nvarc_b0</td><td class="num">1,430</td><td class="num">70.3%</td><td class="num">81.3%</td><td class="num">15.6k / 9.7k / 37.1k</td><td class="num">$16.43</td></tr>
+      <tr class="total"><td>total</td><td class="num">2,500</td><td class="num">81.2%</td><td class="num">86.5%</td><td class="num">11.5k / 5.9k / 31.3k</td><td class="num">$21.45</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">Against E025 (old Flash, lean2roles + helpers) on the same pairs: pass@1 79.7% → 81.2% at 0.53× the output tokens and 0.57× the cost. Stop reasons: 2,478 submitted, 17 at the output budget, 5 at the turn limit. There is no <code>system_fingerprint</code> per rollout; all were collected on 2026-10-18 from Flash-1017.</p>
+</section>
+
+<section aria-labelledby="s2">
+  <div class="sec-head"><span class="sec-no">3</span><h2 id="s2">Training set: correct traces only</h2></div>
+  <p>Rendered with the E028 pipeline (tinker-cookbook <code>qwen3_8_xhigh_reasoning</code>, all assistant turns trained, prompts and tool outputs masked, independent token-level mask check). Two changes for E031: its own tool specs (<code>e031_tools.json</code>), and the DeepSeek system header placed after the tools block in the system turn, as the HF template does. The training rendering is token-identical to the HF chat template on 12 of 12 checked prompts.</p>
+  <div class="two">
+    <div class="tbl"><table>
+      <thead><tr><th>All 2,500 rendered</th><th class="num">value</th></tr></thead>
+      <tbody>
+        <tr><td>total / trained tokens</td><td class="num">52.2M / 29.0M</td></tr>
+        <tr><td>sequences over 64K</td><td class="num">54 (2%), max 84k</td></tr>
+        <tr><td>crossed the 20k “Past the target” note</td><td class="num">542, of which 529 then submitted</td></tr>
+        <tr><td>of those, fit in 64K</td><td class="num">489</td></tr>
+        <tr><td>E028’s set for comparison</td><td class="num">70.9M / 44.5M; 385 cut at 64K; 0 wrap-ups</td></tr>
+      </tbody>
+    </table></div>
+    <div class="tbl"><table>
+      <thead><tr><th>E032 training set</th><th class="num">value</th></tr></thead>
+      <tbody>
+        <tr><td>filter</td><td class="num">correct ∧ train_pass ∧ submitted</td></tr>
+        <tr><td>rollouts</td><td class="num">1,900 (971 arc2 + 929 nvarc)</td></tr>
+        <tr><td>parent tasks</td><td class="num">943</td></tr>
+        <tr><td>total / trained tokens</td><td class="num">29.50M / 13.71M</td></tr>
+        <tr><td>sequence length mean / p50 / p90 / max</td><td class="num">15.5k / 12.4k / 32.3k / 65.1k</td></tr>
+        <tr><td>dropped</td><td class="num">593 not correct, 7 over 64K</td></tr>
+        <tr><td>finish after the 20k note</td><td class="num">161</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+  <h3>Why only correct traces</h3>
+  <p>Two read-only sub-agent audits read 85 incorrect traces end to end, plus scripted checks over all 469.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Incorrect group</th><th class="num">n</th><th>What happened</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td>passed train check, wrong on test</td><td class="num">256</td><td>Clean process: every pair verified, no hard-coding. The rule fits training but not the test; often the model saw an odd test feature and dismissed it.</td><td><span class="pill warn">usable, not needed</span></td></tr>
+      <tr><td>submitted with a failing training pair</td><td class="num">192</td><td>98% submitted right after the 20k note, with hand-typed grids, test-only parameters or copies of the test input. Only 1–2 of 12 made a sensible best guess.</td><td><span class="pill bad">harmful</span></td></tr>
+      <tr><td>never answered</td><td class="num">22</td><td>Long thinking loops; one spent 60k tokens in a single turn with no tool calls.</td><td><span class="pill bad">harmful</span></td></tr>
+      <tr><td>correct but failed train check</td><td class="num">124</td><td>About a third are hand-typed answers that happened to be right.</td><td><span class="pill bad">dropped</span></td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">The recovery moves worth learning (diff a failing check, fix, re-verify; fix a traceback; re-print a misread grid) also appear in the correct traces, so dropping the incorrect ones loses little. The audit also found that the Minimal header cuts the final check of the test input. Median thinking after the last passing check is 38 characters for E031 vs 803 for E025, but E025’s prompt explicitly required that check, so the comparison is confounded.</p>
+</section>
+
+<section aria-labelledby="s3">
+  <div class="sec-head"><span class="sec-no">4</span><h2 id="s3">Training on Tinker</h2></div>
+  <dl class="kv">
+    <dt>base model</dt><dd><code>Qwen/Qwen3.8-27B</code> (64K context), LoRA rank 128</dd>
+    <dt>optimizer</dt><dd>Dimuon (no clipping, β1 0.9). LR 3e-3 decayed linearly to 1e-4, reached exactly on the last step. 3e-3 won E028’s paired pilots against 1e-3.</dd>
+    <dt>batches</dt><dd>Token-budget packing without concatenation: up to 300k tokens per step (mean 286k, 181k–300k), 133k trained on average (70k–179k), 18 rollouts (10–27). Loss is the per-token mean over the batch’s trained tokens.</dd>
+    <dt>schedule</dt><dd>103 steps, 1 epoch. Launched 19:56 UTC, finished 20:16 UTC. Checkpoints at steps 25, 50, 75, 100 and <code>final</code>.</dd>
+    <dt>cost</dt><dd>~$121.5. Tinker bills every datum token at the train price (29.50M × $4.103/M), masked tokens included.</dd>
+    <dt>final sampler</dt><dd><code>tinker://99c4c413-7a89-5c0b-9d9a-30bcfa9a9e1d:train:0/sampler_weights/final</code></dd>
+  </dl>
+  <div class="chart" role="img" aria-label="Training NLL per step with 20-step averages and the learning rate">
+    <svg id="trainChart" viewBox="0 0 900 300"></svg>
+    <div class="legend"><span><span class="sw" style="background:var(--muted);opacity:.5"></span>per-step train NLL (each batch unseen)</span><span><span class="sw" style="background:var(--accent)"></span>20-step token-weighted mean</span><span><span class="sw" style="background:var(--base)"></span>learning rate (right axis)</span></div>
+  </div>
+  <p class="note">Batches differ in difficulty by more than the training gain (per-batch base NLL ranges from about 0.76 to 0.95), so the per-step curve looks flat. The run was paused at step 25 for that reason and resumed a minute later with an identical schedule, after the paired check below showed it was learning. Block means: 0.844, 0.819, 0.803, 0.801, 0.811, then 0.768 for the last 3 steps.</p>
+  <h3>Paired NLL on identical sequences (Tinker compute_logprobs)</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Sequences</th><th class="num">base</th><th class="num">step 25</th><th class="num">step 50</th><th class="num">final</th></tr></thead>
+    <tbody>
+      <tr><td>40 from not-yet-trained batches (≥ step 51)</td><td class="num">0.898</td><td class="num">0.850 (−0.047)</td><td class="num">0.838 (−0.060)</td><td class="num">n/a (trained on)</td></tr>
+      <tr><td>40 held-out E031 rollouts never in the set (incorrect but train_pass)</td><td class="num">0.958</td><td class="num">n/a</td><td class="num">0.906 (−0.052)</td><td class="num e032">0.900 (−0.058)</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">Every checkpoint beats base on 40 of 40 sequences. Most of the gain comes in the first 25–50 steps.</p>
+</section>
+
+<section aria-labelledby="s4">
+  <div class="sec-head"><span class="sec-no">5</span><h2 id="s4">Export, quantization, serving checks</h2></div>
+  <ul>
+    <li><b>Export:</b> <code>save_weights_external</code> plus signed URLs: 3.86 GB adapter. The API key never left this machine.</li>
+    <li><b>Merge:</b> <code>build_hf_model</code> into Qwen3.8-27B BF16 in 117 s, 52 GB.</li>
+    <li><b>Block FP8 in the official <code>Qwen/Qwen3.8-27B-FP8</code> layout:</b> e4m3 128×128 weight blocks, BF16 <code>weight_scale_inv</code>, dynamic activations. Took 18 s, 30.87 GB, max per-tensor relative error 2.65%. <code>quantization_config</code> is identical to the official one. This is E028 v2’s audited recipe.</li>
+    <li><b>Serving:</b> SGLang 0.5.20, one server per GPU, FP8 KV cache, radix cache, 939k KV tokens per RTX PRO 6000. Includes E028’s tool-JSON patch (stock SGLang adds 22 tokens of tool JSON).</li>
+    <li><b>Prompt format:</b> every server reports prompt token counts identical to the training render (12/12 per model, re-checked on every box and after every restart).</li>
+    <li><b>Parity, served vs Tinker:</b> trained-token NLL is within +0.002 to +0.006 for E032 and +0.001 to +0.006 for base. The same offset in both points to the FP8 KV cache. The SFT gain of about −0.10 NLL vs base is preserved when served.</li>
+  </ul>
+  <div class="tbl"><table>
+    <thead><tr><th>Published (private)</th><th>Location</th><th>Verified</th></tr></thead>
+    <tbody>
+      <tr><td>Kaggle model</td><td><code>chankhavu/qwen3-8-27b-e032-sft/transformers/fp8block/1</code></td><td>30/30 files, names and sizes equal to the box copy; pulled back file by file with all 18 index shards present</td></tr>
+      <tr><td>Hugging Face</td><td><code>livobereshka/Qwen3.8-27B-e032-sft-FP8block</code></td><td>30.89 GB, every size matches, no index shard missing</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">The org’s 100 GB private limit was full. To make room, the E028 BF16 repo <code>livobereshka/Qwen3.8-27B-e028-sft</code> was deleted at the user’s request; it remains on Kaggle as <code>.../e028-sft/transformers/bf16</code>. Lesson from E028: vLLM loads a model with missing shards without any error, so check the index before serving.</p>
+</section>
+
+<section aria-labelledby="s5">
+  <div class="sec-head"><span class="sec-no">6</span><h2 id="s5">Evaluation</h2></div>
+  <p><b>Setup:</b> the DeepSeek harness itself with E031’s exact config (60k hard cap, 20k soft target, Minimal header, turns note, 1 attempt) against our SGLang servers. Sampling is temperature 1.0, top_p 0.95, top_k 20, Qwen tier xhigh. “Base” is the official <code>Qwen/Qwen3.8-27B-FP8</code> in the same interface, one GPU per model per box. Pair sets are the 172 public ARC-AGI-2 eval pairs: dev56, the 93 pairs used for E027/E028’s Kaggle-pace runs, and the remaining 23.</p>
+  <h3>E032 vs base, first attempt (xhigh)</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Set</th><th class="num">paired pairs</th><th class="num">E032</th><th class="num">base</th><th class="num">E032 only / base only</th><th>status</th></tr></thead>
+    <tbody>
+      <tr><td>dev56</td><td class="num">56</td><td class="num e032">22 (39.3%)</td><td class="num base">20 (35.7%)</td><td class="num">8 / 6</td><td><span class="pill good">complete</span></td></tr>
+      <tr><td>93 Kaggle-pace pairs</td><td class="num">93</td><td class="num e032">38 (40.9%)</td><td class="num base">35 (37.6%)</td><td class="num">13 / 10</td><td><span class="pill good">complete</span></td></tr>
+      <tr><td>remaining 23</td><td class="num">23</td><td class="num e032">9 (39.1%)</td><td class="num base">7 (30.4%)</td><td class="num">4 / 2</td><td><span class="pill good">complete</span></td></tr>
+      <tr class="total"><td>total (all 172)</td><td class="num">172</td><td class="num e032">69 (40.1%)</td><td class="num base">62 (36.0%)</td><td class="num">25 / 18</td><td>+4.1 pp [−3.9, +12.0]</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">The CI comes from a task-cluster bootstrap. Task-weighted pass@1 is 42.9% vs 38.3%. Both models average about 37.4k output tokens per attempt. E032 hits the 60k cap more often (32 vs 26) and takes more turns (median 13 vs 10), the teacher’s short-thought, test-with-code style.</p>
+
+  <h3>Token efficiency: correct answers within a budget</h3>
+  <div class="chart" role="img" aria-label="Correct answers within 20k, 29k and 40k output tokens, E032 vs base">
+    <svg id="budgetChart" viewBox="0 0 900 260"></svg>
+    <div class="legend"><span><span class="sw" style="background:var(--accent)"></span>E032</span><span><span class="sw" style="background:var(--base)"></span>base</span><span>All 172 pairs, first attempt; 29k ≈ the per-attempt share on Kaggle’s 4×L4</span></div>
+  </div>
+  <p class="note">An attempt that finished correctly within X tokens would finish the same way under an X cap, because the budget notes always say 20k/60k. So this predicts Kaggle-pace accuracy better than the 60k-cap totals. On the 44 pairs both models solve, E032 uses 21.4k tokens on average vs 26.4k for base. Its failures run longer, which roughly cancels the saving overall.</p>
+
+  <h3>Kaggle pace on 4×L4 (E027 session, submitted config)</h3>
+  <p>The E032 notebook’s solver on the 4×L4 box, paced like Kaggle (about 29k tokens per attempt, cut earlier by the time limit), with Kaggle’s exact server flags and <code>force_submit_last</code>, 48 pairs, one attempt each. Records: <code>experiments/E027_l4_throughput/e032_probe48_kflags/</code>.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Run, same 48 pairs</th><th class="num">correct</th><th class="num">gen tok/s</th><th class="num">tokens per attempt</th><th>endings</th></tr></thead>
+    <tbody>
+      <tr><td><b>E032, E031-mode notebook solver</b></td><td class="num e032">6 (12.5%)</td><td class="num">152</td><td class="num">21.8k mean</td><td>37 out of budget, 11 submitted; answers: submit 11, forced 7, salvage 2, none 28</td></tr>
+      <tr><td>base, v4b solver (its Kaggle submission)</td><td class="num base">19 (39.6%)</td><td class="num">~210</td><td class="num">n/a</td><td>both 6, base only 13, E032 only 0</td></tr>
+      <tr><td>E032, first probe (void)</td><td class="num">5</td><td class="num">118</td><td class="num">16.0k mean</td><td>server had tool-call and reasoning parsers that Kaggle doesn’t use</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><b>The notebook reproduces the RTX eval.</b> On these 48 pairs, E032 solved 15 at the 60k cap on the RTX boxes, 7 within 29k, and 6 within the tokens each paced attempt actually got. That is exactly the paced result, so the loss is about finishing within the budget, not about the Kaggle port.</li>
+    <li><b>E032 rarely finishes inside its share.</b> It learned a 20k soft target and a 60k hard stop, the notes still say 60k, and on RTX its attempts average 37k tokens. On Kaggle the share is about 29k, and time cuts bring it to 21.8k on average.</li>
+    <li><b>It is also slower on the same box:</b> 152 vs about 210 tok/s for base. It makes more, shorter requests (1.8k generated tokens per request vs 3.0k), and each re-prefills up to 1.5k tokens because of the cache’s 1,568-token blocks.</li>
+    <li><b>Base in the E031 harness is no better:</b> 8 of these 48 within 29k on RTX, vs 19 for base’s own v4b solver at Kaggle pace. The E031 interface, tuned for DeepSeek’s budget, does not suit a 29k share.</li>
+  </ul>
+
+  <h3>Reasoning-effort tier (Qwen system line), E032</h3>
+  <p>Qwen3.8 has three tiers (xhigh, medium = no line, low), and the template rejects anything else. Like DeepSeek’s invented Minimal header, we wrote a <b>minimal</b> tier, served through a chat template with one added branch: “Reasoning effort is set to minimal. Keep your thinking short and terse: brief notes, not full sentences. Test ideas with small code experiments instead of long deliberation, and submit as soon as the rule reproduces every training pair.” It replaces the xhigh line that E032 was trained with, and the E031 header still follows the tools block. The sentence is byte-identical to Kaggle candidate minimal v2.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Same pairs, first attempt</th><th class="num">pairs</th><th class="num">xhigh</th><th class="num">minimal</th><th class="num">within 29k</th><th class="num">mean out tokens</th><th class="num">60k cap hits</th></tr></thead>
+    <tbody>
+      <tr><td>dev56</td><td class="num">56</td><td class="num">22</td><td class="num">20</td><td class="num">16 vs 13</td><td class="num">37.4k vs 37.4k</td><td class="num">14 vs 9</td></tr>
+      <tr><td>93-pair set</td><td class="num">93</td><td class="num">38</td><td class="num">33</td><td class="num">25 vs 28</td><td class="num">37.2k vs 35.0k</td><td class="num">14 vs 10</td></tr>
+      <tr class="total"><td>total <span class="pill good">complete</span></td><td class="num">149</td><td class="num">60</td><td class="num">53</td><td class="num">41 vs 41</td><td class="num">36.6k vs 35.3k (−4%)</td><td class="num">28 vs 19</td></tr>
+    </tbody>
+  </table></div>
+  <div class="tbl"><table>
+    <thead><tr><th>Medium (no tier line), dev56</th><th class="num">pairs</th><th class="num">xhigh</th><th class="num">medium</th><th class="num">within 29k</th></tr></thead>
+    <tbody>
+      <tr><td>E032</td><td class="num">25</td><td class="num">14</td><td class="num">9</td><td class="num">10 vs 7</td></tr>
+      <tr><td>base</td><td class="num">34</td><td class="num">14</td><td class="num">8</td><td class="num">10 vs 6</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">Minimal does not beat xhigh. At the 60k cap it is 7 pairs behind (53 vs 60): the extra xhigh solves are long ones that minimal gives up on. Within 29k they tie (41 vs 41). It saves almost no tokens: −4% overall, and slightly more tokens on pairs both solve (19.3k vs 18.2k). Its savings come from giving up earlier on failures (19 vs 28 cap hits). E032 is already terse from training on the teacher’s Minimal-header traces, so the extra Qwen sentence has little left to cut; DeepSeek saved 14–27% from the same idea. xhigh is the Kaggle pick.</p>
+  <p class="note"> Medium, which just removes the line, is clearly worse for both models: both seem to need an explicit tier sentence. Medium was paused at 25/34 pairs to give minimal all six GPUs.</p>
+
+  <h3>pass@2 (in progress)</h3>
+  <p>Second attempts ran for part of the set before the boxes were released. On the 20 pairs of the 93-pair set where both models have two attempts, E032 has 15 and base 16. E032 alone is 25 of 31 on dev56 pairs with two attempts. Those finished first, so they skew easy. pass@2 was not completed: Kaggle has time for only one attempt per pair at this pace, so it would not have informed the leaderboard choice.</p>
+</section>
+
+<section aria-labelledby="s6">
+  <div class="sec-head"><span class="sec-no">7</span><h2 id="s6">Kaggle candidates</h2></div>
+  <p>The submission harness (<code>agent_qwen</code> E031 mode, built by the parallel E027 session) replays all 1,900 E032 training rollouts token-identically and matches 583 other E031 rollouts as text. Its settings match E031: lean2sub, E031 tool texts, Minimal header, notes at 20k/60k with strong wording and a warning at 45k, turns note 5, 40 turns, tool timeout 30 s, tool output 16k characters, same sampling.</p>
+  <div class="tbl"><table>
+    <thead><tr><th>Notebook</th><th>Tier</th><th>Commit run (local 8 tasks, 20-min window)</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td><code>chankhavu/arc2-qwen38-e032-sft-submit</code> v1</td><td>xhigh</td><td>PASS · 5.00/8 · internet off · model identity verified · KV 1.49M · server ready 360 s</td><td><span class="pill info">candidate</span></td></tr>
+      <tr><td><code>chankhavu/arc2-qwen38-e032-sft-minimal</code> v2</td><td>minimal (frozen sentence)</td><td>PASS · 6.17/8 · 11/13 answered</td><td><span class="pill info">candidate</span></td></tr>
+      <tr><td><code>chankhavu/arc2-qwen38-e032-sft-minimal</code> v1</td><td>minimal, other wording</td><td>never evaluated</td><td><span class="pill bad">do not submit</span></td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><b>At the cap or time limit:</b> the session <code>answer</code>, then <code>solve(test_input)</code>, then salvage. A forced <code>submit_answer</code> runs only if all three are empty (<code>force_submit_last</code>). E028’s audit found forced submits mostly useless, and an accepted forced copy blocked the fallbacks.</li>
+    <li><b>Hard stop:</b> Kaggle’s per-attempt share is about 29k tokens on L4, below the 60k the notes state. We kept the training wording on purpose, so the share acts as a time limit. In hindsight this is the weak point: most attempts hit it without answering (§6, Kaggle pace).</li>
+    <li><b>Commit-run scores</b> come from 8 tasks under a short window. They show the pipeline works, not which candidate is more accurate.</li>
+  </ul>
+</section>
+
+<section aria-labelledby="s7">
+  <div class="sec-head"><span class="sec-no">8</span><h2 id="s7">Compute and cost</h2></div>
+  <div class="tbl"><table>
+    <thead><tr><th>Item</th><th>Detail</th><th class="num">Cost</th></tr></thead>
+    <tbody>
+      <tr><td>E031 teacher rollouts</td><td>DeepSeek-Flash-1017, 2,500 attempts, 78 min</td><td class="num">$21.45</td></tr>
+      <tr><td>Tinker SFT</td><td>103 steps, 29.50M billed tokens</td><td class="num">~$121.5</td></tr>
+      <tr><td>Tinker sampling checks</td><td>paired NLL, parity, export</td><td class="num">&lt; $2</td></tr>
+      <tr><td>Box B · 56613651</td><td>2× RTX PRO 6000 WS, British Columbia, from 20:24 UTC</td><td class="num">$2.60/h</td></tr>
+      <tr><td>Box A · 56598413</td><td>2× RTX PRO 6000 Max-Q, Virginia, E032 use from about 20:55 UTC</td><td class="num">$2.36/h</td></tr>
+      <tr><td>Box C · 56630374</td><td>2× RTX PRO 6000 Max-Q, France, from 22:49 UTC</td><td class="num">$2.97/h</td></tr>
+      <tr><td>Box 56627440 (removed)</td><td>Czechia; never got ports or SSH</td><td class="num">≈ $1</td></tr>
+      <tr><td>4×L4 · 55889595</td><td>E027 session’s box; runs the Kaggle-pace E032 test</td><td class="num">$1.39/h</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">RTX box time for E032 came to about $35: B 5.4 h, A 4.9 h, C 3.0 h, plus the removed Czechia box. All three were destroyed at 01:47 UTC after confirming no API tokens were left on them.</p>
+</section>
+
+<section aria-labelledby="s8">
+  <div class="sec-head"><span class="sec-no">9</span><h2 id="s8">Incidents and lessons</h2></div>
+  <ul>
+    <li><b>Early-loss readout:</b> with short, varied sequences, per-batch NLL hides a −0.05 gain. Use the paired compute_logprobs check on fixed sequences. The run was paused needlessly at step 25 for about a minute, costing at most one discarded step.</li>
+    <li><b>HF storage:</b> the org hit its 100 GB private limit, which is why E028’s block-FP8 upload stopped at 8/18 shards. That went unnoticed until a vLLM load succeeded silently with missing shards. Every upload is now verified against the index.</li>
+    <li><b>Kaggle downloads outside Kaggle:</b> whole-version downloads return 404, but per-file <code>kagglehub.model_download(path=…)</code> works.</li>
+    <li><b>Box access:</b> some Vast hosts expose SSH only on a direct port. One host (Czechia) never got ports and was replaced. A box-to-box key append ran onto an existing line of <code>authorized_keys</code> because the file had no trailing newline. The user’s key still works, and the repair was not attempted further.</li>
+    <li><b>Wording drift:</b> the minimal sentence was briefly swapped between the eval template and the Kaggle harness. It is now frozen and checked byte for byte.</li>
+  </ul>
+</section>
+
+<section aria-labelledby="s9">
+  <div class="sec-head"><span class="sec-no">10</span><h2 id="s9">Pending and next steps</h2></div>
+  <ul>
+    <li><b>Done on the RTX boxes:</b> complete first attempts for E032 and base on all 172 pairs, and the complete minimal vs xhigh test. The three boxes were destroyed at 01:47 UTC. pass@2 and the medium tier stayed partial.</li>
+    <li><b>Done: Kaggle-pace 4×L4 test</b> of E032 (E027 session) with Kaggle’s exact server flags and <code>force_submit_last</code>, i.e. the submitted config: 6/48, against 19/48 for base v4b (§6). The first 48-pair probe is void: its vLLM server had <code>--enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3</code>, which the Kaggle notebooks don’t pass. With them, the same weights and agent ran at 143 tok/s instead of 192. The slowdown is not from the prefix cache: prompts are 100% token-prefix-stable, there were 0 preemptions, and the v4b agent was just as fast at the same 50% hit rate. E028’s paced run (24.7%) had the same flags, so its gap to base is an upper bound.</li>
+    <li><b>Fit the student to Kaggle’s budget</b>, the main lesson. Options: tell the model its real share (budget notes scaled to about 29k, soft target near 10k), which is out of its training distribution; or re-collect teacher traces at a Kaggle-sized budget (for example soft 10k, hard 30k) and retrain. Either way, compare against base v4b at Kaggle pace, not against base in the teacher’s harness.</li>
+    <li><b>Interface:</b> test the student without the test-check suppression the Minimal header causes. For example, re-collect teacher traces with a test-difference check in the prompt and with helpers (AGENTS.md asks for <code>--helpers</code>).</li>
+    <li><b>More data:</b> add more NVARC batches, or a second epoch; the held-out gain flattens after step 50.</li>
+  </ul>
+</section>
+
+<footer>
+  <span>Files: <code>experiments/E032_qwen38_sft_e031/</code> holds <code>build_dataset.py</code>, <code>train.py</code>, <code>export_adapter.py</code>, <code>merge.py</code>, <code>quantize_blockfp8.py</code>, <code>format_check.py</code>, <code>parity_check.py</code>, <code>paired_nll.py</code>, <code>heldout_nll.py</code>, <code>eval_chain.sh</code>, <code>eval_status.py</code>, <code>min_vs_xhigh.py</code>, <code>chat_template_minimal.jinja</code> and <code>README.md</code>. Results are in <code>evals/results/tools_persistent_grid_lean2sub_{e032,base}_low_e032_*.jsonl</code>.</span>
+  <span>Teacher data: <code>experiments/E031_flash1017_hdr_rollouts/</code>. Previous SFT: <code>experiments/E028_qwen38_sft/REPORT.md</code>.</span>
+</footer>
+</div>
+
+<script>
+(function () {
+  var steps = [[0,0.003,0.8284,130645],[1,0.002972,0.7592,105690],[2,0.002943,0.8125,143996],[3,0.002915,0.8447,120191],[4,0.002886,0.8647,138020],[5,0.002858,0.8455,125308],[6,0.002829,0.8304,160570],[7,0.002801,0.8674,116622],[8,0.002773,0.8367,120128],[9,0.002744,0.8499,139252],[10,0.002716,0.8246,131842],[11,0.002687,0.9285,131015],[12,0.002659,0.8676,128581],[13,0.00263,0.8701,148988],[14,0.002602,0.7807,118149],[15,0.002574,0.8111,128991],[16,0.002545,0.9518,169378],[17,0.002517,0.8346,143563],[18,0.002488,0.818,143116],[19,0.00246,0.8027,132736],[20,0.002431,0.8743,130924],[21,0.002403,0.7675,120289],[22,0.002375,0.8341,143090],[23,0.002346,0.7994,142323],[24,0.002318,0.8029,131181],[25,0.002289,0.8798,161477],[26,0.002261,0.8575,134886],[27,0.002232,0.8605,162396],[28,0.002204,0.7939,132052],[29,0.002175,0.7972,118892],[30,0.002147,0.831,98714],[31,0.002119,0.8138,152063],[32,0.00209,0.7682,163280],[33,0.002062,0.7836,104003],[34,0.002033,0.8431,105740],[35,0.002005,0.8857,179061],[36,0.001976,0.7941,102755],[37,0.001948,0.8346,145636],[38,0.00192,0.7558,122349],[39,0.001891,0.7526,148897],[40,0.001863,0.8539,138553],[41,0.001834,0.7821,135769],[42,0.001806,0.7945,151184],[43,0.001777,0.79,119193],[44,0.001749,0.8789,149180],[45,0.001721,0.7554,112714],[46,0.001692,0.8293,154616],[47,0.001664,0.8043,132991],[48,0.001635,0.8188,117767],[49,0.001607,0.8092,129038],[50,0.001578,0.8292,155266],[51,0.00155,0.771,120635],[52,0.001522,0.747,151077],[53,0.001493,0.7996,153539],[54,0.001465,0.8096,128945],[55,0.001436,0.8434,157482],[56,0.001408,0.766,108867],[57,0.001379,0.7921,161812],[58,0.001351,0.773,133177],[59,0.001323,0.7789,110158],[60,0.001294,0.8056,146729],[61,0.001266,0.784,141240],[62,0.001237,0.7785,124597],[63,0.001209,0.7783,139029],[64,0.00118,0.7546,109029],[65,0.001152,0.7113,109326],[66,0.001124,0.8092,119950],[67,0.001095,0.7415,135198],[68,0.001067,0.8981,129857],[69,0.001038,0.7573,111213],[70,0.00101,0.7463,121137],[71,0.000981,0.8841,174928],[72,0.000953,0.8237,132673],[73,0.000925,0.7508,127896],[74,0.000896,0.8021,143598],[75,0.000868,0.8121,162371],[76,0.000839,0.8349,126659],[77,0.000811,0.8114,151037],[78,0.000782,0.8612,155694],[79,0.000754,0.7948,118278],[80,0.000725,0.7977,127508],[81,0.000697,0.7773,135628],[82,0.000669,0.8367,129599],[83,0.00064,0.7725,136529],[84,0.000612,0.7826,119408],[85,0.000583,0.7522,128706],[86,0.000555,0.8187,143671],[87,0.000526,0.8299,110340],[88,0.000498,0.7682,123812],[89,0.00047,0.8142,117067],[90,0.000441,0.7807,118693],[91,0.000413,0.8521,170195],[92,0.000384,0.7839,110792],[93,0.000356,0.8268,125997],[94,0.000327,0.8111,128567],[95,0.000299,0.8089,144606],[96,0.000271,0.824,120898],[97,0.000242,0.8546,117202],[98,0.000214,0.8392,144979],[99,0.000185,0.8689,158441],[100,0.000157,0.7594,137758],[101,0.000128,0.7519,111649],[102,0.0001,0.8125,69672]];
+  var NS = "http://www.w3.org/2000/svg";
+  function el(tag, attrs, parent, text) {
+    var e = document.createElementNS(NS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (text != null) e.textContent = text;
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  // Training chart
+  var svg = document.getElementById("trainChart");
+  var W = 900, H = 300, L = 56, R = 70, T = 16, B = 40;
+  var x = function (s) { return L + (s / 102) * (W - L - R); };
+  var yMin = 0.70, yMax = 0.96;
+  var y = function (v) { return T + (yMax - v) / (yMax - yMin) * (H - T - B); };
+  var lr = function (v) { return T + (0.003 - v) / 0.003 * (H - T - B); };
+  for (var g = 0.70; g <= 0.961; g += 0.05) {
+    var gy = y(g);
+    el("line", {x1: L, x2: W - R, y1: gy, y2: gy, stroke: "var(--rule)", "stroke-width": 1}, svg);
+    el("text", {x: L - 8, y: gy + 4, "text-anchor": "end", "font-size": 11, fill: "var(--muted)", "font-family": "IBM Plex Mono, monospace"}, svg, g.toFixed(2));
+  }
+  [0, 0.001, 0.002, 0.003].forEach(function (v) {
+    el("text", {x: W - R + 8, y: lr(v) + 4, "font-size": 11, fill: "var(--base)", "font-family": "IBM Plex Mono, monospace"}, svg, v === 0 ? "0" : (v * 1000) + "e-3");
+  });
+  [0, 20, 40, 60, 80, 100].forEach(function (s) {
+    el("text", {x: x(s), y: H - B + 18, "text-anchor": "middle", "font-size": 11, fill: "var(--muted)", "font-family": "IBM Plex Mono, monospace"}, svg, s);
+  });
+  el("text", {x: (L + W - R) / 2, y: H - 6, "text-anchor": "middle", "font-size": 11.5, fill: "var(--muted)"}, svg, "optimizer step");
+  el("text", {x: 14, y: T + 4, "font-size": 11.5, fill: "var(--muted)"}, svg, "NLL");
+  // LR line
+  el("polyline", {points: steps.map(function (r) { return x(r[0]) + "," + lr(r[1]); }).join(" "), fill: "none", stroke: "var(--base)", "stroke-width": 1.5, "stroke-dasharray": "5 4"}, svg);
+  // per-step points
+  steps.forEach(function (r) { el("circle", {cx: x(r[0]), cy: y(r[2]), r: 2.6, fill: "var(--muted)", "fill-opacity": 0.45}, svg); });
+  // 20-step token-weighted block means
+  var blocks = [];
+  for (var a = 0; a < 103; a += 20) {
+    var bl = steps.filter(function (r) { return r[0] >= a && r[0] < a + 20; });
+    var tw = bl.reduce(function (s, r) { return s + r[3]; }, 0);
+    var m = bl.reduce(function (s, r) { return s + r[2] * r[3]; }, 0) / tw;
+    blocks.push([a, Math.min(a + 19, 102), m]);
+  }
+  blocks.forEach(function (b) {
+    el("line", {x1: x(b[0]), x2: x(b[1]), y1: y(b[2]), y2: y(b[2]), stroke: "var(--accent)", "stroke-width": 3, "stroke-linecap": "round"}, svg);
+    el("text", {x: (x(b[0]) + x(b[1])) / 2, y: y(b[2]) - 7, "text-anchor": "middle", "font-size": 11, fill: "var(--accent)", "font-family": "IBM Plex Mono, monospace"}, svg, b[2].toFixed(3));
+  });
+  // pause marker
+  el("line", {x1: x(25), x2: x(25), y1: T, y2: H - B, stroke: "var(--muted)", "stroke-width": 1, "stroke-dasharray": "2 3"}, svg);
+  el("text", {x: x(25) + 5, y: T + 12, "font-size": 10.5, fill: "var(--muted)"}, svg, "paused / resumed at step 25");
+
+  // Budget chart
+  var bs = document.getElementById("budgetChart");
+  var data = [["within 20k", 31, 15], ["within 29k", 47, 35], ["within 40k", 64, 49], ["any (60k cap)", 69, 62]];
+  var BW = 900, BH = 260, BL = 120, BR = 30, BT = 14, BB = 34, max = 80;
+  var bx = function (v) { return BL + v / max * (BW - BL - BR); };
+  [0, 10, 20, 30, 40, 50, 60, 70, 80].forEach(function (v) {
+    el("line", {x1: bx(v), x2: bx(v), y1: BT, y2: BH - BB, stroke: "var(--rule)", "stroke-width": 1}, bs);
+    el("text", {x: bx(v), y: BH - BB + 16, "text-anchor": "middle", "font-size": 11, fill: "var(--muted)", "font-family": "IBM Plex Mono, monospace"}, bs, v);
+  });
+  el("text", {x: (BL + BW - BR) / 2, y: BH - 4, "text-anchor": "middle", "font-size": 11.5, fill: "var(--muted)"}, bs, "correct first attempts (of 172 pairs)");
+  var rowH = (BH - BT - BB) / data.length;
+  data.forEach(function (d, i) {
+    var y0 = BT + i * rowH + 6, h = (rowH - 16) / 2;
+    el("text", {x: BL - 10, y: y0 + h + 4, "text-anchor": "end", "font-size": 12.5, fill: "var(--fg)"}, bs, d[0]);
+    el("rect", {x: BL, y: y0, width: bx(d[1]) - BL, height: h, fill: "var(--accent)", rx: 2}, bs);
+    el("text", {x: bx(d[1]) + 6, y: y0 + h - 2, "font-size": 11.5, fill: "var(--accent)", "font-family": "IBM Plex Mono, monospace"}, bs, d[1]);
+    el("rect", {x: BL, y: y0 + h + 2, width: bx(d[2]) - BL, height: h, fill: "var(--base)", rx: 2}, bs);
+    el("text", {x: bx(d[2]) + 6, y: y0 + 2 * h, "font-size": 11.5, fill: "var(--base)", "font-family": "IBM Plex Mono, monospace"}, bs, d[2]);
+  });
+})();
+</script>

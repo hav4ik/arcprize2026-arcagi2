@@ -159,6 +159,70 @@ preemptions):** E72 C52 399.5 tok/s ~42/h; E128 2-bit C48 419.2 tok/s ~34/h (its
 558.0 tok/s ~57-65/h. So E128's +5 pp pass@2 over E72 costs ~20% of attempts; E96 is ~1.4-1.6x E72 if its ARC holds.
 A tool-use E128 needs its own multi-turn replay (prefix-cache reuse) before its L4 throughput is known.
 
+**4xL4 tool-mode throughput (E042 T2, 2026-10-24).** Setup: dummy weights in these schemas, util 0.93, prefix caching,
+64 GiB tool Engram, replaying the full model's tool turn shapes from `tools_e030_hdrmin`.
+
+| model x streams | gen tok/s | prefix hits | KV tokens | KV peak / p50 | preemptions |
+|---|---:|---:|---:|---:|---:|
+| E72 x 32 (util 0.88) | 205 | 87.8% | | | |
+| E128 2-bit x 48 | 340.5 | 96.1% | 1.47M | 0.77 / 0.68 | 0 / 58 min |
+| E96 2/3-bit x 80 | 453.5 | 96.5% | 2.72M | 0.64 / 0.60 | 0 / 70 min |
+
+- E128: TTFT median 0.84 s, turn median 117 s, turn prompt p50/p90 24.9K/56.3K.
+- E96 measured from vLLM metric deltas over a 17-min window (the same method on E128 gives 342.0 vs the replay's 340.5).
+- E96 x 96 is queued (T3).
+- The pruned models' own turn shapes differ (more, shorter turns; see the interim results below). They go to E042 for
+  a replay once the evals finish.
+
+**Final tool-use E128 2-bit (2026-10-24 13:05 UTC; 120 tasks / 167 pairs x 2 attempts, sub80s40 + header,
+temperature 1.0, `--rescue-code`; reference = API full model E030 on the same attempts; `scripts/tool_interim.py`):**
+
+| model | pass@1 | pass@2 | pass@2 pairs | correct attempts | mean / median / p90 out tokens | turns | stopped by budget | Python-error calls |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| API full | 74.5% | 84.9% | 142/167 | 247/334 | 27.4K / 22.8K / 59.8K | 13.9 | 2 | 2.3% |
+| **tool E128 2-bit** | **72.8%** | **82.5%** | 136/167 | 240/334 | 35.2K / 29.8K / 72.6K | 17.1 | 27 | 14.2% |
+
+pass@1 and pass@2 are task-weighted.
+
+- Within the noise band (2-3 pp) of the full model, at 2 bits and a third of the experts.
+- Pairs: 128 solved by both, 14 by the full model only, 8 by E128 only.
+- Attempts: 212 solved by both, 35 full only, 28 E128 only.
+- The cost is length: +28% output tokens, and 27 attempts hit the 80k budget (10 of them correct for the full
+  model).
+- 0 rescues: the tool-call format holds with the tool-call-block weight.
+
+**Interim tool E96 2/3-bit (13:05 UTC):** 250/334 attempts done, 176 correct vs the API's 200 on the same attempts.
+Mean output 23.5K tokens (API 22.1K), 21.5 turns, 37.6% Python-error calls, 35 attempts at max_turns.
+
+**The tool errors are typos, from pruning.** DSML format errors are negligible (4 of 4,504 calls for E128). The errors
+are Python exceptions in the model's own code, mostly character-level typos:
+- `NameError: coms` (for `comps`), `dequeue`, `zzip`, `mmasks`;
+- `ModuleNotFoundError: scpy`, `sc`, `scip` (for `scipy`);
+- `SyntaxError` from mismatched brackets.
+
+| run | Python-error rate |
+|---|---:|
+| full, self-hosted, native | 2.4% |
+| full + Engram 64 GiB | 2.7% |
+| native E72 MXFP4 (no GPTQ) | 44.6% (same typos) |
+
+So expert pruning causes them, and the 2-bit GPTQ does not; more experts means fewer typos. The model recovers from
+the error message, but each typo costs a turn (E96: 35 of 250 attempts end at max_turns).
+
+**Truncated sampling does not fix the typos.** Test: tool E128 2-bit on 32 dev-family ARC training tasks (sha1 family
+rule), 1 attempt, `eval_arc.sh SAMPLING=...`.
+
+| sampler | solved | tool calls | Python-error calls | typos seen |
+|---|---:|---:|---:|---|
+| temperature 1.0 | 31/32 | 170 | 10.0% | `dequeue`, `froset`, `froroset`, `dint` |
+| + min_p 0.05 | 30/31 | 143 | 10.5% | `coms` x7, `dequeue`, `froroset`, `fset` |
+| top_p 0.95 | 31/32 | 166 | 7.2% | `zys`, `ne`, `coms` |
+
+Typos survive min_p 0.05, so their probability is at least 5% of the top token's. The pruned model genuinely puts mass
+on them; they are not the sampler's tail. The fix has to come from the model: the keep set (for example, weighting
+identifier-copy tokens), or healing. The dev tasks are easy (about 4.5 turns), so this test cannot rank the samplers
+on accuracy.
+
 ## No-tool round (2026-10-23/24)
 
 **Question (user):** without tools the model does not need its coding skills, so maybe it routes over fewer experts

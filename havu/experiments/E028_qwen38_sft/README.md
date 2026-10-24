@@ -278,6 +278,34 @@ for base, so the expected leaderboard score is at or below v4b's (19 / 26 / 23).
 
 Box artifacts (scripts, logs, audit outputs) are in `box_artifacts/`.
 
+## Submission-pace test on 4×L4 (E027 session, finished 2026-10-18 03:25 UTC)
+
+- **Setup:** v5_sft notebook solver (md5 cad74873) + `kaggle_v5_sft_settings.json`, v1 ModelOpt FP8 on CUTLASS, c24,
+  all 71 non-dev eval tasks / 93 pairs, 1 attempt. Only the local window was changed: FORCE 225 / CAP 235 / WALL
+  250 min, Kaggle's 11 h / 259-pair pace. Logs: `experiments/E027_l4_throughput/sft_nb_kaggle/`.
+- **Score:** 23/93 pairs = 24.7% (17.00/71 tasks). Re-checked here from `arc_logs/attempts_local.jsonl` against the
+  eval solutions.
+  - Submitted: 23, of which 22 were correct.
+  - Hit the output budget: 70, of which 1 was correct (forced 31 → 1, none 37, salvage 1, session_solve 1).
+- **Budget:** adaptive share median 28.8k; tokens per attempt median 25.0k, p95 31.9k, max 39.5k; wall time median
+  52 min.
+- **Serving:** 159 gen tok/s at ≥20 running, 75% prefix-cache hits, 0 preemptions.
+- **Paired base run** (same box, pairs, pace, c24; `experiments/E027_l4_throughput/base93_v4b/`): official
+  Qwen3.8-27B-FP8 + v4b solver, 35/93 = 37.6% (28.00/71 tasks).
+  - Base submitted 41 (32 correct); 52 hit the output budget (3 correct); 27.9k mean tokens; 192 tok/s; 82% cache hits.
+  - **Paired SFT − base: −12.9 pp, 95% CI [−23.3, −2.2]** (task-cluster bootstrap). Both solved 18; base alone 17;
+    SFT alone 5. Re-checked here.
+  - **Base sample 2** (same setup; `experiments/E027_l4_throughput/base93_v4b_s2/`): 38/93 = 40.9%, 29.2k mean
+    tokens. Run-to-run noise: sample 2 − sample 1 = +3.2 pp [−7.1, +13.0].
+  - **SFT − base sample 2: −16.1 pp [−25.0, −7.9]. SFT − mean of both base samples: −14.5 pp [−22.7, −6.5].**
+    Re-checked here.
+- **Other base references on the same pairs:**
+  - E027 base on vLLM 0.31 (v4b solver, unpaced): 47.3%.
+  - E020 K3 attempt 0 (unpaced): 37.8% vs SFT 24.4% on 90.
+  - Kaggle v4b probe (paced): 14/29 vs SFT 4/29 on the common pairs.
+- **Conclusion:** at the Kaggle budget the SFT model rarely finishes, and the 64K training cut (no wrap-ups) is the
+  cause. Expect v5 (either build; v2 is ~25% faster, so its budget is ~36k) below v4b on the LB.
+
 > **Teacher provenance (2026-10-17):** all E028 training data (E025) and the dev56 teacher comparison (E017 v3all) come from the *original* DeepSeek-V4.1-Flash. From ~2026-10-17 the API name `deepseek-flash` (and the legacy names) serves **DeepSeek-V4.1-Flash-1017**, and the old model is retired. New rollouts for E028b therefore come from a different teacher. Record the request date and `system_fingerprint` per rollout, and don't mix the two silently.
 
 ## Commands
@@ -299,6 +327,18 @@ $PY -I train.py --name full2500_dimuon_3e-3 --lr 3e-3 --max-cost 300 --yes   # r
 - The Tinker key is `tinker_api_key` in `SECRETS.yaml`, which `train.py` reads at runtime.
 
 ## Open items
+
+- **HF block-FP8 repo is incomplete (found 2026-10-18 by the E027 session).** `livobereshka/Qwen3.8-27B-e028-sft-FP8block`
+  has 8 of 18 shards. `box_artifacts/e028/up_fp8block_hf.log` ends with "Private storage limit reached for org
+  livobereshka", and the org's private repos total exactly 100 GB (BF16 55.6, ModelOpt FP8 30.4, LoRA 3.9, partial
+  block FP8 9.95, E025 data 0.2). The Kaggle `fp8block` variation is complete (notebook v2 is fine).
+  - vLLM 0.23 served the 8-shard directory without an error (weights loaded in 0.7 s).
+  - Before serving any downloaded model, check that every shard listed in `model.safetensors.index.json` is present.
+  - Pulling the Kaggle copy outside Kaggle: whole-version download fails (kagglehub "Resource not found"; kaggle CLI
+    404 at DownloadModelInstanceVersion). Per-file `kagglehub.model_download(handle, path=f)` works: a 1.05 GB shard
+    in 23 s with the exact listed size.
+  - To finish the HF copy, free ≥ ~21 GB first, for example by deleting the superseded ModelOpt FP8 repo (also on
+    Kaggle as `fp8`), or upgrade the org's plan. The user decides.
 
 - **Before evaluating:** the Qwen harness (`evals/arc_harness/agent_qwen.py`) has no `lean2roles` prompt. It has to
   reproduce the training interface (`lean2roles` prompt, task summary, helpers, `submit_answer`, budget notes, xhigh
