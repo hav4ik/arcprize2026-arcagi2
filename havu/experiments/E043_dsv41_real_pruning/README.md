@@ -23,6 +23,29 @@ runs are not resumed.
   - harness: sub80s40 + header, `--rescue-code`, temperature 1.0.
 - **Eval:** both TP4 servers (A and B) serve E112 with runtime masks, and one harness process spreads attempts over
   both. Run 1 is attempt 0 only (pass@1). Run 2 resumes the same tag with `--attempts 2` (pass@2).
+- **Build results (18:42-18:58 UTC):**
+  - Calibration: 61 rollouts, 1.42M tokens, 142,138 rows. These are the same rows as E128.
+  - GPTQ on 8 GPUs, relative output error (mean over 40 layers): w13 2.64% (RTN 10.9%), w2 5.64% (RTN 12.7%). Worst
+    layer 3.6% / 7.2%; every layer decodes bit-exactly. E128: 2.5% / 5.5%.
+  - Dev NLL with runtime masks (64 tool dev traces):
+
+    | model | dev NLL | tool-block NLL |
+    |---|---:|---:|
+    | E128 | 0.7965 (+11.7%) | 0.149 |
+    | **E112** | **0.8233 (+15.5%)** | **0.158** |
+    | E96 2/3-bit | 0.8318 (+16.7%) | 0.158 |
+
+  - The first-turn probe was cut short to start the eval at once (user request).
+- **On HF (18:58 UTC):** `chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-E112-2bit`, private, 124,890,565,440 bytes.
+  - 58 safetensors files, the largest 4.999 GB.
+  - Upload verified by name and size against the export.
+  - Content check before the upload (`scripts/check_lowbit_export.py`):
+    - all 40 layers x 112 experts x 9 GPTQ tensors equal the source GPTQ at the kept ids;
+    - all 120 router tensors equal the checkpoint rows at the kept ids;
+    - the index and files are consistent.
+  - The serving-parity check of the chunked export (needs a GPU server) runs after the eval.
+  - The tool E128 repo stays as it is (user).
+- **Eval (started 18:58 UTC):** both servers, 167 workers, attempt 0 first (`e112t_w10_u2_gptq_eng64_sub80`).
 - **Expected 4xL4 footprint (from the shapes; not measured):** about 15.4 GiB of weights per GPU and ~2.5M KV tokens
   at util 0.93. That is about the same as E96 u2/u3 (15.18 GiB, 2.72M tokens) and 1.44 GiB/GPU less than E128.
 - **HF upload rule (user, 2026-10-24): every safetensors file is at most 5 GB.** Before this, exports carried the
