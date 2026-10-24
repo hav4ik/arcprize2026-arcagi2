@@ -51,6 +51,51 @@ The 120 ARC-AGI-2 eval tasks are never used in the pruning process; they only me
   (`scripts/split_dev.py`: sha1(NVARC parent or ARC task id) % 10 == 0, about 10%); the eval set is touched only for
   final metrics.
 
+## Low-bit round: more experts at 2-3 bits (2026-10-24, in progress)
+
+**Goal (user):** keep more experts at lower precision within the 4xL4 budget; attention, router, shared expert and
+Engram stay as released. Shapes agreed with E042 (dsv4-infer), both fit 4xL4 with Engram 30%:
+**E128** = gate/up uint2 g128 + down uint2 g64; **E96** = gate/up uint2 g128 + down uint3 g64 (asymmetric, bf16
+scales, Humming kernels; E96 + DSpark was dropped by E042: the drafter halves the streams and loses 21-28% throughput).
+
+**Pipeline.**
+1. `patches/apply_e043_humming.py` + `e043_humming.py`: real-weight Humming experts in the vLLM fork. Each MXFP4
+   expert is decoded to exact BF16 at load (checked bit-exact against the fork's DeepGEMM decoder), then Humming
+   quantizes it (RTN) or takes precomputed tensors (`E043_GPTQ_DIR`). Fixes for the fork vs humming 0.1.12 (E042's
+   dummy-weight runs never loaded real weights): native "humming" schema with weight-only keys
+   (`weight_dtype`, `weight_scale_dtype`), no `GROUP_TENSOR`, `weight_scale_2_type`, zero-point loading, per-sublayer
+   schema (`DSV41_EXPERT_HUMMING_W2`), router shapes up to (160, 6), GPTQ-only checkpoints (placeholders).
+2. Calibration: `replay_reap.py --dump-x` records every layer's MoE input; 1.4M no-tool calibration tokens (61
+   rollouts) replayed **under each pruned model's own mask** (E128, E96; plus the full model), 10-20% of positions kept
+   (`calx_transpose.py`).
+3. `gptq_experts.py`: per-expert GPTQ (gate/up share X^T X of the routed tokens; down uses the quantized gate/up
+   outputs with the native clamps, weighted by the routing weight). Experts see ~3.4K rows (median) for 5,120 inputs,
+   so low damping overfits: a held-out sweep (20% of rows) picked percdamp 1.0 (layer 30 down: 0.01 is worse than RTN
+   held-out, 15.0% vs 13.2%; 1.0 gives 8.8%). Every layer's output decodes bit-exactly through Humming.
+4. `make_lowbit_export.py`: GPTQ-only checkpoints (no MXFP4 experts; E042's request): E128 123.1 GB, E96 116.5 GB
+   (Engram 30% compact shared).
+
+**Dev screen** (teacher-forced NLL on 64 no-tool dev traces vs the full model 0.5663; answer-writing probe):
+
+| model (keep set x10, Engram 30%) | dev NLL vs full | answer written correctly |
+|---|---:|---:|
+| E128 native MXFP4 | +8.3% | |
+| **E128 uint2 GPTQ** | **+12.1%** | 97.4% |
+| E128 uint2 RTN | +22.0% | |
+| E96 native MXFP4 | +12.7% | |
+| **E96 uint2 + uint3 down, GPTQ** | **+15.2%** | 97.4% |
+| E72 native MXFP4 (ARC pass@1 57.5%, pass@2 66.9%) | +22.2% | 99.5% |
+| Engram 30% only | +0.10% | |
+
+ARC (no-tool, 2 attempts) for E128 and E96 GPTQ: running.
+
+**unsloth UD-IQ2_XXS comparison.** Our engine cannot read GGUF IQ codebooks, so `gguf_to_humming.py` decodes each
+expert exactly (gguf-py) and re-stores it as uint6 g32 (+0.04% of the weight norm, ~0.5% of IQ2's own error; uint4
+would add 12%). Their "UD-IQ2_XXS" experts are a per-layer mix (projection x layer counts): IQ2_S 25, IQ2_XXS 18,
+IQ3_XXS 15, IQ1_S 10, IQ2_XS 6, Q2_K 1; IQ2_S gate weight error vs the released FP4 is 7.2% (cosine 0.967) vs ~21-25%
+for integer 2-bit RTN. First comparison: their experts on the same E128 keep set (attention/router/Engram as released).
+Their Q5_K Engram cannot be represented in our MXFP8 Engram format without snapping back to the originals.
+
 ## No-tool round (2026-10-23/24)
 
 **Question (user):** without tools the model does not need its coding skills, so maybe it routes over fewer experts

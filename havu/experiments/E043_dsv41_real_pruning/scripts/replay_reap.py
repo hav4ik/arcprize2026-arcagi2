@@ -47,6 +47,8 @@ def main():
     ap.add_argument("--engram-keep", default=None)
     ap.add_argument("--expert-keep", default=None)
     ap.add_argument("--exclude", default=None, help="manifest of an earlier run whose rollouts to skip")
+    ap.add_argument("--dump-x", action="store_true", help="also record every layer's MoE input (low-bit calibration)")
+    ap.add_argument("--dump-x-frac", type=float, default=1.0, help="share of each step's rows whose x is kept")
     a = ap.parse_args()
 
     recs = []
@@ -72,7 +74,8 @@ def main():
     man = open(obs / "manifest.jsonl", "w")
     toks = {d: np.memmap(Path(d) / "tokens.u32", dtype=np.uint32, mode="r") for d in a.tok}
     warm = [0, 128000, 2000, 3000]  # any short prompt: its step is recorded first and skipped by alignment
-    write_ctrl(a.ctrl, observe=str(obs), engram_keep=a.engram_keep, expert_keep=a.expert_keep)
+    write_ctrl(a.ctrl, observe=str(obs), engram_keep=a.engram_keep, expert_keep=a.expert_keep, dump_x=a.dump_x,
+               dump_x_frac=a.dump_x_frac)
     post(a.server, a.model, warm)
     man.write(json.dumps({"warmup": warm}) + "\n")
     t0, done = time.time(), 0

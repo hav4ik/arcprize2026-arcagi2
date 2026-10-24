@@ -14,7 +14,9 @@ the start of every eager forward; CUDA-graph replays keep using the same tensors
    "engram_keep": "/path/keep.npz" | null,     # per Engram layer: packbits(bool[num_embeddings], 'little')
                                                #  -> dropped rows read as zero before Wkv (the declared miss rule)
    "observe": "/path/outdir" | null,           # record per-token router ids/weights and native expert amplitudes
-   "dump_hashes": 0}                           # also record the first N tokens' Engram hash ids
+   "dump_hashes": 0,                           # also record the first N tokens' Engram hash ids
+   "dump_x": false,                            # also record every layer's MoE input x [T, 40, 5120] (BF16 as int16)
+   "dump_x_frac": 1.0}                         # keep x only for this random share of the step's rows (x_rows)
 Observation needs expert parallel (each routed expert output complete on one rank). Rank 0 writes one .npz per
 forward step: input_ids [T], positions [T], ids/w/amp [T, 40, 6] (amp = ||native weighted expert output||_2,
 the reap_native_amp observation, all-reduced over the EP group so every (token, slot) has its owner's value).
@@ -32,8 +34,9 @@ _CTRL = os.environ.get("E043_CTRL")
 
 _s = {
     "mtime": None, "layer": -1, "bias_add": None, "eng_bits": {}, "obs_dir": None, "dump_hashes": 0,
-    "rec": None, "topk_w": None, "step_no": 0, "rank": None, "tp_group": None, "hash_rec": {},
+    "rec": None, "topk_w": None, "step_no": 0, "rank": None, "tp_group": None, "hash_rec": {}, "dump_x": False,
 }
+HIDDEN = 5120
 
 
 def _rank():
@@ -93,6 +96,8 @@ def _apply_ctrl(ctrl, device):
             b.fill_(255)
     _s["obs_dir"] = ctrl.get("observe")
     _s["dump_hashes"] = int(ctrl.get("dump_hashes", 0))
+    _s["dump_x"] = bool(ctrl.get("dump_x", False))
+    _s["dump_x_frac"] = float(ctrl.get("dump_x_frac", 1.0))
     if _s["obs_dir"] and _rank() == 0:
         os.makedirs(_s["obs_dir"], exist_ok=True)
     if _rank() == 0:
@@ -114,6 +119,8 @@ def step_begin(input_ids, positions):
                      "w": torch.zeros((T, N_LAYERS, TOPK), dtype=torch.float32, device=input_ids.device),
                      "amp": torch.zeros((T, N_LAYERS, TOPK), dtype=torch.float32, device=input_ids.device),
                      "seen": torch.zeros(N_LAYERS, dtype=torch.int32)}
+        if _s["dump_x"]:
+            _s["rec"]["x"] = torch.zeros((T, N_LAYERS, HIDDEN), dtype=torch.bfloat16, device=input_ids.device)
     else:
         _s["rec"] = None
 
@@ -123,6 +130,16 @@ def begin_moe(prefix):
         _s["layer"] = int(prefix.split("layers.")[1].split(".")[0])
     except (IndexError, ValueError):
         _s["layer"] = -1
+
+
+def observe_x(hidden_states):
+    """MoE input of the current layer (after the FFN norm) for the calibration dump (low-bit GPTQ statistics)."""
+    rec = _s["rec"]
+    li = _s["layer"]
+    if rec is None or "x" not in rec or _capturing() or li < 0 or li >= N_LAYERS:
+        return
+    if hidden_states.shape[0] == rec["x"].shape[0]:
+        rec["x"][:, li] = hidden_states.to(torch.bfloat16)
 
 
 def masked_bias(correction_bias, li):
@@ -186,9 +203,14 @@ def _flush():
     _s["rec"] = None
     if int(rec["seen"].min()) != 1 or int(rec["seen"].max()) != 1:
         print(f"[E043] WARNING step {_s['step_no']}: per-layer observe counts {rec['seen'].tolist()}", flush=True)
-    out = {k: v.cpu().numpy() for k, v in rec.items() if k != "seen"}
+    out = {k: (v.view(torch.int16) if v.dtype == torch.bfloat16 else v).cpu().numpy() for k, v in rec.items() if k != "seen"}
     out["ids"] = out["ids"].astype(np.int16)
     out["w"] = out["w"].astype(np.float16)
+    if "x" in out and _s.get("dump_x_frac", 1.0) < 1.0:
+        T = out["x"].shape[0]
+        rows = np.sort(np.random.default_rng(_s["step_no"]).choice(T, max(1, int(round(T * _s["dump_x_frac"]))), replace=False))
+        out["x"] = out["x"][rows]
+        out["x_rows"] = rows.astype(np.int32)
     if _s["hash_rec"]:
         for li, chunks in _s["hash_rec"].items():
             out[f"hash{li}"] = torch.cat(chunks).numpy()
