@@ -57,17 +57,19 @@ The 120 ARC-AGI-2 eval tasks are never used in the pruning process; they only me
 and prunes better. Everything in this round is no-tool only: the statistics come only from no-tool training rollouts
 (no mixing with the tool round). Targets: E72 and E64 (inference constraints).
 
-**Answer: yes, much better at E72.** E72 keeps 89% of the full model's no-tool pass@1 (tool round: 44%).
+**Answer: yes, much better at E72.** E72 keeps 89% of the full model's no-tool pass@1 and 87% of its pass@2
+(tool round: 44% of pass@1).
 
 | model (no-tool harness, 120 tasks / 167 pairs, self-hosted) | pass@1 pairs | pass@1 task-weighted | pass@2 task-weighted (pairs) | tool-round counterpart, pass@1 |
 |---|---:|---:|---:|---:|
-| full (384 experts, full Engram) | 108/167 = 64.7% | 67.9% | attempt 2 running | tool harness 65.9% |
+| full (384 experts, full Engram) | 108/167 = 64.7% | 67.9% | 76.8% (125/167) | tool harness 65.9% |
 | **E72, answer block x10, Engram 48 GiB** | 96/167 = 57.5% | 57.4% | **66.9% (110/167)** | E72 w30: 29.3% |
 | E64, answer block x10, Engram 48 GiB | 65/167 = 38.9% | 39.4% | - | E64 w30: 18.0% |
 | E64, answer block x20, Engram 48 GiB | 54/167 = 32.3% | 32.5% | - | |
 
 - Full-model pass@2 for the same no-tool config on the API: 75.4% (DeepSeek API, E035 `hdrsum`), 74.6% (DeepInfra
-  fp8, E044 eval120).
+  fp8, E044 eval120); self-hosted 76.8%.
+- pass@2 pairs: 101 solved by both, 24 by the full model only, 9 by E72 only.
 - E72 vs full, same pairs (attempt 1): 82 solved by both, 26 full only, 14 E72 only, 45 neither. E72 attempt 2 alone:
   84/167.
 - E64 x10 beats x20 (the dev rule picked x20 for perfect answer writing, but its +7 points of NLL cost more than the
@@ -140,6 +142,22 @@ answer itself (1 greedy + 4 samples at T=1), scored with the harness parser. Ans
 - The no-tool sets beat the tool-round sets by ~9 NLL points at the same size and write answers better.
 - Free-generation peek (3 dev prompts, `freegen_peek.py` style): E72 x10 reasons like the full model but often starts
   its reasoning with a stray "." or ":"; on 2 of 164 eval pairs that start derails into a near-empty or garbled trace.
+
+## Side measurement: DSpark drafter acceptance (for E042 / dsv4-infer, 2026-10-24)
+
+The 1017 checkpoint ships a DSpark speculative drafter: `mtp.0-2`, 2,401 tensors, 7.38 GiB (routed experts 6.72 GiB
+MXFP4 + scales, dense 0.66 GiB), 128 experts top-3, block size 5, conditioned on target layers 37-39.
+`scripts/dspark_probe.sh`: server B restarted with `--speculative-config {"method":"dspark","num_speculative_tokens":5}`
+(standard rejection sampling, T=1), four 15-minute windows of real eval traffic (24 tasks, 24 workers), /metrics
+counter deltas. The drafter drafts the block in one pass, so the per-position counters give the acceptance length for
+any N <= 5. Runtime masks leave the drafter's own experts unmasked. Results: `results/dspark_probe.jsonl`.
+
+| config | mean acceptance length N=1 / 2 / 4 / 5 | per-position acceptance 1..5 |
+|---|---|---|
+| full, tool harness | 1.66 / 2.11 / 2.64 / 2.81 | 0.66 0.45 0.31 0.22 0.17 |
+| full, no-tool harness | 1.69 / 2.19 / 2.83 / 3.05 | 0.69 0.49 0.36 0.28 0.22 |
+| E72 x10 (no-tool set) + Engram 48 GiB, no-tool | 1.59 / 1.99 / 2.49 / 2.66 | 0.59 0.39 0.28 0.21 0.17 |
+| E72 w30 (tool set) + Engram 64 GiB, tool + rescue | 1.39 / 1.62 / 1.88 / 1.97 | 0.39 0.22 0.15 0.11 0.09 |
 
 ## Setup
 
