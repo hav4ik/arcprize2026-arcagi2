@@ -51,11 +51,21 @@ The 120 ARC-AGI-2 eval tasks are never used in the pruning process; they only me
   (`scripts/split_dev.py`: sha1(NVARC parent or ARC task id) % 10 == 0, about 10%); the eval set is touched only for
   final metrics.
 
-## No-tool round (in progress, 2026-10-23)
+## No-tool round (2026-10-23, in progress)
 
-**Question (user):** without tools, the model does not need its coding skills, so maybe it routes over fewer experts
+**Question (user):** without tools the model does not need its coding skills, so maybe it routes over fewer experts
 and prunes better. Everything in this round is no-tool only: the statistics come only from no-tool training rollouts
-(no mixing with the tool round) and the targets are E72 and E64 (inference constraints), plus E48.
+(no mixing with the tool round). Targets: E72 and E64 (inference constraints), plus E48.
+
+**Answer so far: yes, much better at E72.**
+
+| model (no-tool harness, 120 tasks / 167 pairs, 1 attempt, self-hosted) | pass@1 | same pairs: full no-tool | tool-round counterpart |
+|---|---:|---:|---:|
+| full (384 experts, full Engram) | 108/167 = 64.7% | - | tool harness 65.9% |
+| E72, answer block x10, Engram 48 GiB | 96/164 = 58.5% (partial) | 106 = 64.6% | E72 w30: 49 on the same pairs |
+| E64, answer block x20, Engram 48 GiB | 54/155 = 34.8% (partial) | 103 = 66.5% | E64 w30: 29 on the same pairs |
+
+### Data and splits
 
 - **Data:** the `notool_e044_*` configs of `livobereshka/arc-agi2-deepseek-flash1017-rollouts-e031-e036` (E044 = E035
   arm D: effort low + minimal header + task summary, official ARC Prize prompt, one turn), snapshot of 2026-10-23
@@ -63,25 +73,64 @@ and prunes better. Everything in this round is no-tool only: the statistics come
   118.6M tokens (`tokenize_rollouts.py --no-tools`). Prompt tokens match API usage on 5,379/5,379; completion counts
   differ by 0-3 tokens (the usage convention for EOS and `</think>`).
 - **Dev split** (`split_dev.py`, family-disjoint, no eval data): calibration 4,931 rollouts / 109.2M tokens, dev
-  448 / 9.4M. Screens (NLL, probes) run on dev; the 120 eval tasks are used only for the final ARC scores.
-- **No-tool ARC baseline (full model, self-hosted, `scripts/eval_notool.sh`):** 108/167 = **64.7%** pass@1, mean 31.3k
-  output tokens, 1 cut at the context limit (`e043nt_full_a1`). Tool harness, same server: 65.9%.
+  448 / 9.4M. All screens (NLL, probes) run on dev; the 120 eval tasks are used only for the final ARC scores.
+- **Baseline:** `scripts/eval_notool.sh` (E044 config against the box's server), full model 108/167 = 64.7%, mean 31.3k
+  output tokens, 1 cut at the context limit (`e043nt_full_a1`).
 
-### Pilot on the first snapshot (1,778 calibration rollouts, 10M replayed tokens, dev NLL on 64 traces)
+### Engram (census on the 109M calibration tokens; dev NLL, 64 traces)
 
-- Engram: all 36 GiB of observed rows +0.16% NLL, 32 GiB +0.29%, 16 GiB +0.87%.
-- **Routing is somewhat more concentrated without tools, but not by much:**
+| mask | share of rows | NLL gen | vs full |
+|---|---:|---:|---:|
+| full table | 100% | 0.5663 | - |
+| all observed, 73 GiB | 39% | 0.5666 | +0.05% |
+| 64 GiB | 34% | 0.5667 | +0.07% |
+| 48 GiB (used below) | 25% | 0.5668 | +0.10% |
 
-| | tool round (10M tokens) | no-tool pilot (10M tokens) |
+The answer-writing probe below gives 192/192 with Engram 48 GiB alone.
+
+### Routing: fewer effective experts without tools (REAP replay, 20M calibration tokens, `compare_routing.py`)
+
+| | tool round (10M tokens) | no-tool (20M tokens) |
 |---|---:|---:|
-| effective experts per layer, mean (exp of routing entropy) | 121.7 | 107.1 |
-| routing share kept by the top-48 / 64 / 72 (contribution ranking) | 59.3 / 66.3 / 69.0% | 64.7 / 71.2 / 73.9% |
+| effective experts per layer, mean (exp of routing entropy) | 121.7 | 108.4 |
+| encoder layers 0-19 / decoder layers 20-39 | 127.8 / 115.5 | 111.2 / 105.6 |
+| routing share kept by the top-48 / 64 / 72 (contribution ranking) | 59.3 / 66.3 / 69.0% | 64.5 / 70.9 / 73.7% |
 
-The two workloads' top-64 sets share 83% of their experts.
+No-tool routing is more concentrated in 39 of 40 layers. The two workloads' top-64 sets share 84% of their experts;
+the tool-round top-64 set keeps only 66.9% of no-tool routing (the no-tool set: 70.9%).
 
-- Dev NLL (no-tool, contribution / decoder-generation rule): E72 +19.6%, E64 +26.4%, E48 +40.9%, E40 +49.3%, E32
-  +71.4% (tool round on eval traces: E72 +23.8%, E64 +29.1%, E48 +44.9%; different text, so only roughly comparable).
-  Answer block (`</think>` to EOS, the grid): top-1 99.84% at E72 vs 99.97% full.
+### Dev screen (teacher-forced NLL on 64 dev traces + answer-writing probe on 48 teacher-correct dev traces)
+
+`answer_copy_probe.py` feeds the teacher's prompt and reasoning up to `</think>` and lets the masked model write the
+answer itself (1 greedy + 4 samples at T=1), scored with the harness parser. Answer-block weighting ("answer xW") adds
+(W-1) x the contribution on the generated answer block (`</think>` to EOS) to the contribution score
+(`special_stats.py select --weight W`, no-tool answer-block statistics).
+
+| keep set (+ Engram 48 GiB) | NLL gen vs full | answer written correctly (T=1) | unparsed |
+|---|---:|---:|---:|
+| 384 experts | +0.2% | 192/192 | 0 |
+| E96 | +11.1% | 183/192 | 8 |
+| E80 | +16.1% | | |
+| E72 | +20.2% | 157/192 | 32 |
+| **E72 answer x10** | +22.2% | 191/192 | 0 |
+| E72 answer x30 | +32.0% | 192/192 | 0 |
+| tool-round E72 w30 set | +41.6% | 180/192 | 0 |
+| E64 | +25.3% | 155/192 | 34 |
+| E64 answer x10 | +27.0% | 184/192 | 6 |
+| **E64 answer x20** | +34.1% | 192/192 | 0 |
+| E64 answer x30 | +39.2% | 192/192 | 0 |
+| tool-round E64 w30 set | +47.9% | 178/192 | 0 |
+| E56 | +31.4% | | |
+| E48 | +39.0% | | |
+| E48 answer x30 | +63.1% | 179/192 | 11 |
+
+- Plain pruning loses ~1 in 5 answers *when handed correct reasoning* (mostly unparsable output), so the answer
+  block needs protection; a small weight fixes it.
+- Rule used for the evals: the smallest answer weight that writes >= 99% of the answers on dev (E72: x10, E64: x20).
+  E64 x20 then costs 7 points of NLL over x10, so E64 x10 is evaluated too.
+- The no-tool sets beat the tool-round sets by ~9 NLL points at the same size and write answers better.
+- Free-generation peek (3 dev prompts, `freegen_peek.py` style): E72 x10 reasons like the full model but often starts
+  its reasoning with a stray "." or ":"; on 2 of 164 eval pairs that start derails into a near-empty or garbled trace.
 
 ## Setup
 
