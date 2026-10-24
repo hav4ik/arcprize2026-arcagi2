@@ -1152,6 +1152,11 @@ would need a real quantization (GPTQ/AutoRound-style calibration) and an eval.
     context 36.1K vs E72's 32.3K) it should make ≈ 47–50 attempts/h, ≈ 1.15× E72 and ≈ 1.4× E128.
   - `ds_x96_u93_l` (`run_rest4.sh`, via `run_seq9.sh` after T2) measures it at its own shapes
     (`metadata/trace_shapes/notools_e043_e96.json`, 334 calls), up to C = 96.
+  - **Result (13:16):** C = 88 (the largest under the 80% guard): **585.9 tok/s** decode, prefill 1284 tok/s,
+    snapshot context mean 37.4K (p50 / p90 / max 32.9K / 76.2K / 104.5K). KV peak 0.83, p50 0.48, 0 preemptions over
+    45 min, 72–73 °C. Attempts/h ≈ 3600 / (37.4K / 585.9 + 9.4K / 1284) ≈ **50.6/h, ≈ 6.6 h for 334 attempts**:
+    1.19× E72 (42.4/h) and 1.50× E128 (33.8/h), at pass@2 75.3% vs 66.9% and 72.0%.
+    The peak ran past the guard (0.83 vs 0.80 planned), so a real run should use C ≈ 80.
 - **Direction change (10:10, the user via E043): tool-integrated reasoning with a pruned + quantized model, targets
   E128 and E96.** E043 dropped the no-tool full-384 2-bit ARC run and is building tool E128 (eval ~15:00) and tool E96
   (~16:30), using tool keep sets, the 64 GiB tool Engram table and tool GPTQ calibration.
@@ -1201,6 +1206,18 @@ would need a real quantization (GPTQ/AutoRound-style calibration) and an eval.
     attempts. E96's partial subset is not comparable yet. Its extra turns re-prefill more tool output per generated
     token, so its rate needs its own replay.
   - Per-turn shapes from both tool evals will follow (E128 ~14:00, E96 ~16:00, self-hosted full model ~18:00).
+- **E043 final tool E128 (13:15; sub80s40 + header, 2 attempts, 120 tasks, no rescues):** pass@1 72.8%, **pass@2
+  82.5%**, mean output 35.2K, against the API full model's 74.5% / 84.9% / 27.4K. Tool E96 at 250/334 is weaker: 176 vs
+  the full model's 200 correct on the same attempts, 21.5 turns per attempt.
+  - GPTQ-only export on E043's box: `tool_e128_w10_eng64_gptq`, 131,090,957,662 B (128 experts u2 g128 w13 / u2 g64
+    w2, 64 GiB tool Engram). Env as the no-tool E128. HF upload after a parity check (~16:00).
+  - Turn shapes (`metadata/trace_shapes/tools_e043_e128t.json`, converted from E043's
+    `results/tool_shapes_e128t_w10_u2_gptq_eng64_sub80.json`): 17.1 turns per attempt (E030 13.9), turn prompt p50 / p90
+    27.7K / 67.9K (24.3K / 57.9K), tool tokens per turn p50 / p90 310 / 1268 (300 / 1157), 35.2K generated per attempt
+    (27.4K). Stops: 296 submitted, 27 output budget, 11 max turns.
+  - **T4 (`scripts/run_tool4.sh` via `run_seq11.sh` after T3; `runs/t4.log`):** E128 × 40 and × 48 at these shapes,
+    `--max-wall-s 4800` each. KV per slot grows ~15% over T2, so × 48 should peak near 0.88 and × 40 near 0.75.
+    Attempts/h = gen tok/s × 3600 / 35.2K.
 - **E043 follow-ups (09:00):**
   - E96 2/3-bit GPTQ ARC now goes first, from a GPTQ-only E96 export. E043's user wants E96 only if it is much
     faster. Partial (51 easy-first pairs): pass@1 31 vs full 37, mean output 26.8K (1.12× full).

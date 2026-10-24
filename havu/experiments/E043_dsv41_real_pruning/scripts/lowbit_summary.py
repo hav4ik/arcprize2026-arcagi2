@@ -35,7 +35,7 @@ L4 = {
     "full_a1": "does not fit",
     "e72_w10_eng48": "16.56 GiB/GPU; util .93, own shapes: C52, 399.5 tok/s, ~42 attempts/h",
     "e128_u2_gptq_eng56": "16.87 GiB/GPU; util .93, own 331 shapes: C48, 419.2 tok/s, ~34 attempts/h",
-    "e96_u2u3_gptq_eng56": "15.18 GiB/GPU; util .93, E72 shapes: C80, 558.0 tok/s, ~57-65 attempts/h at 27-31K out (~50/h at its own 37.4K)",
+    "e96_u2u3_gptq_eng56": "15.18 GiB/GPU; util .93, own 37.4K shapes: C88, 585.9 tok/s, 50.6 attempts/h (KV peak 0.83; C80 for a real run)",
     "e128_u2_gptq_fp4eng": "as E128 (Engram is host RAM: 56.6 -> ~30 GiB)",
 }
 

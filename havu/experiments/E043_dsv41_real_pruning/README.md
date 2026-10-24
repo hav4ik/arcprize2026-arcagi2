@@ -95,7 +95,7 @@ scales, Humming kernels; E96 + DSpark was dropped by E042: the drafter halves th
 | full (native) | 64.7% | 76.8% | 31.4K | does not fit |
 | **E128 2-bit GPTQ + Engram 30%** | **59.6%** | **72.0%** | 41.6K | 16.87 GiB/GPU; util .93: 419 tok/s @48 |
 | E72 x10 native | 57.5% | 66.9% | 31.0K | util .93: 311 tok/s @36 |
-| **E96 2/3-bit GPTQ + Engram 30%** (final) | 58.7% | **75.3%** (125/167 pairs, = full) | 37.4K | 15.18 GiB/GPU; util .93: 558 tok/s @80, ~50 attempts/h |
+| **E96 2/3-bit GPTQ + Engram 30%** (final) | 58.7% | **75.3%** (125/167 pairs, = full) | 37.4K | 15.18 GiB/GPU; util .93: 585.9 tok/s @88, 50.6 attempts/h |
 
 (3 of 334 E128 attempts timed out while queued: the client timeout of 3600 s also counted queue time; raised to 6 h
 for `--base-url` runs.) E128 2-bit reasons longer (median per-attempt ratio 1.29x vs the full model on the same
@@ -154,9 +154,18 @@ task-weighted, 27.4k mean tokens; s20x60 + header: 69.9% / 80.3% at 23.3k). The 
 calibration came from s20x60 rollouts (experts assumed stable across budgets). Same for the tool-use E96 2/3-bit run
 (server B, block weight 10 or 30 picked on the dev first-turn probe).
 
-**4xL4 attempts per hour (E042, dummy weights, util 0.93, own output shapes, largest C under an 80% KV guard, 0
-preemptions):** E72 C52 399.5 tok/s ~42/h; E128 2-bit C48 419.2 tok/s ~34/h (its answers are longer); E96 2/3-bit C80
-558.0 tok/s ~57-65/h. So E128's +5 pp pass@2 over E72 costs ~20% of attempts; E96 is ~1.4-1.6x E72 if its ARC holds.
+**4xL4 no-tool attempts per hour (E042, dummy weights, util 0.93, each model's own ARC output shapes, 0
+preemptions):**
+
+| model | output mean | streams | decode tok/s | attempts/h | 334-attempt eval |
+|---|---:|---:|---:|---:|---:|
+| E72 | 31.0K | 52 | 399.5 | 42.4 | 7.9 h |
+| E128 2-bit | 41.6K | 48 | 419.2 | 33.8 | 9.9 h |
+| E96 2/3-bit | 37.4K | 88 | 585.9 | 50.6 | 6.6 h |
+
+- E96's KV peaked at 0.83, past E042's 80% guard, so E042 would run it at about 80 streams.
+- E96 is 1.19x E72 and 1.50x E128 on attempts/h, at no-tool pass@2 75.3% vs 66.9% / 72.0%.
+- E128's +5 pp pass@2 over E72 costs about 20% of attempts.
 A tool-use E128 needs its own multi-turn replay (prefix-cache reuse) before its L4 throughput is known.
 
 **4xL4 tool-mode throughput (E042 T2, 2026-10-24).** Setup: dummy weights in these schemas, util 0.93, prefix caching,
@@ -181,6 +190,7 @@ temperature 1.0, `--rescue-code`; reference = API full model E030 on the same at
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | API full | 74.5% | 84.9% | 142/167 | 247/334 | 27.4K / 22.8K / 59.8K | 13.9 | 2 | 2.3% |
 | **tool E128 2-bit** | **72.8%** | **82.5%** | 136/167 | 240/334 | 35.2K / 29.8K / 72.6K | 17.1 | 27 | 14.2% |
+| tool E96 2/3-bit | 64.9% | 75.8% | 126/167 | 213/334 | 30.5K / 26.6K / 59.8K | 23.6 | 2 (+58 at 40 turns) | 37.4% |
 
 pass@1 and pass@2 are task-weighted.
 
@@ -191,8 +201,24 @@ pass@1 and pass@2 are task-weighted.
   model).
 - 0 rescues: the tool-call format holds with the tool-call-block weight.
 
-**Interim tool E96 2/3-bit (13:05 UTC):** 250/334 attempts done, 176 correct vs the API's 200 on the same attempts.
-Mean output 23.5K tokens (API 22.1K), 21.5 turns, 37.6% Python-error calls, 35 attempts at max_turns.
+**Engram size on the 2-bit model.** Question: does a weaker model lean on Engram more? Measured on the tool E128 2-bit
+server, dev NLL on 64 tool dev traces:
+
+| Engram | dev NLL |
+|---|---:|
+| 64 GiB | 0.79679 |
+| 112 GiB | 0.79647 |
+| full table | 0.79650 |
+
+The spread is 0.04%, the same noise floor as on the full model, so the 64 GiB tool table stays.
+
+**Tool E96 2/3-bit is turn-limited.** It finished at pass@2 75.8%, 9 pp below full.
+- Pairs: 117 solved by both, 25 by the full model only, 9 by E96 only.
+- 58 attempts stopped at the harness's 40-turn cap, after only 40.4K of their 80K output tokens on average. The full
+  model solved 38 of those attempts, and E96's session-answer fallback saved 7.
+- Rerun queued on server B with `--max-turns 64`, everything else unchanged (`e96t_..._sub80_mt64`).
+- E96's attempts are shorter than E128's (30.5K vs 35.2K tokens). At E042's tool-mode rates (453.5 vs 340.5 tok/s on
+  full-model shapes) that is about 53 vs 35 attempts/h on 4xL4.
 
 **The tool errors are typos, from pruning.** DSML format errors are negligible (4 of 4,504 calls for E128). The errors
 are Python exceptions in the model's own code, mostly character-level typos:
@@ -212,11 +238,13 @@ the error message, but each typo costs a turn (E96: 35 of 250 attempts end at ma
 **Truncated sampling does not fix the typos.** Test: tool E128 2-bit on 32 dev-family ARC training tasks (sha1 family
 rule), 1 attempt, `eval_arc.sh SAMPLING=...`.
 
-| sampler | solved | tool calls | Python-error calls | typos seen |
+| sampler | solved (attempts done of 36) | tool calls | Python-error calls | typos seen |
 |---|---:|---:|---:|---|
-| temperature 1.0 | 31/32 | 170 | 10.0% | `dequeue`, `froset`, `froroset`, `dint` |
-| + min_p 0.05 | 30/31 | 143 | 10.5% | `coms` x7, `dequeue`, `froroset`, `fset` |
+| temperature 1.0 | 32/33 | 170 | 10.0% | `dequeue`, `froset`, `froroset`, `dint` |
+| + min_p 0.05 | 32/33 | 161 | 9.9% | `coms` x7, `dequeue`, `froroset`, `fset` |
 | top_p 0.95 | 31/32 | 166 | 7.2% | `zys`, `ne`, `coms` |
+
+The last 3-4 long attempts of each arm were stopped to free server A.
 
 Typos survive min_p 0.05, so their probability is at least 5% of the top token's. The pruned model genuinely puts mass
 on them; they are not the sampler's tail. The fix has to come from the model: the keep set (for example, weighting
