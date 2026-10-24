@@ -6,7 +6,8 @@ reasoning traces in evals/results/; dev screens come from results/tool_nll_tool_
 results/tool_gen_probe_tool_dev.jsonl; the no-tool table from results/lowbit_summary.json. 4xL4 serving numbers are
 E042's measurements (dsv4-infer, dummy weights in the real schemas), entered below in L4 with their sources.
 
-  make_tool_report.py reports/tool_pruning_report.html
+  make_tool_report.py reports/tool_pruning_report.html [--fragment]
+(--fragment: no doctype/html/head/body wrapper, for publishing as a hosted page that adds its own skeleton.)
 """
 import collections
 import glob
@@ -25,6 +26,7 @@ HERE = Path(__file__).resolve().parent
 EVR = HERE / "../../../evals/results"
 RES = HERE / "../results"
 OUT = sys.argv[1]
+FRAGMENT = "--fragment" in sys.argv[2:]
 W = 720
 
 FULL, E128, E96 = "e030_hdrmin", "e043_e128t_w10_u2_gptq_eng64_sub80", "e043_e96t_w10_u2u3_gptq_eng64_sub80"
@@ -496,7 +498,7 @@ items = [(lab, slot) for _, lab, slot, _ in MODELS]
 now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1"><title>Tool-use pruning report</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>DeepSeek Tool-Use Pruning</title>
 <style>{CSS}{EXTRA}</style></head><body><main>
 <h1>Pruning DeepSeek-V4.1-Flash for tool-integrated ARC on 4xL4</h1>
 <p class="sub">Experiment E043, 2026-10-23 to 2026-10-24. Generated {now} by <code>scripts/make_tool_report.py</code> from the
@@ -666,5 +668,9 @@ document.querySelectorAll('.hit').forEach(g=>{{g.addEventListener('pointermove',
 g.addEventListener('pointerleave',()=>tip.style.display='none');g.addEventListener('blur',()=>tip.style.display='none');}});
 </script></body></html>"""
 page = page.replace('class="lab2"', 'class="lab"').replace('class="val2"', 'class="val"')
+if FRAGMENT:
+    page = page.replace('<!doctype html><html lang="en"><head><meta charset="utf-8">\n'
+                        '<meta name="viewport" content="width=device-width, initial-scale=1">', "", 1)
+    page = page.replace("</head><body>", "\n", 1).replace("</body></html>", "", 1)
 open(OUT, "w").write(page)
 print(OUT, len(page))
