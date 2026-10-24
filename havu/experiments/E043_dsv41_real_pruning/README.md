@@ -115,6 +115,43 @@ runs are not resumed.
     15.29 GiB/GPU (estimate 15.43), KV 2,571,147 tokens per GPU (+78% vs E128), smoke test OK, GPUs <= 73 C.
   - dsv4-infer's recommendation to the user: E112 for Kaggle, on the throughput margin (~48 vs ~35 attempts/h,
     early-phase estimates). Caveat: the late-run regime, which the E112 L4 run measures until ~21:00.
+- **E112 final (2026-10-24 20:45 UTC, 334/334, 0 errors):**
+
+  | tool harness, 167 pairs x 2 | pass@1 | pass@2 | attempt 0 / 1 correct | mean / median / p90 tokens | turns | 40-turn stops | Python-error calls |
+  |---|---:|---:|---:|---:|---:|---:|---:|
+  | API full | 74.5% | 84.9% (142) | 119 / 128 | 27.4K / 22.8K / 59.8K | 13.9 | 8 | 2.3% |
+  | E128 2-bit | 72.8% | 82.5% (136) | 119 / 121 | 35.2K / 29.8K / 72.6K | 17.1 | 11 | 14.0% |
+  | **E112 2-bit** | **64.8%** | **75.6% (124)** | **116 / 95** | 36.4K / 31.2K / 72.6K | 20.9 | 39 | 28.6% |
+  | E96 2/3-bit | 64.9% | 75.8% (126) | 106 / 107 | 30.5K / 26.6K / 59.8K | 23.6 | 58 | 37.3% |
+
+  - **Open anomaly:** E112's attempt 1 is far below its attempt 0.
+    - Attempt-0-only vs attempt-1-only correct pairs: 29 vs 8, sign test p = 0.0008. Every other run is balanced:
+      E128 15 vs 17, E96 19 vs 20, API 14 vs 23.
+    - On the 98 hard pairs where both E112 attempts used `--token-exact`: attempt 0 solved 55 (E128 57) and
+      attempt 1 solved 40 (E128 59). Tokens, turns and rescue frequency are the same in both.
+    - The rescues were concentrated in 3 looping attempts in attempt 0 (36, 14 and 14 rescues); 9 attempts per side
+      had any rescue at all.
+    - The harness diff between the two process starts touches only the counter and the job filter.
+    - Ruled out:
+      - server masks (both control files and the server logs show only the E112 masks);
+      - per-server effects: the drop is on both servers;
+      - sandbox timeouts (0.2-0.3% of calls) and session-id collisions (uuid4);
+      - `args.attempts`, which never reaches the model.
+    - The remaining difference: attempt 1 ran entirely in a second process beside attempt 0's tail.
+    - **Clean rerun:** `e112t_w10_u2_gptq_eng64_sub80_r2`, started 20:47 UTC: one process, current code, a third
+      independent attempt.
+- **L4 steady state with the fix (dsv4-infer, E112 x 60, 63-min run):**
+  - 416-422 tok/s from minute 8 to 42; hits rose 95% -> 98%; KV max 0.37; 0 preemptions. The late-run collapse is
+    gone.
+  - FP4 KV (vLLM's `nvfp4_ds_mla`) is refused by the fork for V4.1. The `fp8` flag already selects its native mixed
+    FP8/FP4 KV.
+- **Loop guard (dsv4-infer, gzip-ratio monitor on reasoning + content, 1k windows, ratio > 8):**
+  - E128: 0 streaks in 5,699 turns.
+  - E112: one real doom loop (18 windows), plus streaks of 7-8 in terse notes.
+  - The Kaggle driver therefore checks thinking only and requires 10 windows in a row.
+- **Second-attempt priority (dsv4-infer, from the E128 file):** skipping attempt 2 when attempt 1 train-passes would
+  cost 8 of 167 pairs (-4.8 pp) for -26% tokens. The Kaggle driver instead runs the non-train-passed pairs' second
+  attempts first.
 - **Expected 4xL4 footprint (from the shapes, before measurement):** about 15.4 GiB of weights per GPU and ~2.5M KV tokens
   at util 0.93. That is about the same as E96 u2/u3 (15.18 GiB, 2.72M tokens) and 1.44 GiB/GPU less than E128.
 - **HF upload rule (user, 2026-10-24): every safetensors file is at most 5 GB.** Before this, exports carried the
