@@ -1314,6 +1314,26 @@ would need a real quantization (GPTQ/AutoRound-style calibration) and an eval.
       thinking decode ran, have been evicted from the ~450K-token free pool on L4, so the turn re-prefills from much
       earlier. The miss grows with context: uncached prefill rose from 435 to 893 tok/s.
     - **Lesson:** token-exact replays overstate tool throughput for this model on L4. Validate on real traffic.
+  - **Where the prefix breaks (the user, 19:05: "please figure out where is the mismatch"):**
+    - Offline (`scripts/prefix_offline.py`, server `/tokenize` on 25 turns of 3 saved real-run transcripts): each
+      prompt is an exact token prefix of the next one. With tools in the request, the V4.1 encoder keeps every
+      earlier turn's thinking (`effective_drop_thinking = False`), so the old part of the prompt never changes.
+    - Live (`scripts/prefix_probe.py`, real harness with `return_token_ids`, 3 tasks): 6 of 6 short turns (162–688
+      sampled tokens) were exact extensions of prompt + sampled ids.
+    - E043 (`render_parity.py` on its 8× E112 server): 1 of 11 tool turns broke 11 tokens into a 1,032-token turn.
+      The model had sampled a non-canonical split ("fil|ls"), and re-tokenizing the text gives the canonical split.
+      On 78,992 API turns, 13% re-tokenize to a different length.
+    - Under real 40-stream load (`scripts/prefix_hitlog.py`, server `rw_e128t3` with
+      `--enable-prompt-tokens-details`, first 12 min; `hitlog_e128t_w40_report.txt`): **20 of 93 turns (21%)
+      broke**.
+      - Eviction loss (cache that existed but was gone) was 3.1% of queried tokens: 2.1 points on broken turns,
+        1.1 on exact ones.
+      - The break itself cost only 0.6%, but it moves the resume point back into turn-k blocks freed during the
+        decode.
+      - Early in a run the misses are mostly first prompts (22%), so this window understates the late-run loss.
+    - Fix (E043, 19:43): `--token-exact` in `evals/run_deepseek_tools.py` (opt-in, `--base-url` only). Each attempt
+      keeps its exact token history; only newly appended messages are rendered, through the server's
+      `/tokenize`, and the turn is generated via `/v1/completions` with the ids.
 - **E043 follow-ups (09:00):**
   - E96 2/3-bit GPTQ ARC now goes first, from a GPTQ-only E96 export. E043's user wants E96 only if it is much
     faster. Partial (51 easy-first pairs): pass@1 31 vs full 37, mean output 26.8K (1.12× full).

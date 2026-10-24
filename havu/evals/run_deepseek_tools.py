@@ -603,7 +603,9 @@ def turn_token_exact(client, args, messages, max_tokens, tok):
         upto = render(messages[:tok["n"]], False)
         if full[:len(upto)] == upto:
             ids = tok["ids"] + full[len(upto):]
-            tok["breaks"] += upto != tok["ids"]  # turns where a re-render would have changed the cached history
+            # a break: re-rendering the last assistant turn does not give back its sampled ids (it starts where the
+            # previous turn's prompt render ended)
+            tok["breaks"] += upto[tok["prev_len"]:] != tok["prev_sampled"]
         else:
             ids = full
             tok["rerenders"] += 1
@@ -640,7 +642,7 @@ def turn_token_exact(client, args, messages, max_tokens, tok):
         finish = "tool_calls" if finish == "stop" else finish
     if failure or finish is None or usage is None:
         raise TurnError(failure or "Incomplete stream: missing finish reason or usage", assistant, usage, finish)
-    tok["ids"], tok["n"] = ids + sampled, len(messages) + 1
+    tok["ids"], tok["n"], tok["prev_len"], tok["prev_sampled"] = ids + sampled, len(messages) + 1, len(full), sampled
     tok["turns"] += 1
     return assistant, usage, finish
 
@@ -737,7 +739,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
     n_rescues = 0  # E043 --rescue-code
     n_nudge_rescues = 0
     # E043 --token-exact: the attempt's exact token history (prompt + sampled ids) and counters
-    tok = ({"ids": None, "n": 0, "turns": 0, "breaks": 0, "rerenders": 0, "parse_fallbacks": 0}
+    tok = ({"ids": None, "n": 0, "prev_len": 0, "prev_sampled": [], "turns": 0, "breaks": 0, "rerenders": 0,
+            "parse_fallbacks": 0}
            if getattr(args, "token_exact", False) and getattr(args, "base_url", None) else None)
     events, error, content, t0 = [], None, "", time.monotonic()
     session_final = getattr(args, "final_mode", "turn") == "session"
@@ -930,7 +933,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
     if getattr(args, "rescue_code", False):
         result["rescues"] = n_rescues
     if tok is not None:
-        result["token_exact"] = {k: v for k, v in tok.items() if k not in ("ids", "n")}
+        result["token_exact"] = {k: v for k, v in tok.items() if k not in ("ids", "n", "prev_len", "prev_sampled")}
     if getattr(args, "train_check", False):
         result.update({"train_pass": None, "train_frac": None, "train_trace": "no_answer"} if pred is None else labels)
     if any(getattr(args, k, v) != v for k, v in V4_DEFAULTS.items()):
@@ -1044,6 +1047,8 @@ def parser():
     ap.add_argument("--think-turns", type=int, default=-1,
                     help="E010: thinking only on the first N assistant turns, disabled after (-1 = always think)")
     ap.add_argument("--budget-warn", type=float, default=0.8, help="fraction at which the note says to answer now")
+    ap.add_argument("--only-attempts", default=None,
+                    help="E043: comma-separated attempt indices to run (others are left to another process)")
     ap.add_argument("--token-exact", action="store_true",
                     help="E043 (--base-url): send each turn as the attempt's exact token ids (prompt + sampled ids + "
                          "rendered new messages) to /v1/completions, so re-tokenizing sampled text never breaks the "
@@ -1169,6 +1174,9 @@ def main():
             for a in range(args.attempts) if (t, p, a) not in latest or "error" in latest[t, p, a]]
     if pairs is not None:
         jobs = [job for job in jobs if job[:2] in pairs]
+    if getattr(args, "only_attempts", None):  # E043: e.g. attempt 1 in a second process beside a running attempt 0
+        keep_attempts = {int(x) for x in args.only_attempts.split(",")}
+        jobs = [job for job in jobs if job[2] in keep_attempts]
     if policy:
         jobs += [(t, p, 2) for t, task in tasks.items() for p in range(len(task["test"]))
                  if (pairs is None or (t, p) in pairs) and needs_extra(t, p)]

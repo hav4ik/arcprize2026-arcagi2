@@ -78,8 +78,24 @@ runs are not resumed.
       - live: the history equals the server's own render whenever re-tokenizing reproduces it;
       - 2 end-to-end harness attempts;
       - unit tests: 2 new parser tests, 62 existing harness tests pass.
-    - The E112 eval was restarted with it at 19:43 UTC. 69 attempt-0 results were kept, and 98 in-flight attempts
+    - The E112 eval was restarted with it at 19:24 UTC. 69 attempt-0 results were kept, and 98 in-flight attempts
       were re-run. Per-attempt counters: `token_exact`.
+    - **Counter caveat:** processes started before ~19:47 count `breaks` wrongly. They compared the whole history with
+      the canonical render, so every turn after the first break counted again. That covers both E112 eval processes
+      and dsv4-infer's first L4 `--token-exact` run.
+      - From those records, `breaks` = turns minus the index of the first break. That gives the share of attempts
+        with at least one break, not the per-turn rate.
+      - Fixed: a break is now counted only when the last assistant turn's own re-render differs from its sampled
+        ids.
+      - Only the counter was affected; the tokens sent were always exact.
+    - **Attempt 1 in parallel (19:40 UTC, for the user's 20:30 decision):** a second harness process runs only
+      attempt 1 (new opt-in `--only-attempts 1`) on the same results file, beside the attempt-0 process. Each
+      record is appended in one write. A final `--attempts 2` pass retries any errors.
+    - `scripts/tool_paired.py`: runs compared on exactly the attempts the first run has finished.
+      - pass@1 plain and task-weighted;
+      - pass@2 on pairs with both attempts;
+      - tokens, turns, Python-error share from the traces, turn-cap and budget stops;
+      - one-sided wins.
   - Fix options sent to dsv4-infer:
     - token-exact continuation in the harness: keep the token ids and send `/v1/completions` with the previous ids
       plus the rendered tool result;
