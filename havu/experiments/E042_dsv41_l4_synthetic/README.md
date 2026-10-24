@@ -1276,6 +1276,44 @@ would need a real quantization (GPTQ/AutoRound-style calibration) and an eval.
     which that jsonl's `rescues` field shows it used), 2 attempts, 40 workers. It runs from the workstation through an SSH tunnel, using E042's own sandbox (`arc-sandbox-e042`,
     http://172.18.0.6:6000). Time-boxed to ~18:45: real tok/s, hits, KV and temperatures over the steady part,
     plus correctness paired with E043's attempts. The finished attempts are biased toward short ones.
+  - **Server `rw_e128t2`** (with the parsers): up in 120 s, 16.87 GiB/GPU, KV 1,447,673 tokens (2.13 GiB). Per GPU,
+    out of 22.04 GiB usable (ECC on: 23,034 MiB total, 469 MiB reserved): ~1.0 GiB non-torch, 0.51 activations,
+    0.31 CUDA graphs. nvidia-smi shows ~21.4 GiB used.
+  - **Real-weight decode, 8K random-token context, no DSpark** (`rw_dw.sh`, `runs/rw_e128t2/dw_8192_c*.json`):
+
+    | C | tok/s | per stream | ITL | dummy (ds_x128_u93) |
+    |---:|---:|---:|---:|---:|
+    | 32 | 464.0 | 14.5 | 68.8 ms | 334.9 |
+    | 64 | 625.1 | 9.77 | 102.3 ms | 487.5 |
+    | 128 | 750.9 | 5.87 | 170.1 ms | — |
+
+    Prefill ~1330–1376 tok/s; at C128, GPUs 71–73 °C, KV peak 0.71, 0 preemptions. Real routing is more concentrated
+    than the dummy weights' routing, so the real weights decode 28–39% faster.
+  - **Real ARC tool run** (`eval_rw.sh rw_e128t_l4`, 40 workers, 17:25–18:59 UTC; stopped by PID at the time box,
+    `evals/results/tools_persistent_grid_lean2sub_dsv41_low_e042_rw_e128t_l4.jsonl`). From `kvmon.log`:
+
+    | window (UTC) | gen tok/s | prefix hits | uncached prefill tok/s | KV p50 / max |
+    |---|---:|---:|---:|---:|
+    | 17:25–17:40 | 263.5 | 84.7% | 435 | 0.21 / 0.31 |
+    | 17:40–18:00 | 247.5 | 74.7% | 521 | 0.35 / 0.45 |
+    | 18:00–18:20 | 180.4 | 66.5% | 712 | 0.49 / 0.57 |
+    | 18:20–18:40 | 176.4 | 64.7% | 728 | 0.59 / 0.63 |
+    | 18:40–19:00 | 130.9 | 54.8% | 893 | 0.66 / 0.69 |
+    | **17:45–19:00** | **176.8** | **63.8%** | **736** | 0.55 / 0.69 |
+
+    - 0 preemptions; 38–40 running; GPUs max 71–73 °C at ~99% utilisation.
+    - The T4 replay at the same C40 gave 318.6 tok/s and 96.7% hits at KV peak 0.76.
+    - At 35.2K output per attempt, 176.8 tok/s is ≈ 18 attempts/h (≈ 18.5 h for 334), vs 32.6 from the replay.
+    - Only 18 attempts finished: one attempt takes ~75 min at ~4.4 tok/s per stream. On the same attempts this run had
+      17 correct and E043 18, too few to judge.
+    - E043's 8× box, same harness and model, got ~92% cumulative hits at KV ≤ 17% (`E043 results/cache_watch.tsv`).
+      So the low hit rate comes from L4's small cache pool, not from the harness alone.
+    - **Hypothesis (unverified):** the replay sends token-exact prefixes. The real harness re-renders the transcript
+      through the chat template, which likely changes the last assistant turn (thinking or DSML tool call), so the
+      cache has to resume before it. The blocks there, probably the sliding-window state freed while the 15–20 min
+      thinking decode ran, have been evicted from the ~450K-token free pool on L4, so the turn re-prefills from much
+      earlier. The miss grows with context: uncached prefill rose from 435 to 893 tok/s.
+    - **Lesson:** token-exact replays overstate tool throughput for this model on L4. Validate on real traffic.
 - **E043 follow-ups (09:00):**
   - E96 2/3-bit GPTQ ARC now goes first, from a GPTQ-only E96 export. E043's user wants E96 only if it is much
     faster. Partial (51 easy-first pairs): pass@1 31 vs full 37, mean output 26.8K (1.12× full).

@@ -1,141 +1,135 @@
 #!/usr/bin/env python3
-"""E042 P4: prefix-caching probe against the running server.
+"""E042 RW: does each tool turn's prompt extend the previous prompt + generated tokens token-for-token?
 
-parity: P (3000 random tokens), P again, then P+S (S = 300 more tokens); greedy 24 tokens each with logprobs.
-  Prints token ids, logprobs and prefix-cache counter deltas per request, for comparing a cache-on server
-  (warm P+S reuses P's blocks, including the Engram n-gram lookback across the boundary) with a cache-off one.
-gencache: P, then P + its greedy output + 16 tokens; counts cache hits to see whether generated-token blocks are reused.
-replay: C attempts x T turns shaped like tool use: every turn re-sends the whole history (base prompt, every
-  earlier output, a random "tool result" per turn), so a cache should serve all but the new tail.
-  Reports per-turn latency, total wall time, generated tok/s and the prefix-cache hit rate over the replay.
+Runs the real harness (run_deepseek_tools.solve, eval_rw.sh flags) for a few attempts with a short turn cap, asks
+the server for token IDs (`return_token_ids`), and records per turn the prompt IDs the server built and the IDs it
+generated. For turns k, k+1 it reports the first position where prompt[k+1] differs from prompt[k] + generated[k],
+with the decoded text around it, so the prefix-cache miss can be traced to the exact characters.
+
+Usage (from evals/): prefix_probe.py --out <json> [--tasks N] [--max-turns T]
 """
-
 import argparse
-import asyncio
+import copy
 import json
-import random
-import statistics
-import time
+import sys
+import threading
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-import aiohttp
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "evals"))
+import run_deepseek_tools as h  # noqa: E402
+from openai import OpenAI  # noqa: E402
 
-
-def rand_tokens(rng, n):
-    return [rng.randrange(1000, 100000) for _ in range(n)]
-
-
-async def complete(session, a, prompt, max_tokens, logprobs=False):
-    body = {"model": a.model, "prompt": prompt, "max_tokens": max_tokens, "temperature": 0,
-            "ignore_eos": True, "return_token_ids": True, "logprobs": 1, "return_tokens_as_token_ids": True}
-    async with session.post(f"{a.url}/v1/completions", json=body) as r:
-        r.raise_for_status()
-        d = await r.json()
-    c = d["choices"][0]
-    ids = c.get("token_ids") or [int(t.split(":")[1]) for t in c["logprobs"]["tokens"]]
-    return ids, c["logprobs"]["token_logprobs"], d["usage"]
+TAG = "prefix_probe"
+HARNESS = [
+    "--mode", "grid", "--effort", "low", "--prompt", "lean2sub", "--answer-tool", "--final-mode", "session",
+    "--lenient-parse", "--max-tokens", "64000", "--max-total-output", "80000", "--budget-soft", "40000",
+    "--budget-notes", "0.01", "--budget-warn", "0.75", "--effort-header", "minimal", "--turns-note", "5",
+    "--train-check", "--rescue-code", "--attempts", "1", "--model", "dsv41",
+]
 
 
-async def cache_counters(session, a):
-    async with session.get(f"{a.url}/metrics") as r:
-        txt = await r.text()
-    q = h = 0.0
-    for line in txt.splitlines():
-        if line.startswith("vllm:prefix_cache_queries_total"):
-            q += float(line.split()[-1])
-        elif line.startswith("vllm:prefix_cache_hits_total"):
-            h += float(line.split()[-1])
-    return q, h
+class Recorder:
+    """OpenAI client stand-in: forwards chat.completions.create and keeps prompt / generated token IDs per turn."""
+
+    def __init__(self, real):
+        self.real, self.turns = real, []
+        self.chat = self
+        self.completions = self
+
+    def create(self, **kw):
+        rec = {"n_messages": len(kw["messages"]), "messages": copy.deepcopy(kw["messages"]),
+               "prompt_ids": None, "gen_ids": []}
+        self.turns.append(rec)
+        return _Stream(self.real.chat.completions.create(**kw), rec)
 
 
-async def parity(session, a):
-    rng = random.Random(a.seed)
-    p = rand_tokens(rng, 3000)
-    s = rand_tokens(rng, 300)
+class _Stream:
+    def __init__(self, stream, rec):
+        self.stream, self.rec = stream, rec
+
+    def __iter__(self):
+        for chunk in self.stream:
+            extra = chunk.model_extra or {}
+            if extra.get("prompt_token_ids") is not None:
+                self.rec["prompt_ids"] = list(extra["prompt_token_ids"])
+            for ch in chunk.choices or []:
+                ids = (ch.model_extra or {}).get("token_ids")
+                if ids:
+                    self.rec["gen_ids"].extend(ids)
+            yield chunk
+
+    def close(self):
+        self.stream.close()
+
+
+def detok(base, ids):
+    req = urllib.request.Request(base.rsplit("/v1", 1)[0] + "/detokenize",
+                                 data=json.dumps({"model": "dsv41", "tokens": ids}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=60))["prompt"]
+
+
+def compare(base, turns):
     out = []
-    for name, prompt in (("P_cold", p), ("P_again", p), ("P+S", p + s)):
-        q0, h0 = await cache_counters(session, a)
-        t0 = time.perf_counter()
-        ids, lps, usage = await complete(session, a, prompt, 24)
-        dt = time.perf_counter() - t0
-        q1, h1 = await cache_counters(session, a)
-        out.append({"req": name, "prompt_len": len(prompt), "s": round(dt, 2), "cache_queries": q1 - q0,
-                    "cache_hits": h1 - h0, "token_ids": ids, "logprobs": [round(x, 4) for x in lps]})
-        print(json.dumps({k: v for k, v in out[-1].items() if k not in ("token_ids", "logprobs")}), flush=True)
-    same = out[0]["token_ids"] == out[1]["token_ids"]
-    dlp = max(abs(x - y) for x, y in zip(out[0]["logprobs"], out[1]["logprobs"]))
-    print(json.dumps({"P_again_same_tokens": same, "P_again_max_abs_dlogprob": round(dlp, 4)}), flush=True)
-    return {"mode": "parity", "requests": out, "P_again_same_tokens": same, "P_again_max_abs_dlogprob": dlp}
-
-
-async def gencache(session, a):
-    """Are the KV blocks of generated tokens reusable? P, then P + its greedy output + a short tail."""
-    rng = random.Random(a.seed)
-    out = []
-    for gen in (512, 1024):
-        p = rand_tokens(rng, 3000)
-        ids, _, _ = await complete(session, a, p, gen)
-        q0, h0 = await cache_counters(session, a)
-        await complete(session, a, p + ids + rand_tokens(rng, 16), 1)
-        q1, h1 = await cache_counters(session, a)
-        r = {"prompt": 3000, "generated": len(ids), "resend_len": 3000 + len(ids) + 16, "hits": h1 - h0,
-             "hits_if_prompt_only": (3000 // 128) * 128, "hits_if_output_cached": ((3000 + len(ids)) // 128) * 128}
-        out.append(r)
-        print(json.dumps(r), flush=True)
-    return {"mode": "gencache", "rows": out}
-
-
-async def attempt(session, a, i, rec):
-    rng = random.Random(a.seed * 1000 + i)
-    hist = rand_tokens(rng, a.base)
-    for t in range(a.turns):
-        t0 = time.perf_counter()
-        ids, _, _ = await complete(session, a, hist, a.gen)
-        rec.append({"attempt": i, "turn": t, "prompt_len": len(hist), "s": time.perf_counter() - t0})
-        hist = hist + ids + rand_tokens(rng, a.tool)
-
-
-async def replay(session, a):
-    q0, h0 = await cache_counters(session, a)
-    rec = []
-    t0 = time.perf_counter()
-    await asyncio.gather(*(attempt(session, a, i, rec) for i in range(a.conc)))
-    wall = time.perf_counter() - t0
-    q1, h1 = await cache_counters(session, a)
-    prompt_tokens = sum(r["prompt_len"] for r in rec)
-    new_tokens = a.conc * (a.base + (a.turns - 1) * (a.gen + a.tool))
-    per_turn = {t: round(statistics.mean(r["s"] for r in rec if r["turn"] == t), 2) for t in range(a.turns)}
-    out = {"mode": "replay", "conc": a.conc, "turns": a.turns, "base": a.base, "gen": a.gen, "tool": a.tool,
-           "wall_s": round(wall, 1), "gen_tok_s": round(a.conc * a.turns * a.gen / wall, 1),
-           "prompt_tokens": prompt_tokens, "reusable_frac": round(1 - new_tokens / prompt_tokens, 3),
-           "cache_queries": q1 - q0, "cache_hits": h1 - h0,
-           "hit_rate": round((h1 - h0) / (q1 - q0), 3) if q1 > q0 else None,
-           "turn_latency_mean_s": per_turn}
-    print(json.dumps(out), flush=True)
+    for k in range(len(turns) - 1):
+        a = turns[k]["prompt_ids"] + turns[k]["gen_ids"]
+        b = turns[k + 1]["prompt_ids"]
+        if a is None or b is None:
+            continue
+        i = next((j for j, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+        row = {"turn": k + 1, "prompt_k": len(turns[k]["prompt_ids"]), "gen_k": len(turns[k]["gen_ids"]),
+               "prompt_k1": len(b), "first_diff": i, "exact_extension": i == len(a),
+               "lost_tokens_after_diff": len(a) - i}
+        if i < len(a):
+            lo = max(0, i - 12)
+            row["ids_expected"] = a[lo:i + 12]
+            row["ids_actual"] = b[lo:i + 12]
+            row["text_expected"] = detok(base, a[lo:i + 12])
+            row["text_actual"] = detok(base, b[lo:i + 12])
+            row["diff_offset_in_gen"] = i - len(turns[k]["prompt_ids"])
+        out.append(row)
     return out
 
 
-async def run(a):
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=3600)
-    async with aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=0)) as session:
-        res = await {"parity": parity, "replay": replay, "gencache": gencache}[a.mode](session, a)
-    if a.json:
-        with open(a.json, "w") as f:
-            json.dump(res, f, indent=1)
-
-
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("mode", choices=["parity", "replay", "gencache"])
-    p.add_argument("--url", default="http://127.0.0.1:8100")
-    p.add_argument("--model", default="dsv41-e64")
-    p.add_argument("--conc", type=int, default=16)
-    p.add_argument("--turns", type=int, default=6)
-    p.add_argument("--base", type=int, default=2048)
-    p.add_argument("--gen", type=int, default=192)
-    p.add_argument("--tool", type=int, default=384)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--json")
-    asyncio.run(run(p.parse_args()))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--tasks", type=int, default=8)
+    ap.add_argument("--max-turns", type=int, default=3)
+    ap.add_argument("--base-url", default="http://127.0.0.1:18100/v1")
+    ap.add_argument("--sandbox-url", default="http://172.18.0.6:6000")
+    a = ap.parse_args()
+    extra = {"chat_template_kwargs": {"thinking": True, "reasoning_effort": 50}, "temperature": 1.0, "top_p": 1.0,
+             "cache_salt": TAG, "return_token_ids": True}
+    args = h.parser().parse_args(HARNESS + ["--max-turns", str(a.max_turns), "--sandbox-url", a.sandbox_url,
+                                            "--base-url", a.base_url, "--extra-body", json.dumps(extra),
+                                            "--challenges", str(ROOT / "data/arc-agi-2-github/data/evaluation")])
+    tasks = h.load_tasks(args.challenges)
+    names = sorted(tasks)[:a.tasks]
+    results, lock = {}, threading.Lock()
+
+    def work(t):
+        client = Recorder(OpenAI(api_key="none", base_url=a.base_url, timeout=7200, max_retries=0))
+        try:
+            h.solve(client, args, tasks[t], tasks[t]["test"][0]["input"])
+            err = None
+        except Exception as exc:  # keep whatever turns were recorded
+            err = f"{type(exc).__name__}: {exc}"
+        rows = compare(a.base_url, [x for x in client.turns if x["prompt_ids"] is not None])
+        with lock:
+            results[t] = {"error": err, "comparisons": rows,
+                          "turns": [{"messages": x["messages"], "prompt_ids": x["prompt_ids"], "gen_ids": x["gen_ids"]}
+                                    for x in client.turns]}
+            for r in rows:
+                print(t, json.dumps({k: v for k, v in r.items() if not k.startswith("ids_")}, ensure_ascii=False),
+                      flush=True)
+
+    with ThreadPoolExecutor(len(names)) as ex:
+        list(ex.map(work, names))
+    Path(a.out).write_text(json.dumps(results))
 
 
 if __name__ == "__main__":

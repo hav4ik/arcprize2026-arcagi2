@@ -46,6 +46,32 @@ runs are not resumed.
   - The serving-parity check of the chunked export (needs a GPU server) runs after the eval.
   - The tool E128 repo stays as it is (user).
 - **Eval (started 18:58 UTC):** both servers, 167 workers, attempt 0 first (`e112t_w10_u2_gptq_eng64_sub80`).
+- **Real-weight tool E128 on 4xL4 (dsv4-infer, E042; tag `e042_rw_e128t_l4`, 40 workers, 17:25-18:59 UTC):**
+  - 177 gen tok/s in the steady window (17:45-19:00), not the T4 replay's 318.6. That is ~18 attempts/h, not 32.6.
+  - Prefix hits fell over the run: 85%, then 75, 67, 65 and 55% per 20-min window. KV peaked at 0.69, with 0
+    preemptions.
+  - 18 attempts finished, 17 correct (E128 on the 8x box: 18 on the same attempts). Too few to judge.
+  - The 8x run of the same harness held ~92% hits at KV <= 17%, so the loss shows only with L4's small KV pool.
+- **Render parity (`scripts/render_parity.py`, on the E112 server):** does the next prompt reproduce the tokens the
+  server actually sampled? Method: stream a turn like the harness, with `return_token_ids`; rebuild the assistant
+  message as the harness does; `/tokenize` the next prompt; find the first differing token.
+
+  | finding | result |
+  |---|---|
+  | Earlier reasoning dropped from the next prompt? | No. `reasoning_content` and `reasoning` render identically, and the prompt prefix stays stable. |
+  | DSML tool calls re-rendered differently? | No, token-exact. |
+  | Whole tool-call turn token-exact | 10 of 11 turns |
+  | Where the 11th turn broke | 11 tokens into a 1,032-token turn, at a non-canonical split the model sampled ("fil" + "ls"); re-tokenizing picks the canonical split |
+
+  - E043's tokenizer check on 78,992 API turns agrees: 13% of sampled completions were one token longer than their
+    re-tokenization.
+  - So on at least ~1 turn in 8, the cached prefix ends inside the last assistant turn. Resuming there needs
+    sliding-window state from early in that decode. The 8x box never evicts it; L4 does.
+  - Fix options sent to dsv4-infer:
+    - token-exact continuation in the harness: keep the token ids and send `/v1/completions` with the previous ids
+      plus the rendered tool result;
+    - E112's larger KV;
+    - fewer streams.
 - **Expected 4xL4 footprint (from the shapes; not measured):** about 15.4 GiB of weights per GPU and ~2.5M KV tokens
   at util 0.93. That is about the same as E96 u2/u3 (15.18 GiB, 2.72M tokens) and 1.44 GiB/GPU less than E128.
 - **HF upload rule (user, 2026-10-24): every safetensors file is at most 5 GB.** Before this, exports carried the
