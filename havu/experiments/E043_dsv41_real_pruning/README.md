@@ -7,6 +7,30 @@ Quality: the 120 ARC-AGI-2 eval tasks with the same harness, full vs pruned on t
 The plan pack (the user's upload, unzipped) is in `plan/` (START_HERE.md, REAP_IMPLEMENTATION_CONTRACT.md,
 TASKS_ENGRAM_FIRST.md, ...). Deployment counterpart: E042 (session dsv4-infer).
 
+## E112 2-bit tool round (2026-10-24 18:00 UTC, running)
+
+The user restarted the 8x box (~17:55 UTC). New plan: find the best Kaggle serving configuration. First step: a
+tool E112 2-bit model built like tool E128, then its pass@1 and pass@2. The partial full-reference and E96 64-turn
+runs are not resumed.
+- **Keep set:** the same rule as tool E128: tool stats, contrib score on decoder-generated tokens, tool-call-block
+  weight 10 (`special_stats.py select --weight 10 --experts 112`). File:
+  `data/reap/keep_tool/keep_contrib_dec_sp0_w10_e112.npy`. The sets are nested: tool E96 < E112 < E128 on all 40
+  layers. 94.9% of the tool-block contribution is kept.
+- **Same as tool E128 otherwise:**
+  - calibration: the E128 replay (tool calibration tokens, 1.4M, seed 61, 10% of rows) under the E112 mask;
+  - GPTQ: w13 uint2 g128 + w2 uint2 g64, percdamp 1.0;
+  - Engram: the 64 GiB tool table;
+  - harness: sub80s40 + header, `--rescue-code`, temperature 1.0.
+- **Eval:** both TP4 servers (A and B) serve E112 with runtime masks, and one harness process spreads attempts over
+  both. Run 1 is attempt 0 only (pass@1). Run 2 resumes the same tag with `--attempts 2` (pass@2).
+- **Expected 4xL4 footprint (from the shapes; not measured):** about 15.4 GiB of weights per GPU and ~2.5M KV tokens
+  at util 0.93. That is about the same as E96 u2/u3 (15.18 GiB, 2.72M tokens) and 1.44 GiB/GPU less than E128.
+- **Recovery after the stop:** the checkpoint was re-downloaded into `/dev/shm`; the image's SGLang service was stopped
+  again.
+- **False start (fixed):** the chain's download wait matched the old `DONE` line in the appended `download.log`. It
+  started a server on the partial checkpoint, which failed on the missing tokenizer. It was stopped within a minute,
+  and nothing was built from it. The wait now requires a `DONE` after the restart marker, plus 48 shards.
+
 ## Status and verdict (2026-10-24 15:00 UTC)
 
 HTML report focused on the tool E128 / E96 models: `reports/tool_pruning_report.html` (private web copy:
