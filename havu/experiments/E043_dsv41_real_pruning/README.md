@@ -224,7 +224,7 @@ The spread is 0.04%, the same noise floor as on the full model, so the 64 GiB to
 - Pairs: 117 solved by both, 25 by the full model only, 9 by E96 only.
 - 58 attempts stopped at the harness's 40-turn cap, after only 40.4K of their 80K output tokens on average. The full
   model solved 38 of those attempts, and E96's session-answer fallback saved 7.
-- Rerun queued on server B with `--max-turns 64`, everything else unchanged (`e96t_..._sub80_mt64`).
+- Rerun on server B with `--max-turns 64`, everything else unchanged (`e96t_..._sub80_mt64`); interrupted, see below.
 - E96's attempts are shorter than E128's (30.5K vs 35.2K tokens). At E042's tool-mode rates (453.5 vs 340.5 tok/s on
   full-model shapes) that is about 53 vs 35 attempts/h on 4xL4.
 
@@ -258,6 +258,38 @@ Typos survive min_p 0.05, so their probability is at least 5% of the top token's
 on them; they are not the sampler's tail. The fix has to come from the model: the keep set (for example, weighting
 identifier-copy tokens), or healing. The dev tasks are easy (about 4.5 turns), so this test cannot rank the samplers
 on accuracy.
+
+**Interrupted runs (2026-10-24 14:46 UTC: the Vast account's credit ran out and Vast stopped both boxes).** Two runs
+lost their in-flight attempts:
+- the self-hosted full-model reference (`full_ref_sub80`, server A, started 13:29);
+- the E96 max-turns-64 rerun (server B, started 13:56).
+
+The attempts that finished are the shorter ones, so only same-attempt comparisons mean anything:
+
+| run (finished attempts) | correct | API full | tool E128 2-bit | tool E96, 40 turns | out tokens (vs API) | turns (vs API) |
+|---|---:|---:|---:|---:|---:|---:|
+| self-hosted full (171/334) | 134 | 144 | 146 | 118 | 20.7K (21.8K) | 12.5 (12.4) |
+| tool E96 2/3-bit, 64 turns (110/334) | 93 | 96 | 101 | 86 | 14.9K (16.0K) | 16.7 (10.2) |
+
+- **Self-hosted full vs the API full model**, same 171 attempts: 9 solved only self-hosted, 19 only by the API (sign
+  test p = 0.09).
+  - Against tool E128 2-bit: 9 vs 20 (p = 0.06).
+  - Harness and config are the same (persistent-v6, sub80s40 + header); the self-hosted run adds `--train-check
+    --turns-note 5`. Python-error rate 2.6% (API 2.3%).
+  - A possible cause is the sampler: self-hosted runs use temperature 1.0 / top_p 1.0, and the API's thinking-mode
+    sampler is not known to match.
+  - Not conclusive at 171 attempts. If it holds, the self-hosted full model is the fairer baseline for the pruned
+    models (same stack and sampler), and tool E128 2-bit is level with it.
+- **E96 at 64 turns vs 40 turns**, same 110 attempts: 93 vs 86 (15 vs 8, p = 0.21). The longest attempt used 60 turns.
+  Python-error rate 34.5%.
+- **What was lost:** the box's `/dev/shm`, which a stop clears. It held the checkpoint (re-download ~25 min), the tool
+  E96 GPTQ tensors and calibration dumps. Only their per-layer stats are in `results/box`; the GPTQ itself took ~5 min
+  on 4 GPUs.
+  - Every uploaded checkpoint is safe on HF.
+  - `/workspace` survives a stop. It holds the exports and the server logs after 13:39 UTC, which were not pulled yet.
+  - All traces and results are local (`evals/results/`), and the cache-health series is in `results/cache_watch.tsv`.
+- **Resume:** run `eval_arc.sh` again with the same TAG. The harness re-runs attempts recorded as errors
+  (`run_deepseek_tools.py`: jobs = missing or `"error" in latest`).
 
 ## No-tool round (2026-10-23/24)
 
@@ -755,6 +787,9 @@ setup time). No API spend.
 - ARC eval, 167 attempts: 1-1.5 h per model per 4-GPU server.
 
 ## Incidents
+
+- 2026-10-24 14:46 UTC: the Vast account's credit ran out (balance -$0.49), and Vast stopped the 8x box and the 4xL4
+  box mid-eval. `/dev/shm` was lost; the partial results are under "Interrupted runs".
 
 - The image's auto-started SGLang service held GPU memory; stopped with `supervisorctl stop sglang model-ui`.
 - The first download went to the RAID1 disk (~120 MB/s flush) and stalled; switched to `/dev/shm`. A watchdog that

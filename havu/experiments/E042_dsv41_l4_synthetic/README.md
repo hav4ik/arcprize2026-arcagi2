@@ -1228,6 +1228,15 @@ would need a real quantization (GPTQ/AutoRound-style calibration) and an eval.
   - Not replayed yet: E128 is ahead by 6.7 pp pass@2, so E96 gets a replay only if the 64-turn rerun closes the gap.
   - Engram on the 2-bit E128 (E043 dev NLL): 0.79679 at 64 GiB, 0.79647 at 112 GiB, 0.79650 full. The 64 GiB tool
     table stays.
+- **Tool E128 on HF (14:00):** `chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-E128-2bit` (private), 131,090,957,662 B =
+  122.1 GiB, 122 files.
+  - Layout: backbone without routed experts 9.74 GB, 64 GiB tool Engram in `model-engram-0000{1,2,3}`, and
+    `gptq/layer_LL.safetensors` (128 experts, compact ids). `gptq/layer_LL.json` holds error stats the loader ignores.
+  - Env: as the no-tool E128, plus the router shape (128, 6) from `apply_e043_humming.py`.
+  - Parity on 64 tool dev traces: NLL 0.79640 (export) vs 0.79652 (runtime masks), tool-block NLL 0.1490 vs 0.1494.
+  - **Fitting it on the pod:** 122.1 GiB is more than `/dev/shm` (117 GiB) or the free disk (34 GB) alone. One
+    Engram file (~21 GiB) plus ~10 GiB of `gptq/` can go on disk and the rest (~91 GiB) in `/dev/shm`, symlinked into
+    one model dir. Host RAM while serving ≈ 91 GiB tmpfs + 64 GiB pinned Engram + ~40 GiB processes ≈ 195 of 251 GiB.
 - **E043 follow-ups (09:00):**
   - E96 2/3-bit GPTQ ARC now goes first, from a GPTQ-only E96 export. E043's user wants E96 only if it is much
     faster. Partial (51 easy-first pairs): pass@1 31 vs full 37, mean output 26.8K (1.12× full).
