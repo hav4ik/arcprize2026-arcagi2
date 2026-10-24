@@ -1,6 +1,7 @@
 #!/bin/bash
 # E042 RW: serve a real DeepSeek-V4.1-Flash checkpoint on 4xL4 (serve.sh without the synthetic init, the synthetic
-# Engram rows and --load-format dummy; served as "dsv41", the model name of E043's harness runs).
+# Engram rows and --load-format dummy; served as "dsv41", the model name of E043's harness runs, with E043 serve.sh's
+# reasoning and tool-call parsers, which the harness needs).
 # Usage: serve_real.sh <run_name> [extra vllm args...]   (env: PORT, SEQS, MBT, UTIL, MAXLEN, EAGER, MODEL)
 # Starts in the background; logs to /root/dsv41/runs/<run_name>/server.log; writes server.pid.
 set -u
@@ -20,6 +21,7 @@ cmd=(vllm serve ${MODEL:-/root/dsv41/model-e128t} --served-model-name dsv41 --ho
   --max-num-seqs ${SEQS:-8} --max-num-batched-tokens ${MBT:-2048} --gpu-memory-utilization ${UTIL:-0.85}
   --no-enable-prefix-caching --engram-config '{"cpu_offload":true}'
   --tokenizer-mode deepseek_v41 --language-model-only
+  --reasoning-parser deepseek_v41 --tool-call-parser deepseek_v41 --enable-auto-tool-choice
   "${GRAPH[@]}" "$@")
 printf '%q ' "${cmd[@]}" > $R/cmd.txt; echo >> $R/cmd.txt
 env | grep -E '^(VLLM_|DSV41_|FLASHINFER_|TORCH_CUDA|CUDA_HOME|HF_HUB|NCCL)' | sort > $R/env.txt
