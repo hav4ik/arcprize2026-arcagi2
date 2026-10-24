@@ -29,12 +29,13 @@ RUNS = [
     ("e128_unsloth_iq2_eng56", "E128 unsloth UD-IQ2_XXS experts", "128 x IQ1_S-IQ3_XXS mix (as uint6)", 2.3,
      "30% (56.6 GiB)", "e128_unsloth_iq2", "e128_unsloth_iq2", [("tp4B_e128_unsloth", "None")]),
 ]
-# E042, 4xL4, dummy weights at the same shapes, no-tool output shapes (mean ctx ~35K), Engram 30% for the low-bit rows
+# E042 (2026-10-24), 4xL4, dummy weights at the same shapes, Engram 30%, util 0.93, largest C under an 80% KV guard, 0
+# preemptions; attempts/h = output / decode rate + 9.4K prompt / ~1,270 tok/s prefill (crude, serial)
 L4 = {
     "full_a1": "does not fit",
-    "e72_w10_eng48": "16.56 GiB/GPU; util .88: KV 0.82M, 271 tok/s @28; util .93: KV 1.59M, 311 tok/s @36",
-    "e128_u2_gptq_eng56": "16.87 GiB/GPU; util .88: KV 0.77M, 299 tok/s @28; util .93: KV 1.47M, 419 tok/s @48",
-    "e96_u2u3_gptq_eng56": "15.18 GiB/GPU; util .88: KV 2.03M, 380 tok/s @40 (u93 pending)",
+    "e72_w10_eng48": "16.56 GiB/GPU; util .93, own shapes: C52, 399.5 tok/s, ~42 attempts/h",
+    "e128_u2_gptq_eng56": "16.87 GiB/GPU; util .93, own 331 shapes: C48, 419.2 tok/s, ~34 attempts/h",
+    "e96_u2u3_gptq_eng56": "15.18 GiB/GPU; util .93, E72 shapes: C80, 558.0 tok/s, ~57-65 attempts/h at 27-31K out (~50/h at its own 37.4K)",
     "e128_u2_gptq_fp4eng": "as E128 (Engram is host RAM: 56.6 -> ~30 GiB)",
 }
 

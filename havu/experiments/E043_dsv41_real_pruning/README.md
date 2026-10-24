@@ -95,6 +95,7 @@ scales, Humming kernels; E96 + DSpark was dropped by E042: the drafter halves th
 | full (native) | 64.7% | 76.8% | 31.4K | does not fit |
 | **E128 2-bit GPTQ + Engram 30%** | **59.6%** | **72.0%** | 41.6K | 16.87 GiB/GPU; util .93: 419 tok/s @48 |
 | E72 x10 native | 57.5% | 66.9% | 31.0K | util .93: 311 tok/s @36 |
+| **E96 2/3-bit GPTQ + Engram 30%** (final) | 58.7% | **75.3%** (125/167 pairs, = full) | 37.4K | 15.18 GiB/GPU; util .93: 558 tok/s @80, ~50 attempts/h |
 
 (3 of 334 E128 attempts timed out while queued: the client timeout of 3600 s also counted queue time; raised to 6 h
 for `--base-url` runs.) E128 2-bit reasons longer (median per-attempt ratio 1.29x vs the full model on the same
@@ -123,6 +124,40 @@ would add 12%). Their "UD-IQ2_XXS" experts are a per-layer mix (projection x lay
 IQ3_XXS 15, IQ1_S 10, IQ2_XS 6, Q2_K 1; IQ2_S gate weight error vs the released FP4 is 7.2% (cosine 0.967) vs ~21-25%
 for integer 2-bit RTN. First comparison: their experts on the same E128 keep set (attention/router/Engram as released).
 Their Q5_K Engram cannot be represented in our MXFP8 Engram format without snapping back to the originals.
+
+## Tool-use E128 2-bit (2026-10-24, in progress)
+
+User request: E128 with tool use. Everything comes from tool data only:
+- **Keep sets:** the tool round's statistics (10M tokens of training tool rollouts, `stats_all.npz` + `toolblock_all.npz`).
+- **Engram:** the tool round's 64 GiB table.
+- **GPTQ calibration:** its own dump of tool rollouts under the E128 mask (1.4M tokens, 10% of rows).
+- **Screens:** a family-disjoint dev split of the 10,001 tool rollouts (`split_dev.py`: 833 dev, 9,168 calibration) and
+  first-turn probes on 8 dev prompts (`make_dev_probe_parquet.py`). The 120 eval tasks only score the final model.
+  (The tool statistics predate the split and include dev-family rollouts; this biases all candidates equally.)
+
+| native weights, tool dev (64 traces) | dev NLL vs full | tool-block NLL | tool-block top-1 | valid first-turn calls | length cut |
+|---|---:|---:|---:|---:|---:|
+| full | 0 (0.7130) | 0.118 | 95.7% | - | - |
+| full + Engram 64 GiB | +0.04% | 0.118 | 95.7% | 25/25 | 0 |
+| E128, tool-block weight 0 | +5.9% | 0.156 | 94.6% | 20/25 | 5 |
+| **E128, tool-block weight 10 (chosen)** | +7.9% | 0.135 | 95.2% | 22/25 | 2 |
+| E128, tool-block weight 30 | +9.6% | 0.131 | 95.3% | 23/25 | 1 |
+
+All three keep sets keep ~83% of tool-mode routing and overlap the no-tool E128 set by 71-81%. Without the weight the
+first-turn format already breaks (the E72 failure mode). Weight 10 recovers most of the tool-block quality at less
+general-NLL cost than 30. 2-bit build and the 2-attempt tool-harness eval (`--rescue-code`): running.
+GPTQ on tool calibration (layer 0): w13 relative output error 2.6% (RTN 11.9%), w2 5.5% (RTN 13.2%).
+
+**Harness (user, 2026-10-24): sub80s40 + minimal header** (`eval_arc.sh` `PRESET=sub80s40`: 80k total output, 40k
+soft budget, per-turn 64k), the best-accuracy API config on the full model (E030, 120 tasks: pass@1 74.5%, pass@2 84.9%
+task-weighted, 27.4k mean tokens; s20x60 + header: 69.9% / 80.3% at 23.3k). The user accepts that the keep sets and
+calibration came from s20x60 rollouts (experts assumed stable across budgets). Same for the tool-use E96 2/3-bit run
+(server B, block weight 10 or 30 picked on the dev first-turn probe).
+
+**4xL4 attempts per hour (E042, dummy weights, util 0.93, own output shapes, largest C under an 80% KV guard, 0
+preemptions):** E72 C52 399.5 tok/s ~42/h; E128 2-bit C48 419.2 tok/s ~34/h (its answers are longer); E96 2/3-bit C80
+558.0 tok/s ~57-65/h. So E128's +5 pp pass@2 over E72 costs ~20% of attempts; E96 is ~1.4-1.6x E72 if its ARC holds.
+A tool-use E128 needs its own multi-turn replay (prefix-cache reuse) before its L4 throughput is known.
 
 ## No-tool round (2026-10-23/24)
 
