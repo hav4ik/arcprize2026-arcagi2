@@ -56,8 +56,11 @@ pass@1 and pass@2 are task-weighted.
 
 ## 4xL4 throughput
 
-E042, dummy weights in this schema, util 0.93, prefix caching, replaying the full model's tool turn shapes: 340.5 gen
-tok/s at 48 streams, 96.1% prefix hits, 0 preemptions. This model's own turns are about 15% longer, so about 40
-streams fit.
+E042, dummy weights in this schema, util 0.93, prefix caching. Replaying this model's own tool turns (17.1 turns and
+35.2K output tokens per attempt) at 40 streams:
+- 318.6 gen tok/s, 96.7% prefix hits, KV peak 0.76, 0 preemptions in 60 min;
+- 32.6 attempts/h, about 10.3 h for 334 attempts.
+
+40 streams is about the ceiling: past a KV peak of ~0.8 the prefix cache thrashes.
 
 Details: havu/experiments/E043_dsv41_real_pruning in hav4ik/arcprize2026-arcagi2.

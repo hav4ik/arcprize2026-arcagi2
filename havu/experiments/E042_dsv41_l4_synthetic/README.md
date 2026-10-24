@@ -1225,6 +1225,13 @@ would need a real quantization (GPTQ/AutoRound-style calibration) and an eval.
   - **T4 (`scripts/run_tool4.sh` via `run_seq11.sh` after T3; `runs/t4.log`):** E128 × 40 and × 48 at these shapes,
     `--max-wall-s 4800` each. KV per slot grows ~15% over T2, so × 48 should peak near 0.88 and × 40 near 0.75.
     Attempts/h = gen tok/s × 3600 / 35.2K.
+  - **T4 result (15:48), E128 × 40 at its own tool shapes: 318.6 gen tok/s at 96.7% hits**, uncached prefill 175.6
+    tok/s, KV peak 0.76 / p50 0.68, 0 preemptions over 60 min, 72–73 °C. 298 turns and 16 attempts finished in the
+    30-min window, TTFT median 0.76 s, turn median 114.9 s, turn prompt p50 / p90 24.5K / 72.7K. Host 192 GiB used,
+    including the downloaded checkpoint in /dev/shm.
+  - **≈ 32.6 attempts/h (318.6 × 3600 / 35.2K), ≈ 10.3 h for 334 attempts.** Tool E128 sits at no-tool E128's rate
+    (33.8/h): fewer tok/s, but shorter attempts (35.2K vs 41.6K). The KV peak sits just under the ~0.8 edge from T3, so
+    × 40 is about the limit at these shapes. The × 48 point was dropped (the user).
 - **E043 final tool E96 u2/u3 (sub80s40 + header, 2 attempts, 40-turn cap):** pass@1 64.9%, **pass@2 75.8%**, against
   E128's 72.8% / 82.5% and full's 74.5% / 84.9%. It is turn-limited: 58 of 334 attempts hit the 40-turn cap at a mean
   40.4K of their 80K budget, because Python typos cost turns. E043 reruns it with `--max-turns 64`.
@@ -1254,8 +1261,19 @@ would need a real quantization (GPTQ/AutoRound-style calibration) and an eval.
     switch is `unpatch_engram.py` (dry-run checked again), then `apply_compact_engram.py` and `apply_e043_humming.py`.
     It then serves with `serve_real.sh` (`serve.sh` without the synthetic init and dummy load) at the T2 config and
     checks one chat answer.
-  - `eval_rw.sh`: E043's eval with the same harness flags (config checked against E043's jsonl), 2 attempts, 40
-    workers. It runs from the workstation through an SSH tunnel, using E042's own sandbox (`arc-sandbox-e042`,
+  - Download: 15:08–15:17 (≈ 230 MB/s), 40 GPTQ layers and 3 Engram files. Disk free afterwards 4.1 GiB, /dev/shm
+    free 24 GiB. Pod memory (cgroup v1) during T4: 174 of 232 GiB used, 159.7 GiB of it shmem (94 GiB checkpoint +
+    the synthetic 64 GiB Engram table). The Engram loader `narrow()`s and `copy_()`s into the pinned shard, so a real
+    load peaks near the synthetic one, plus ~15 GiB of row-map temporaries.
+  - E043 caveat: its ARC run used runtime masks on the full checkpoint. The export layout was checked only by NLL
+    parity and a 25-prompt first-turn probe, so this is the first ARC run on the export itself. Its noise:
+    E128 vs full differed by 28 vs 35 one-sided attempt wins out of 334.
+  - E043's third patch, `apply_e043_patches.py` (its runtime-mask and REAP observation hooks), is left out on purpose.
+    Without `$E043_CTRL` it only adds a zero bias and an all-ones Engram bitmap ("i.e. the original model"), the
+    other two patches don't use it, and a Kaggle deployment wouldn't carry per-step observation hooks. Outputs
+    should still pair with E043's run.
+  - `eval_rw.sh`: E043's eval with the same harness flags (config checked against E043's jsonl, plus `--rescue-code`,
+    which that jsonl's `rescues` field shows it used), 2 attempts, 40 workers. It runs from the workstation through an SSH tunnel, using E042's own sandbox (`arc-sandbox-e042`,
     http://172.18.0.6:6000). Time-boxed to ~18:45: real tok/s, hits, KV and temperatures over the steady part,
     plus correctness paired with E043's attempts. The finished attempts are biased toward short ones.
 - **E043 follow-ups (09:00):**

@@ -28,8 +28,11 @@ first, E96 if it works; E192 is the last resort. Harness: sub80s40 + minimal hea
 
    - E128 is within the 2-3 pp noise band of the full model, at 2 bits and a third of the experts.
    - It costs +28% output tokens. 14% of its tool calls are Python typos, which it recovers from.
-   - On 4xL4 (E042, dummy weights, full-model turn shapes): 340.5 tok/s at 48 streams, 96% prefix hits, 0 preemptions.
-     That is ~35 attempts/h at its 35.2K tokens. A replay at its own shapes (E042 T4) is pending.
+   - On 4xL4 (E042 T4, dummy weights, util 0.93, replaying E128's own tool turns), 40 streams:
+     - 318.6 gen tok/s, 96.7% prefix hits, KV peak 0.76, 0 preemptions;
+     - 32.6 attempts/h, so a 334-attempt eval takes ~10.3 h, the same rate as no-tool E128 (33.8/h);
+     - 40 streams is about the ceiling: KV ~0.8 is where the prefix cache starts thrashing.
+   - A real-weight 4xL4 run of the HF export is starting on dsv4-infer's Runpod pod (user-approved).
 2. **Tool E96 2/3-bit is not there yet.** It is 9 pp below on pass@2 at the 40-turn cap.
    - Typos cost it turns: 58 attempts hit the cap with half their token budget unused.
    - A 64-turn rerun was cut off by the box stop. It looked better on the 110 attempts that finished: 93 correct vs 86
@@ -90,7 +93,8 @@ first, E96 if it works; E192 is the last resort. Harness: sub80s40 + minimal hea
 | Self-hosted full-model tool reference | **partial, 171/334** | `evals/results/*_full_ref_sub80*` |
 | Dev sampling test (min_p, top_p), Engram size on 2-bit, DSpark acceptance | done | below |
 | 4xL4 replays (E042, dummy weights): no-tool own shapes; tool T2 full-model shapes | done | below |
-| 4xL4 tool replay at E128's own shapes (E042 T4) | running on dsv4-infer's Runpod pod | E042 |
+| 4xL4 tool replay at E128's own shapes (E042 T4) | done: x 40, 318.6 tok/s, 32.6 attempts/h | below |
+| Real-weight 4xL4 ARC run of the HF tool E128 export | running (dsv4-infer, Runpod, until ~18:45 UTC) | E042 |
 | E192 2-bit | dev NLL only (+5.5%); paused by the user; doesn't fit 4xL4 at 2 bits | layers 0-19 on HF `dsv41-flash1017-e043-gptq-artifacts` (HF storage cap stopped the rest) |
 | Real-weight 4xL4 test, healing fine-tune for the typos | not started; the user's call | |
 
@@ -274,9 +278,12 @@ A tool-use E128 needs its own multi-turn replay (prefix-cache reuse) before its 
 |---|---:|---:|---:|---:|---:|
 | E72 x 32 (util 0.88) | 205 | 87.8% | | | |
 | E128 2-bit x 48 | 340.5 | 96.1% | 1.47M | 0.77 / 0.68 | 0 / 58 min |
+| E128 2-bit x 40, **its own tool shapes** (T4) | 318.6 | 96.7% | | 0.76 / 0.68 | 0 / 60 min |
 | E96 2/3-bit x 80 | 453.5 | 96.5% | 2.72M | 0.64 / 0.60 | 0 / 70 min |
 
 - E128: TTFT median 0.84 s, turn median 117 s, turn prompt p50/p90 24.9K/56.3K.
+- T4 (E128 at its own shapes: 17.1 turns, 35.2K output tokens): TTFT median 0.76 s, turn median 115 s, 72-73 °C;
+  32.6 attempts/h, ~10.3 h per 334-attempt eval. x 40 is about the ceiling (KV ~0.8 is E042's thrash edge).
 - E96 measured from vLLM metric deltas over a 17-min window (the same method on E128 gives 342.0 vs the replay's 340.5).
 - E96 x 96 (T3) is past the knee: 291.3 tok/s at 85.8% hits vs 453.5 at 96.5% for x 80.
   - Uncached prefill triples, with 0 preemptions and KV peak 0.80. The cache thrashes before anything is preempted, so
