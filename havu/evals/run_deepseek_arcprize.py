@@ -183,7 +183,9 @@ def main():
         args.max_balance_stop = float("-inf")
     if balance < args.max_balance_stop:
         ap.error("Balance below --max-balance-stop")
-    client = OpenAI(api_key=key, base_url=base, timeout=3600, max_retries=3)
+    # E043: self-hosted servers queue requests beyond their batch slots; a queued stream gets no bytes until it is
+    # scheduled, so allow far more than the API timeout there.
+    client = OpenAI(api_key=key, base_url=base, timeout=(6 * 3600 if args.base_url else 3600), max_retries=3)
     lock = threading.Lock()
     guard = {"t": time.time(), "stop": False}
 

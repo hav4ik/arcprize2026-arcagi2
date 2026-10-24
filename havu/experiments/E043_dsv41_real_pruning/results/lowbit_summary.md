@@ -1,0 +1,9 @@
+| model | experts x format | expert bits | Engram | dev NLL vs full | answer written (T=1) | pairs done | pass@1 | pass@1 task-w | pass@2 task-w (pairs) | same pairs pass@1: this vs full | same pairs pass@2: this vs full | out tokens mean / median / p90 | length cut / unparsed | RTX gen tok/s @ running (4 GPUs) | 4xL4 (E042) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| full model | 384 x MXFP4 | 4.25 | full table | +0.0% | 191/192 | 167/167 | 64.7% | 67.9% | 76.8% (167) | - | - | 31.4K / 26.7K / 58.4K | 1 / 1 | 1,309 @87 | does not fit |
+| E72 x10 | 72 x MXFP4 | 4.25 | 48 GiB | +22.2% | 191/192 | 167/167 | 57.5% | 57.4% | 66.9% (167) | 96 vs 108 /167 | 110 vs 125 /167 | 31.0K / 26.7K / 59.2K | 4 / 13 | 1,534 @88 | 16.56 GiB/GPU; util .88: KV 0.82M, 271 tok/s @28; util .93: KV 1.59M, 311 tok/s @36 |
+| E64 x10 | 64 x MXFP4 | 4.25 | 48 GiB | +27.0% | 184/192 | 167/167 | 38.9% | 39.4% | - | 65 vs 108 /167 | - | 37.8K / 27.5K / 79.0K | 15 / 33 | 1,466 @73 |  |
+| E64 x20 | 64 x MXFP4 | 4.25 | 48 GiB | +34.1% | 192/192 | 167/167 | 32.3% | 32.5% | - | 54 vs 108 /167 | - | 30.6K / 23.9K / 51.4K | 7 / 18 | 1,303 @68 |  |
+| E128 2-bit GPTQ | 128 x uint2 (w13 g128, w2 g64) | 2.19 | 30% (56.6 GiB) | +12.1% | 187/192 | 166/167 | 59.6% | 59.9% | 72.0% (164) | 99 vs 108 /166 | 118 vs 123 /164 | 41.6K / 36.4K / 78.4K | 2 / 2 | 1,438 @63 | 16.87 GiB/GPU; util .88: KV 0.77M, 299 tok/s @28; util .93: KV 1.47M, 419 tok/s @48 |
+| E96 2/3-bit GPTQ | 96 x uint2 / uint3 down | 2.53 | 30% (56.6 GiB) | +15.2% | 187/192 | 51/167 | 60.8% | 59.0% | 84.8% (44) | 31 vs 37 /51 | 37 vs 38 /44 | 26.8K / 23.8K / 47.4K | 0 / 1 | 1,447 @61 | 15.18 GiB/GPU; util .88: KV 2.03M, 380 tok/s @40 (u93 pending) |
+| E128 2-bit GPTQ, FP4 Engram | 128 x uint2 | 2.19 | 30%, MXFP4 | - | - | 23/167 | 82.6% | 83.3% | 91.7% (14) | 19 vs 21 /23 | 13 vs 14 /14 | 14.3K / 16.0K / 19.3K | 0 / 0 | - | as E128 (Engram is host RAM: 56.6 -> ~30 GiB) |

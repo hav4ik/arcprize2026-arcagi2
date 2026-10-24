@@ -47,7 +47,10 @@ def main():
     wm = idx["weight_map"]
     dropped = 0
     for f in sorted(base.iterdir()):
-        if f.name == "model.safetensors.index.json" or f.is_dir():
+        if f.is_dir():  # encoding/, inference/ (DeepSeek's chat encoder and reference code)
+            shutil.copytree(f, out / f.name)
+            continue
+        if f.name == "model.safetensors.index.json":
             continue
         if f.suffix == ".safetensors" and not f.name.startswith("model-engram"):
             with safe_open(str(f), framework="pt") as sf:

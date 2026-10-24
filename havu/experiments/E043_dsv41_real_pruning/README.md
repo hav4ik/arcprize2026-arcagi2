@@ -87,7 +87,32 @@ scales, Humming kernels; E96 + DSpark was dropped by E042: the drafter halves th
 | E72 native MXFP4 (ARC pass@1 57.5%, pass@2 66.9%) | +22.2% | 99.5% |
 | Engram 30% only | +0.10% | |
 
-ARC (no-tool, 2 attempts) for E128 and E96 GPTQ: running.
+**ARC** (no-tool, 120 tasks, 2 attempts; full comparison table with tokens and throughput:
+`results/lowbit_summary.md`, `scripts/lowbit_summary.py`):
+
+| model | pass@1 | pass@2 task-weighted | out tokens mean | 4xL4 (E042, dummy weights) |
+|---|---:|---:|---:|---|
+| full (native) | 64.7% | 76.8% | 31.4K | does not fit |
+| **E128 2-bit GPTQ + Engram 30%** | **59.6%** | **72.0%** | 41.6K | 16.87 GiB/GPU; util .93: 419 tok/s @48 |
+| E72 x10 native | 57.5% | 66.9% | 31.0K | util .93: 311 tok/s @36 |
+
+(3 of 334 E128 attempts timed out while queued: the client timeout of 3600 s also counted queue time; raised to 6 h
+for `--base-url` runs.) E128 2-bit reasons longer (median per-attempt ratio 1.29x vs the full model on the same
+attempts) without looping (gzip ratio of the reasoning 0.321 vs 0.326, last 20K chars 0.345 vs 0.342, no loop-like
+tails) but with more hedging ("maybe" 1.47x, "hmm" 1.54x per 10K chars; `scripts/reasoning_loops.py`). Attempts per
+hour on 4xL4 are then about equal to E72 (~36/h each); the gain is +5 pp pass@2.
+
+**FP4 Engram** (`make_fp4_engram.py`, MXFP4 rows emulated exactly in the MXFP8 container, 1.39% relative MSE vs the
+released table): E128 2-bit dev NLL 0.63507 vs 0.63499 with FP8 Engram, answer writing 188/192 vs 187/192. Free; halves
+the host-RAM table (56.6 -> ~30 GiB) given a 4-bit Engram lookup kernel.
+
+**Deliverable:** `chankhavu/DeepSeek-V4.1-Flash-1017-arc-notool-E128-2bit` (private, 123.1 GB, GPTQ-only layout,
+Engram 30% FP8): parity dev NLL 0.63486 (export) vs 0.63499 (runtime masks). E96 export built
+(`export/notool_e96_x10_eng56_gptq`, 116.5 GB), not uploaded (E96 paused by the user).
+
+**Expert coverage** (no-tool routing, answer x10 rule): kept share of routing selections E72 74%, E96 81%, E128 87.5%,
+E160 92%, E192 95%, E256 98%; a decode batch of 48 tokens touches ~110 distinct experts per layer (max layer 140).
+E192 2-bit GPTQ (quality probe; does not fit 4xL4 at 2 bits) and unsloth's experts at E128: evaluating.
 
 **unsloth UD-IQ2_XXS comparison.** Our engine cannot read GGUF IQ codebooks, so `gguf_to_humming.py` decodes each
 expert exactly (gguf-py) and re-stores it as uint6 g32 (+0.04% of the weight norm, ~0.5% of IQ2's own error; uint4
