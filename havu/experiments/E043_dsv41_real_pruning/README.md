@@ -76,6 +76,15 @@ and prunes better. Everything in this round is no-tool only: the statistics come
   ~4% of answers it saves); E64 still loses most of the hard pairs (15 runs to the context limit, 33 unparsed answers).
 - **E48 dropped (user, 2026-10-24):** pruning is clearly not enough at that size; it would need expert merging.
 
+### Deployable checkpoint (E72 x10 + Engram 48 GiB)
+
+`export_pruned.py --expert-keep reap/keep_nt2/keep_contrib_dec_sp0_w10_e72.npy --engram-keep
+engram/masks_nt2_calib/engram_top48gib.npz --text-only` -> `export/notool_e72_x10_eng48` (118.5 GB in 13 shards:
+backbone + compact Engram, 107.8M / 87.4M rows kept on layers 1 / 14). Served on the fork with
+`apply_compact_engram.py` (TP4+EP4: 16.64 GiB weights per GPU); teacher-forced NLL on the 64 dev traces 0.69195 vs
+0.6918 with runtime masks on the full checkpoint (top-1 77.65% vs 77.66%), i.e. parity. Private HF model:
+`chankhavu/DeepSeek-V4.1-Flash-1017-arc-notool-E72` (Engram files included; DSpark and vision tensors removed).
+
 ### Data and splits
 
 - **Data:** the `notool_e044_*` configs of `livobereshka/arc-agi2-deepseek-flash1017-rollouts-e031-e036` (E044 = E035
@@ -418,6 +427,8 @@ E64 loses the idea more often, with garbled reasoning ("Weod=w?? Need."), typo l
 - `chankhavu/dsv41-flash1017-e043-pruning-artifacts` (dataset): Engram counts/masks/geometry, REAP stats and keep
   sets, token streams (calibration + eval traces), raw observer records (20 GB), NLL results, code snapshot.
 - `chankhavu/DeepSeek-V4.1-Flash-1017-arc-engram64`: shared compact Engram files + `engram_index.json`.
+- `chankhavu/DeepSeek-V4.1-Flash-1017-arc-notool-E72`: the no-tool round's E72 x10 checkpoint with its own compact
+  48 GiB Engram files (self-contained).
 - `chankhavu/DeepSeek-V4.1-Flash-1017-arc-E72`, `-arc-E64`, `-arc-E48`: backbone checkpoints with the w30 keep sets
   (no Engram files; download the engram64 repo's `model-engram-*.safetensors` into the same folder).
 - The artifacts dataset also has `evals/` (all E043 ARC result jsonl and transcripts), `obs/iter_contrib_dec_e*`
