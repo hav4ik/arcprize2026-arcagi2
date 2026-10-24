@@ -434,6 +434,39 @@ E64 loses the idea more often, with garbled reasoning ("Weod=w?? Need."), typo l
 - The artifacts dataset also has `evals/` (all E043 ARC result jsonl and transcripts), `obs/iter_contrib_dec_e*`
   (iterative-stage observer records), `reap/protect` (tool-block keep sets), `results/` (NLL, probes) and `code/`.
 
+## Data inventory for the tech report (2026-10-24, before the box is released)
+
+Local = this folder (also on GitHub); HF = `chankhavu/dsv41-flash1017-e043-pruning-artifacts` (private dataset).
+
+| what | local (`results/` unless noted) | HF |
+|---|---|---|
+| Tool-round ARC evals (jsonl + transcripts) | `evals/results/tools_persistent_grid_lean2sub_dsv41_low_e043_*`, `eval_stats.json` | `evals/` |
+| No-tool ARC evals (jsonl + reasoning traces, 2 attempts for full / E72) | `evals/results/e043nt_*`, `notool_eval_stats.json` | `evals/notool/` |
+| DSpark acceptance windows + their eval runs | `dspark_probe.jsonl`, `evals/results/*e043_dspark*` | `evals/dspark/`, `box_runs/tp4B_dspark/` |
+| Engram census, tool round (counts, masks, report stats, sufficiency, unseen rows) | `engram_stats.json`, `unseen_eval6.json` | `engram/`, `engram_counts/`, `results/` |
+| Engram census, no-tool (counts on 109M tokens, masks 16-128 GiB, half-data census, report stats vs dev and eval traces, coverage logs, unseen rows on eval traces) | `notool_unseen_*`, `notool_engram_stats_*.json` | `notool/engram*`, `notool/engram_stats/` |
+| REAP sufficient statistics (N, A, Q, W, MX per layer x role x expert), tool / no-tool / pilots | - | `reap/stats_*.npz`, `notool/reap/stats_nt2.npz`, `notool/pilot/reap/` |
+| Tool-block / answer-block statistics | - | `reap/toolblock_all.npz`, `reap/special_all.npz`, `notool/reap/answerblock_nt2.npz` |
+| Keep sets (bool [40, 384]) | - | `reap/keep_*`, `reap/protect`, `notool/reap/keep*` |
+| Expert-routing report stats (activity, coverage curves, per-layer kept shares, overlaps, Jaccard, tool vs no-tool) | `expert_stats.json`, `expert_activity.json`, `expert_stats_notool.json`, `compare_tool_notool*.json` | `notool/reap/` |
+| Teacher-forced NLL screens (per sequence) | `nll_*.jsonl`, `notool_nll_*.jsonl` (incl. export parity) | `results/`, `notool/results/` |
+| Free-generation / answer-writing probes | `gen_probe*.jsonl`, `notool_copy_probe_*.jsonl` | `results/`, `notool/results/` |
+| Raw observer records (per token: ids, positions, 40 x 6 experts, router weights, amplitudes) | - | `obs/` (tool), `notool/obs/` (20M tokens), `notool/pilot/obs/` |
+| Token streams + roles (calibration, dev, eval traces) | - | `tok/`, `notool/tok/` |
+| Rollout snapshot actually used (no-tool) | `notool_rollout_snapshot.json` (sha256) | `notool/rollouts_snapshot/` |
+| Server time series (10 s stats: tok/s, running, KV %, prefix hit %; DSpark lines; mask switches) | `server_series.json`, `throughput_series.json` | `results/`, `box_runs/` |
+| Box logs (every job), environment locks, plan pack | `locks/`, `plan/` | `box_logs/`, `e043_experiment/` |
+| Checkpoints | - | models `...-arc-engram64`, `-arc-E72`, `-arc-E64`, `-arc-E48` (tool), `-arc-notool-E72` |
+
+Known gaps:
+- The tool round's early `runs/tp4B/server.log` was overwritten when B restarted at 20:52 UTC. Its throughput series had been
+  extracted into `throughput_series.json`, and an earlier copy is in HF `box_runs/tp4B`.
+- Not run: a no-tool ARC control with all 384 experts + Engram 48 GiB. Engram 48 GiB was only evaluated together with E72; the
+  tool round's 64 GiB control was lossless.
+- The combined tool + no-tool Engram counts (pilot, `counts_comb*`) were not kept (the user wanted no-tool-only statistics;
+  they are the sum of the two censuses).
+- Pruned-drafter DSpark (16-32 drafter experts) was not tested (E042 put it on hold).
+
 ## Reproduce
 
 Box: Vast 8x RTX PRO 6000 (SM120), >= 1 TB RAM (two servers each pin the full ~203 GB Engram table), 1 TB disk.
