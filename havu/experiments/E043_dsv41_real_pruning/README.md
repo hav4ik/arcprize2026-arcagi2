@@ -51,19 +51,28 @@ The 120 ARC-AGI-2 eval tasks are never used in the pruning process; they only me
   (`scripts/split_dev.py`: sha1(NVARC parent or ARC task id) % 10 == 0, about 10%); the eval set is touched only for
   final metrics.
 
-## No-tool round (2026-10-23, in progress)
+## No-tool round (2026-10-23/24)
 
 **Question (user):** without tools the model does not need its coding skills, so maybe it routes over fewer experts
 and prunes better. Everything in this round is no-tool only: the statistics come only from no-tool training rollouts
-(no mixing with the tool round). Targets: E72 and E64 (inference constraints), plus E48.
+(no mixing with the tool round). Targets: E72 and E64 (inference constraints).
 
-**Answer so far: yes, much better at E72.**
+**Answer: yes, much better at E72.** E72 keeps 89% of the full model's no-tool pass@1 (tool round: 44%).
 
-| model (no-tool harness, 120 tasks / 167 pairs, 1 attempt, self-hosted) | pass@1 | same pairs: full no-tool | tool-round counterpart |
-|---|---:|---:|---:|
-| full (384 experts, full Engram) | 108/167 = 64.7% | - | tool harness 65.9% |
-| E72, answer block x10, Engram 48 GiB | 96/164 = 58.5% (partial) | 106 = 64.6% | E72 w30: 49 on the same pairs |
-| E64, answer block x20, Engram 48 GiB | 54/155 = 34.8% (partial) | 103 = 66.5% | E64 w30: 29 on the same pairs |
+| model (no-tool harness, 120 tasks / 167 pairs, self-hosted) | pass@1 pairs | pass@1 task-weighted | pass@2 task-weighted (pairs) | tool-round counterpart, pass@1 |
+|---|---:|---:|---:|---:|
+| full (384 experts, full Engram) | 108/167 = 64.7% | 67.9% | attempt 2 running | tool harness 65.9% |
+| **E72, answer block x10, Engram 48 GiB** | 96/167 = 57.5% | 57.4% | **66.9% (110/167)** | E72 w30: 29.3% |
+| E64, answer block x10, Engram 48 GiB | 65/167 = 38.9% | 39.4% | - | E64 w30: 18.0% |
+| E64, answer block x20, Engram 48 GiB | 54/167 = 32.3% | 32.5% | - | |
+
+- Full-model pass@2 for the same no-tool config on the API: 75.4% (DeepSeek API, E035 `hdrsum`), 74.6% (DeepInfra
+  fp8, E044 eval120).
+- E72 vs full, same pairs (attempt 1): 82 solved by both, 26 full only, 14 E72 only, 45 neither. E72 attempt 2 alone:
+  84/167.
+- E64 x10 beats x20 (the dev rule picked x20 for perfect answer writing, but its +7 points of NLL cost more than the
+  ~4% of answers it saves); E64 still loses most of the hard pairs (15 runs to the context limit, 33 unparsed answers).
+- **E48 dropped (user, 2026-10-24):** pruning is clearly not enough at that size; it would need expert merging.
 
 ### Data and splits
 
