@@ -1191,6 +1191,13 @@ would need a real quantization (GPTQ/AutoRound-style calibration) and an eval.
   - **T3 (`scripts/run_tool3.sh` via `run_seq10.sh` after `run_rest4.sh`; `runs/t3.log`):** E96 × 96 with the same
     server and traffic, capped with the replay's own `--max-wall-s 5400` instead of a shell timeout. Question: does the
     hit rate hold, and how much throughput does C = 96 add?
+  - **T3 result (14:45): C = 96 is past the knee.** 291.3 tok/s at 85.8% hits (C = 80: 453.5 at 96.5%), uncached
+    prefill 736.5 tok/s (3× C = 80's), TTFT median 1.54 s, turn median 250 s. KV peak 0.80 / p50 0.60, 0 preemptions
+    over 86 min, 72–73 °C. The cache thrashes before anything is preempted: once active sequences fill ~0.8 of KV, the
+    blocks a slot leaves cached during its 1-s tool call get evicted, and its next turn re-prefills. Setup 2370 s,
+    drain 667 s, full 30-min window.
+  - For sizing: E96 holds at C = 80 and drops 36% at C = 96 on these shapes. Watch the hit rate, not preemptions: KV
+    peak ≈ 0.8 marks the edge, and E128 × 48 (peak 0.77) sat just under it.
 - **E043 interim tool ARC (12:50; 8× RTX, sub80s40 + header, temperature 1.0, vs the API full model E030 hdrmin on the
   same attempts):**
 
@@ -1237,6 +1244,20 @@ would need a real quantization (GPTQ/AutoRound-style calibration) and an eval.
   - **Fitting it on the pod:** 122.1 GiB is more than `/dev/shm` (117 GiB) or the free disk (34 GB) alone. One
     Engram file (~21 GiB) plus ~10 GiB of `gptq/` can go on disk and the rest (~91 GiB) in `/dev/shm`, symlinked into
     one model dir. Host RAM while serving ≈ 91 GiB tmpfs + 64 GiB pinned Engram + ~40 GiB processes ≈ 195 of 251 GiB.
+- **RW plan (the user, 15:00: "Yes, drop the 48 replay"):** T4 runs C = 40 only (`run_cut3.sh` stops `run_tool4.sh`
+  after it), then a real-weight check of the tool E128 checkpoint, done ~19:00.
+  - `dl_e128t.sh` (started 15:08, during T4's setup; ~200 MB/s). Disk part in `/root/dsv41/model-e128t`, /dev/shm
+    part in `/dev/shm/e128t`. The pod's cgroup limit is 232.8 GiB (`memory.max` 249,999,998,976 B).
+    `hf download` reads extra patterns after one `--include` as file names, so the script passes one flag per pattern.
+  - `run_rw.sh`: waits for `T4_CUT_DONE` and `DL_DONE`, then switches the venv's vLLM from E042's synthetic Engram
+    fold to E043's compact Engram loader. The files are backed up to `/root/dsv41/vllm_backup_e042synth` first; the
+    switch is `unpatch_engram.py` (dry-run checked again), then `apply_compact_engram.py` and `apply_e043_humming.py`.
+    It then serves with `serve_real.sh` (`serve.sh` without the synthetic init and dummy load) at the T2 config and
+    checks one chat answer.
+  - `eval_rw.sh`: E043's eval with the same harness flags (config checked against E043's jsonl), 2 attempts, 40
+    workers. It runs from the workstation through an SSH tunnel, using E042's own sandbox (`arc-sandbox-e042`,
+    http://172.18.0.6:6000). Time-boxed to ~18:45: real tok/s, hits, KV and temperatures over the steady part,
+    plus correctness paired with E043's attempts. The finished attempts are biased toward short ones.
 - **E043 follow-ups (09:00):**
   - E96 2/3-bit GPTQ ARC now goes first, from a GPTQ-only E96 export. E043's user wants E96 only if it is much
     faster. Partial (51 easy-first pairs): pass@1 31 vs full 37, mean output 26.8K (1.12× full).

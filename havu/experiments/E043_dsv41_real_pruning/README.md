@@ -243,7 +243,9 @@ User request: E128 with tool use. Everything comes from tool data only:
 All three keep sets keep ~83% of tool-mode routing and overlap the no-tool E128 set by 71-81%. Without the weight the
 first-turn format already breaks (the E72 failure mode). Weight 10 recovers most of the tool-block quality at less
 general-NLL cost than 30. 2-bit build and the 2-attempt tool-harness eval (`--rescue-code`): running.
-GPTQ on tool calibration (layer 0): w13 relative output error 2.6% (RTN 11.9%), w2 5.5% (RTN 13.2%).
+GPTQ on tool calibration, relative output error, mean over 40 layers: w13 2.5% (RTN 10.9%), w2 5.5% (RTN 12.7%); worst
+layer 3.5% / 7.1%; layer 0 0.8% / 2.5% (from the shipped `gptq/layer_LL.json`; an earlier version of this line and
+of the model card mislabeled the numbers as layer 0).
 
 **Harness (user, 2026-10-24): sub80s40 + minimal header** (`eval_arc.sh` `PRESET=sub80s40`: 80k total output, 40k
 soft budget, per-turn 64k), the best-accuracy API config on the full model (E030, 120 tasks: pass@1 74.5%, pass@2 84.9%
@@ -276,7 +278,10 @@ A tool-use E128 needs its own multi-turn replay (prefix-cache reuse) before its 
 
 - E128: TTFT median 0.84 s, turn median 117 s, turn prompt p50/p90 24.9K/56.3K.
 - E96 measured from vLLM metric deltas over a 17-min window (the same method on E128 gives 342.0 vs the replay's 340.5).
-- E96 x 96 is queued (T3).
+- E96 x 96 (T3) is past the knee: 291.3 tok/s at 85.8% hits vs 453.5 at 96.5% for x 80.
+  - Uncached prefill triples, with 0 preemptions and KV peak 0.80. The cache thrashes before anything is preempted, so
+    KV peak ~0.8 is the practical edge.
+  - So E96 runs at C <= 80.
 - The pruned models' own turn shapes differ (more, shorter turns; see the interim results below). They go to E042 for
   a replay once the evals finish.
 
@@ -305,6 +310,21 @@ verified against the export by name and size).
 - The 64 GiB tool Engram table is shared with the tool-round exports.
 - Parity on 64 tool dev traces: export 0.79640 vs runtime masks 0.79652 (dev NLL); tool-block NLL 0.1490 vs 0.1494.
 - First-turn probe: 22/25 valid calls vs 24/25 (sampling noise at 25).
+- **Re-verified from HF alone (2026-10-24, box down):** `scripts/hf_headers.py` + `scripts/hf_verify_content.py` read the safetensors headers and byte ranges
+  of the HF repo and of the original checkpoint, without downloading the full weights.
+  - Index and headers agree (1,260 backbone + Engram tensors).
+  - Only routed experts, DSpark (mtp) and vision tensors were dropped.
+  - The router weight / bias / bias_vl equal the original rows at the manifest's kept ids on all 40 layers, bit for bit.
+    Those ids equal the local keep set, whose sha matches the config.
+  - 63/63 sampled unchanged tensors are byte-equal, including embed, head and norm.
+  - 80/80 sampled Engram rows equal the original rows through `row_map`.
+  - The GPTQ files hold all 128 experts x {w1, w3, w2} x {q, s, z} on all 40 layers, with uint2 g128 / g64 shapes.
+  - Dequantized GPTQ experts vs their original MXFP4 experts: cosine 0.89-0.93 (2-bit weight error ~0.42, as
+    expected), vs |cosine| <= 0.003 against the neighbouring expert. This held on 48 checks (4 layers x 4 experts x 3
+    projections), so the id mapping is right.
+  - Original tokenizer and encoding files are present, with the same sizes.
+  - Fixed in commit 9bce98c5: the model card's GPTQ error numbers were mislabeled, and two stray `__pycache__` files
+    were removed. Weights unchanged.
 
 **Engram size on the 2-bit model.** Question: does a weaker model lean on Engram more? Measured on the tool E128 2-bit
 server, dev NLL on 64 tool dev traces:
