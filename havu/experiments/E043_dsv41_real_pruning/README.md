@@ -7,7 +7,98 @@ Quality: the 120 ARC-AGI-2 eval tasks with the same harness, full vs pruned on t
 The plan pack (the user's upload, unzipped) is in `plan/` (START_HERE.md, REAP_IMPLEMENTATION_CONTRACT.md,
 TASKS_ENGRAM_FIRST.md, ...). Deployment counterpart: E042 (session dsv4-infer).
 
-## Summary (2026-10-23)
+## Status and verdict (2026-10-24 15:00 UTC)
+
+**Status: paused.** The Vast account's credit ran out at 14:46 UTC, and Vast stopped the 8x RTX PRO 6000 box (and the
+4xL4 box 55889595). Two runs stopped part-way (below). The box ran ~26.4 h (2026-10-23 12:23 to 2026-10-24 14:46 UTC)
+at $13.73/h, about $363. There was no API spend.
+
+**User's target (2026-10-24):** a pruned and quantized model that does tool-integrated reasoning well on 4xL4. E128
+first, E96 if it works; E192 is the last resort. Harness: sub80s40 + minimal header.
+
+### Verdict
+
+1. **Tool E128 2-bit works.** It is the deliverable for the user's target.
+
+   | tool harness, 120 tasks / 167 pairs x 2 attempts | pass@1 | pass@2 | mean out tokens | turns | Python-error calls |
+   |---|---:|---:|---:|---:|---:|
+   | full model (DeepSeek API, E030) | 74.5% | 84.9% | 27.4K | 13.9 | 2.3% |
+   | **tool E128 2-bit GPTQ** (on HF) | **72.8%** | **82.5%** | 35.2K | 17.1 | 14.2% |
+   | tool E96 2/3-bit GPTQ, 40-turn cap | 64.9% | 75.8% | 30.5K | 23.6 | 37.4% |
+
+   - E128 is within the 2-3 pp noise band of the full model, at 2 bits and a third of the experts.
+   - It costs +28% output tokens. 14% of its tool calls are Python typos, which it recovers from.
+   - On 4xL4 (E042, dummy weights, full-model turn shapes): 340.5 tok/s at 48 streams, 96% prefix hits, 0 preemptions.
+     That is ~35 attempts/h at its 35.2K tokens. A replay at its own shapes (E042 T4) is pending.
+2. **Tool E96 2/3-bit is not there yet.** It is 9 pp below on pass@2 at the 40-turn cap.
+   - Typos cost it turns: 58 attempts hit the cap with half their token budget unused.
+   - A 64-turn rerun was cut off by the box stop. It looked better on the 110 attempts that finished: 93 correct vs 86
+     at 40 turns on the same attempts, not significant.
+   - It is the faster model on 4xL4: 453.5 tok/s at 80 streams, ~53 attempts/h. Its accuracy decides whether that
+     speed matters.
+3. **No-tool fallbacks are ready.** The no-tool harness scores 76.8% pass@2 on the full model.
+   - E96 2/3-bit: 75.3%, the same 125/167 pairs as the full model, and the fastest on 4xL4 at 50.6 attempts/h.
+   - E128 2-bit: 72.0%. E72 MXFP4: 66.9%.
+   - All three are on HF.
+4. **Open question: which full-model baseline.** The self-hosted full model scored below the API on the same 171
+   finished attempts: 134 vs 144 correct (p = 0.09). Tool E128 got 146 on those attempts.
+   - If the full reference run confirms this, the self-hosted model is the fairer baseline (same stack and sampler), and
+     tool E128 2-bit matches it.
+   - The run was 171/334 when the box stopped.
+
+### What we learned
+
+- **Engram rows prune for free.** A 64 GiB (tool) or 48 GiB (no-tool) top-frequency table matches the full table on
+  NLL and ARC.
+  - A weaker 2-bit model does not lean on Engram more: dev NLL with 64 GiB, 112 GiB and the full table is identical
+    to 0.04%.
+  - FP4 Engram rows are free too, but host RAM does not bind, so they are not needed.
+- **Expert count matters more than bits.**
+  - 2-3-bit GPTQ with 96-128 experts beats 4-bit MXFP4 with 72.
+  - Dev NLL vs the full model, no-tool: E192 2-bit +5.5%, E128 2-bit +12.1%, E96 2/3-bit +15.2%, E72 native +22.2%.
+  - 2-bit RTN is not usable (E128 +22.0%). GPTQ needs strong damping (percdamp 1.0) because each expert sees only
+    ~3.4K calibration rows.
+  - unsloth's UD-IQ2_XXS experts on the same E128 keep set score +11.4% vs our +12.1%. Their mixed IQ2/IQ3 codebooks
+    have no batched vLLM kernel, so they are only a quality reference.
+- **Tool use needs a protected tool-call format.** Weighting tool-call-block tokens (x10-x30) in the expert score
+  keeps the DSML format.
+  - Without it, pruned models stop emitting valid calls (0/10 at E72).
+  - With it, tool E128 needed 0 rescues.
+- **Pruning causes the remaining tool errors; quantization doesn't.** They are character-level identifier typos:
+  `coms` for `comps`, `scpy` for `scipy`, mismatched brackets.
+  - Share of tool calls with a Python error: E72 native 44.6%, E96 37.4%, E128 14.2%, full 2.3-2.7%. More experts,
+    fewer typos.
+  - min_p 0.05 and top_p 0.95 do not remove them, so the pruned model puts real probability on them.
+  - The fix has to come from the model: a keep-set rule for identifier copying, or healing.
+- **E72 and below fail in the tool harness:** pass@1 29% (E72), 18% (E64) and 0% (E48), vs 66% for the full model.
+  Without tools, E72 keeps 87% of the full model's pass@2.
+- **Routing is broad.** A 48-token decode batch touches ~110 distinct experts per layer. The no-tool kept share of
+  routing is E72 74%, E96 81%, E128 87.5%, E192 95%.
+
+### What is finished
+
+| work | status | where |
+|---|---|---|
+| Engram census and masks (tool, no-tool) | done | HF artifacts and expert-importance datasets |
+| Expert statistics and keep sets (tool, no-tool) | done | same |
+| First round: tool-harness E72 / E64 / E48 at 4 bits | done, failed (29 / 18 / 0% pass@1) | below |
+| No-tool round: E72 / E64 at 4 bits | done; E72 66.9% pass@2 | HF `-arc-notool-E72` |
+| Low-bit no-tool: E128 2-bit, E96 2/3-bit (GPTQ, exports, parity, ARC) | done; 72.0% / 75.3% pass@2 | HF `-arc-notool-E128-2bit`, `-arc-notool-E96-2bit3bit` |
+| Tool E128 2-bit (keep set, GPTQ, ARC, export, parity) | done; 82.5% pass@2 | HF `-arc-tool-E128-2bit` |
+| Tool E96 2/3-bit, 40-turn cap | done; 75.8% pass@2; not exported | GPTQ tensors lost with the box's RAM disk (rebuild ~5 min) |
+| Tool E96 2/3-bit, 64-turn cap | **partial, 110/334** | `evals/results/*_mt64*` |
+| Self-hosted full-model tool reference | **partial, 171/334** | `evals/results/*_full_ref_sub80*` |
+| Dev sampling test (min_p, top_p), Engram size on 2-bit, DSpark acceptance | done | below |
+| 4xL4 replays (E042, dummy weights): no-tool own shapes; tool T2 full-model shapes | done | below |
+| 4xL4 tool replay at E128's own shapes (E042 T4) | running on dsv4-infer's Runpod pod | E042 |
+| E192 2-bit | dev NLL only (+5.5%); paused by the user; doesn't fit 4xL4 at 2 bits | layers 0-19 on HF `dsv41-flash1017-e043-gptq-artifacts` (HF storage cap stopped the rest) |
+| Real-weight 4xL4 test, healing fine-tune for the typos | not started; the user's call | |
+
+To finish the two partial runs, restart the box. Then re-download the checkpoint into `/dev/shm` (~25 min) and rebuild
+the tool E96 GPTQ (calibration replay plus ~5 min). Run `eval_arc.sh` again with the same TAGs; the harness re-runs
+only the attempts recorded as errors.
+
+## First round (2026-10-23): E48-E72 in the tool harness
 
 Reports: `reports/pruning_results.html` (ARC evals, routing statistics, NLL screens, probes, throughput) and
 `reports/engram_census.html` (Engram rows). The plan pack the work followed is in `plan/`.
@@ -37,8 +128,9 @@ Reports: `reports/pruning_results.html` (ARC evals, routing statistics, NLL scre
   - Iterative pruning (re-observing under each mask) lost to one-shot statistics at every size.
   - Plain REAP (mean amplitude when an expert is selected) keeps strong but rare experts, covering only 32% of the
     routing traffic at E64.
-- **Next options (the user's call).** A healing fine-tune (distillation) of E72 toward the full model; top-8 routing
-  for the pruned models (whitelist prepared, untested); or a different model for Kaggle.
+- **Next options at the time (the user's call).** A healing fine-tune (distillation) of E72 toward the full model;
+  top-8 routing for the pruned models (whitelist prepared, untested); or a different model for Kaggle. Since then the
+  no-tool round and the low-bit rounds (below) went further.
 
 ## Validation hygiene (user rule, 2026-10-23)
 
@@ -51,7 +143,7 @@ The 120 ARC-AGI-2 eval tasks are never used in the pruning process; they only me
   (`scripts/split_dev.py`: sha1(NVARC parent or ARC task id) % 10 == 0, about 10%); the eval set is touched only for
   final metrics.
 
-## Low-bit round: more experts at 2-3 bits (2026-10-24, in progress)
+## Low-bit round: more experts at 2-3 bits (2026-10-24, done)
 
 **Goal (user):** keep more experts at lower precision within the 4xL4 budget; attention, router, shared expert and
 Engram stay as released. Shapes agreed with E042 (dsv4-infer), both fit 4xL4 with Engram 30%:
@@ -116,7 +208,9 @@ GPTQ tensors only.
 
 **Expert coverage** (no-tool routing, answer x10 rule): kept share of routing selections E72 74%, E96 81%, E128 87.5%,
 E160 92%, E192 95%, E256 98%; a decode batch of 48 tokens touches ~110 distinct experts per layer (max layer 140).
-E192 2-bit GPTQ (quality probe; does not fit 4xL4 at 2 bits) and unsloth's experts at E128: evaluating.
+E192 2-bit GPTQ (quality probe; does not fit 4xL4 at 2 bits): dev NLL 0.59729, +5.5% vs the full model; paused by the
+user (it would need the teammate's CPU+GPU expert offload). Its layers 0-19 are in the GPTQ artifacts dataset; HF's
+storage cap stopped the upload of layers 20-39, which were lost with the box's RAM disk.
 
 **unsloth UD-IQ2_XXS comparison.** Our engine cannot read GGUF IQ codebooks, so `gguf_to_humming.py` decodes each
 expert exactly (gguf-py) and re-stores it as uint6 g32 (+0.04% of the weight norm, ~0.5% of IQ2's own error; uint4
@@ -124,8 +218,11 @@ would add 12%). Their "UD-IQ2_XXS" experts are a per-layer mix (projection x lay
 IQ3_XXS 15, IQ1_S 10, IQ2_XS 6, Q2_K 1; IQ2_S gate weight error vs the released FP4 is 7.2% (cosine 0.967) vs ~21-25%
 for integer 2-bit RTN. First comparison: their experts on the same E128 keep set (attention/router/Engram as released).
 Their Q5_K Engram cannot be represented in our MXFP8 Engram format without snapping back to the originals.
+Result (dev NLL, 64 no-tool dev traces): unsloth experts at E128 0.63087 (+11.4% vs the full model) vs our E128 uint2
+GPTQ 0.63499 (+12.1%). Slightly better at a higher average bit width, but there is no batched vLLM kernel for IQ
+codebooks; no ARC run.
 
-## Tool-use E128 2-bit (2026-10-24, in progress)
+## Tool-use round: E128 2-bit and E96 2/3-bit (2026-10-24; E128 done, E96 and full reference partial)
 
 User request: E128 with tool use. Everything comes from tool data only:
 - **Keep sets:** the tool round's statistics (10M tokens of training tool rollouts, `stats_all.npz` + `toolblock_all.npz`).
@@ -685,11 +782,22 @@ E64 loses the idea more often, with garbled reasoning ("Weod=w?? Need."), typo l
 
 - `chankhavu/dsv41-flash1017-e043-pruning-artifacts` (dataset): Engram counts/masks/geometry, REAP stats and keep
   sets, token streams (calibration + eval traces), raw observer records (20 GB), NLL results, code snapshot.
-- `chankhavu/DeepSeek-V4.1-Flash-1017-arc-engram64`: shared compact Engram files + `engram_index.json`.
-- `chankhavu/DeepSeek-V4.1-Flash-1017-arc-notool-E72`: the no-tool round's E72 x10 checkpoint with its own compact
-  48 GiB Engram files (self-contained).
-- `chankhavu/DeepSeek-V4.1-Flash-1017-arc-E72`, `-arc-E64`, `-arc-E48`: backbone checkpoints with the w30 keep sets
-  (no Engram files; download the engram64 repo's `model-engram-*.safetensors` into the same folder).
+- `chankhavu/dsv41-flash1017-expert-importance` (dataset, 13.5 GB): per-expert and per-Engram-row importance scores
+  for both workloads, ready keep sets and masks, results (card: `importance_dataset_README.md`).
+- `chankhavu/dsv41-flash1017-e043-gptq-artifacts` (dataset, 37.2 GB): E192 2-bit GPTQ tensors, layers 0-19 only (HF
+  storage cap), plus a box snapshot of small files.
+
+Checkpoints (all private, self-contained: backbone + compact Engram files + GPTQ dir where low-bit):
+
+| repo | experts | Engram | size | pass@2 (harness) |
+|---|---|---|---:|---|
+| `DeepSeek-V4.1-Flash-1017-arc-tool-E128-2bit` | 128 x uint2 GPTQ, tool keep set w10 | 64 GiB tool table | 131.1 GB | 82.5% (tool sub80s40) |
+| `DeepSeek-V4.1-Flash-1017-arc-notool-E96-2bit3bit` | 96 x uint2 / uint3 down, no-tool keep set | 30% (56.6 GiB) | 116.5 GB | 75.3% (no-tool) |
+| `DeepSeek-V4.1-Flash-1017-arc-notool-E128-2bit` | 128 x uint2 GPTQ, no-tool keep set | 30% (56.6 GiB) | 123.1 GB | 72.0% (no-tool) |
+| `DeepSeek-V4.1-Flash-1017-arc-notool-E72` | 72 x MXFP4 (native) | 48 GiB | 118.5 GB | 66.9% (no-tool) |
+
+The first round's `-arc-engram64`, `-arc-E72`, `-arc-E64` and `-arc-E48` repos (tool harness, 29-0% pass@1) were
+deleted on 2026-10-24 (user's choice) to free HF storage. Total E043 HF storage now: 680.5 GB.
 - The artifacts dataset also has `evals/` (all E043 ARC result jsonl and transcripts), `obs/iter_contrib_dec_e*`
   (iterative-stage observer records), `reap/protect` (tool-block keep sets), `results/` (NLL, probes) and `code/`.
 
@@ -715,7 +823,7 @@ Local = this folder (also on GitHub); HF = `chankhavu/dsv41-flash1017-e043-pruni
 | Rollout snapshot actually used (no-tool) | `notool_rollout_snapshot.json` (sha256) | `notool/rollouts_snapshot/` |
 | Server time series (10 s stats: tok/s, running, KV %, prefix hit %; DSpark lines; mask switches) | `server_series.json`, `throughput_series.json` | `results/`, `box_runs/` |
 | Box logs (every job), environment locks, plan pack | `locks/`, `plan/` | `box_logs/`, `e043_experiment/` |
-| Checkpoints | - | models `...-arc-engram64`, `-arc-E72`, `-arc-E64`, `-arc-E48` (tool), `-arc-notool-E72` |
+| Checkpoints | - | models `-arc-tool-E128-2bit`, `-arc-notool-E96-2bit3bit`, `-arc-notool-E128-2bit`, `-arc-notool-E72` (the first round's `-arc-engram64`, `-arc-E72/E64/E48` were deleted) |
 
 Known gaps:
 - The tool round's early `runs/tp4B/server.log` was overwritten when B restarted at 20:52 UTC. Its throughput series had been
@@ -779,8 +887,9 @@ Environment locks are in `locks/`: `venv_vllm.freeze` (the vLLM fork stack from 
 
 ## Cost and time
 
-Box rental 12:23-~20:30 UTC on 2026-10-23, ~8 h at $13.73/h, about $110 (the whole 8-GPU node, including idle and
-setup time). No API spend.
+Box rental 2026-10-23 12:23 UTC to 2026-10-24 14:46 UTC (stopped by Vast when the credit ran out), ~26.4 h at
+$13.73/h, about $363 (the whole 8-GPU node, including idle and setup time; storage while stopped is extra). No API
+spend.
 - Checkpoint download into RAM: ~25 min.
 - Engram census: ~5 min on CPU.
 - REAP replay of 10M tokens: ~28 min on 4 GPUs.
