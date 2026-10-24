@@ -66,13 +66,14 @@ def main():
     # router rows
     names = [f"layers.{L}.ffn.gate.{p}" for L in range(40) for p in ("weight", "bias", "bias_vl")]
     ours, orig = tensors_of(X, names), tensors_of(a.src, names)
+    assert set(ours) == set(orig) and len(orig) >= 80, (sorted(set(orig) - set(ours))[:3], len(orig))
     n = 0
     for name, t in ours.items():
         L = int(name.split(".")[1])
         ref = orig[name][torch.from_numpy(np.nonzero(keep[L])[0])]
         assert torch.equal(t, ref), name
         n += 1
-    assert n >= 80, n
+    assert n == len(orig), n
     print(f"router: {n} tensors equal the checkpoint rows at the kept ids")
     # index and file sizes
     wm = json.load(open(X / "model.safetensors.index.json"))["weight_map"]

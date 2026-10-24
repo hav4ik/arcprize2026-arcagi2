@@ -31,8 +31,9 @@ def main():
           f"local {len(local)} files")
     print(f"missing {missing[:5]} ({len(missing)}), size mismatch {wrong[:5]} ({len(wrong)}), extra {extra[:5]}, "
           f"safetensors above 5 GB {big}")
-    if info.private and not missing and not wrong and not big:
-        print("UPLOAD-VERIFIED")
+    ok = info.private and not missing and not wrong and not big
+    print("UPLOAD-VERIFIED" if ok else "UPLOAD-NOT-VERIFIED")
+    raise SystemExit(0 if ok else 1)
 
 
 if __name__ == "__main__":

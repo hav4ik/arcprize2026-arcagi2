@@ -11,10 +11,11 @@ E043C row-chunk loader copies each chunk into the rank's rows. File groups keep 
 model-engram-* files go to model-engram-XXXXX-of-YYYYY.safetensors, the rest to model-XXXXX-of-YYYYY.safetensors.
 Within a file, tensors are ordered by dtype size (largest first) so every tensor stays aligned.
 
-The new files are written to <dir>/.reshard/. Every source tensor's sha256 is compared with its bytes re-read from
-the new files (all chunks in row order) before the indexed old files are unlinked (a hardlink shared with another
-export stays there) and model.safetensors.index.json is replaced. Files outside the index (gptq/, configs) are
-untouched.
+The new files are written to <dir>/.reshard/ (leftovers of an interrupted run are cleared first). Every source tensor's
+sha256 is compared with its bytes re-read from the new files (all chunks in row order). Then the new files are moved
+in, model.safetensors.index.json is replaced, and only then are the indexed old files unlinked (a hardlink shared
+with another export stays there). A directory already within the cap is left alone; new names that collide with
+existing files are refused. Files outside the index (gptq/, configs) are untouched.
 """
 import argparse
 import hashlib
@@ -149,27 +150,40 @@ def main():
         print(f"{fn}: {len(pieces)} tensors ({chunks} row chunks), {sum(p[5] - p[4] for p in pieces) / 1e9:.3f} GB")
     old = sorted(set(index["weight_map"].values()))
     print(f"{len(old)} files -> {len(names)} files, cap {max_bytes / 1e9:g} GB", flush=True)
+    if all((d / fn).stat().st_size <= max_bytes for fn in old):
+        print("every file is already within the cap; nothing to do")
+        return
+    clash = sorted(set(names.values()) & set(old))
+    if clash:  # replacing a file in place would leave the old index pointing at new bytes mid-way
+        raise SystemExit(f"new file names collide with existing ones: {clash[:3]}")
     if a.dry_run:
         return
     new_dir = d / ".reshard"
     new_dir.mkdir(exist_ok=True)
+    for f in new_dir.glob("*.safetensors"):  # leftovers of an interrupted run
+        f.unlink()
     weight_map = {}
     for (grp, i), fn in names.items():
         weight_map.update(write_file(new_dir / fn, groups[grp][i], d))
         size = (new_dir / fn).stat().st_size
         assert size <= max_bytes, f"{fn} is {size} bytes"
     check(d, new_dir, weight_map, tensors)
-    for fn in old:
-        os.unlink(d / fn)
+    # Crash-safe order: new files in, then the index swap, then the old files out. Until the swap the old index and
+    # files stay valid; after it the new ones are (leftover old files are only dead weight).
     for fn in names.values():
         os.rename(new_dir / fn, d / fn)
-    new_dir.rmdir()
     meta = dict(index.get("metadata", {}))
     meta["total_size"] = sum(t[3] - t[2] for t in tensors)
     meta["e043_reshard"] = {"max_bytes": max_bytes, "row_chunk_suffix": ".rows_<start>"}
     tmp = d / "model.safetensors.index.json.tmp"
     tmp.write_text(json.dumps({"metadata": meta, "weight_map": dict(sorted(weight_map.items()))}, indent=2) + "\n")
     os.replace(tmp, d / "model.safetensors.index.json")
+    for fn in old:
+        os.unlink(d / fn)
+    try:
+        new_dir.rmdir()
+    except OSError:
+        print(f"note: {new_dir} is not empty; left in place")
     largest = max((d / fn).stat().st_size for fn in names.values())
     print(f"done: {len(tensors)} tensors verified (sha256), largest file {largest / 1e9:.3f} GB")
 

@@ -514,17 +514,18 @@ def main():
     LOG.mkdir(parents=True, exist_ok=True)
     (LOG / "traces").mkdir(exist_ok=True)
     sys.path[:0] = [str(KIT / "repo" / "evals")]
-    tasks = json.loads(Path(CHALLENGES).read_text())
-    if TASK_LIMIT:
-        tasks = dict(list(sorted(tasks.items()))[:TASK_LIMIT])
-    write_fallback(tasks)
+    # The submission always covers every task of the challenge file; ARC_TASK_LIMIT (smoke tests) only limits the
+    # tasks that get attempts.
+    all_tasks = json.loads(Path(CHALLENGES).read_text())
+    tasks = dict(list(sorted(all_tasks.items()))[:TASK_LIMIT]) if TASK_LIMIT else all_tasks
+    write_fallback(all_tasks)
     n_pairs = sum(len(x["test"]) for x in tasks.values())
-    log(f"fallback submission written: {len(tasks)} tasks, {n_pairs} pairs; deadlines: stop-new "
+    log(f"fallback submission written ({len(all_tasks)} tasks); attempting {len(tasks)} tasks, {n_pairs} pairs; deadlines: stop-new "
         f"{STOP_NEW_S / 3600:.2f}h, force {FORCE_AT_S / 3600:.2f}h, hard stop {HARD_STOP_S / 3600:.2f}h")
 
     def on_signal(sig, _frame):
         log(f"signal {sig}: final write and exit")
-        write_submission(tasks, "signal")
+        write_submission(all_tasks, "signal")
         stop_server()
         os._exit(0)
 
@@ -623,7 +624,7 @@ def main():
                     rates.append(rec["usage"]["completion"] / rec["wall_s"])
                 with LOCK:
                     RECORDS.setdefault((t, p), []).append(rec)
-                write_submission(tasks)
+                write_submission(all_tasks)
                 log(f"[{done}] {t}.{p}#{a} pred={'yes' if rec.get('pred') else 'no'} stop={rec.get('stop_reason')} "
                     f"turns={rec.get('turns')} out={rec.get('usage', {}).get('completion')} "
                     f"train_pass={rec.get('train_pass')} cuts={rec.get('cuts')} {rec.get('wall_s')}s")
@@ -632,7 +633,7 @@ def main():
                 status(tasks, queue, running, done, errors)
     finally:
         STATE["phase"] = "final"
-        write_submission(tasks, "final")
+        write_submission(all_tasks, "final")
         status(tasks, queue, running, done, errors)
         s = score(tasks)
         if s:

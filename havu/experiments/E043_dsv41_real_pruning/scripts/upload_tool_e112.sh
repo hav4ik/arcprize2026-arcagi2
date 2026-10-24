@@ -20,5 +20,5 @@ for i in 1 2 3; do
   echo "upload attempt $i failed; retrying in 60 s"; sleep 60
 done
 date -u
-tvenv/bin/python code/scripts/hf_verify_upload.py --repo $REPO --path $X
-echo UPLOAD-TOOL-E112-DONE
+if tvenv/bin/python code/scripts/hf_verify_upload.py --repo $REPO --path $X; then echo UPLOAD-TOOL-E112-DONE
+else echo UPLOAD-TOOL-E112-FAILED; exit 1; fi

@@ -453,33 +453,58 @@ class E009OptionTests(unittest.TestCase):
 
 
 class TokenExactParseTests(unittest.TestCase):
-    """E043 --token-exact: raw V4.1 completions parse like the model's encoding.parse_message_from_completion_text."""
+    """E043 --token-exact: canonical V4.1 completions parse like the model's encoding (clean); anything else parses
+    leniently like the server's deepseek_v41 tool parser (not clean -> the next turn re-renders the history)."""
 
     @staticmethod
-    def call(name, params):
+    def call(name, params, close=True):
         body = "".join(f'<｜DSML｜ parameter name="{k}" string="{s}">{v}</｜DSML｜ parameter>\n' for k, (v, s) in params)
-        return f'<｜DSML｜ invoke name="{name}">\n{body}</｜DSML｜ invoke>\n'
+        return f'<｜DSML｜ invoke name="{name}">\n{body}' + ("</｜DSML｜ invoke>\n" if close else "")
 
-    def test_tool_calls_and_answer(self):
-        from run_deepseek_tools import DS_EOS, parse_ds_completion
+    def args(self, calls):
+        return [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in calls]
+
+    def test_canonical_is_clean(self):
+        from run_deepseek_tools import DS_EOS, _parse_ds_lenient, parse_ds_completion
         text = ("look at rows</think>" + "\n\n<｜DSML｜ calls>\n"
                 + self.call("run_python", [("code", ("print(1)\nx = '<a>'", "true"))])
                 + self.call("submit_answer", [("code", ("answer", "true")), ("n", ("3", "false"))])
                 + "</｜DSML｜ calls>" + DS_EOS)
-        reasoning, content, calls = parse_ds_completion(text)
+        reasoning, content, calls, clean = parse_ds_completion(text)
+        self.assertTrue(clean)
         self.assertEqual((reasoning, content), ("look at rows", ""))
-        self.assertEqual([c["function"]["name"] for c in calls], ["run_python", "submit_answer"])
-        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"code": "print(1)\nx = '<a>'"})
-        self.assertEqual(json.loads(calls[1]["function"]["arguments"]), {"code": "answer", "n": 3})
-        self.assertEqual(parse_ds_completion("ok</think>[[1]]" + DS_EOS), ("ok", "[[1]]", []))
+        self.assertEqual(self.args(calls), [("run_python", {"code": "print(1)\nx = '<a>'"}),
+                                            ("submit_answer", {"code": "answer", "n": 3})])
+        r2, c2, k2 = _parse_ds_lenient(text)  # the lenient parser agrees on canonical text
+        self.assertEqual((r2, c2, self.args(k2)), (reasoning, content, self.args(calls)))
+        self.assertEqual(parse_ds_completion("ok</think>[[1]]" + DS_EOS), ("ok", "[[1]]", [], True))
 
-    def test_format_errors_raise(self):
+    def test_lenient_like_server(self):
         from run_deepseek_tools import DS_EOS, parse_ds_completion
-        for bad in ["no think end" + DS_EOS, "r</think>text without eos",
-                    "r</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"run_python\">\ncode</｜DSML｜ invoke>\n"
-                    "</｜DSML｜ calls>" + DS_EOS]:
-            with self.assertRaises(ValueError):
-                parse_ds_completion(bad)
+        run = self.call("run_python", [("code", ("print(2)", "true"))])
+        cases = {
+            "call inside thinking": ("think more\n\n<｜DSML｜ calls>\n" + run + "</｜DSML｜ calls>" + DS_EOS,
+                                     "think more\n\n", ""),
+            "single newline before calls": ("r</think>text\n<｜DSML｜ calls>\n" + run + "</｜DSML｜ calls>" + DS_EOS,
+                                            "r", "text"),
+            "missing </invoke>": ("r</think>\n\n<｜DSML｜ calls>\n" + self.call("run_python", [("code", ("print(2)", "true"))],
+                                  close=False) + "</｜DSML｜ calls>" + DS_EOS, "r", ""),
+            "newline after </calls>": ("r</think>\n\n<｜DSML｜ calls>\n" + run + "</｜DSML｜ calls>\n" + DS_EOS, "r", ""),
+            "doubled </think>": ("to inspect.</think>Let me inspect.</think>\n\n<｜DSML｜ calls>\n" + run
+                                 + "</｜DSML｜ calls>" + DS_EOS, "to inspect.", "Let me inspect."),
+        }
+        for tag, (text, reasoning, content) in cases.items():
+            with self.subTest(tag):
+                r, c, calls, clean = parse_ds_completion(text)
+                self.assertFalse(clean)
+                self.assertEqual((r, c), (reasoning, content))
+                self.assertEqual(self.args(calls), [("run_python", {"code": "print(2)"})])
+        r, c, calls, clean = parse_ds_completion('r</think>\n\n<｜DSML｜ calls>\n' + self.call(
+            "submit_answer", [("code", ("answer", "true")), ("k", ("not json", "false"))]) + "</｜DSML｜ calls>" + DS_EOS)
+        self.assertFalse(clean)
+        self.assertEqual(self.args(calls), [("submit_answer", {"code": "answer", "k": "not json"})])
+        self.assertEqual(parse_ds_completion("still thinking, cut by max_tokens"),
+                         ("still thinking, cut by max_tokens", "", [], False))
 
 
 class SandboxClientTests(unittest.TestCase):

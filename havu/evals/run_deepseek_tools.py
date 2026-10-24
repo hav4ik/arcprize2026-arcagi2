@@ -530,7 +530,7 @@ def _read_until(text, index, stops):
     return p + len(s), text[index:p], s
 
 
-def parse_ds_completion(text):
+def _parse_ds_strict(text):
     """Raw V4.1 thinking-mode completion (after the prompt's `<think>`) -> (reasoning, content, tool_calls), like the
     model's parse_message_from_completion_text. Raises ValueError on any format error."""
     i, reasoning, stop = _read_until(text, 0, [DS_THINK_END, DS_CALLS_START])
@@ -574,15 +574,69 @@ def parse_ds_completion(text):
     return reasoning, content, calls
 
 
+DS_TOOL_START = f"<{DSML} calls>"
+DS_INVOKE_RE = re.compile(rf'<{DSML} invoke name="(.*?)">(.*?)(?=</{DSML} invoke>|$)', re.DOTALL)
+DS_PARAM_RE = re.compile(rf'<{DSML} parameter\s+name="([^"]+)"\s+string="(true|false)">(.*?)'
+                         rf'(?:</{DSML} parameter>|(?=<{DSML} parameter\s+name=))', re.DOTALL)
+
+
+def _parse_ds_lenient(text):
+    """Like the server's deepseek_v41 parser (vllm/parser/deepseek_v4.py state machine): reasoning ends at the first
+    `</think>` or at a calls block opened inside the thinking; an invoke ends at `</invoke>` or its block's end; a
+    parameter ends at its close tag or the next parameter; a non-JSON `string="false"` value stays a string; think tags
+    in the content are dropped. Never raises."""
+    text = text.replace(DS_EOS, "")
+    t, e = text.find(DS_TOOL_START), text.find(DS_THINK_END)
+    if e != -1 and (t == -1 or e < t):
+        reasoning, rest = text[:e], text[e + len(DS_THINK_END):]
+    elif t != -1:
+        reasoning, rest = text[:t], text[t:]
+    else:
+        return text, "", []
+    content, calls, i = [], [], 0
+    while (t := rest.find(DS_TOOL_START, i)) != -1:
+        content.append(rest[i:t])
+        end = rest.find(DS_CALLS_END, t)
+        block = rest[t + len(DS_TOOL_START):end if end != -1 else len(rest)]
+        for name, body in DS_INVOKE_RE.findall(block):
+            args = {}
+            for key, is_str, value in DS_PARAM_RE.findall(body):
+                try:
+                    args[key] = value if is_str == "true" else json.loads(value)
+                except ValueError:
+                    args[key] = value
+            calls.append({"id": f"call_{uuid4().hex[:24]}", "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+        if end == -1:
+            i = len(rest)
+            break
+        i = end + len(DS_CALLS_END)
+    content.append(rest[i:])
+    content = "".join(content).replace(DS_THINK_END, "").replace("<think>", "")
+    return reasoning, content.rstrip("\n") if calls else content, calls
+
+
+def parse_ds_completion(text):
+    """-> (reasoning, content, tool_calls, clean). clean: the text is in the encoding's canonical form, so the sampled
+    ids are a faithful history; otherwise it is parsed leniently like the server's parser."""
+    try:
+        return (*_parse_ds_strict(text), True)
+    except ValueError:
+        return (*_parse_ds_lenient(text), False)
+
+
 def turn_token_exact(client, args, messages, max_tokens, tok):
     """E043 --token-exact (--base-url only): continue the attempt's exact token history instead of letting the server
     re-render earlier assistant turns. Re-tokenizing sampled text does not always give back the sampled ids (the
     model sometimes samples a non-canonical split; ~13% of turns), which ends the cached prefix inside that turn; on a
     small KV pool (4xL4) the state needed to resume there is evicted. Only the messages appended since the last turn
     are rendered (server /tokenize: full render minus the render through the last assistant turn), and generation
-    goes to /v1/completions with the token ids. The output is parsed like the model's encoding; a format error keeps
-    the text as content (so --rescue-code still sees garbled calls). If the render is not prefix-stable (e.g. a new
-    user message drops earlier reasoning), the turn uses the full render."""
+    goes to /v1/completions with the token ids. Canonical output is parsed like the model's encoding; anything else is
+    parsed leniently like the server's tool parser. The next turn is rendered from the messages (as on the chat path)
+    instead of the sampled ids when this turn was not canonical, was cut by max_tokens, or the harness rewrote it
+    (rescue / tool-name fix: tok["resync"]), so the model never sees malformed history the chat path would have shown
+    cleanly. If the render is not prefix-stable (e.g. a new user message drops earlier reasoning), the turn uses the
+    full render too."""
     import httpx
     root = str(client.base_url).rstrip("/").removesuffix("/v1")
     body = dict(json.loads(args.extra_body or "{}"))
@@ -597,8 +651,9 @@ def turn_token_exact(client, args, messages, max_tokens, tok):
         return r.json()["tokens"]
 
     full = render(messages, True)
-    if tok["ids"] is None:
+    if tok["ids"] is None or tok["resync"]:
         ids = full
+        tok["resyncs"] += tok["ids"] is not None
     else:
         upto = render(messages[:tok["n"]], False)
         if full[:len(upto)] == upto:
@@ -628,14 +683,10 @@ def turn_token_exact(client, args, messages, max_tokens, tok):
         if stream is not None:
             stream.close()
     text = "".join(text)
-    try:
-        reasoning, content, calls = parse_ds_completion(text if text.endswith(DS_EOS) or finish != "stop"
-                                                        else text + DS_EOS)
-    except ValueError:
-        tok["parse_fallbacks"] += finish != "length"
-        reasoning, sep, rest = text.partition(DS_THINK_END)
-        reasoning, content, calls = (reasoning, rest, []) if sep else (text, "", [])
-        content = content.removesuffix(DS_EOS)
+    reasoning, content, calls, clean = parse_ds_completion(text if text.endswith(DS_EOS) or finish != "stop"
+                                                           else text + DS_EOS)
+    tok["parse_fallbacks"] += not clean and finish != "length"
+    tok["resync"] = not clean or finish == "length"
     assistant = {"role": "assistant", "content": content, "reasoning_content": reasoning}
     if calls:
         assistant["tool_calls"] = calls
@@ -739,8 +790,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
     n_rescues = 0  # E043 --rescue-code
     n_nudge_rescues = 0
     # E043 --token-exact: the attempt's exact token history (prompt + sampled ids) and counters
-    tok = ({"ids": None, "n": 0, "prev_len": 0, "prev_sampled": [], "turns": 0, "breaks": 0, "rerenders": 0,
-            "parse_fallbacks": 0}
+    tok = ({"ids": None, "n": 0, "prev_len": 0, "prev_sampled": [], "resync": False, "turns": 0, "breaks": 0,
+            "rerenders": 0, "resyncs": 0, "parse_fallbacks": 0}
            if getattr(args, "token_exact", False) and getattr(args, "base_url", None) else None)
     events, error, content, t0 = [], None, "", time.monotonic()
     session_final = getattr(args, "final_mode", "turn") == "session"
@@ -812,6 +863,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                         messages[-1] = msg
                         calls = [rescued]
                         n_rescues += 1
+                        if tok is not None:
+                            tok["resync"] = True
                         events.append({"turn": n_turns, "rescued": "code"})
                     elif n_nudge_rescues < 3 and not valid_grid(parse(msg.get("content") or "")):
                         # No call, no code and no answer grid: remind the model to use the tools (at most 3x).
@@ -853,6 +906,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                                 events.append({"turn": n_turns, "rescued": f"name {name}"})
                                 name = fixed
                                 call["function"]["name"] = fixed
+                                if tok is not None:
+                                    tok["resync"] = True
                         if accepted is not None:
                             output = "[skipped: solution already accepted]"
                         elif name == "run_python":
@@ -933,7 +988,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
     if getattr(args, "rescue_code", False):
         result["rescues"] = n_rescues
     if tok is not None:
-        result["token_exact"] = {k: v for k, v in tok.items() if k not in ("ids", "n", "prev_len", "prev_sampled")}
+        result["token_exact"] = {k: v for k, v in tok.items()
+                                 if k not in ("ids", "n", "prev_len", "prev_sampled", "resync")}
     if getattr(args, "train_check", False):
         result.update({"train_pass": None, "train_frac": None, "train_trace": "no_answer"} if pred is None else labels)
     if any(getattr(args, k, v) != v for k, v in V4_DEFAULTS.items()):
@@ -1174,12 +1230,12 @@ def main():
             for a in range(args.attempts) if (t, p, a) not in latest or "error" in latest[t, p, a]]
     if pairs is not None:
         jobs = [job for job in jobs if job[:2] in pairs]
-    if getattr(args, "only_attempts", None):  # E043: e.g. attempt 1 in a second process beside a running attempt 0
-        keep_attempts = {int(x) for x in args.only_attempts.split(",")}
-        jobs = [job for job in jobs if job[2] in keep_attempts]
     if policy:
         jobs += [(t, p, 2) for t, task in tasks.items() for p in range(len(task["test"]))
                  if (pairs is None or (t, p) in pairs) and needs_extra(t, p)]
+    if getattr(args, "only_attempts", None):  # E043: e.g. attempt 1 in a second process beside a running attempt 0
+        keep_attempts = {int(x) for x in args.only_attempts.split(",")}
+        jobs = [job for job in jobs if job[2] in keep_attempts]
     price_out = PRICES.get(args.model, (0.0, 0.0, 0.0))[2]
     output_cap = len(jobs) * args.max_total_output * price_out * args.price_multiplier / 1e6
     expected = len(jobs) * 65000 * price_out * args.price_multiplier / 1e6

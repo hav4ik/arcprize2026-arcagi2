@@ -140,6 +140,48 @@ runs are not resumed.
     - The remaining difference: attempt 1 ran entirely in a second process beside attempt 0's tail.
     - **Clean rerun:** `e112t_w10_u2_gptq_eng64_sub80_r2`, started 20:47 UTC: one process, current code, a third
       independent attempt.
+- **Code audit (user request, 2026-10-24 ~21:00 UTC; two independent read-only sub-agents):**
+  - **Harness:** no code cause for E112's attempt-1 gap.
+    - Both processes sent identical first prompts and sampling (temperature, top_p, salt, max_tokens).
+    - Trace behaviour is the same: Python-error share 30.5% vs 28.8%, sandbox timeouts 5 vs 8, state resets 5 vs 3.
+    - The remaining differences are wall clock, server load (~265 concurrent streams while both ran) and server
+      pinning.
+  - **Real problems found in `--token-exact`, now fixed:**
+    1. **Strict parser.** It was stricter than the server's `deepseek_v41` tool parser. These made it fall back to
+       content:
+       - a calls block inside the thinking;
+       - a single `\n` before the calls block;
+       - a missing `</invoke>`;
+       - a newline after `</calls>`;
+       - a non-JSON `string="false"` value.
+
+       Garbled `submit_answer` calls then became `run_python` through `--rescue-code`. A call written inside the
+       thinking ended the attempt after 3 nudges. Now: strict canonical parse first, then a lenient parse that
+       mirrors the server's state machine.
+    2. **History kept malformed tokens.** After a fallback, rescue or tool-name fix, the history kept the raw
+       malformed tokens; the chat path shows a clean re-rendered call. That plausibly fed attempt 0's three rescue
+       loops (36, 14 and 14 rescues). Now the next turn is re-rendered from the messages after any non-canonical,
+       rewritten or length-cut turn (`resyncs`).
+    3. **Latent length bug.** After a length cut followed by `continue`, the delta was empty, so the server would
+       continue the cut text. It never triggered in this run; it is fixed by the same re-render.
+  - **Bookkeeping:**
+    - `--only-attempts` now also filters the policy attempt-2 jobs.
+    - `breaks` no longer counts rewritten turns.
+  - Tests: 2 parser tests (canonical, plus the server-like lenient cases), 64 harness tests pass, and a live
+    end-to-end run solved 3/3. The r2 rerun deliberately uses the pre-audit code, so it is comparable with attempt 1.
+  - **Checkpoint tooling:** no bug in the published E112 export or its TP4 loading. Fixed:
+    - **Loader coverage check:** it had holes. A TP8 rank inside a missing file stayed uninitialised, and a duplicate
+      chunk could mask a missing one. It now checks exact row intervals per rank, skips other pipeline-parallel
+      ranks' layers, and the patch upgrades already-patched forks in place. Tested TP1/2/4/8 with dropped and
+      duplicated chunks. The E112 HF repo's `serving/` copy is updated.
+    - **Resharder swap:** it was not crash-safe. Now: new files in, index swap, then old files out. Stale temp files
+      are cleared, name collisions are refused, and an already-capped directory is left alone.
+    - `hf_verify_upload.py` now exits 1 when the upload is not verified.
+    - `check_lowbit_export.py` compares exact router name sets.
+    - `export_tool_e112.sh` resumes only after a finished reshard.
+  - Remaining audit notes: vLLM skips index files missing on disk, and fp8 skips the uninitialized-weights check, so
+    a pre-flight file check belongs in the Kaggle stager (sent to dsv4-infer). The index `total_size` excludes the
+    Engram with `--engram-from`; that is cosmetic and older.
 - **L4 steady state with the fix (dsv4-infer, E112 x 60, 63-min run):**
   - 416-422 tok/s from minute 8 to 42; hits rose 95% -> 98%; KV max 0.37; 0 preemptions. The late-run collapse is
     gone.

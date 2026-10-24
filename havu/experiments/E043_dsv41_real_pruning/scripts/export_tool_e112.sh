@@ -13,7 +13,7 @@ B=/dev/shm/e043/export/tool_e112_w10_eng64_base
 X=/dev/shm/e043/export/tool_e112_w10_eng64_gptq
 until [ "$(ls $O/*.json 2>/dev/null | wc -l)" = 40 ] && ! pgrep -f "gptq_experts.py --calx /dev/shm/e043/calx_tool_e112" > /dev/null; do sleep 30; done
 date -u; echo "GPTQ done; chunking the tool Engram"
-if [ ! -f $E/model.safetensors.index.json ]; then
+if ! grep -q e043_reshard $E/model.safetensors.index.json 2>/dev/null; then  # not (fully) resharded yet
   rm -rf $E; mkdir -p $E
   for f in $SRC/model-engram-*.safetensors; do ln -s $(readlink -f $f) $E/$(basename $f); done
   cp $SRC/config.json $SRC/e043_manifest.json $E/

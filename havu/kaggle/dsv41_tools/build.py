@@ -159,9 +159,10 @@ def _ok(g):
             and len({len(r) for r in g}) == 1 and all(type(v) is int and 0 <= v <= 9 for r in g for v in r))
 try:
     sub = json.load(open(f"{WORK}/submission.json"))
-    assert set(sub) == set(_tasks)
+    assert set(sub) == set(_tasks), f"task ids differ ({len(sub)} vs {len(_tasks)})"
     for t, v in _tasks.items():
-        assert len(sub[t]) == len(v["test"]) and all(_ok(r["attempt_1"]) and _ok(r["attempt_2"]) for r in sub[t])
+        assert len(sub[t]) == len(v["test"]), f"{t}: {len(sub[t])} rows for {len(v['test'])} test inputs"
+        assert all(_ok(r["attempt_1"]) and _ok(r["attempt_2"]) for r in sub[t]), f"{t}: invalid grid"
     print("submission.json valid", flush=True)
 except Exception as exc:
     print("submission.json invalid, writing the fallback:", exc, flush=True)
