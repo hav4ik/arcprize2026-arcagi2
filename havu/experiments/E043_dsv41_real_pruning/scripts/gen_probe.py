@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow.parquet as pq
 import requests
@@ -51,6 +52,7 @@ def main():
     ap.add_argument("--n", type=int, default=3)
     ap.add_argument("--max-tokens", type=int, default=4000)
     ap.add_argument("--samples", type=int, default=0, help="extra temperature-1.0 samples per ARC prompt")
+    ap.add_argument("--workers", type=int, default=1, help="concurrent requests within one config")
     ap.add_argument("--out", required=True)
     ap.add_argument("configs", nargs="+")
     a = ap.parse_args()
@@ -68,10 +70,11 @@ def main():
                       timeout=120)
         t0 = time.time()
         salt = f"{tag}-{time.time()}"
-        res = [("simple", chat(a.server, SIMPLE, [tools[0]], 400, salt=salt))]
-        res += [(tid, chat(a.server, msgs, tools, a.max_tokens, salt=salt)) for tid, msgs in arc]
-        res += [(f"{tid}@T1#{k}", chat(a.server, msgs, tools, a.max_tokens, 1.0, salt))
-                for tid, msgs in arc for k in range(a.samples)]
+        jobs = [("simple", SIMPLE, [tools[0]], 400, 0.0)] + [(tid, msgs, tools, a.max_tokens, 0.0) for tid, msgs in arc]
+        jobs += [(f"{tid}@T1#{k}", msgs, tools, a.max_tokens, 1.0) for tid, msgs in arc for k in range(a.samples)]
+        with ThreadPoolExecutor(a.workers) as pool:
+            outs = list(pool.map(lambda j: chat(a.server, j[1], j[2], j[3], j[4], salt), jobs))
+        res = [(j[0], o) for j, o in zip(jobs, outs)]
         with open(a.out, "a") as f:
             for name, r in res:
                 f.write(json.dumps({"config": tag, "probe": name, **r}) + "\n")

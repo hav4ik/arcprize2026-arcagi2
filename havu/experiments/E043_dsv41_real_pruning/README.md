@@ -107,8 +107,11 @@ released table): E128 2-bit dev NLL 0.63507 vs 0.63499 with FP8 Engram, answer w
 the host-RAM table (56.6 -> ~30 GiB) given a 4-bit Engram lookup kernel.
 
 **Deliverable:** `chankhavu/DeepSeek-V4.1-Flash-1017-arc-notool-E128-2bit` (private, 123.1 GB, GPTQ-only layout,
-Engram 30% FP8): parity dev NLL 0.63486 (export) vs 0.63499 (runtime masks). E96 export built
-(`export/notool_e96_x10_eng56_gptq`, 116.5 GB), not uploaded (E96 paused by the user).
+Engram 30% FP8): parity dev NLL 0.63486 (export) vs 0.63499 (runtime masks). `chankhavu/DeepSeek-V4.1-Flash-1017-arc-notool-E96-2bit3bit` (private, 116.5 GB, w13 uint2 g128 + w2 uint3 g64,
+same layout): parity dev NLL 0.65215 (export) vs 0.65213 (runtime masks); ARC pending. Upload rule (user, 2026-10-24):
+every model with a known 4xL4 inference path and modest loss vs the full model goes to the user's HF account; quality
+probes that don't fit 4xL4 (E192, full model at 2 bits) go to `chankhavu/dsv41-flash1017-e043-gptq-artifacts` as
+GPTQ tensors only.
 
 **Expert coverage** (no-tool routing, answer x10 rule): kept share of routing selections E72 74%, E96 81%, E128 87.5%,
 E160 92%, E192 95%, E256 98%; a decode batch of 48 tokens touches ~110 distinct experts per layer (max layer 140).
