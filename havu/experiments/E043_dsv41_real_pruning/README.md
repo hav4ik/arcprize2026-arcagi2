@@ -201,6 +201,14 @@ pass@1 and pass@2 are task-weighted.
   model).
 - 0 rescues: the tool-call format holds with the tool-call-block weight.
 
+**Deliverable:** `chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-E128-2bit` (private; uploaded 13:51 UTC; all 122 files
+verified against the export by name and size).
+- GPTQ-only layout, `export/tool_e128_w10_eng64_gptq`, 131,090,957,662 bytes.
+- Built by `export_pruned.py --no-routed-experts --engram-from export/e72_w30_eng64`, then `make_lowbit_export.py`.
+- The 64 GiB tool Engram table is shared with the tool-round exports.
+- Parity on 64 tool dev traces: export 0.79640 vs runtime masks 0.79652 (dev NLL); tool-block NLL 0.1490 vs 0.1494.
+- First-turn probe: 22/25 valid calls vs 24/25 (sampling noise at 25).
+
 **Engram size on the 2-bit model.** Question: does a weaker model lean on Engram more? Measured on the tool E128 2-bit
 server, dev NLL on 64 tool dev traces:
 

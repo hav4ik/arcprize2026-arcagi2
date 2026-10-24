@@ -1218,6 +1218,16 @@ would need a real quantization (GPTQ/AutoRound-style calibration) and an eval.
   - **T4 (`scripts/run_tool4.sh` via `run_seq11.sh` after T3; `runs/t4.log`):** E128 × 40 and × 48 at these shapes,
     `--max-wall-s 4800` each. KV per slot grows ~15% over T2, so × 48 should peak near 0.88 and × 40 near 0.75.
     Attempts/h = gen tok/s × 3600 / 35.2K.
+- **E043 final tool E96 u2/u3 (sub80s40 + header, 2 attempts, 40-turn cap):** pass@1 64.9%, **pass@2 75.8%**, against
+  E128's 72.8% / 82.5% and full's 74.5% / 84.9%. It is turn-limited: 58 of 334 attempts hit the 40-turn cap at a mean
+  40.4K of their 80K budget, because Python typos cost turns. E043 reruns it with `--max-turns 64`.
+  - Shapes (`metadata/trace_shapes/tools_e043_e96t_t40.json`, from `tool_shapes_e96t_w10_u2u3_gptq_eng64_sub80.json`;
+    8 negative tool-token values clamped): 23.6 turns per attempt (p90 40), turn prompt p50 / p90 25.1K / 54.2K,
+    completion per turn mean / p50 / p90 1,290 / 455 / 3,218, 30.5K generated per attempt. Tool tokens per generated
+    token are the same as E128's (0.256 vs 0.255). E96 has shorter turns, so prefill and per-turn overhead weigh more.
+  - Not replayed yet: E128 is ahead by 6.7 pp pass@2, so E96 gets a replay only if the 64-turn rerun closes the gap.
+  - Engram on the 2-bit E128 (E043 dev NLL): 0.79679 at 64 GiB, 0.79647 at 112 GiB, 0.79650 full. The 64 GiB tool
+    table stays.
 - **E043 follow-ups (09:00):**
   - E96 2/3-bit GPTQ ARC now goes first, from a GPTQ-only E96 export. E043's user wants E96 only if it is much
     faster. Partial (51 easy-first pairs): pass@1 31 vs full 37, mean output 26.8K (1.12× full).
