@@ -38,6 +38,8 @@ ARGS=(
   --compilation-config '{"cudagraph_mode": "FULL", "max_cudagraph_capture_size": 64}'
 )
 [ -n "$KV_BLOCKS" ] && ARGS+=(--num-gpu-blocks-override "$KV_BLOCKS")
+# EXTRA_ARGS: whitespace-separated extra server flags for test runs (e.g. --worker-extension-cls e051_ext.E051Ext).
+if [ -n "${EXTRA_ARGS:-}" ]; then read -ra X <<< "$EXTRA_ARGS"; ARGS+=("${X[@]}"); fi
 
 if [ "$OFFLOAD_GIB" != "0" ]; then
   BYTES=$(( OFFLOAD_GIB * 1024 * 1024 * 1024 ))

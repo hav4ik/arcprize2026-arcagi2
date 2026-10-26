@@ -12,6 +12,7 @@ Counters are cumulative; diff consecutive samples for rates.
 """
 
 import argparse
+import os
 import json
 import time
 import urllib.request
@@ -62,11 +63,29 @@ def host_mem():
     return out
 
 
+def group_rss(pgid):
+    """PSS of our server's process group (the box's RAM may be shared, so MemAvailable is not ours alone)."""
+    tot = 0
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            if os.getpgid(int(d)) != pgid:
+                continue
+            for line in open(f"/proc/{d}/smaps_rollup"):  # Pss: shared pages split across the processes mapping them
+                if line.startswith("Pss:"):
+                    tot += int(line.split()[1])
+        except (OSError, ProcessLookupError):
+            continue
+    return round(tot / 2**20, 2)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--url", default="http://127.0.0.1:8100")
     p.add_argument("--out", required=True)
     p.add_argument("--interval", type=float, default=5.0)
+    p.add_argument("--pgid", type=int, help="server process group: log its summed PSS as server_pss_GiB")
     a = p.parse_args()
     with open(a.out, "a") as f:
         while True:
@@ -76,6 +95,8 @@ def main():
             except Exception as e:  # server restarting: keep logging host memory
                 row["error"] = str(e)[:120]
             row.update(host_mem())
+            if a.pgid:
+                row["server_pss_GiB"] = group_rss(a.pgid)
             f.write(json.dumps(row) + "\n")
             f.flush()
             time.sleep(a.interval)

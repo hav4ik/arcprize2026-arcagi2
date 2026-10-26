@@ -62,7 +62,7 @@ def retention_args(a):
 
 def settings_cell(a):
     env = [("ARC_WORKERS", str(a.workers)), ("ARC_MULTI_TEST", "1"), ("ARC_MULTI_BUDGET", str(a.budget)),
-           ("ARC_CONTEXT_LIMIT", "163840"), ("ARC_MAX_NUM_SEQS", "64"), ("ARC_GPU_UTIL", "0.945")]
+           ("ARC_CONTEXT_LIMIT", "163840"), ("ARC_MAX_NUM_SEQS", "64"), ("ARC_GPU_UTIL", str(getattr(a, "util", 0.945)))]
     if a.gate:
         env += [("ARC_KV_ADMIT_MAX", str(a.gate)), ("ARC_KV_ADMIT_MIN_WORKERS", "16")]
     env += opt_env(a)
@@ -181,6 +181,7 @@ def main():
     ap.add_argument("--solver", type=Path, default=HERE / "solver_dsv41.py")
     ap.add_argument("--harness", type=Path, default=ROOT / "evals/run_deepseek_tools.py")
     ap.add_argument("--retention", type=int, default=0, help="--prefix-cache-retention-interval (0: the base 128)")
+    ap.add_argument("--util", type=float, default=0.945, help="ARC_GPU_UTIL (V5/V6: 0.945)")
     ap.add_argument("--effort", type=int, default=0, help="ARC_REASONING_EFFORT (0: the solver's 50)")
     ap.add_argument("--auto-repair", action="store_true", help="ARC_AUTO_REPAIR=1 + embed evals/auto_repair*.")
     ap.add_argument("--best-guess-at", type=float, default=0.0)
@@ -196,6 +197,8 @@ def main():
     if a.gate:
         expect["ARC_KV_ADMIT_MAX"] = str(a.gate)
     expect.update(opt_env(a))
+    if a.util != 0.945:
+        expect["ARC_GPU_UTIL"] = str(a.util)
     files = {"solver_dsv41.py": a.solver, "repo/evals/run_deepseek_tools.py": a.harness}
     new, need = [], opt_need(a)
     if a.auto_repair:

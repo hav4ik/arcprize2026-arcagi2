@@ -1,0 +1,448 @@
+--- a/vllm/model_executor/kernels/attention/dsa/dsv41_indexer.py	2026-10-26 12:59:39.185781753 -0700
++++ b/vllm/model_executor/kernels/attention/dsa/dsv41_indexer.py	2026-10-26 12:59:39.186781647 -0700
+@@ -15,7 +15,22 @@
+ SCALE_GROUP_SIZE = 32
+ SCALES_PER_HEAD = 4
+ CANDIDATE_BLOCK_SIZE = 8
++# Tile and pipeline configuration per code path. The FP4 tensor-core path has
++# no per-element decode, so wide tiles amortize the address and page-table work
++# (128 columns, one stage measured best on RTX PRO 6000); the decode path keeps
++# the narrow tiles that hide its integer decode behind the MMA.
+ _LOGITS_BLOCK_N = 16
++_LOGITS_NUM_STAGES = 2
++_LOGITS_BLOCK_N_FP4 = 128
++_LOGITS_NUM_STAGES_FP4 = 1
++# Each program strides over a row's column tiles, so the grid does not depend
++# on the row's context and CUDA graph replays stay valid. The number of
++# programs per row targets a fixed total: few rows (decode) get many programs
++# for parallelism, many rows (prefill) get few so q is loaded once per row and
++# the K tiles are shared through L2 across the rows scoring the same tile.
++_LOGITS_TARGET_PROGRAMS = 16_384
++_LOGITS_MIN_TILE_PROGRAMS = 8
++_LOGITS_NUM_WARPS = 4
+ _CUDA_GRID_Y_LIMIT = 65_535
+ 
+ _INDEX_HEADS = tl.constexpr(32)
+@@ -24,6 +39,7 @@
+ _SCALE_GROUP_SIZE = tl.constexpr(32)
+ _SCALES_PER_HEAD = tl.constexpr(4)
+ _CANDIDATE_BLOCK_SIZE = tl.constexpr(8)
++_FILL_BLOCK = tl.constexpr(256)
+ 
+ 
+ @triton.jit
+@@ -105,123 +121,206 @@
+     PREFILL: tl.constexpr,
+     USE_CANDIDATES: tl.constexpr,
+     CANDIDATE_STRIDE_ROW: tl.constexpr,
+-    SWAP_GRID_AXES: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     Q_PREDECODED: tl.constexpr,
++    FP4_DOT: tl.constexpr,
+ ):
+-    if SWAP_GRID_AXES:
+-        row = tl.program_id(1).to(tl.int64)
+-        col_tile = tl.program_id(0)
+-    else:
+-        row = tl.program_id(0).to(tl.int64)
+-        col_tile = tl.program_id(1)
+-    cols = col_tile * BLOCK_N + tl.arange(0, BLOCK_N)
++    row = tl.program_id(0).to(tl.int64)
++    first_tile = tl.program_id(1)
++    tile_programs = tl.num_programs(1)
+     dims = tl.arange(0, _INDEX_HEAD_DIM)
+     heads = tl.arange(0, _INDEX_HEADS)
+ 
++    # Per-row bounds. Dense rows score only [first_col, stop); the columns
++    # outside get -inf from the fill loops below, so the output equals the
++    # one-tile-per-program kernel bit for bit while the work follows the
++    # row's context instead of the launch width.
+     if PREFILL:
+         start = tl.load(row_starts + row)
+         end = tl.load(row_ends + row)
+         has_context = end > start
+         req = tl.load(token_to_seq + start, mask=has_context, other=0).to(tl.int64)
+         if USE_CANDIDATES:
+-            candidate_slot = cols // _CANDIDATE_BLOCK_SIZE
+-            candidate_offset = cols % _CANDIDATE_BLOCK_SIZE
+-            candidate_block = tl.load(
+-                candidates + row * CANDIDATE_STRIDE_ROW + candidate_slot,
+-                mask=cols < width,
+-                other=-1,
+-            ).to(tl.int64)
+-            token = candidate_block * _CANDIDATE_BLOCK_SIZE + candidate_offset
+-            valid = (
+-                (cols < width)
+-                & has_context
+-                & (candidate_block >= 0)
+-                & (token < end - start)
+-            )
++            first_col = 0
++            stop = width
+         else:
+-            packed_col = cols
+-            valid = (packed_col >= start) & (packed_col < end) & (packed_col < width)
+-            req = tl.load(token_to_seq + packed_col, mask=valid, other=0).to(tl.int64)
+-            req_start = tl.load(cu_seq_lens + req, mask=valid, other=0)
+-            token = packed_col - req_start
++            first_col = tl.minimum(start, width)
++            stop = tl.minimum(end, width)
+     else:
+         req = row // ROW_REPEAT
+         end = tl.load(row_ends + row)
++        first_col = 0
+         if USE_CANDIDATES:
+-            candidate_slot = cols // _CANDIDATE_BLOCK_SIZE
+-            candidate_offset = cols % _CANDIDATE_BLOCK_SIZE
+-            candidate_block = tl.load(
+-                candidates + row * CANDIDATE_STRIDE_ROW + candidate_slot,
+-                mask=cols < width,
+-                other=-1,
+-            ).to(tl.int64)
+-            token = candidate_block * _CANDIDATE_BLOCK_SIZE + candidate_offset
+-            valid = (cols < width) & (candidate_block >= 0) & (token < end)
++            stop = width
+         else:
+-            token = cols
+-            valid = (cols < width) & (token < end)
+-
+-    logical_block = token // PAGE_SIZE
+-    block_offset = token % PAGE_SIZE
+-    valid = valid & (token >= 0) & (logical_block < block_table_width)
+-    physical_block = tl.load(
+-        block_tables + req * block_table_stride + logical_block,
+-        mask=valid,
+-        other=-1,
+-    ).to(tl.int64)
+-    valid = valid & (physical_block >= 0) & (physical_block < num_cache_blocks)
+-
+-    packed_dim = dims // 2
+-    if Q_PREDECODED:
+-        # BF16 q written by _mxfp4_indexer_q_decode_kernel; equal to the inline
+-        # decode below after its cast to BF16 for tl.dot.
+-        q = tl.load(
+-            q_decoded
+-            + row * (_INDEX_HEADS * _INDEX_HEAD_DIM)
+-            + heads[:, None] * _INDEX_HEAD_DIM
+-            + dims[None, :]
+-        )
+-    else:
++            stop = tl.minimum(end, width)
++    first_tile_of_row = first_col // BLOCK_N
++    stop = tl.maximum(stop, first_tile_of_row * BLOCK_N)
++    last_tile = (stop + BLOCK_N - 1) // BLOCK_N
++    my_first_tile = first_tile_of_row + first_tile
++    num_tiles = (last_tile - my_first_tile + tile_programs - 1) // tile_programs
++
++    if FP4_DOT:
++        # q stays packed: [32 heads, 64 bytes] e2m1 pairs (even dim in the low
++        # nibble) and [32, 4] ue8m0 scales, the layouts tl.dot_scaled expects.
++        packed = tl.arange(0, _PACKED_HEAD_DIM)
++        grp = tl.arange(0, _SCALES_PER_HEAD)
+         q_bytes = tl.load(
+             q_values
+             + row * qv_stride_row
+             + heads[:, None] * qv_stride_head
+-            + packed_dim[None, :]
++            + packed[None, :]
+         )
+-        q_nibbles = tl.where((dims[None, :] & 1) == 0, q_bytes & 0xF, q_bytes >> 4)
+         q_scale_bytes = tl.load(
+             q_scales
+             + row * qs_stride_row
+             + heads[:, None] * qs_stride_head
+-            + (dims[None, :] // _SCALE_GROUP_SIZE)
++            + grp[None, :]
+         )
+-        q = _decode_e2m1(q_nibbles) * tl.exp2(q_scale_bytes.to(tl.float32) - 127.0)
++    else:
++        packed_dim = dims // 2
++        if Q_PREDECODED:
++            # BF16 q written by _mxfp4_indexer_q_decode_kernel; equal to the inline
++            # decode below after its cast to BF16 for tl.dot.
++            q = tl.load(
++                q_decoded
++                + row * (_INDEX_HEADS * _INDEX_HEAD_DIM)
++                + heads[:, None] * _INDEX_HEAD_DIM
++                + dims[None, :]
++            )
++        else:
++            q_bytes = tl.load(
++                q_values
++                + row * qv_stride_row
++                + heads[:, None] * qv_stride_head
++                + packed_dim[None, :]
++            )
++            q_nibbles = tl.where((dims[None, :] & 1) == 0, q_bytes & 0xF, q_bytes >> 4)
++            q_scale_bytes = tl.load(
++                q_scales
++                + row * qs_stride_row
++                + heads[:, None] * qs_stride_head
++                + (dims[None, :] // _SCALE_GROUP_SIZE)
++            )
++            q = _decode_e2m1(q_nibbles) * tl.exp2(q_scale_bytes.to(tl.float32) - 127.0)
++    head_weights = tl.load(weights + row * weight_stride_row + heads)
+ 
+-    value_offsets = (
+-        physical_block[None, :] * cache_block_stride
+-        + block_offset[None, :] * _PACKED_HEAD_DIM
+-        + packed_dim[:, None]
+-    )
+-    k_bytes = tl.load(k_cache + value_offsets, mask=valid[None, :], other=0)
+-    k_nibbles = tl.where((dims[:, None] & 1) == 0, k_bytes & 0xF, k_bytes >> 4)
+-    scale_offsets = (
+-        physical_block[None, :] * cache_block_stride
+-        + PAGE_SIZE * _PACKED_HEAD_DIM
+-        + block_offset[None, :] * _SCALES_PER_HEAD
+-        + (dims[:, None] // _SCALE_GROUP_SIZE)
+-    )
+-    k_scale_bytes = tl.load(k_cache + scale_offsets, mask=valid[None, :], other=0)
+-    k = _decode_e2m1(k_nibbles) * tl.exp2(k_scale_bytes.to(tl.float32) - 127.0)
++    for i in range(0, num_tiles):
++        col_tile = my_first_tile + i * tile_programs
++        cols = col_tile * BLOCK_N + tl.arange(0, BLOCK_N)
++        if PREFILL:
++            if USE_CANDIDATES:
++                candidate_slot = cols // _CANDIDATE_BLOCK_SIZE
++                candidate_offset = cols % _CANDIDATE_BLOCK_SIZE
++                candidate_block = tl.load(
++                    candidates + row * CANDIDATE_STRIDE_ROW + candidate_slot,
++                    mask=cols < width,
++                    other=-1,
++                ).to(tl.int64)
++                token = candidate_block * _CANDIDATE_BLOCK_SIZE + candidate_offset
++                valid = (
++                    (cols < width)
++                    & has_context
++                    & (candidate_block >= 0)
++                    & (token < end - start)
++                )
++                tile_req = req
++            else:
++                packed_col = cols
++                valid = (packed_col >= start) & (packed_col < end) & (packed_col < width)
++                tile_req = tl.load(token_to_seq + packed_col, mask=valid, other=0).to(tl.int64)
++                req_start = tl.load(cu_seq_lens + tile_req, mask=valid, other=0)
++                token = packed_col - req_start
++        else:
++            tile_req = req
++            if USE_CANDIDATES:
++                candidate_slot = cols // _CANDIDATE_BLOCK_SIZE
++                candidate_offset = cols % _CANDIDATE_BLOCK_SIZE
++                candidate_block = tl.load(
++                    candidates + row * CANDIDATE_STRIDE_ROW + candidate_slot,
++                    mask=cols < width,
++                    other=-1,
++                ).to(tl.int64)
++                token = candidate_block * _CANDIDATE_BLOCK_SIZE + candidate_offset
++                valid = (cols < width) & (candidate_block >= 0) & (token < end)
++            else:
++                token = cols
++                valid = (cols < width) & (token < end)
++
++        logical_block = token // PAGE_SIZE
++        block_offset = token % PAGE_SIZE
++        valid = valid & (token >= 0) & (logical_block < block_table_width)
++        physical_block = tl.load(
++            block_tables + tile_req * block_table_stride + logical_block,
++            mask=valid,
++            other=-1,
++        ).to(tl.int64)
++        valid = valid & (physical_block >= 0) & (physical_block < num_cache_blocks)
++
++        if FP4_DOT:
++            # K stays packed too: [64 bytes, BLOCK_N] values and [BLOCK_N, 4]
++            # scales (dot_scaled wants rhs scales as [N, K // 32]).
++            value_offsets = (
++                physical_block[None, :] * cache_block_stride
++                + block_offset[None, :] * _PACKED_HEAD_DIM
++                + packed[:, None]
++            )
++            k_bytes = tl.load(k_cache + value_offsets, mask=valid[None, :], other=0)
++            scale_offsets = (
++                physical_block[:, None] * cache_block_stride
++                + PAGE_SIZE * _PACKED_HEAD_DIM
++                + block_offset[:, None] * _SCALES_PER_HEAD
++                + grp[None, :]
++            )
++            k_scale_bytes = tl.load(
++                k_cache + scale_offsets, mask=valid[:, None], other=127
++            )
++            head_scores = tl.dot_scaled(
++                q_bytes, q_scale_bytes, "e2m1", k_bytes, k_scale_bytes, "e2m1"
++            )
++        else:
++            value_offsets = (
++                physical_block[None, :] * cache_block_stride
++                + block_offset[None, :] * _PACKED_HEAD_DIM
++                + packed_dim[:, None]
++            )
++            k_bytes = tl.load(k_cache + value_offsets, mask=valid[None, :], other=0)
++            k_nibbles = tl.where((dims[:, None] & 1) == 0, k_bytes & 0xF, k_bytes >> 4)
++            scale_offsets = (
++                physical_block[None, :] * cache_block_stride
++                + PAGE_SIZE * _PACKED_HEAD_DIM
++                + block_offset[None, :] * _SCALES_PER_HEAD
++                + (dims[:, None] // _SCALE_GROUP_SIZE)
++            )
++            k_scale_bytes = tl.load(k_cache + scale_offsets, mask=valid[None, :], other=0)
++            k = _decode_e2m1(k_nibbles) * tl.exp2(k_scale_bytes.to(tl.float32) - 127.0)
+ 
+-    head_scores = tl.dot(q.to(tl.bfloat16), k.to(tl.bfloat16))
+-    head_weights = tl.load(weights + row * weight_stride_row + heads)
+-    scores = tl.sum(tl.maximum(head_scores, 0.0) * head_weights[:, None], axis=0)
+-    tl.store(
+-        logits + row * logits_stride_row + cols,
+-        tl.where(valid, scores, -float("inf")),
+-        mask=cols < width,
+-    )
++            head_scores = tl.dot(q.to(tl.bfloat16), k.to(tl.bfloat16))
++        scores = tl.sum(tl.maximum(head_scores, 0.0) * head_weights[:, None], axis=0)
++        tl.store(
++            logits + row * logits_stride_row + cols,
++            tl.where(valid, scores, -float("inf")),
++            mask=cols < width,
++        )
++
++    if not USE_CANDIDATES:
++        # Columns outside [first_tile_of_row * BLOCK_N, last_tile * BLOCK_N) hold
++        # no keys for this row: write -inf without touching the cache.
++        fill_cols = tl.arange(0, _FILL_BLOCK)
++        neg_inf = tl.full([_FILL_BLOCK], -float("inf"), tl.float32)
++        tail_start = last_tile * BLOCK_N + first_tile * _FILL_BLOCK
++        fill_step = tile_programs * _FILL_BLOCK
++        num_tail = (width - tail_start + fill_step - 1) // fill_step
++        for i in range(0, num_tail):
++            cols = tail_start + i * fill_step + fill_cols
++            tl.store(logits + row * logits_stride_row + cols, neg_inf, mask=cols < width)
++        if PREFILL:
++            head_stop = first_tile_of_row * BLOCK_N
++            head_start = first_tile * _FILL_BLOCK
++            num_head = (head_stop - head_start + fill_step - 1) // fill_step
++            for i in range(0, num_head):
++                cols = head_start + i * fill_step + fill_cols
++                tl.store(logits + row * logits_stride_row + cols, neg_inf, mask=cols < head_stop)
+ 
+ 
+ @triton.jit
+@@ -276,10 +375,11 @@
+ def _use_q_predecode(device: torch.device) -> bool:
+     """Decode q once per row in a separate kernel instead of in every program.
+ 
+-    On SM120 each logits program otherwise re-decodes the whole MXFP4 q
+-    (32 x 128 values) to score only BLOCK_N keys; predecoding is 1.6-1.8x faster
+-    on production shapes with bit-identical output. Other architectures keep
+-    the inline decode until measured.
++    Only used when the FP4 tensor-core path is off (non-SM120 targets or
++    VLLM_DSV41_INDEXER_FP4_DOT=0). On SM120 each logits program otherwise
++    re-decodes the whole MXFP4 q (32 x 128 values) to score only BLOCK_N keys;
++    predecoding is 1.6-1.8x faster on production shapes with bit-identical
++    output. Other architectures keep the inline decode until measured.
+     """
+     if device.type != "cuda":
+         return False
+@@ -368,17 +468,37 @@
+     return out
+ 
+ 
+-def _logits_launch_grid(rows: int, width: int) -> tuple[tuple[int, int], bool]:
+-    col_tiles = triton.cdiv(width, _LOGITS_BLOCK_N)
+-    swap_grid_axes = col_tiles > _CUDA_GRID_Y_LIMIT
+-    if swap_grid_axes and rows > _CUDA_GRID_Y_LIMIT:
+-        raise ValueError(
+-            "DeepSeek V4.1 native indexer cannot launch with both "
+-            f"rows={rows} and column tiles={col_tiles} above "
+-            f"the CUDA grid-y limit {_CUDA_GRID_Y_LIMIT}"
+-        )
+-    grid = (col_tiles, rows) if swap_grid_axes else (rows, col_tiles)
+-    return grid, swap_grid_axes
++@functools.cache
++def _fp4_dot_for_device(device_index: int) -> bool:
++    major, _ = torch.cuda.get_device_capability(device_index)
++    return major == 12 and hasattr(tl, "dot_scaled")
++
++
++def _use_fp4_dot(device: torch.device) -> bool:
++    """Score with the block-scaled FP4 tensor-core MMA instead of decoding.
++
++    SM120 lowers tl.dot_scaled(e2m1, e2m1) to a native MMA; on other targets
++    Triton would emulate it by upcasting, which is slower than the inline decode.
++    VLLM_DSV41_INDEXER_FP4_DOT=0 forces the decode path for bisecting.
++    """
++    if device.type != "cuda" or os.environ.get("VLLM_DSV41_INDEXER_FP4_DOT", "1") == "0":
++        return False
++    index = device.index if device.index is not None else torch.cuda.current_device()
++    return _fp4_dot_for_device(index)
++
++
++def _logits_config(device: torch.device) -> tuple[bool, int, int]:
++    """(fp4_dot, BLOCK_N, num_stages) for the logits kernel on this device."""
++    if _use_fp4_dot(device):
++        return True, _LOGITS_BLOCK_N_FP4, _LOGITS_NUM_STAGES_FP4
++    return False, _LOGITS_BLOCK_N, _LOGITS_NUM_STAGES
++
++
++def _logits_launch_grid(rows: int, width: int, block_n: int = _LOGITS_BLOCK_N) -> tuple[int, int]:
++    col_tiles = triton.cdiv(width, block_n)
++    per_row = max(_LOGITS_MIN_TILE_PROGRAMS, _LOGITS_TARGET_PROGRAMS // max(rows, 1))
++    tile_programs = max(1, min(col_tiles, per_row, _CUDA_GRID_Y_LIMIT))
++    return rows, tile_programs
+ 
+ 
+ def dsv41_mxfp4_dense_logits(
+@@ -416,8 +536,9 @@
+     logits = _prepare_logits_out(q_values, rows, width, out)
+     if rows == 0 or width == 0:
+         return logits
+-    grid, swap_grid_axes = _logits_launch_grid(rows, width)
+-    q_predecoded = _use_q_predecode(q_values.device)
++    fp4_dot, block_n, num_stages = _logits_config(q_values.device)
++    grid = _logits_launch_grid(rows, width, block_n)
++    q_predecoded = not fp4_dot and _use_q_predecode(q_values.device)
+     q_decoded = _predecode_q(q_values, q_scales) if q_predecoded else q_values
+     _mxfp4_indexer_logits_kernel[grid](
+         q_values,
+@@ -448,11 +569,11 @@
+         PREFILL=prefill,
+         USE_CANDIDATES=False,
+         CANDIDATE_STRIDE_ROW=0,
+-        SWAP_GRID_AXES=swap_grid_axes,
+-        BLOCK_N=_LOGITS_BLOCK_N,
++        BLOCK_N=block_n,
+         Q_PREDECODED=q_predecoded,
+-        num_warps=4,
+-        num_stages=2,
++        FP4_DOT=fp4_dot,
++        num_warps=_LOGITS_NUM_WARPS,
++        num_stages=num_stages,
+     )
+     return logits
+ 
+@@ -497,8 +618,9 @@
+     logits = _prepare_logits_out(q_values, rows, width, out)
+     if rows == 0 or width == 0:
+         return logits
+-    grid, swap_grid_axes = _logits_launch_grid(rows, width)
+-    q_predecoded = _use_q_predecode(q_values.device)
++    fp4_dot, block_n, num_stages = _logits_config(q_values.device)
++    grid = _logits_launch_grid(rows, width, block_n)
++    q_predecoded = not fp4_dot and _use_q_predecode(q_values.device)
+     q_decoded = _predecode_q(q_values, q_scales) if q_predecoded else q_values
+     _mxfp4_indexer_logits_kernel[grid](
+         q_values,
+@@ -529,11 +651,11 @@
+         PREFILL=prefill,
+         USE_CANDIDATES=True,
+         CANDIDATE_STRIDE_ROW=candidates.stride(0),
+-        SWAP_GRID_AXES=swap_grid_axes,
+-        BLOCK_N=_LOGITS_BLOCK_N,
++        BLOCK_N=block_n,
+         Q_PREDECODED=q_predecoded,
+-        num_warps=4,
+-        num_stages=2,
++        FP4_DOT=fp4_dot,
++        num_warps=_LOGITS_NUM_WARPS,
++        num_stages=num_stages,
+     )
+     return logits
+ 

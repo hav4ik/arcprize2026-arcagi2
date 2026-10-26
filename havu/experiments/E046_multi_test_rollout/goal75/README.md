@@ -46,3 +46,14 @@ measured thrash severity (x0.3 throughput above KV 0.88), `kvcap.py` / `kvcap2.p
 | x3 (KV offload) | 73.0 | | 74.1 | 74.1 | 76.1 |
 
 So >= 75 needs more effective KV (util 0.97, KV offload E051, or a smaller model) AND fewer tokens at equal accuracy.
+
+## util 0.97: not stable (2026-10-26 18:36-19:55 UTC, pod wd44, run pods/runs/mt44_g70_ri512_u970)
+KV pool 2,049,111 tokens (+32%) at startup, same 0.31 GiB slack below free memory as Kaggle, but the server died with
+`RuntimeError: Triton Error [CUDA]: out of memory` within the first hour and again later (2 restarts, 91 attempts
+re-queued; the S6 restart logic kept the run alive). Safe point is between 0.945 (Kaggle 3 h clean; V5's 12 h rerun
+pending) and 0.97. The util lever is out for the next candidate unless 0.955-0.96 passes a multi-hour soak.
+
+## Candidate config soak: x44 + gate 0.7 + interval 512 + new code + auto-repair at the Kaggle-equivalent util
+Run `mt44_g70_ri512_new` (pod hegn, from 16:32 UTC): at 3.1 h KV max 0.79, 306-360 tok/s, 0 errors, 0 restarts;
+left running to the solver's default deadlines (~11.2 h) as the S4 >= 8 h stress test. Throughput probe
+`mt48_g75_ri512` (pod wd44, from 19:58): x48 + gate 0.75.

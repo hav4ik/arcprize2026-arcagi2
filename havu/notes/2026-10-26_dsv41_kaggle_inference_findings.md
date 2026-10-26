@@ -180,3 +180,85 @@ Pods ran the full Kaggle pipeline (`local_run.py`, `pods/podrun.sh`) on the eval
 
 All gaps found (30 items, each with a required regression test) are in `kaggle/dsv41_tools/next_candidate_fixes.md`;
 the audit's tests and e2e tools are in `kaggle/dsv41_tools/tests_mtf_v6/`.
+
+## 11. Evening (2026-10-26 13:00-21:00 UTC): goal >= 75 projected, throughput, KV
+
+Goal set by the user at ~13:45 UTC: a model/harness projected at >= 75 on Kaggle within 24 h; later also a throughput
+target of >= 400 gen tok/s end to end (gold), ~550 for 1st place (today ~300-315 at 36 streams on Kaggle).
+Boxes: 2x Runpod 4xL4 (hegn9880s1tz6m, wd44jicex44qyc; Kaggle-sized pool at util 0.938), 3x Vast 4x4090
+(57816747, 57817226, 57867594; SM89, same kernels, ~1.35-1.7x the L4's speed). Nothing ran on Kaggle (user rule:
+Kaggle only for short correctness smokes, every run through the user).
+
+### 11.1 What the simulator says it takes (`experiments/E046_multi_test_rollout/goal75/`)
+- V6 is near the one-attempt ceiling (71.7): >= 75 needs second attempts on >= 25% of tasks, i.e. more throughput or
+  fewer tokens at equal accuracy. With the measured thrash severity (x0.3 throughput above KV ~0.88), effective KV
+  capacity is the decisive lever: KV x1.0 69.2 (V6), x1.37 72.5-73.3, x2 74.1, x3 76.1 (x56). Throughput comes from
+  batch size: Kaggle decode fits `step ~ 58 ms + 0.9 ms per batch sequence` at 32K (E042 DS1), the 58 ms is near the
+  weight-read floor, so ~48-56 streams are needed for 400 tok/s end to end and ~64+ for 550.
+
+### 11.2 Tested and rejected
+- **Reasoning effort 25 (E050):** tokens per task 43.4k vs 42.2k (ratio 1.029, CI 0.95-1.11), pass@1 tie. It moves
+  tokens between phases (11% shorter turns, +1.1 turns, first pass later, shorter post-pass tail). The fork maps
+  "low"=25/"high"=50 but DeepSeek's own encoder maps low=50/high=75/max=100; we send the integer 50 (= official low).
+  The API only takes named levels (E035 probe: minimal ~ low).
+- **Retention interval 512 alone (L2):** ungated x44 thrashed at KV 0.89 / 2.08 h vs 0.835 / 2.13 h for its live
+  interval-128 control with the same code. Thrash is KV-capacity-driven; 512 buys ~0.06 of KV headroom (kept in the
+  candidate).
+- **GPU util 0.97:** KV pool 2,049,111 tokens (+32%) at startup with Kaggle's exact memory numbers, but
+  `Triton Error [CUDA]: out of memory` within the first hour (2 restarts). 0.945 stays.
+- **Best-guess nudge (I7, E052 arm B):** fired in 24 attempts, 0 rescued; -1.4 turns, -1.6% tokens. Not adopted.
+- **Give-up rule (dsv4-pruning trace analysis):** cutting never-passing attempts at 50-70K tokens is neutral to slightly
+  negative in the simulator (freed tokens buy low-value second attempts).
+- **E120 model:** +2 at today's KV only via its bigger pool; a tie once util/KV are raised otherwise (dsv4-pruning).
+- **vLLM upgrade (E053):** no fork release after vision11 (base 09-02, 3,088 upstream commits behind; maintainer has
+  no hardware); upstream main cannot start V4.1 on SM89 (FlashMLA / FlashInfer DSV41 / DeepGEMM need SM90+); a port
+  is 3-6 weeks. Stay on the fork and cherry-pick.
+- **Speculative decoding (DSpark drafter):** ~2 GiB/GPU of KV and 1.39-1.66 accepted tokens/step in tool mode (E042
+  DS1 / E043 probe): KV-negative on L4.
+
+### 11.3 Adopted / promising
+- **New code (fix list + auto-repair), E052 arm A vs V6 code on identical 4090 settings:** task pass@1 **76.5% vs
+  71.4%** (+5.1, CI -1.8..+12.2; multi-input tasks 77.2 vs 66.7, single 76.1 vs 74.6), 114 vs 109 submitted, tokens
+  x1.017. Not significant on 120 tasks (same-config noise 2.5 pp); credited at +2..+4. Mechanisms: A1 per-pair partial
+  multi answers, A9 context-capped budget notes (3-4-input tasks warned in time), A6 multi train checks, A2/A4 session
+  answers survive cuts/errors, A5 no `test_inputs` NameError. Auto-repair: 134 applied, 70% of retries ok.
+- **Candidate config soak (L4 hegn, run `mt44_g70_ri512_new`):** x44 + gate 0.7 + interval 512 + new code at the
+  Kaggle-equivalent util: 4.1 h clean (KV <= 0.79, 306-367 tok/s, 0 errors, 0 restarts); attempts/hour about equal to
+  V6's gated x36 pod run, so its value is the new code, not throughput.
+- **Exact cherry-picks (E053 ranking, prepared in E054):**
+  - **Fork PR #156 indexer skip:** under FULL CUDA graphs the decode indexer scores `max_model_len // ratio` columns
+    (81,920 on the 2x-compressed layers, 163,840 on layer 20) whatever the real context (~45K mean), so ~60-70% of its
+    work is on empty tiles (the old kernel takes 287 vs 310 us at short vs long context). The fix reads each row's
+    context length from a tensor (graph-safe) and skips tiles beyond it: identical scores for real positions; the tail
+    could never be selected. Indexer ~12% of decode time -> est. +5-10% decode.
+  - **#58678 Engram `wkv` split across TP ranks:** frees ~0.22 GiB/GPU -> ~+9-10% KV.
+- **Approximate, larger:** #56227 SWA bounded replay (prefix hits no longer need SWA blocks at the hit point: fixes the
+  640-token full re-prefills and cuts SWA LRU churn from 29 to 1 cached block per 128 tokens); #58132 decoder replay
+  (+5-8% via prefill).
+- **KV CPU offload (E051, qwen27b-train session; `experiments/E051_kv_offload/`):** gates 1-3 passed on a 4090 box:
+  byte-identical restored KV pages vs GPU prefix hits at 3k-120k tokens with the pool poisoned before each restore;
+  120k restore ~0.12 s (PCIe Gen4) vs tens of seconds of re-prefill; host 94 GiB Engram + 28 GiB offload. Capacity A/B
+  (56/72 streams, offload on vs off) running overnight. Upstream main offloads DeepSeek-V4 (not V4.1) by caching only
+  the compressed MLA group and recomputing SWA via bounded replay (approximate); our fork predates it.
+
+### 11.4 Other findings
+- **The stack is not run-to-run deterministic** at the server level (two identical runs differ at token 0, also with
+  VLLM_BATCH_INVARIANT=1): gate changes on kernel-level checks with saved inputs or byte-level KV checks, and judge
+  accuracy statistically against an old-vs-old noise band.
+- **Box-image credentials in logs:** the solver wrote every `HF_*` env var into `server_cmd.json`, and Vast images set
+  `HF_TOKEN`; copies were redacted (nothing reached GitHub), and the live solver now redacts TOKEN/KEY/SECRET/PASS
+  values (test `test_server_cmd_json_redacts_credentials`).
+- **4090 boxes measure E128 accuracy faithfully:** E050's effort-50 arm reproduces the 8x-box run 7 (72.7 vs 72.8%).
+- **Venv copies:** `bin/` scripts keep `#!/root/dsv41/venv/bin/python` shebangs; a copied venv silently runs the
+  original's code unless they are rewritten (E051).
+
+### 11.5 Projection if everything lands (simulator, E128 accuracy, `goal75/recap.py`)
+| stack | projected |
+|---|---|
+| V6 | 69.2 |
+| next candidate config | ~68-69 (+2..+4 from the new code's accuracy -> ~71-73) |
+| + #156 indexer + #58678 Engram | ~72 (-> ~74-76 with the accuracy gain) |
+| + KV offload (effective KV x2.5, x56-64 ungated) | 78.7-79.6 (-> ~80+ with the accuracy gain) |
+Caveats: throughput factors are estimates, offload overhead is not modelled, the accuracy gain is within noise, and
+offload still needs a capacity win, an L4 soak, notebook packaging (cell 0b can append the patched vLLM files to the
+kit's overlay tarball before cell 2 installs it) and a short Kaggle smoke; realistic for an Oct 30-31 candidate.
