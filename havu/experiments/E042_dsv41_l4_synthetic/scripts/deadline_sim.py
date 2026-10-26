@@ -47,10 +47,12 @@ def G(n, s):
 
 
 def load(files):
+    """Per-pair attempt pools from result files; an entry is a tag (every attempt) or (tag, attempts to keep)."""
     pairs = collections.defaultdict(list)
     for f in files:
+        f, keep = (f, None) if isinstance(f, str) else f
         for r in map(json.loads, open(RES / f"{TAG}{f}.jsonl")):
-            if "task_id" not in r:
+            if "task_id" not in r or (keep is not None and r.get("attempt") not in keep):
                 continue
             u = r.get("usage") or {}
             pairs[(r["task_id"], r["pair"])].append({
@@ -65,6 +67,11 @@ def first_prompts():
 
 
 POLICY = "current"
+# T6: E112's clean pool is main attempt 0 + r2 attempt 0. Main's attempt 1 and r3 ran in a second harness process at
+# the same time and are anomalous (95 and 101 of 167 correct vs 116 and 114; dsv4-pruning session, 2026-10-26); with
+# them the E112 rows were ~1.5 pp pessimistic (the E128 pick is unaffected).
+POOLS = {"E128": ["e128t_w10_u2_gptq_eng64_sub80"],
+         "E112": [("e112t_w10_u2_gptq_eng64_sub80", {0}), ("e112t_w10_u2_gptq_eng64_sub80_r2", {0})]}
 
 
 def priority(st, rec0):
@@ -191,9 +198,7 @@ def main():
     FIT, FOLLOW = a.fit, a.follow
     THRASH = tuple(map(float, a.thrash.split(":"))) if a.thrash else None
     fp = first_prompts()
-    models = {"E128": load(["e128t_w10_u2_gptq_eng64_sub80"]),
-              "E112": load(["e112t_w10_u2_gptq_eng64_sub80", "e112t_w10_u2_gptq_eng64_sub80_r2",
-                            "e112t_w10_u2_gptq_eng64_sub80_r3"])}
+    models = {m: load(files) for m, files in POOLS.items()}
     # KV pool in context tokens = reported KV tokens / (KV tokens per context token). The ratio is 0.83 if the
     # simulated E128 x48 contexts at 1.74 h match Kaggle's 0.735 usage, 0.6 from pod B's E112 x128 at 1.41 h.
     kv_tokens = {("E128", 1.00): 1.437e6, ("E128", 1.10): 1.356e6, ("E128", 1.101): 1.356e6 * 1.15, ("E128", 1.155): 1.356e6 * 1.15,

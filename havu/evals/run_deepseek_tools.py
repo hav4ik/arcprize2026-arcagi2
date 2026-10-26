@@ -5,6 +5,8 @@ Defaults use the ARC Prize public eval prompt/parser/scoring. Each independent
 attempt owns one Python session. See experiments/E004_tool_use/README.md.
 """
 import argparse
+import ast
+import builtins
 import gzip
 import json
 import os
@@ -217,25 +219,113 @@ _arc_run()
     return json.dumps({"accepted": True, "pred": outputs[-1]}), outputs[-1]
 
 
+def grid_problem(grid):
+    """Why `grid` is not a rectangular 1-30 by 1-30 grid of ints 0-9, or None if it is one (A11 feedback)."""
+    if not isinstance(grid, list):
+        return type(grid).__name__
+    if not 1 <= len(grid) <= 30:
+        return f"{len(grid)} rows"
+    if not all(isinstance(row, list) for row in grid):
+        return "its rows are not lists"
+    lengths = sorted({len(row) for row in grid})
+    if len(lengths) > 1 or not 1 <= lengths[0] <= 30:
+        return f"{len(grid)} rows, row lengths {lengths[:6]}"
+    for row in grid:
+        for value in row:
+            if not (type(value) is int and 0 <= value <= 9):
+                return f"value {json.dumps(value)[:20]} is not an int 0-9"
+    return None
+
+
+# Nested numpy rows / grids (e.g. [solve(t) for t in test_inputs], or a solve that returns a list of numpy rows) have no
+# .tolist() at the top and json.dumps(default=int) then fails ("only length-1 arrays"): convert nested values first.
+# Values that already serialize are unchanged (E046 run 7: a single-test fallback failed on this). A10: a nested numpy
+# bool scalar becomes 0/1, as v3's json.dumps(default=int) did (Python bools and bool arrays stay rejected, as in v3).
+ANSWER_PLAIN = '''
+    def _plain(v):
+        if _b.getattr(v, 'ndim', None) == 0 and _b.getattr(_b.getattr(v, 'dtype', None), 'kind', '') == 'b':
+            return _b.int(v)
+        if _b.hasattr(v, 'tolist'):
+            return v.tolist()
+        return [_plain(x) for x in v] if _b.isinstance(v, (_b.list, _b.tuple)) else v'''
+# Built-ins via the builtins module: the model's session may define its own eval / compile / exec / print (E046 run 3:
+# a session function named eval(grid, H, bg) broke the answer and fallback-solve paths of 4e34c42c; A7: print).
+# {body} sets `text`. A11: a value longer than the session's output limit is kept in a session variable and read back
+# in slices (one 30x30 grid is ~1.9k characters; 6 of them used to be cut and rejected as "got NoneType").
+ANSWER_CELL = '''
+def _arc_answer():
+    import builtins as _b, contextlib, io, json{plain}
+{body}
+    if _b.len(text) > {chunk}:
+        _b.globals()[{name!r}] = text
+    _b.print({marker!r} + _b.str(_b.len(text)) + ':' + text[:{chunk}])
+try:
+    _arc_answer()
+finally:
+    del _arc_answer
+'''
+ANSWER_SLICE = '''
+def _arc_slice():
+    import builtins as _b
+    _b.print({marker!r} + _b.globals()[{name!r}][{start}:{end}])
+try:
+    _arc_slice()
+finally:
+    del _arc_slice
+'''
+ANSWER_DROP = '''
+def _arc_drop():
+    import builtins as _b
+    _b.globals().pop({name!r}, None)
+try:
+    _arc_drop()
+finally:
+    del _arc_drop
+'''
+
+
+def _answer_value(session, body):
+    """Run an answer cell (`body` sets `text`, a JSON string) in the session; -> (result, value, found). `found` is
+    False when no marker line came back (error, timeout, or the cell printed nothing)."""
+    marker, name = f"ARC_ANSWER_{uuid4().hex}:", f"_arc_text_{uuid4().hex[:12]}"
+    chunk = max(1000, int(getattr(session, "max_output", 16000) or 16000) - len(marker) - 64)
+    cell = ANSWER_CELL.format(plain=ANSWER_PLAIN, body=body, chunk=chunk, name=name, marker=marker)
+    result = session.execute(cell)
+    if result["process_status"] != "completed":
+        return result, None, False
+
+    def marked(res):
+        for line in reversed(res.get("stdout", "").splitlines()):
+            if line.startswith(marker):
+                return line[len(marker):]
+        return None
+    head = marked(result)
+    if head is None:
+        return result, None, False
+    size, _, text = head.partition(":")
+    try:
+        size = int(size)
+        while len(text) < size:  # A11: the rest of a long value, in slices below the output limit
+            part = session.execute(ANSWER_SLICE.format(marker=marker, name=name, start=len(text),
+                                                       end=min(size, len(text) + chunk)))
+            piece = marked(part) if part["process_status"] == "completed" else None
+            if not piece:
+                break
+            text += piece
+        if size > chunk:
+            session.execute(ANSWER_DROP.format(name=name))
+        return result, json.loads(text) if len(text) == size else None, True
+    except (ValueError, KeyError):
+        return result, None, True
+
+
 def submit_answer(session, code, n=None):
     """Evaluate the model's answer expression in its own persistent session and return (feedback, grid|None).
     n (E046 --multi-test): the value must be a list of n grids, one per test input; returns that list.
 
     `code` is an expression (e.g. solve(test_input)) or statements that set `answer`. Printed output from
     the evaluation is captured so only the marker line comes back. The session never holds test answers."""
-    marker = f"ARC_ANSWER_{uuid4().hex}:"
-    # Nested numpy rows / grids (e.g. [solve(t) for t in test_inputs], or a solve that returns a list of numpy rows)
-    # have no .tolist() at the top and json.dumps(default=int) then fails ("only length-1 arrays"): convert nested
-    # values first. Values that already serialize are unchanged (E046 run 7: a single-test fallback failed on this).
-    plain = ("\n        def _plain(v):\n            if _b.hasattr(v, 'tolist'):\n                return v.tolist()\n"
-             "            return [_plain(x) for x in v] if _b.isinstance(v, (_b.list, _b.tuple)) else v\n"
-             "        value = _plain(value)")
-    # Built-ins via the builtins module: the model's session may define its own eval / compile / exec (E046 run 3:
-    # a session function named eval(grid, H, bg) broke the answer and fallback-solve paths of 4e34c42c).
-    cell = f'''
-def _arc_answer():
-    import builtins as _b, contextlib, io, json
-    _src = {code!r}
+    body = f'''    _src = {code!r}
     with contextlib.redirect_stdout(io.StringIO()):
         try:
             _expr = _b.compile(_src, '<answer>', 'eval')
@@ -249,32 +339,21 @@ def _arc_answer():
                 raise _b.NameError('code did not define answer')
             value = _b.globals()['answer']
         if _b.hasattr(value, 'tolist'):
-            value = value.tolist(){plain}
-        text = json.dumps(value, default=int)
-    print({marker!r} + text)
-try:
-    _arc_answer()
-finally:
-    del _arc_answer
-'''
-    result = session.execute(cell)
-    grid = None
-    if result["process_status"] == "completed":
-        for line in reversed(result.get("stdout", "").splitlines()):
-            if line.startswith(marker):
-                try:
-                    grid = json.loads(line[len(marker):])
-                except json.JSONDecodeError:
-                    pass
-                break
-        else:
-            return "[answer not accepted] no value returned", None
-    else:
+            value = value.tolist()
+        value = _plain(value)
+        text = json.dumps(value, default=_b.int, separators=(',', ':'))'''
+    result, grid, found = _answer_value(session, body)
+    if result["process_status"] != "completed":
         return tool_output(result, session.max_output)[:2000] + "\n[answer not accepted]", None
+    if not found:
+        return "[answer not accepted] no value returned", None
     if n is not None:
         if not (isinstance(grid, list) and len(grid) == n and all(valid_grid(g) for g in grid)):
             bad = (f"a list of {len(grid)} items" if isinstance(grid, list) and not valid_grid(grid)
                    else "one grid" if valid_grid(grid) else type(grid).__name__)
+            if isinstance(grid, list) and len(grid) == n and not valid_grid(grid):  # A11: name the bad grids
+                probs = [(i, grid_problem(g)) for i, g in enumerate(grid)]
+                bad += "".join(f"; grid {i} (test input {i}): {p}" for i, p in probs if p)
             return (f"[answer not accepted] this task has {n} test inputs: give a list of {n} rectangular 1-30 by "
                     f"1-30 grids of ints 0-9, one per test input in order (e.g. [solve(t) for t in test_inputs]); "
                     f"got {bad}"), None
@@ -284,6 +363,167 @@ finally:
                  if isinstance(grid, list) else type(grid).__name__)
         return ("[answer not accepted] must be a rectangular 1-30 by 1-30 grid of ints 0-9; got " + shape), None
     return f"[answer accepted: {len(grid)}x{len(grid[0])} grid]", grid
+
+
+def _items_result(result, items, found, n, what):
+    """(feedback, [grid or None] * n, or None when no grid is valid) from an items cell's JSON list."""
+    if result["process_status"] != "completed" or not found:
+        text = tool_output(result, 2000)[:300] if result["process_status"] != "completed" else "no value returned"
+        return f"[{what}: {text}]", None
+    if not isinstance(items, list) or len(items) != n:
+        return f"[{what}: not a list of {n} items]", None
+    grids = [g if valid_grid(g) else None for g in items]
+    probs = "".join(f"; grid {i}: {grid_problem(g)}" for i, g in enumerate(items) if not valid_grid(g))
+    return f"[{what}: {n - grids.count(None)} of {n} grids valid{probs}]", grids if any(grids) else None
+
+
+def answer_items(session, code, n):
+    """A1 (--multi-test fallbacks): the value of `code` (e.g. answer) as n separately validated grids, so one bad grid
+    no longer loses the other test inputs' answers. -> (feedback, [grid or None] * n, or None if none is valid)."""
+    body = f'''    with contextlib.redirect_stdout(io.StringIO()):
+        value = _b.eval(_b.compile({code!r}, '<answer>', 'eval'), _b.globals())
+        if _b.hasattr(value, 'tolist'):
+            value = value.tolist()
+        parts = []
+        if _b.isinstance(value, (_b.list, _b.tuple)) and _b.len(value) == {n}:
+            for x in value:
+                try:
+                    parts.append(json.dumps(_plain(x), default=_b.int, separators=(',', ':')))
+                except _b.Exception:
+                    parts.append('null')
+        text = '[' + ','.join(parts) + ']' if parts else 'null\''''
+    result, items, found = _answer_value(session, body)
+    return _items_result(result, items, found, n, "session answer")
+
+
+def solve_items(session, inputs):
+    """A1 / A3 / A8 (--fallback-solve): the session's solve on each test input separately (host copies of the inputs),
+    first as a list, then as a numpy array if the list call raises, each with its own time limit and errors caught
+    per input. -> (feedback, [grid or None] per input, or None if none is valid)."""
+    per = max(1.0, float(getattr(session, "timeout", 30) or 30))
+    body = f'''    import copy, signal
+    class _T(_b.Exception):
+        pass
+    def _h(*a):
+        raise _T()
+    _solve, parts = _b.globals().get('solve'), []
+    old = signal.signal(signal.SIGALRM, _h)
+    try:
+        for t in json.loads({json.dumps(inputs)!r}):
+            v = None
+            if _b.callable(_solve):
+                for arg in ('list', 'numpy'):
+                    signal.setitimer(signal.ITIMER_REAL, {per})
+                    try:
+                        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                            if arg == 'list':
+                                v = _solve(copy.deepcopy(t))
+                            else:
+                                import numpy
+                                v = _solve(numpy.array(t))
+                        break
+                    except (_b.Exception, _T):
+                        v = None
+                    finally:
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+            try:
+                if _b.hasattr(v, 'tolist'):
+                    v = v.tolist()
+                parts.append(json.dumps(_plain(v), default=_b.int, separators=(',', ':')))
+            except _b.Exception:
+                parts.append('null')
+    finally:
+        signal.signal(signal.SIGALRM, old)
+    text = '[' + ','.join(parts) + ']\''''
+    old_timeout = getattr(session, "timeout", None)
+    if old_timeout is not None:
+        session.timeout = per * 2 * len(inputs) + old_timeout
+    try:
+        result, items, found = _answer_value(session, body)
+    finally:
+        if old_timeout is not None:
+            session.timeout = old_timeout
+    return _items_result(result, items, found, len(inputs), "session solve")
+
+
+def restore_inputs(session, test_inputs, multi):
+    """A8: rebind `test_input` (and `test_inputs` when the session defines it) to the host's copies before the
+    fallbacks read them: model code may have rebound them (5 rebinds in 1,779 E046 traces)."""
+    names = {"test_input": test_inputs[0]}
+    if multi:
+        names["test_inputs"] = test_inputs
+    session.execute(f'''
+def _arc_restore():
+    import builtins as _b, json
+    _g = _b.globals()
+    for _k, _v in json.loads({json.dumps(names)!r}).items():
+        _g[_k] = _v
+try:
+    _arc_restore()
+finally:
+    del _arc_restore
+''')
+
+
+def multi_check_code(code, test_inputs):
+    """A6: a --multi-test answer program as the one-grid program train_check labels (grid 0 of the list), with
+    test_inputs[0] bound to the input being checked (train_check binds test_input) and the other test inputs kept."""
+    if code is None:
+        return None
+    if code == "answer":
+        return "answer[0]"
+    rest = json.dumps(test_inputs[1:])
+    try:
+        compile(code, "<answer>", "eval")
+    except SyntaxError:
+        return f"test_inputs = [test_input] + {rest}\n{code}\nanswer = answer[0]"
+    return f"(lambda test_inputs: ({code})[0])([test_input] + {rest})"
+
+
+def inputs_prelude(test_inputs):
+    """E046 session prelude: `test_inputs` (A5: also in single-test sessions under --multi-test, as [test_input])."""
+    return f"\nimport json as _arc_json\ntest_inputs = _arc_json.loads({json.dumps(test_inputs)!r})\n"
+
+
+PRELOADED = {"train", "test_input", "np", "json"}
+NAMES_CELL = '''
+def _arc_names():
+    import builtins as _b, json
+    _b.print({marker!r} + json.dumps(_b.sorted(k for k in _b.globals() if not k.startswith('_'))))
+try:
+    _arc_names()
+finally:
+    del _arc_names
+'''
+
+
+def session_names(session):
+    """I5 --auto-repair: the public names in the session's globals (auto_repair's NameError candidates), or None."""
+    marker = f"ARC_NAMES_{uuid4().hex}:"
+    result = session.execute(NAMES_CELL.format(marker=marker))
+    lines = result.get("stdout", "").splitlines() if result.get("process_status") == "completed" else []
+    for line in reversed(lines):
+        if line.startswith(marker):
+            try:
+                return set(json.loads(line[len(marker):]))
+            except ValueError:
+                return None
+    return None
+
+
+def auto_repair_cell(session, code, output, propose, names, limit, stats):
+    """I5 --auto-repair: after a run_python cell failed, auto_repair.propose() may fix an identifier typo (a unique close
+    match, and the part of the cell that ran changed nothing outside it); the fixed cell runs once in the same session
+    and the model sees the note + the retry's output. -> (output, status, the code that ran) or None (no repair)."""
+    fix = propose(code, output, (session_names(session) or set()) | names)
+    if fix is None:
+        return None
+    new_code, note = fix
+    stats["proposed"] += 1
+    result = session.execute(new_code)
+    stats["applied"] += 1
+    stats["retry_ok"] += result["process_status"] == "completed"
+    return note + "\n" + tool_output(result, limit), result["process_status"], new_code
 
 
 def check_answer_on_train(session, code):
@@ -780,6 +1020,25 @@ def budget_note(args, used):
     return note
 
 
+def context_budget(args, usage, used):
+    """A9 (--context-limit): the args the budget notes see, with the hard budget capped at the output that still fits
+    before the context limit (this turn's prompt + output, the 16-token margin and CONTEXT_MIN_ROOM), so an attempt
+    the context ends first (--multi-budget: 160k for n = 3 in a 163,840 context) still gets the "nearly spent" note."""
+    limit = getattr(args, "context_limit", 0)
+    if not limit or not usage:
+        return args
+    ctx = (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0)
+    cap = used + max(0, limit - ctx - 16 - CONTEXT_MIN_ROOM)
+    if cap >= args.max_total_output:
+        return args
+    import copy
+    capped = copy.copy(args)
+    capped.max_total_output = max(1, cap)
+    if capped.budget_soft and capped.budget_soft >= capped.max_total_output:
+        capped.budget_soft = 0
+    return capped
+
+
 # E030: a "below low" effort header, written like DeepSeek's own effort prefixes (notes/prompts/
 # deepseek_v4_0813_reasoning_effort_prefixes.txt: `high`/`max` prepend one, `low` adds nothing), sent as a system message.
 EFFORT_HEADERS = {
@@ -803,6 +1062,277 @@ def turns_note(args, index):
         return ""
     return (f"\n[{left} turn{'s' if left != 1 else ''} left: call submit_answer with your best answer now, "
             "or at least set `answer`.]")
+
+
+# I7 --best-guess-at / --best-guess-turns: E128 runs 32 of its 91 never-train-passing attempts to the 80k budget or the
+# 40-turn cap without an answer (0 correct) although the budget and turn notes say "submit now"; full V4.1 submits a
+# best guess in 74 of 82 such attempts (43 right). One firm note, once per attempt, after the tool output.
+BEST_GUESS_NOTE = ("\n[Stop exploring now] Call submit_answer with your best current answer, even if it does not "
+                   "reproduce every training pair. An imperfect answer can still score; no answer scores zero.")
+BEST_GUESS_MULTI = " Submit all {n} test grids."
+
+
+def best_guess_due(args, budget, used, turns):
+    """I7: True when the best-guess note is due on the tool result of assistant turn `turns` (1-based): `used` output
+    tokens >= --best-guess-at x `budget` (the attempt's hard budget as the budget notes see it: scaled under
+    --multi-budget, capped at the room left under --context-limit) or turns >= max_turns - --best-guess-turns, while
+    another turn can still follow (no point in a note the model never reads)."""
+    f, k = getattr(args, "best_guess_at", 0), getattr(args, "best_guess_turns", 0)
+    if not (f or k) or used >= budget or turns >= args.max_turns:
+        return False
+    return bool((f and used >= f * budget) or (k and turns >= args.max_turns - k))
+
+
+# I8 --post-pass-note: E128 (effort 50, E050) spends 14% of its output after its code first reproduces every training
+# pair, 81% of it in 20 attempts with > 10K post-pass tokens (0.75 vs 0.90 for short tails: partly productive rework).
+# One note, once per attempt, on the first tool result that shows a program passing every training pair.
+POST_PASS_NOTE = ("\n[All training pairs pass] Check with code any assumption about the test input that the training "
+                  "pairs do not cover (sizes, colours, object counts), then submit_answer.")
+POST_PASS_MULTI = " Submit all {n} test grids."
+_PP_SKIP = re.compile(r"Traceback|\w+Error:|\w+Exception:|\[output truncated\]|\[Python state lost")
+_PP_NEG = re.compile(r"\bFalse\b|\bFAIL|\bfail(?:ed|s|ure)?\b|\bwrong\b|\bincorrect\b|✗|\bnot (?:ok|equal|match)"
+                     r"|\bno match|\bdiffer(?:s|ent|ence)?\b"
+                     r"|\b(?:mismatch(?:es|ed)?|errors?|bad)\b(?!\D{0,4}\b0\b)", re.I)  # "errors 0" is fine
+_PP_COUNT = re.compile(r"\b(?:diffs?|ndiffs?|n_diff|diff_count|mismatch(?:es)?|errors?|wrong|nwrong|bad)\b"
+                       r"[^\d\n]{0,12}?(\d+)", re.I)  # a nonzero count is a failure
+_PP_WRAP = {"array", "asarray", "list", "tuple"}  # f(grid) that keeps the grid
+_PP_METHOD = {"tolist", "copy", "astype"}  # grid.m() that keeps the grid
+_PP_COMP = (ast.ListComp, ast.GeneratorExp, ast.SetComp, ast.DictComp)
+
+
+def _pp_nodes(tree):
+    """The cell's AST nodes outside function, class and lambda bodies."""
+    todo = [tree]
+    while todo:
+        node = todo.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            todo.extend(ast.iter_child_nodes(node))
+
+
+def _pp_slice(node):
+    return node.slice.value if type(node.slice).__name__ == "Index" else node.slice  # Python < 3.9: ast.Index
+
+
+def _pp_key(node, key):
+    """x['key'] or x.get('key')."""
+    if isinstance(node, ast.Subscript):
+        s = _pp_slice(node)
+        return isinstance(s, ast.Constant) and s.value == key
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+            and bool(node.args) and isinstance(node.args[0], ast.Constant) and node.args[0].value == key)
+
+
+def _pp_over_train(it):
+    """train, enumerate(train), zip(train, ...) or range(len(train)): every training pair, never a slice."""
+    if isinstance(it, ast.Name):
+        return it.id == "train"
+    if not (isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.args):
+        return False
+    if it.func.id in ("enumerate", "zip"):
+        return _pp_over_train(it.args[0])
+    a = it.args[0]
+    return (it.func.id == "range" and len(it.args) == 1 and isinstance(a, ast.Call) and isinstance(a.func, ast.Name)
+            and a.func.id == "len" and len(a.args) == 1 and isinstance(a.args[0], ast.Name) and a.args[0].id == "train")
+
+
+def _pp_per_pair(target, it):
+    """Names a loop over train binds per pair besides the pair itself: enumerate / range(len(train)) indices and the
+    partners of zip(train, ...)."""
+    if isinstance(it, ast.Name):
+        return []
+    elts = target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]
+    if it.func.id == "enumerate" and len(elts) == 2:
+        return _pp_targets(elts[0]) + _pp_per_pair(elts[1], it.args[0])
+    if it.func.id == "zip" and len(elts) == len(it.args):
+        return _pp_per_pair(elts[0], it.args[0]) + [n for e in elts[1:] for n in _pp_targets(e)]
+    return [n for e in elts for n in _pp_targets(e)]  # range(len(train)), or a target shape not understood
+
+
+def _pp_targets(target):
+    """Names bound (or item-assigned) by an assignment target."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+        return [target.value.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [n for t in target.elts for n in _pp_targets(t)]
+    if isinstance(target, ast.Starred):
+        return _pp_targets(target.value)
+    return []
+
+
+def train_pass_shown(code, output, n_train):
+    """I8: True when a run_python result (`output`, as the model sees it) of cell `code` shows a program reproducing
+    every one of the n_train training pairs. Conservative, since a miss only delays the note and a false alarm
+    misleads: the cell completed without a traceback or truncation and no output line (lines naming the test input
+    aside) has a negative verdict (False, fail, mismatch, differ, wrong, a nonzero diff count, ...); and either the
+    helpers' check(fn) printed ALL PASS, or, outside any function, a loop or comprehension over all of `train` compares
+    (== or array_equal) a function's result on the pair's input (a call of a non-builtin name whose arguments read
+    the pair's 'input' and never an 'output') with the pair's 'output' grid, and prints it, with `True` on at least
+    n_train lines (one line for a printed comprehension or all()), or asserts it."""
+    try:
+        return _train_pass_shown(code, output, n_train)
+    except Exception:  # e.g. SyntaxError (IPython magics) or RecursionError: no note, never a broken turn
+        return False
+
+
+def _train_pass_shown(code, output, n_train):
+    head, sep, rest = output.partition("[completed]\n")
+    if not sep or (head and not head.startswith("[auto-corrected")) or _PP_SKIP.search(rest) or n_train < 1:
+        return False
+    lines = [ln for ln in rest.split("\n") if not re.search(r"\btest", ln, re.I)]
+    if any(_PP_NEG.search(ln) or any(int(m.group(1)) for m in _PP_COUNT.finditer(ln)) for ln in lines):
+        return False
+    tree = ast.parse(code)
+    nodes = list(_pp_nodes(tree))
+    calls = [n for n in nodes if isinstance(n, ast.Call)]
+    if any(ln.strip() == "ALL PASS" for ln in lines) and any(  # the helpers' check(fn), on every training pair
+            isinstance(c.func, ast.Name) and c.func.id == "check" and len(c.args) == 1 and not c.keywords
+            for c in calls):
+        return True
+    parent, assigns = {}, {}
+    for node in nodes:
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and node.value is not None:
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                for name in _pp_targets(target):
+                    assigns.setdefault(name, []).append(node)
+    printed = {n.id for c in calls if isinstance(c.func, ast.Name) and c.func.id == "print"
+               for a in c.args for n in ast.walk(a) if isinstance(n, ast.Name)}
+    index = {n for node in nodes for target, it in (
+        [(node.target, node.iter)] if isinstance(node, ast.For) else
+        [(g.target, g.iter) for g in node.generators] if isinstance(node, _PP_COMP) else [])
+        if _pp_over_train(it) for n in _pp_per_pair(target, it)}
+
+    def bound(name, at):
+        """What `name` holds at node `at`: its last assignment before `at` in the cell (or every one if none)."""
+        stmts = assigns.get(name, [])
+        before = [s for s in stmts if (s.lineno, s.col_offset) < (at.lineno, at.col_offset)]
+        return [max(before, key=lambda s: (s.lineno, s.col_offset)).value] if before else [s.value for s in stmts]
+
+    def reads(node, key):  # the expression or, through the cell's assignments, anything it was built from
+        seen, todo = set(), [node]
+        while todo:
+            for n in ast.walk(todo.pop()):
+                if _pp_key(n, key):
+                    return True
+                if isinstance(n, ast.Name) and n.id not in seen:
+                    seen.add(n.id)
+                    todo.extend(s.value for s in assigns.get(n.id, []))
+        return False
+
+    def is_output(node, depth=0):  # the pair's output grid itself (maybe as an array or a list)
+        if _pp_key(node, "output"):
+            return True
+        if depth > 6:
+            return False
+        if isinstance(node, ast.Name):
+            vals = bound(node.id, node)
+            return bool(vals) and all(is_output(v, depth + 1) for v in vals)
+        if isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute)):
+            f = node.func
+            name = f.id if isinstance(f, ast.Name) else f.attr
+            if name in _PP_WRAP and node.args:
+                return is_output(node.args[0], depth + 1)
+            return isinstance(f, ast.Attribute) and name in _PP_METHOD and is_output(f.value, depth + 1)
+        return False
+
+    def is_result(node, depth=0):  # a non-builtin function's result on the pair's input (maybe wrapped or indexed)
+        if depth > 6:
+            return False
+        if isinstance(node, ast.Name):
+            vals = bound(node.id, node)
+            return bool(vals) and all(is_result(v, depth + 1) for v in vals)
+        if isinstance(node, ast.Subscript):
+            return is_result(node.value, depth + 1)
+        if not (isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute))):
+            return False
+        f = node.func
+        name = f.id if isinstance(f, ast.Name) else f.attr
+        if name in _PP_WRAP and node.args:
+            return is_result(node.args[0], depth + 1)
+        if isinstance(f, ast.Attribute):
+            return name in _PP_METHOD and is_result(f.value, depth + 1)
+        args = [*node.args, *(k.value for k in node.keywords)]
+        return (not hasattr(builtins, name) and any(reads(a, "input") for a in args)
+                and not any(reads(a, "output") or per_pair(a) for a in args))
+
+    def per_pair(node):
+        """Built from a loop index or zip partner other than as train[i], also through branches on one (hand-fit
+        per-pair arguments such as [2, 2, 6][i] or `s = 7 if i == 0 else 6` are not a program)."""
+        seen, todo = set(), [node]
+        while todo:
+            for n in ast.walk(todo.pop()):
+                if not isinstance(n, ast.Name):
+                    continue
+                p = parent.get(n)
+                if n.id in index and not (isinstance(p, ast.Subscript) and _pp_slice(p) is n
+                                          and isinstance(p.value, ast.Name) and p.value.id == "train"):
+                    return True
+                if n.id not in seen:
+                    seen.add(n.id)
+                    for stmt in assigns.get(n.id, []):
+                        todo.append(stmt.value)
+                        x = stmt
+                        while x in parent and not isinstance(x, ast.For):
+                            x = parent[x]
+                            if isinstance(x, (ast.If, ast.While)):
+                                todo.append(x.test)
+        return False
+
+    def in_train_for(node):
+        x = node
+        while x in parent:
+            if isinstance(parent[x], ast.For) and _pp_over_train(parent[x].iter) and x is not parent[x].iter:
+                return True
+            x = parent[x]
+        return False
+
+    def use(node):
+        """How the comparison's value reaches the output, through f-strings, tuples, bool()/str() and at most one
+        list comprehension or all(generator) over train: ("print" | "assert" | None, via such a comprehension)."""
+        x, comp = node, False
+        while x in parent:
+            p = parent[x]
+            if isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id == "print" and x is not p.func:
+                return "print", comp
+            if isinstance(p, ast.Assert) and x is p.test:
+                return "assert", comp
+            if isinstance(p, (ast.Assign, ast.AnnAssign)) and x is p.value:
+                targets = p.targets if isinstance(p, ast.Assign) else [p.target]
+                return ("print" if any(n in printed for t in targets for n in _pp_targets(t)) else None), comp
+            if (isinstance(p, (ast.ListComp, ast.GeneratorExp)) and x is p.elt and not comp
+                    and any(_pp_over_train(g.iter) for g in p.generators)):
+                comp = True
+            elif not ((isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.args and x is p.args[0]
+                       and ((p.func.id == "all" and comp and isinstance(x, (ast.GeneratorExp, ast.ListComp)))
+                            or p.func.id in ("bool", "str")))
+                      or isinstance(p, (ast.FormattedValue, ast.JoinedStr, ast.Tuple, ast.List))):
+                return None, comp
+            x = p
+        return None, comp
+
+    kinds = set()
+    for node in nodes:
+        if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq):
+            a, b = node.left, node.comparators[0]
+        elif (isinstance(node, ast.Call) and len(node.args) == 2 and isinstance(node.func, (ast.Name, ast.Attribute))
+              and (node.func.id if isinstance(node.func, ast.Name) else node.func.attr) == "array_equal"):
+            a, b = node.args
+        else:
+            continue
+        if not ((is_result(a) and is_output(b)) or (is_result(b) and is_output(a))):
+            continue
+        how, comp = use(node)
+        if how is None or not (comp or in_train_for(node)):
+            continue
+        if how == "assert":
+            return True  # asserted for every training pair, and the cell raised nothing
+        kinds.add("one" if comp else "for")
+    true_lines = sum(bool(re.search(r"\bTrue\b", ln)) for ln in lines)
+    return bool(kinds) and (true_lines >= n_train or ("one" in kinds and true_lines >= 1))
 
 
 def build_prompt_multi(train, test_inputs):
@@ -956,6 +1486,13 @@ def solve(client, args, task, test_input, session_factory=SandboxSession, test_i
     n_rescues = 0  # E043 --rescue-code
     alt_pred = None  # E049 --alt-answer
     n_nudge_rescues = 0
+    repair, repairs = None, None  # I5 --auto-repair: auto_repair.propose and its counters
+    if getattr(args, "auto_repair", False):
+        repairs = {"proposed": 0, "applied": 0, "retry_ok": 0}
+        try:
+            from auto_repair import propose as repair
+        except Exception as exc:  # e.g. a Kaggle kit without evals/auto_repair.py
+            repairs["unavailable"] = f"{type(exc).__name__}: {exc}"[:200]
     # E043 --token-exact: the attempt's exact token history (prompt + sampled ids) and counters
     tok = ({"ids": None, "n": 0, "prev_len": 0, "prev_sampled": [], "resync": False, "turns": 0, "breaks": 0,
             "rerenders": 0, "resyncs": 0, "parse_fallbacks": 0}
@@ -967,182 +1504,270 @@ def solve(client, args, task, test_input, session_factory=SandboxSession, test_i
     executed, submit_code, labels = [], None, {}  # E017 --train-check state
     auto_price = getattr(args, "auto_peak_price", False)
     cost = {"total": 0.0, "peak": 0.0, "peak_turns": 0}
-    extra = {"prelude_extra": HELPERS_SRC} if getattr(args, "helpers", False) else {}
-    if multi:
-        extra = {"prelude_extra": extra.get("prelude_extra", "")
-                 + f"\nimport json as _arc_json\ntest_inputs = _arc_json.loads({json.dumps(test_inputs)!r})\n"}
+    helpers = HELPERS_SRC if getattr(args, "helpers", False) else ""
+    # E046: the session's `test_inputs` (A5: also [test_input] in single-test sessions under --multi-test, which the
+    # tool description promises); the train check's transcript replay binds test_inputs[0] to the replayed input (A6)
+    all_inputs = test_inputs if multi else [test_input]
+    with_inputs = bool(multi) or getattr(args, "multi_test", False)
+
+    def session_extra(inputs):
+        text = helpers + (inputs_prelude(inputs) if with_inputs else "")
+        return {"prelude_extra": text} if text else {}
+    extra = session_extra(all_inputs)
+    cut_parse = False  # A2: pred came from the text of a turn cut by max_tokens
+    guess_on = bool(getattr(args, "best_guess_at", 0) or getattr(args, "best_guess_turns", 0))
+    best_guess = None  # I7: {fired_at_tokens, fired_at_turn} once the note was given
+
+    def guess_note(budget_args, final=False):
+        """I7: the best-guess note for the tool result of the turn just made (at most once per attempt), else ""."""
+        nonlocal best_guess
+        if (not guess_on or best_guess is not None or final
+                or not best_guess_due(args, budget_args.max_total_output, total["completion"], n_turns)):
+            return ""
+        best_guess = {"fired_at_tokens": total["completion"], "fired_at_turn": n_turns}
+        events.append({"turn": n_turns, "best_guess": True})
+        return BEST_GUESS_NOTE + (BEST_GUESS_MULTI.format(n=multi) if multi else "")
+    post_on = bool(getattr(args, "post_pass_note", False))
+    post_pass = None  # I8: {fired_at_turn, fired_at_tokens} once the note was given
+    n_train = len(task["train"])
     try:
         with session_factory(args.sandbox_url, task["train"], test_input,
                              args.tool_timeout, args.max_tool_output, **extra) as session:
-            for index in range(args.max_turns):
-                remaining = args.max_total_output - total["completion"]
-                if remaining <= 0:
-                    stop = "output_budget"
-                    break
-                if session_final:
-                    # E009: no forced final turn; the budget-end fallback is the session's `answer`.
-                    final, cap = False, min(args.max_tokens, remaining)
-                else:
-                    # Reserve last turn/tokens for final grid. Keep tools= present so
-                    # DeepSeek continues consuming reasoning_content from previous turns.
-                    final = index == args.max_turns - 1 or remaining <= args.final_tokens
-                    if final:
-                        messages.append({"role": "user", "content":
-                                         "Finalize now. Return only your best test output as a JSON grid."})
-                    cap = min(args.max_tokens, remaining if final else remaining - args.final_tokens)
-                n_turns += 1
-                mult = peak_multiplier() if auto_price else args.price_multiplier
-                try:
-                    think = args.think_turns < 0 or index < args.think_turns
-                    msg, usage, finish = turn(client, args, messages, cap, final, think, tok)
-                except ContextFull as exc:
-                    n_turns -= 1
-                    events.append({"turn": n_turns + 1, "context_full": str(exc)})
-                    stop = "context"
-                    break
-                except TurnError as exc:
-                    messages.append(exc.assistant)
-                    if exc.usage:
-                        add_usage(total, exc.usage)
-                        add_cost(cost, exc.usage, args.model, mult)
-                    finish = exc.finish
-                    raise
-                add_cost(cost, usage, args.model, mult)
-                messages.append(msg)
-                add_usage(total, usage)
-                events.append({"turn": n_turns, "usage": usage, "finish_reason": finish,
-                               "max_tokens": cap, "final": final})
-                if not think:
-                    events[-1]["thinking"] = False
-                if finish not in {"stop", "tool_calls", "length"}:
-                    raise RuntimeError(f"Provider interrupted generation: {finish}")
-                if finish == "length" and not final and getattr(args, "cap_nudge", False) and cap < remaining:
-                    # E030 --cap-nudge: the per-turn max_tokens cut this turn. Keep its reasoning, drop any partial
-                    # text or tool call, and close it with a synthetic run_python call whose output is the nudge.
-                    call_id = f"cap_{n_turns}"
-                    msg = {"role": "assistant", "content": "", "reasoning_content": msg.get("reasoning_content", ""),
-                           "tool_calls": [{"id": call_id, "type": "function", "function": {
-                               "name": "run_python", "arguments": json.dumps({"code": "pass  # per-turn thinking limit"})}}]}
-                    messages[-1] = msg
-                    note = (CAP_NOTE.format(k=round(cap / 1000)) + budget_note(args, total["completion"])
-                            + turns_note(args, index))
-                    messages.append({"role": "tool", "tool_call_id": call_id, "content": note})
-                    events.append({"turn": n_turns, "cap_nudge": True})
-                    n_nudges += 1
-                    continue
-                calls = msg.get("tool_calls", [])
-                if not calls and getattr(args, "rescue_code", False) and not final and finish == "stop":
-                    rescued = rescue_tool_call(msg.get("content"), n_turns)
-                    if rescued is not None:
-                        msg = {**msg, "content": "", "tool_calls": [rescued]}
-                        messages[-1] = msg
-                        calls = [rescued]
-                        n_rescues += 1
-                        if tok is not None:
-                            tok["resync"] = True
-                        events.append({"turn": n_turns, "rescued": "code"})
-                    elif n_nudge_rescues < 3 and not valid_grid(parse(msg.get("content") or "")):
-                        # No call, no code and no answer grid: remind the model to use the tools (at most 3x).
-                        messages.append({"role": "user", "content": RESCUE_NUDGE})
-                        n_rescues += 1
-                        n_nudge_rescues += 1
-                        events.append({"turn": n_turns, "rescued": "nudge"})
-                        continue
-                if not calls:
-                    content = msg["content"]
-                    candidate = parse(content)
-                    pred = candidate if valid_grid(candidate) else None
-                    source = "parse" if pred is not None else None
-                    if multi:
-                        pred, source = None, None  # a text answer gives one grid; the session fallback below
-                    if pred is None and getattr(args, "lenient_parse", False) and not multi:
-                        pred = lenient_parse(content)
-                        source = "lenient" if pred is not None else None
-                    if finish == "length" and not final:
-                        # Reasoning can fill a whole turn before a grid is emitted.
-                        # Use the reserved budget to ask for the answer next turn.
-                        continue
-                    stop = "final" if finish == "stop" else finish
-                    break
-                accepted = None
-                for call in calls:
-                    n_tools += 1
-                    status = "completed"
+            try:
+                for index in range(args.max_turns):
+                    remaining = args.max_total_output - total["completion"]
+                    if remaining <= 0:
+                        stop = "output_budget"
+                        break
+                    if session_final:
+                        # E009: no forced final turn; the budget-end fallback is the session's `answer`.
+                        final, cap = False, min(args.max_tokens, remaining)
+                    else:
+                        # Reserve last turn/tokens for final grid. Keep tools= present so
+                        # DeepSeek continues consuming reasoning_content from previous turns.
+                        final = index == args.max_turns - 1 or remaining <= args.final_tokens
+                        if final:
+                            messages.append({"role": "user", "content":
+                                             "Finalize now. Return only your best test output as a JSON grid."})
+                        cap = min(args.max_tokens, remaining if final else remaining - args.final_tokens)
+                    n_turns += 1
+                    mult = peak_multiplier() if auto_price else args.price_multiplier
                     try:
-                        if finish == "length" or final:
-                            raise ValueError("Tool skipped: truncated response or final-turn budget reached")
-                        arguments = json.loads(call["function"]["arguments"])
-                        if not isinstance(arguments, dict) or not isinstance(arguments.get("code"), str):
-                            raise ValueError("Expected an object with a string code field")
-                        name, code = call["function"]["name"], arguments["code"]
-                        if getattr(args, "rescue_code", False) and name not in ("run_python", "submit_answer",
-                                                                                  "submit_solution"):
-                            fixed = rescue_name(name)
-                            if fixed != name:
-                                n_rescues += 1
-                                events.append({"turn": n_turns, "rescued": f"name {name}"})
-                                name = fixed
-                                call["function"]["name"] = fixed
-                                if tok is not None:
-                                    tok["resync"] = True
-                        if accepted is not None:
-                            output = "[skipped: solution already accepted]"
-                        elif name == "run_python":
-                            executed.append((name, code))
-                            result = session.execute(code)
-                            status = result["process_status"]
-                            output = tool_output(result, args.max_tool_output)
-                        elif name == "submit_solution" and args.mode == "code":
-                            output, accepted = submit_solution(session, code)
-                            status = "completed" if accepted is not None else "rejected"
-                        elif name == "submit_answer" and getattr(args, "answer_tool", False):
-                            executed.append((name, code))
-                            output, accepted = submit_answer(session, code, multi) if multi else submit_answer(session, code)
-                            if accepted is not None and getattr(args, "verify_submit", False) and not multi:
-                                check = check_answer_on_train(session, code)
-                                verified = None if check is None else not check[0]
-                                if check and check[0] and code not in forced:
-                                    forced.add(code)
-                                    output, accepted = (
-                                        f"[answer not accepted yet: the same expression with test_input = each "
-                                        f"training input fails training pairs {check[0]} ({check[1]}). Fix the rule, "
-                                        "or call submit_answer again with exactly the same code to submit anyway.]"), None
-                                else:
-                                    submit_verified = verified
-                            status = "completed" if accepted is not None else "rejected"
-                        else:
-                            raise ValueError(f"Unknown tool: {name}")
-                    except (ValueError, TypeError, KeyError) as exc:
-                        output, status = f"[tool error: {exc}]", "error"
-                    # Transport errors abort rather than repeat ambiguous executions.
-                    n_errors += status != "completed"
-                    messages.append({"role": "tool", "tool_call_id": call["id"], "content": output})
-                    events.append({"turn": n_turns, "tool_call_id": call["id"], "status": status})
-                if accepted is not None:
-                    pred, content, stop, source = accepted, json.dumps(accepted), "submitted", "submit"
-                    submit_code = code
-                    break
-                note = budget_note(args, total["completion"]) + turns_note(args, index)
-                if note and messages[-1]["role"] == "tool":
-                    messages[-1]["content"] += note
-                if final:
-                    stop = "length" if finish == "length" else "max_turns"
-                    break
-            else:
-                stop = "max_turns"
-            if session_final and pred is None and stop in {"output_budget", "max_turns", "length", "final", "context"}:
+                        think = args.think_turns < 0 or index < args.think_turns
+                        msg, usage, finish = turn(client, args, messages, cap, final, think, tok)
+                    except ContextFull as exc:
+                        n_turns -= 1
+                        events.append({"turn": n_turns + 1, "context_full": str(exc)})
+                        stop = "context"
+                        break
+                    except TurnError as exc:
+                        messages.append(exc.assistant)
+                        if exc.usage:
+                            add_usage(total, exc.usage)
+                            add_cost(cost, exc.usage, args.model, mult)
+                        finish = exc.finish
+                        raise
+                    add_cost(cost, usage, args.model, mult)
+                    messages.append(msg)
+                    add_usage(total, usage)
+                    events.append({"turn": n_turns, "usage": usage, "finish_reason": finish,
+                                   "max_tokens": cap, "final": final})
+                    if not think:
+                        events[-1]["thinking"] = False
+                    if finish not in {"stop", "tool_calls", "length"}:
+                        raise RuntimeError(f"Provider interrupted generation: {finish}")
+                    if finish == "length" and not final and getattr(args, "cap_nudge", False) and cap < remaining:
+                        # E030 --cap-nudge: the per-turn max_tokens cut this turn. Keep its reasoning, drop any partial
+                        # text or tool call, and close it with a synthetic run_python call whose output is the nudge.
+                        call_id = f"cap_{n_turns}"
+                        msg = {"role": "assistant", "content": "", "reasoning_content": msg.get("reasoning_content", ""),
+                               "tool_calls": [{"id": call_id, "type": "function", "function": {
+                                   "name": "run_python",
+                                   "arguments": json.dumps({"code": "pass  # per-turn thinking limit"})}}]}
+                        messages[-1] = msg
+                        budget_args = context_budget(args, usage, total["completion"])
+                        note = (CAP_NOTE.format(k=round(cap / 1000)) + guess_note(budget_args)
+                                + budget_note(budget_args, total["completion"]) + turns_note(args, index))
+                        messages.append({"role": "tool", "tool_call_id": call_id, "content": note})
+                        events.append({"turn": n_turns, "cap_nudge": True})
+                        n_nudges += 1
+                        continue
+                    calls = msg.get("tool_calls", [])
+                    if not calls and getattr(args, "rescue_code", False) and not final and finish == "stop":
+                        rescued = rescue_tool_call(msg.get("content"), n_turns)
+                        if rescued is not None:
+                            msg = {**msg, "content": "", "tool_calls": [rescued]}
+                            messages[-1] = msg
+                            calls = [rescued]
+                            n_rescues += 1
+                            if tok is not None:
+                                tok["resync"] = True
+                            events.append({"turn": n_turns, "rescued": "code"})
+                        elif n_nudge_rescues < 3 and not valid_grid(parse(msg.get("content") or "")):
+                            # No call, no code and no answer grid: remind the model to use the tools (at most 3x).
+                            messages.append({"role": "user", "content": RESCUE_NUDGE})
+                            n_rescues += 1
+                            n_nudge_rescues += 1
+                            events.append({"turn": n_turns, "rescued": "nudge"})
+                            continue
+                    if not calls:
+                        content = msg["content"]
+                        candidate = parse(content)
+                        pred = candidate if valid_grid(candidate) else None
+                        source = "parse" if pred is not None else None
+                        if multi:
+                            pred, source = None, None  # a text answer gives one grid; the session fallback below
+                        if pred is None and getattr(args, "lenient_parse", False) and not multi:
+                            pred = lenient_parse(content)
+                            source = "lenient" if pred is not None else None
+                        if finish == "length" and not final:
+                            # Reasoning can fill a whole turn before a grid is emitted.
+                            # Use the reserved budget to ask for the answer next turn.
+                            cut_parse = pred is not None  # A2: a cut turn's text grid yields to a session answer
+                            continue
+                        cut_parse = False
+                        stop = "final" if finish == "stop" else finish
+                        break
+                    accepted, pass_at = None, None  # I8: index of this turn's first all-train-pass tool result
+                    for call in calls:
+                        n_tools += 1
+                        status = "completed"
+                        try:
+                            if finish == "length" or final:
+                                raise ValueError("Tool skipped: truncated response or final-turn budget reached")
+                            arguments = json.loads(call["function"]["arguments"])
+                            if not isinstance(arguments, dict) or not isinstance(arguments.get("code"), str):
+                                raise ValueError("Expected an object with a string code field")
+                            name, code = call["function"]["name"], arguments["code"]
+                            if getattr(args, "rescue_code", False) and name not in ("run_python", "submit_answer",
+                                                                                      "submit_solution"):
+                                fixed = rescue_name(name)
+                                if fixed != name:
+                                    n_rescues += 1
+                                    events.append({"turn": n_turns, "rescued": f"name {name}"})
+                                    name = fixed
+                                    call["function"]["name"] = fixed
+                                    if tok is not None:
+                                        tok["resync"] = True
+                            if accepted is not None:
+                                output = "[skipped: solution already accepted]"
+                            elif name == "run_python":
+                                executed.append((name, code))
+                                result = session.execute(code)
+                                status = result["process_status"]
+                                output = tool_output(result, args.max_tool_output)
+                                if repair is not None and status == "error":
+                                    fixed = auto_repair_cell(session, code, output, repair,
+                                                             PRELOADED | ({"test_inputs"} if with_inputs else set()),
+                                                             args.max_tool_output, repairs)
+                                    if fixed is not None:  # the repaired cell is what the session ran last
+                                        output, status, executed[-1] = fixed[0], fixed[1], (name, fixed[2])
+                                        events.append({"turn": n_turns, "auto_repair": status})
+                                if (post_on and post_pass is None and pass_at is None and status == "completed"
+                                        and train_pass_shown(executed[-1][1], output, n_train)):
+                                    pass_at = len(messages)  # the tool message appended below
+                            elif name == "submit_solution" and args.mode == "code":
+                                output, accepted = submit_solution(session, code)
+                                status = "completed" if accepted is not None else "rejected"
+                            elif name == "submit_answer" and getattr(args, "answer_tool", False):
+                                executed.append((name, code))
+                                output, accepted = (submit_answer(session, code, multi) if multi
+                                                    else submit_answer(session, code))
+                                if accepted is not None and getattr(args, "verify_submit", False) and not multi:
+                                    check = check_answer_on_train(session, code)
+                                    verified = None if check is None else not check[0]
+                                    if check and check[0] and code not in forced:
+                                        forced.add(code)
+                                        output, accepted = (
+                                            f"[answer not accepted yet: the same expression with test_input = each "
+                                            f"training input fails training pairs {check[0]} ({check[1]}). Fix the rule, "
+                                            "or call submit_answer again with exactly the same code to submit "
+                                            "anyway.]"), None
+                                    else:
+                                        submit_verified = verified
+                                status = "completed" if accepted is not None else "rejected"
+                            else:
+                                raise ValueError(f"Unknown tool: {name}")
+                        except (ValueError, TypeError, KeyError) as exc:
+                            output, status = f"[tool error: {exc}]", "error"
+                        # Transport errors abort rather than repeat ambiguous executions.
+                        n_errors += status != "completed"
+                        messages.append({"role": "tool", "tool_call_id": call["id"], "content": output})
+                        events.append({"turn": n_turns, "tool_call_id": call["id"], "status": status})
+                    if accepted is not None:
+                        pred, content, stop, source = accepted, json.dumps(accepted), "submitted", "submit"
+                        submit_code, cut_parse = code, False
+                        break
+                    # I7: a valid submit ended the attempt above, so reaching here means no answer was accepted yet
+                    budget_args = context_budget(args, usage, total["completion"])
+                    if (pass_at is not None and not final and total["completion"] < budget_args.max_total_output
+                            and n_turns < args.max_turns):  # I8, once, while another turn can follow
+                        post_pass = {"fired_at_turn": n_turns, "fired_at_tokens": total["completion"]}
+                        events.append({"turn": n_turns, "post_pass": True})
+                        messages[pass_at]["content"] += (POST_PASS_NOTE
+                                                         + (POST_PASS_MULTI.format(n=multi) if multi else ""))
+                    note = ((guess_note(budget_args, final) if messages[-1]["role"] == "tool" else "")
+                            + budget_note(budget_args, total["completion"]) + turns_note(args, index))
+                    if note and messages[-1]["role"] == "tool":
+                        messages[-1]["content"] += note
+                    if final:
+                        stop = "length" if finish == "length" else "max_turns"
+                        break
+                else:
+                    stop = "max_turns"
+            except Exception as exc:
+                if not session_final:
+                    raise
+                # A4: a turn failed (stream, server or tool transport error). The session may still hold `answer`:
+                # the fallbacks below run before the attempt is recorded as an error (the error is kept).
+                error, stop = f"{type(exc).__name__}: {exc}"[:1000], "error"
+            if session_final and (pred is None or cut_parse) and stop in {"output_budget", "max_turns", "length",
+                                                                           "final", "context", "error"}:
                 # Budget or turns ran out without an answer: take the session's `answer` if it is a valid grid.
-                output, grid = submit_answer(session, "answer", multi) if multi else submit_answer(session, "answer")
-                events.append({"fallback": "session_answer", "accepted": grid is not None, "output": output[:300]})
-                if grid is not None:
-                    pred, content, source, submit_code = grid, json.dumps(grid), "session", "answer"
-                elif getattr(args, "fallback_solve", False):
-                    # E029: no valid `answer`; evaluate the session's solve on the test input, if defined.
-                    expr = "[solve(t) for t in test_inputs]" if multi else "solve(test_input)"
-                    output, grid = submit_answer(session, expr, multi) if multi else submit_answer(session, expr)
-                    events.append({"fallback": "session_solve", "accepted": grid is not None, "output": output[:300]})
-                    if grid is not None:
-                        pred, content, source, submit_code = grid, json.dumps(grid), "session_solve", expr
+                try:
+                    restore_inputs(session, all_inputs, with_inputs)  # A8: the host's copies, not model rebinds
+                    if multi:
+                        # A1: one grid per test input from `answer`, then (E029) solve() on the test inputs still
+                        # without one, each checked on its own, so one bad grid no longer loses the others
+                        output, grids = answer_items(session, "answer", multi)
+                        events.append({"fallback": "session_answer", "accepted": grids is not None,
+                                       "output": output[:300]})
+                        grids = grids or [None] * multi
+                        codes = ["answer" if g is not None else None for g in grids]
+                        missing = [i for i, g in enumerate(grids) if g is None]
+                        if missing and getattr(args, "fallback_solve", False):
+                            output, got = solve_items(session, [all_inputs[i] for i in missing])
+                            events.append({"fallback": "session_solve", "accepted": got is not None,
+                                           "output": output[:300]})
+                            for i, g in zip(missing, got or []):
+                                if g is not None:
+                                    grids[i], codes[i] = g, "[solve(t) for t in test_inputs]"
+                        if any(g is not None for g in grids):
+                            pred, content, submit_code = grids, json.dumps(grids), codes[0]
+                            source, cut_parse = "session" if "answer" in codes else "session_solve", False
+                    else:
+                        output, grid = submit_answer(session, "answer")
+                        events.append({"fallback": "session_answer", "accepted": grid is not None,
+                                       "output": output[:300]})
+                        if grid is not None:
+                            pred, content, source, submit_code = grid, json.dumps(grid), "session", "answer"
+                            cut_parse = False
+                        elif getattr(args, "fallback_solve", False):
+                            # E029: no valid `answer`; evaluate the session's solve on the test input, if defined.
+                            expr = "solve(test_input)"
+                            output, grid = submit_answer(session, expr)
+                            if grid is None:  # A3: numpy-only programs (solve(np.array(test_input)))
+                                more, got = solve_items(session, all_inputs)
+                                grid, output = (got or [None])[0], output[:150] + " " + more
+                            events.append({"fallback": "session_solve", "accepted": grid is not None,
+                                           "output": output[:300]})
+                            if grid is not None:
+                                pred, content, source, submit_code = grid, json.dumps(grid), "session_solve", expr
+                                cut_parse = False
+                except Exception as exc:
+                    if error is None:
+                        raise
+                    events.append({"fallback": "failed", "output": f"{type(exc).__name__}: {exc}"[:300]})
             if getattr(args, "alt_answer", "") and pred is not None:
                 # E049: the session's optional second guess (no model tokens); kept only if valid and different
                 output, grid = (submit_answer(session, "alt_answer", multi) if multi
@@ -1151,12 +1776,17 @@ def solve(client, args, task, test_input, session_factory=SandboxSession, test_i
             if getattr(args, "train_check", False) and pred is not None:
                 # E017: label the answer program on the training pairs (no model tokens; host compares hashes).
                 try:
-                    # multi: label the program behind test input 0's grid (session functions, cells)
-                    labels = train_check(session, executed, pred[0] if multi else pred,
-                                         None if multi else submit_code, submit=submit_answer,
-                                         replay_session=lambda grid: session_factory(
-                                             args.sandbox_url, task["train"], grid, args.tool_timeout,
-                                             args.max_tool_output, **extra))
+                    if multi and pred[0] is None:  # A1: a partial multi answer without grid 0 is not labelled
+                        labels = {"train_pass": None, "train_frac": None, "train_trace": "no_answer_0"}
+                    else:
+                        # multi: label the program behind test input 0's grid (session functions, cells); A6: as a
+                        # one-grid program, replayed with test_inputs[0] = each training input
+                        labels = train_check(session, executed, pred[0] if multi else pred,
+                                             multi_check_code(submit_code, all_inputs) if multi else submit_code,
+                                             submit=submit_answer,
+                                             replay_session=lambda grid: session_factory(
+                                                 args.sandbox_url, task["train"], grid, args.tool_timeout,
+                                                 args.max_tool_output, **session_extra([grid] + all_inputs[1:])))
                 except Exception as exc:
                     labels = {"train_pass": None, "train_frac": None, "train_trace": "check_error",
                               "train_check_error": f"{type(exc).__name__}: {exc}"[:300]}
@@ -1176,6 +1806,18 @@ def solve(client, args, task, test_input, session_factory=SandboxSession, test_i
         result["alt_pred"] = alt_pred
     if getattr(args, "rescue_code", False):
         result["rescues"] = n_rescues
+    if repairs is not None:
+        result["auto_repairs"] = repairs
+    if guess_on:  # I7: null when the note never fired
+        result["best_guess"] = None if best_guess is None else {
+            **best_guess, "submitted_after": source == "submit" and pred is not None,
+            "turns_after": n_turns - best_guess["fired_at_turn"],
+            "tokens_after": total["completion"] - best_guess["fired_at_tokens"]}
+    if post_on:  # I8: null when the note never fired
+        result["post_pass"] = None if post_pass is None else {
+            **post_pass, "turns_after": n_turns - post_pass["fired_at_turn"],
+            "tokens_after": total["completion"] - post_pass["fired_at_tokens"],
+            "submitted_after": source == "submit" and pred is not None}
     if tok is not None:
         result["token_exact"] = {k: v for k, v in tok.items()
                                  if k not in ("ids", "n", "prev_len", "prev_sampled", "resync")}
@@ -1301,6 +1943,23 @@ def parser():
     ap.add_argument("--rescue-code", action="store_true",
                     help="E043: a non-final turn without a valid tool call but with code (garbled DSML or a ```python "
                          "block) becomes a run_python call; near-miss tool names are mapped (pruned models)")
+    ap.add_argument("--auto-repair", action="store_true",
+                    help="I5: when a run_python cell fails on an identifier typo, evals/auto_repair.py may rewrite the "
+                         "name to its unique close match; the fixed cell runs once and the model sees the note and its "
+                         "output (auto_repairs per attempt; not part of the config, so files resume)")
+    ap.add_argument("--best-guess-at", type=float, default=0.0,
+                    help="I7: once per attempt without an accepted answer, when the output tokens reach this fraction "
+                         "of the attempt's hard budget (scaled by --multi-budget, capped by --context-limit, as the "
+                         "budget notes), the tool result says to stop exploring and submit the best current answer "
+                         "(0=off; recommended 0.8; best_guess per attempt; not part of the config, so files resume)")
+    ap.add_argument("--best-guess-turns", type=int, default=0,
+                    help="I7: the same note (still once per attempt) when turns so far >= --max-turns - K "
+                         "(0=off; recommended 3)")
+    ap.add_argument("--post-pass-note", action="store_true",
+                    help="I8: once per attempt without an accepted answer, the first run_python result that shows a "
+                         "program reproducing every training pair (train_pass_shown) says to check the test input's "
+                         "uncovered assumptions with code, then submit (post_pass per attempt; not part of the "
+                         "config, so files resume)")
     ap.add_argument("--lenient-parse", action="store_true",
                     help="E009: if the ARC Prize parser finds no grid in the final text, take the last valid one")
     ap.add_argument("--task-summary", action="store_true",
@@ -1393,6 +2052,12 @@ def main():
         ap.error("--fallback-solve needs --final-mode session")
     if args.turns_note < 0 or args.turns_note >= args.max_turns:
         ap.error("--turns-note must be in [0, --max-turns)")
+    if not 0 <= args.best_guess_at < 1 or not 0 <= args.best_guess_turns < args.max_turns:
+        ap.error("--best-guess-at must be in [0, 1) and --best-guess-turns in [0, --max-turns)")
+    if (args.best_guess_at or args.best_guess_turns) and not args.answer_tool:
+        ap.error("--best-guess-at / --best-guess-turns need --answer-tool (the note asks for submit_answer)")
+    if args.post_pass_note and not args.answer_tool:
+        ap.error("--post-pass-note needs --answer-tool (the note asks for submit_answer)")
     if args.answer_tool and args.mode != "grid":
         ap.error("--answer-tool is for grid mode")
     if args.budget_soft and (not args.budget_notes or not 0 < args.budget_soft < args.max_total_output):

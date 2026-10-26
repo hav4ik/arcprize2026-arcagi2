@@ -236,7 +236,7 @@ class PolicyTests(unittest.TestCase):
         passes = {("aa", 0): True, ("aa", 1): False, ("bb", 0): False, ("bb", 1): None, ("bb", 2): True}
         calls = []
 
-        def fake_solve(client, args, task, test_input):
+        def fake_solve(client, args, task, test_input, **kw):  # E047: prior=
             t = "aa" if test_input == [[1]] else "bb"
             a = sum(1 for c in calls if c == t)
             calls.append(t)

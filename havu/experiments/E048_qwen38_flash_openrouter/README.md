@@ -34,7 +34,27 @@ pass@2 delta -9.4 pp [95% CI -16.1, -3.2] (bootstrap over tasks). Pairs solved: 
 Qwen3.8 Flash is a competent tool user (far above our self-hosted Qwen3.8-27B) but clearly below DeepSeek-1017, with
 ~10% more output tokens and ~30% higher cost per attempt (cache reads $0.016/M vs $0.003/M).
 
-## No tools
-Running (`evals/results/arcprize_qwen38-flash_e048_notool.jsonl`, `cfg_notool.txt`): ARC Prize prompt, reasoning on,
-max_tokens 131072, 2 attempts, 32 workers; the same API errors (12% of the first 97 calls); `auto_retry.sh` resumes it
-afterwards (the script re-runs only errored calls).
+## Results: no tools (ARC Prize prompt), 2026-10-26
+File `evals/results/arcprize_qwen38-flash_e048_notool.jsonl` (`cfg_notool.txt`): reasoning on, max_tokens 131072,
+2 attempts, 32 workers. **Stopped early by decision (2026-10-26 ~12:40 UTC): the gap was clear.** 241/334 calls
+succeeded; 94 failed on the API side (76 "Provider returned error" from Alibaba, 17 connection drops, 1 truncated
+stream; rate limiting under 32 parallel calls) and the resume of those was stopped. 36 successful calls hit the 131k
+cap (no answer). Cost $8.92 (failed calls record no cost).
+
+Paired with DeepSeek-1017 no-tool (E034, max effort, same prompt), 104 pairs / 79 tasks where both attempts exist:
+
+| Model | pass@1 | pass@2 | out tokens/call mean / median | $/call |
+|---|---|---|---|---|
+| Qwen3.8 Flash | 46.0% | **58.2%** | 75.5k / 71.2k | $0.036 |
+| DeepSeek V4.1-Flash-1017 | 63.3% | **80.4%** | 48.3k / 41.6k | ~$0.031 (E034 $10.44 / 334) |
+
+pass@2 delta -22.2 pp [95% CI -32.9, -10.8]. Pairs: both 57, only Qwen 5, only DeepSeek 28, neither 14.
+The subset excludes pairs with API-failed attempts; if failures cluster on long calls the gap may shift, not its sign.
+
+## Conclusion
+Qwen3.8 Flash (Flash-Next) is consistently worse than DeepSeek V4.1-Flash-1017 on ARC-AGI-2 eval: -9.4 pp pass@2 with
+tools, -22 pp without. Tools help it much more (+~14 pp pass@2 vs ~+2 for DeepSeek). It is not cheaper per attempt
+(more tokens; cached input $0.016/M vs $0.003/M). Through OpenRouter it is served only by Alibaba, which rate-limits
+and errors heavily at 32 parallel requests (4% of tool attempts, 28% of no-tool calls). Not worth switching to.
+
+Total spend ~$19 (tools ~$9.6 incl. retries, no tools $8.9, smoke $0.1).

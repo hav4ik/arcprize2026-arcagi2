@@ -26,7 +26,7 @@ Cells:
    index file and gptq layer against its safetensors header size; a failure keeps the fallback.
 2. Offline install, overlay (sha256 checked), CUDA 13 shim, import check.
 3. `solver_dsv41.py` (see its docstring):
-   - the vLLM server in its own process group, with watchdog and one restart;
+   - the vLLM server in its own process group, with watchdog and up to 3 restarts (one before 2026-10-26);
    - the tool harness: sub80s40 + minimal header, `--token-exact --rescue-code --train-check`, 48 workers,
      LocalExecutor tool sessions on the image's Python;
    - deadlines: stop-new 10h50, wrap-up note 15 min before force, force 11h10, hard stop 11h30;
@@ -43,3 +43,8 @@ three cases:
 Two bugs found and fixed:
 - a task limit wrote a partial submission;
 - after a server restart, attempts relaunched before the death was noticed and used up their retry.
+
+Unit tests (no GPU; the V5 Kaggle kit `kaggle_kit_v5/` with the live solver and harness over it, as cell 0b installs
+them): `.venv/bin/python -m unittest discover -s kaggle/dsv41_tools/tests` (solver, notebook cells 00 / 0b, E042
+tooling) and `evals/tests/test_dsv41_harness.py` (the harness's Kaggle paths). Open and fixed gaps of the next
+candidate: `next_candidate_fixes.md`.

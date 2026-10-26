@@ -22,6 +22,7 @@ An index of public methods and datasets relevant to ARC-AGI-2. Each method gets 
 | Tiny Recursive Models (TRM) | 2025 paper award | 7M-parameter recursive model, per-puzzle embeddings | ~8% ARC-AGI-2 | [repo](https://github.com/SamsungSAILMontreal/TinyRecursiveModels) | — |
 | SOAR | 2025 paper award | Self-improving evolutionary program synthesis with hindsight relabelling | — | [data](https://huggingface.co/datasets/julien31/soar_arc_train_5M) | — |
 | Poetiq | 2025 | Refinement harness on frontier LLMs | — | [repo](https://github.com/poetiq-ai/poetiq-arc-agi-solver) | — |
+| Project Maya (mw00) | 2026-10 | Not ARC: single-PC C++/CUDA engine for DeepSeek-V4.1 / GLM (experts over VRAM/RAM/SSD, one conversation at a time); low-bit IQ quants | Ideas for our V4.1 serving: SWA checkpoints at turn boundaries, numeric reasoning effort, exact long-prompt skip, routing-weighted GPTQ | [repo](https://github.com/mw00/project-maya) | [project_maya.md](project_maya.md) |
 | ARC Prize benchmarking harness | — | Plain single-prompt eval used for the leaderboard | DeepSeek V4 Flash 0731 max: 61.4% semi-private | [repo](https://github.com/arcprize/arc-agi-benchmarking) | Prompts in `../notes/prompts/` |
 
 ## Datasets

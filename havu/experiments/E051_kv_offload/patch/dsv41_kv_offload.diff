@@ -1,0 +1,753 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
+@@ -55,7 +55,15 @@
+     )
+ 
+     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+-    for group in groups:
++    for group, kv_cache_group in zip(groups, kv_cache_config.kv_cache_groups):
++        # [dsv41-offload] Per-request scratch groups (DeepSeek-V4.1 compressor
++        # ring, CircularBufferSpec, 8-row blocks) are never prefix-cached and
++        # never offloaded (the scheduler skips them, as upstream #57145 does),
++        # so they are exempt from the hash-granularity check. Every config
++        # this exempts failed this assert before, so working configs are
++        # unchanged.
++        if not kv_cache_group.kv_cache_spec.prefix_cacheable:
++            continue
+         assert group.tokens_per_block % tokens_per_hash == 0, (
+             f"tokens_per_block={group.tokens_per_block} not divisible by "
+             f"tokens_per_hash={tokens_per_hash}. "
+@@ -82,7 +90,11 @@
+     elif tokens_per_chunk is not None:
+         tokens_per_chunk_int = int(tokens_per_chunk)
+ 
+-        unique_tokens_per_block = {group.tokens_per_block for group in groups}
++        unique_tokens_per_block = {
++            group.tokens_per_block
++            for group, kv_cache_group in zip(groups, kv_cache_config.kv_cache_groups)
++            if kv_cache_group.kv_cache_spec.prefix_cacheable
++        }
+ 
+         assert len(unique_tokens_per_block) == 1, (
+             "If 'block_size' is specified in kv_connector_extra_config, "
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import math
+ import time
+ from collections.abc import Iterable, Sequence
+ from dataclasses import dataclass, field
+@@ -37,6 +38,8 @@
+     KVCacheSpec,
+     MambaSpec,
+     SlidingWindowSpec,
++    UniformTypeKVCacheSpecs,
++    iter_layer_specs,
+ )
+ from vllm.v1.kv_offload.base import (
+     GPULoadStoreSpec,
+@@ -104,11 +107,50 @@
+     # of these groups is volatile and lacks a stable hash, so it must
+     # be excluded from store and load scheduling.
+     is_eagle_group: bool = False
++    # [dsv41-offload] Per-request scratch group (not prefix-cacheable, e.g.
++    # the DeepSeek-V4.1 compressor ring). It keeps its slot so group indices
++    # stay positional, but it gets no offload keys, no lookups, no loads and
++    # no stores. A GPU prefix-cache hit does not restore it either.
++    skip: bool = False
++
++
++# [dsv41-offload] kv_connector_extra_config["swa_store_policy"].
++#   "all": store every sliding-window chunk (upstream behaviour, default).
++#   "checkpoint": store only the window that ends at the prompt-end resume
++#     boundary and the window at the latest aligned boundary ("rolling"), and
++#     free the superseded rolling window. A resume needs only those windows.
++SWA_STORE_POLICY_KEY = "swa_store_policy"
++SWA_STORE_ALL = "all"
++SWA_STORE_CHECKPOINT = "checkpoint"
++# [dsv41-offload] kv_connector_extra_config["align_hits"]: round every
++# offloaded hit down to the lcm of the offloaded groups' chunk sizes (128 for
++# DeepSeek-V4.1), so a host restore resumes where a GPU prefix-cache hit would.
++# Defaults to True under the checkpoint policy and False otherwise.
++ALIGN_HITS_KEY = "align_hits"
++
++
++def is_scratch_group_spec(kv_cache_spec: KVCacheSpec) -> bool:
++    """Whether a group is per-request scratch that is never offloaded."""
++    return not kv_cache_spec.prefix_cacheable
+ 
+ 
+ def get_sliding_window_size_in_chunks(
+     kv_cache_spec: KVCacheSpec, tokens_per_chunk: int
+ ) -> int | None:
++    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
++        # [dsv41-offload] Packed layouts (DeepSeek-V4/V4.1) wrap every group in
++        # UniformTypeKVCacheSpecs; its layers share one attention type, so
++        # they share one window. Before this branch such groups always failed
++        # the FullAttentionSpec assert below.
++        windows = {
++            get_sliding_window_size_in_chunks(spec, tokens_per_chunk)
++            for spec in kv_cache_spec.kv_cache_specs.values()
++        }
++        assert len(windows) == 1, (
++            f"Layers of one KV cache group need one window, got {windows}"
++        )
++        return windows.pop()
++
+     if isinstance(kv_cache_spec, SlidingWindowSpec):
+         assert kv_cache_spec.sliding_window > 0
+         return cdiv(kv_cache_spec.sliding_window, tokens_per_chunk)
+@@ -176,6 +218,11 @@
+     num_workers: int
+     offload_prompt_only: bool
+     supports_partial_tail: bool
++    # [dsv41-offload] Opt-in knobs; the defaults keep upstream behaviour.
++    # True under swa_store_policy="checkpoint".
++    swa_checkpoints: bool = False
++    # Offloaded hits end on a multiple of this many tokens (1 = no rounding).
++    hit_alignment_tokens: int = 1
+ 
+     @classmethod
+     def from_spec(
+@@ -192,6 +239,8 @@
+         full_attn_tokens_per_chunk: set[int] = set()
+         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+             kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
++            if is_scratch_group_spec(kv_spec):
++                continue
+             sw = get_sliding_window_size_in_chunks(
+                 kv_spec, tokens_per_block * spec.blocks_per_chunk
+             )
+@@ -242,6 +291,22 @@
+         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+             kv_cache_group = kv_cache_config.kv_cache_groups[idx]
+             kv_spec = kv_cache_group.kv_cache_spec
++            if is_scratch_group_spec(kv_spec):
++                # [dsv41-offload] Keep the positional slot, offload nothing.
++                kv_group_configs_list.append(
++                    GroupOffloadConfig(
++                        group_idx=idx,
++                        tokens_per_block=tokens_per_block,
++                        tokens_per_chunk=tokens_per_block * spec.blocks_per_chunk,
++                        hashes_per_chunk=0,
++                        sliding_window_size_in_chunks=None,
++                        kv_event_group_spec=get_offloading_event_group_spec(
++                            kv_cache_group
++                        ),
++                        skip=True,
++                    )
++                )
++                continue
+             sw = get_sliding_window_size_in_chunks(
+                 kv_spec, tokens_per_block * spec.blocks_per_chunk
+             )
+@@ -267,7 +332,11 @@
+                 )
+             )
+         kv_group_configs = tuple(kv_group_configs_list)
+-        group_block_sizes = {config.tokens_per_block for config in kv_group_configs}
++        if all(config.skip for config in kv_group_configs):
++            raise ValueError("KV offloading needs at least one cacheable group.")
++        group_block_sizes = {
++            config.tokens_per_block for config in kv_group_configs if not config.skip
++        }
+         has_partial_recurrent_group = any(
+             config.requires_cow_source
+             and config.tokens_per_block > spec.tokens_per_hash
+@@ -286,9 +355,22 @@
+                 for config in kv_group_configs
+             )
+             and not any(config.is_eagle_group for config in kv_group_configs)
++            and not any(config.skip for config in kv_group_configs)
+             and vllm_config.parallel_config.decode_context_parallel_size == 1
+         )
+ 
++        swa_checkpoints, hit_alignment_tokens = _resolve_dsv41_options(
++            getattr(spec, "extra_config", None),
++            kv_group_configs,
++            supports_partial_tail,
++            blocks_per_chunk=spec.blocks_per_chunk,
++            has_mamba=any(
++                isinstance(layer_spec, MambaSpec)
++                for group in kv_cache_config.kv_cache_groups
++                for layer_spec in iter_layer_specs(group.kv_cache_spec)
++            ),
++        )
++
+         return cls(
+             num_workers=vllm_config.parallel_config.world_size,
+             kv_group_configs=kv_group_configs,
+@@ -296,9 +378,75 @@
+             tokens_per_hash=spec.tokens_per_hash,
+             offload_prompt_only=spec.offload_prompt_only,
+             supports_partial_tail=supports_partial_tail,
++            swa_checkpoints=swa_checkpoints,
++            hit_alignment_tokens=hit_alignment_tokens,
+         )
+ 
+ 
++def _resolve_dsv41_options(
++    extra_config: Any,
++    kv_group_configs: tuple[GroupOffloadConfig, ...],
++    supports_partial_tail: bool,
++    blocks_per_chunk: int = 1,
++    has_mamba: bool = False,
++) -> tuple[bool, int]:
++    """[dsv41-offload] Parse swa_store_policy / align_hits.
++
++    Returns (swa_checkpoints, hit_alignment_tokens). With neither key set the
++    result is (False, 1): upstream behaviour.
++    """
++    extra_config = extra_config or {}
++    policy = str(extra_config.get(SWA_STORE_POLICY_KEY, SWA_STORE_ALL))
++    if policy not in (SWA_STORE_ALL, SWA_STORE_CHECKPOINT):
++        raise ValueError(
++            f"{SWA_STORE_POLICY_KEY} must be {SWA_STORE_ALL!r} or "
++            f"{SWA_STORE_CHECKPOINT!r}, got {policy!r}"
++        )
++    swa_checkpoints = policy == SWA_STORE_CHECKPOINT
++    raw_align = extra_config.get(ALIGN_HITS_KEY, swa_checkpoints)
++    if not isinstance(raw_align, bool):
++        raise ValueError(f"{ALIGN_HITS_KEY} must be a bool, got {raw_align!r}")
++    offloaded = [config for config in kv_group_configs if not config.skip]
++    hit_alignment_tokens = (
++        math.lcm(*(config.tokens_per_chunk for config in offloaded))
++        if raw_align
++        else 1
++    )
++    if swa_checkpoints:
++        if not raw_align:
++            raise ValueError(
++                f"{SWA_STORE_POLICY_KEY}={SWA_STORE_CHECKPOINT!r} needs "
++                f"{ALIGN_HITS_KEY}=true: checkpoints sit on aligned boundaries."
++            )
++        if has_mamba or supports_partial_tail:
++            raise ValueError(
++                f"{SWA_STORE_POLICY_KEY}={SWA_STORE_CHECKPOINT!r} does not "
++                "support Mamba groups."
++            )
++        if blocks_per_chunk != 1:
++            raise ValueError(
++                f"{SWA_STORE_POLICY_KEY}={SWA_STORE_CHECKPOINT!r} needs "
++                f"blocks_per_chunk=1, got {blocks_per_chunk}."
++            )
++        if not any(
++            config.sliding_window_size_in_chunks is not None for config in offloaded
++        ):
++            logger.warning(
++                "KV offloading: %s=%r has no sliding-window group to act on.",
++                SWA_STORE_POLICY_KEY,
++                SWA_STORE_CHECKPOINT,
++            )
++    if swa_checkpoints or hit_alignment_tokens > 1:
++        logger.info(
++            "KV offloading: swa_store_policy=%s, hits aligned to %d tokens, "
++            "skipped scratch groups %s",
++            policy,
++            hit_alignment_tokens,
++            [config.group_idx for config in kv_group_configs if config.skip],
++        )
++    return swa_checkpoints, hit_alignment_tokens
++
++
+ @dataclass
+ class RequestGroupState:
+     offload_keys: list[OffloadKey] = field(default_factory=list)
+@@ -332,6 +480,11 @@
+     partial_tail_boundary: int | None = None
+     # True once on_request_finished has been signaled to the manager.
+     finished_signaled: bool = False
++    # [dsv41-offload] swa_store_policy="checkpoint" bookkeeping: aligned
++    # boundaries whose sliding-window window was handed to prepare_store, and
++    # the latest rolling (non prompt-end) checkpoint boundary.
++    swa_ckpt_done: set[int] = field(default_factory=set)
++    swa_rolling_boundary: int | None = None
+ 
+     def __post_init__(self) -> None:
+         self.group_states = tuple(
+@@ -357,6 +510,8 @@
+         for group_config, group_state in zip(
+             self.config.kv_group_configs, self.group_states
+         ):
++            if group_config.skip:
++                continue
+             for req_block_hash in islice(
+                 self.req.block_hashes,
+                 group_config.hashes_per_chunk * len(group_state.offload_keys)
+@@ -504,6 +659,9 @@
+         full_attention_groups: list[int] = []
+         sliding_window_groups: list[int] = []
+         for group_config in self.config.kv_group_configs:
++            if group_config.skip:
++                # [dsv41-offload] scratch groups take no part in lookups.
++                continue
+             if group_config.sliding_window_size_in_chunks is None:
+                 full_attention_groups.append(group_config.group_idx)
+             else:
+@@ -561,6 +719,15 @@
+ 
+         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+ 
++        # [dsv41-offload] Superseded rolling SWA checkpoint keys to free once
++        # their store completes (swa_store_policy="checkpoint" only).
++        self._pending_discards: list[OffloadKey] = []
++        self._swa_ckpt_groups: frozenset[int] = (
++            frozenset(self._sliding_window_groups)
++            if self.config.swa_checkpoints
++            else frozenset()
++        )
++
+     def _maybe_observe_lookup_async_delay(
+         self, req_status: RequestOffloadState
+     ) -> None:
+@@ -667,6 +834,8 @@
+         for group_config, group_state in zip(
+             self.config.kv_group_configs, req_status.group_states
+         ):
++            if group_config.skip:
++                continue
+             if group_config.sliding_window_size_in_chunks is None:
+                 self.manager.touch(group_state.offload_keys, req_status.req_context)
+             else:
+@@ -715,6 +884,10 @@
+                 max_hit_size_tokens = round_down(
+                     max_hit_size_tokens, self._mamba_align_size
+                 )
++        # [dsv41-offload] Resume only where a GPU prefix-cache hit could.
++        hit_alignment = self.config.hit_alignment_tokens
++        if hit_alignment > 1:
++            max_hit_size_tokens = round_down(max_hit_size_tokens, hit_alignment)
+ 
+         num_hit_tokens: int = 0
+         defer_lookup = False
+@@ -726,6 +899,9 @@
+         eagle_verified: set[int] = set()
+         while lookup_groups:
+             looked_up_sliding_window: bool = False
++            # [dsv41-offload] set when alignment rounding moved the bound below
++            # a window an SWA group has just confirmed.
++            realigned = False
+             groups_iter = iter(lookup_groups)
+             lookup_groups = ()
+             for group_idx in groups_iter:
+@@ -803,6 +979,11 @@
+                         max_hit_size_tokens,
+                         tokens_per_chunk * (start_chunk_idx + num_hit_chunks),
+                     )
++                    if hit_alignment > 1:
++                        aligned = round_down(max_hit_size_tokens, hit_alignment)
++                        if aligned < max_hit_size_tokens:
++                            max_hit_size_tokens = aligned
++                            realigned = True
+ 
+                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
+                 if new_num_hit_tokens < tokens_per_chunk:
+@@ -825,6 +1006,11 @@
+                 looked_up_sliding_window |= sliding_window_size_in_chunks is not None
+                 num_hit_tokens = new_num_hit_tokens
+ 
++            if realigned and not lookup_groups and not defer_lookup:
++                # Every window must end exactly on the aligned bound: re-check
++                # all sliding-window groups (full attention is downward closed).
++                lookup_groups = self._sliding_window_groups
++
+         if defer_lookup:
+             logger.debug(
+                 "Offloading manager delayed request %s as backend requested",
+@@ -1018,6 +1204,13 @@
+                 block.block_id for block in group_blocks if block.block_id != 0
+             )
+ 
++            if group_config.skip:
++                # [dsv41-offload] The scratch ring keeps its freshly claimed
++                # block; nothing is loaded into it (as on a GPU prefix hit).
++                group_sizes.append(0)
++                block_indices.append(0)
++                continue
++
+             tokens_per_block = group_config.tokens_per_block
+             tokens_per_chunk = group_config.tokens_per_chunk
+             offload_keys = group_state.offload_keys
+@@ -1075,6 +1268,12 @@
+             if req_status.offloading_context.policy == OffloadPolicy.BLOCK_LEVEL:
+                 group_state.next_stored_chunk_idx = num_chunks
+ 
++        if self.config.swa_checkpoints:
++            # [dsv41-offload] The window ending at the hit is on the host
++            # already; keep stale-block protection on the next windows.
++            req_status.swa_ckpt_done.add(num_cached_tokens)
++            self._set_swa_ckpt_progress(req_status, num_cached_tokens)
++
+         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+         dst_spec = GPULoadStoreSpec(
+             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
+@@ -1319,6 +1518,163 @@
+ 
+         return store_jobs
+ 
++    # ------------------------------------------------------------------
++    # [dsv41-offload] swa_store_policy="checkpoint"
++    #
++    # A resume at aligned boundary b needs, per sliding-window group, only the
++    # W chunks that end at b (W = sliding_window_size_in_chunks). Instead of
++    # storing every SWA chunk (DeepSeek-V4.1: ~25 KB/token/rank, 28x the MLA
++    # bytes), store the window at two boundaries per request:
++    #   * prompt end: b_p = round_down(num_prompt_tokens - 1, A), the hit a
++    #     request with the same prompt (or a re-rendered next turn) can take;
++    #   * rolling: b_r = round_down(computed tokens, A), the latest resume
++    #     point; the previous rolling window is freed once superseded.
++    # A is hit_alignment_tokens. Windows are stored in the step that first
++    # covers b, while the GPU still holds them: b > the tokens computed before
++    # this step, so remove_skipped_blocks has not freed any of their blocks.
++    # next_stored_chunk_idx of a checkpoint group is the first chunk of the
++    # earliest window still to come, so _update_req_states keeps zeroing
++    # reallocated block ids at every position a future store can read.
++    # ------------------------------------------------------------------
++    def _swa_window_chunks(
++        self, group_config: GroupOffloadConfig, boundary: int
++    ) -> range:
++        window = group_config.sliding_window_size_in_chunks
++        assert window is not None
++        window += int(group_config.is_eagle_group)
++        end = boundary // group_config.tokens_per_chunk
++        return range(max(0, end - window), end)
++
++    def _swa_prompt_boundary(self, req_status: RequestOffloadState) -> int:
++        return round_down(
++            req_status.req.num_prompt_tokens - 1, self.config.hit_alignment_tokens
++        )
++
++    def _plan_swa_checkpoints(
++        self, req_status: RequestOffloadState, num_offloadable_tokens: int
++    ) -> tuple[list[int], dict[int, list[int]]]:
++        """Return the boundaries to checkpoint now and, per SWA group, the
++        sorted chunk indices to store for them."""
++        align = self.config.hit_alignment_tokens
++        done = req_status.swa_ckpt_done
++        prompt_boundary = self._swa_prompt_boundary(req_status)
++        candidates: list[int] = []
++        if 0 < prompt_boundary <= num_offloadable_tokens:
++            candidates.append(prompt_boundary)
++        rolling = round_down(num_offloadable_tokens, align)
++        if (
++            rolling > 0
++            and rolling != prompt_boundary
++            and rolling > (req_status.swa_rolling_boundary or 0)
++        ):
++            candidates.append(rolling)
++
++        targets: list[int] = []
++        chunks: dict[int, set[int]] = {}
++        for boundary in candidates:
++            if boundary in done:
++                continue
++            per_group: dict[int, range] = {}
++            complete = True
++            for group_idx in self._swa_ckpt_groups:
++                group_config = self.config.kv_group_configs[group_idx]
++                group_state = req_status.group_states[group_idx]
++                window = self._swa_window_chunks(group_config, boundary)
++                if (
++                    window.stop > len(group_state.offload_keys)
++                    or window.stop > len(group_state.block_ids)
++                    or any(group_state.block_ids[c] == 0 for c in window)
++                ):
++                    complete = False
++                    break
++                per_group[group_idx] = window
++            if not complete:
++                # A window that is not fully resident now never will be:
++                # give the boundary up rather than store a partial window.
++                done.add(boundary)
++                continue
++            targets.append(boundary)
++            for group_idx, window in per_group.items():
++                chunks.setdefault(group_idx, set()).update(window)
++        return targets, {g: sorted(c) for g, c in chunks.items()}
++
++    def _finish_swa_checkpoints(
++        self,
++        req_status: RequestOffloadState,
++        num_offloadable_tokens: int,
++        targets: list[int],
++        stored: bool,
++    ) -> None:
++        if not self._swa_ckpt_groups:
++            return
++        if stored:
++            prompt_boundary = self._swa_prompt_boundary(req_status)
++            req_status.swa_ckpt_done.update(targets)
++            new_rolling = max(
++                (b for b in targets if b != prompt_boundary), default=None
++            )
++            if new_rolling is not None:
++                old_rolling = req_status.swa_rolling_boundary
++                req_status.swa_rolling_boundary = new_rolling
++                if old_rolling is not None and old_rolling not in (
++                    prompt_boundary,
++                    new_rolling,
++                ):
++                    self._queue_swa_discard(
++                        req_status, old_rolling, keep=(prompt_boundary, new_rolling)
++                    )
++        self._set_swa_ckpt_progress(req_status, num_offloadable_tokens)
++
++    def _queue_swa_discard(
++        self,
++        req_status: RequestOffloadState,
++        boundary: int,
++        keep: tuple[int, ...],
++    ) -> None:
++        for group_idx in self._swa_ckpt_groups:
++            group_config = self.config.kv_group_configs[group_idx]
++            group_state = req_status.group_states[group_idx]
++            kept: set[int] = set()
++            for keep_boundary in keep:
++                if keep_boundary > 0:
++                    kept.update(self._swa_window_chunks(group_config, keep_boundary))
++            for chunk_idx in self._swa_window_chunks(group_config, boundary):
++                if chunk_idx not in kept and chunk_idx < len(group_state.offload_keys):
++                    self._pending_discards.append(group_state.offload_keys[chunk_idx])
++
++    def _set_swa_ckpt_progress(
++        self, req_status: RequestOffloadState, num_tokens: int
++    ) -> None:
++        """Point next_stored_chunk_idx of checkpoint groups at the first chunk
++        of the earliest window a later step may store."""
++        if not self._swa_ckpt_groups:
++            return
++        align = self.config.hit_alignment_tokens
++        done = req_status.swa_ckpt_done
++        pending = [round_down(num_tokens, align) + align]
++        rolling = round_down(num_tokens, align)
++        if rolling > 0 and rolling not in done:
++            pending.append(rolling)
++        prompt_boundary = self._swa_prompt_boundary(req_status)
++        if prompt_boundary > 0 and prompt_boundary not in done:
++            pending.append(prompt_boundary)
++        for group_idx in self._swa_ckpt_groups:
++            group_config = self.config.kv_group_configs[group_idx]
++            req_status.group_states[group_idx].next_stored_chunk_idx = min(
++                self._swa_window_chunks(group_config, b).start for b in pending
++            )
++
++    def _process_pending_discards(self) -> None:
++        if not self._pending_discards:
++            return
++        discard = getattr(self.manager, "discard", None)
++        if discard is None:
++            self._pending_discards.clear()
++            return
++        # Keys whose store is still in flight come back for another try.
++        still_pending = discard(self._pending_discards)
++        self._pending_discards = list(still_pending)[-65536:]
++
+     def _build_store_jobs(
+         self,
+         scheduler_output: SchedulerOutput,
+@@ -1337,7 +1693,11 @@
+             if req.status is RequestStatus.FINISHED_ABORTED:
+                 num_tokens_after_batch = req.num_computed_tokens
+             elif req.is_finished():
+-                num_tokens_after_batch = req.num_tokens
++                # [dsv41-offload] Backport of upstream main: the final sampled
++                # token's KV slot is never written (async scheduling may also
++                # leave a discarded step's KV there), so a chunk ending on it
++                # must not be stored under the full-prefix hash.
++                num_tokens_after_batch = max(req.num_prompt_tokens, req.num_tokens - 1)
+             else:
+                 num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                 num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
+@@ -1346,12 +1706,29 @@
+                 req_status, num_tokens_after_batch
+             )
+ 
++            # [dsv41-offload] Checkpoint policy: which SWA windows to store.
++            ckpt_targets: list[int] = []
++            ckpt_chunks: dict[int, list[int]] = {}
++            if self._swa_ckpt_groups:
++                ckpt_targets, ckpt_chunks = self._plan_swa_checkpoints(
++                    req_status, num_offloadable_tokens
++                )
++
+             # Filter out chunks skipped due to sliding window attention / SSM
+             # or unreachable by the load path's alignment constraints.
+             new_offload_keys: list[OffloadKey] = []
+             for group_config, group_state in zip(
+                 self.config.kv_group_configs, req_status.group_states
+             ):
++                if group_config.skip:
++                    continue
++                if group_config.group_idx in self._swa_ckpt_groups:
++                    new_offload_keys.extend(
++                        group_state.offload_keys[chunk_idx]
++                        for chunk_idx in ckpt_chunks.get(group_config.group_idx, ())
++                    )
++                    continue
++
+                 num_chunks = req_status.storable_chunks(
+                     group_config, group_state, num_offloadable_tokens
+                 )
+@@ -1398,6 +1775,9 @@
+ 
+             if not new_offload_keys:
+                 req_status.advance_stored_idx(num_offloadable_tokens)
++                self._finish_swa_checkpoints(
++                    req_status, num_offloadable_tokens, ckpt_targets, stored=True
++                )
+                 continue
+ 
+             store_output = self.manager.prepare_store(
+@@ -1408,10 +1788,16 @@
+                     _ConnectorMetricName.ALLOCATION_FAILURE
+                 )
+                 logger.warning("Request %s: cannot store chunks", req_id)
++                self._finish_swa_checkpoints(
++                    req_status, num_offloadable_tokens, ckpt_targets, stored=False
++                )
+                 continue
+ 
+             if not store_output.keys_to_store:
+                 req_status.advance_stored_idx(num_offloadable_tokens)
++                self._finish_swa_checkpoints(
++                    req_status, num_offloadable_tokens, ckpt_targets, stored=True
++                )
+                 continue
+ 
+             self._touch(req_status)
+@@ -1426,9 +1812,14 @@
+             for group_config, group_state in zip(
+                 self.config.kv_group_configs, req_status.group_states
+             ):
++                if group_config.skip:
++                    group_sizes.append(0)
++                    block_indices.append(0)
++                    continue
+                 is_sliding_window = (
+                     group_config.sliding_window_size_in_chunks is not None
+                 )
++                is_ckpt_group = group_config.group_idx in self._swa_ckpt_groups
+                 num_chunks = req_status.storable_chunks(
+                     group_config, group_state, num_offloadable_tokens
+                 )
+@@ -1436,14 +1827,20 @@
+                 block_ids = group_state.block_ids
+                 num_group_blocks = 0
+                 start_gpu_block_idx: int | None = None
+-                for idx, offload_key in enumerate(
+-                    group_state.offload_keys[start_chunk_idx:num_chunks]
+-                ):
++                # Same chunks as slicing offload_keys[start_chunk_idx:num_chunks].
++                chunk_indices: Iterable[int] = (
++                    ckpt_chunks.get(group_config.group_idx, ())
++                    if is_ckpt_group
++                    else range(
++                        start_chunk_idx,
++                        min(num_chunks, len(group_state.offload_keys)),
++                    )
++                )
++                for chunk_idx in chunk_indices:
++                    offload_key = group_state.offload_keys[chunk_idx]
+                     if offload_key not in keys_to_store:
+                         continue
+ 
+-                    chunk_idx = start_chunk_idx + idx
+-
+                     self._events_tracker.record_store(
+                         req, group_config, chunk_idx, offload_key
+                     )
+@@ -1464,9 +1861,13 @@
+ 
+                 group_sizes.append(num_group_blocks)
+                 block_indices.append(start_gpu_block_idx or 0)
+-                group_state.next_stored_chunk_idx = max(
+-                    group_state.next_stored_chunk_idx, num_chunks
+-                )
++                if not is_ckpt_group:
++                    group_state.next_stored_chunk_idx = max(
++                        group_state.next_stored_chunk_idx, num_chunks
++                    )
++            self._finish_swa_checkpoints(
++                req_status, num_offloadable_tokens, ckpt_targets, stored=True
++            )
+ 
+             src_spec = GPULoadStoreSpec(
+                 src_block_ids, group_sizes=group_sizes, block_indices=block_indices
+@@ -1552,6 +1953,7 @@
+ 
+         partial_store_jobs = self._build_partial_tail_store_jobs(scheduler_output)
+         normal_store_jobs = self._build_store_jobs(scheduler_output)
++        self._process_pending_discards()
+         meta = OffloadingConnectorMetadata(
+             load_jobs=self._current_batch_load_jobs,
+             store_jobs=partial_store_jobs | normal_store_jobs,
+@@ -1756,6 +2158,9 @@
+                 group_state.next_stored_chunk_idx = 0
+             status.transfer_jobs.clear()
+             status.partial_tail_boundary = None
++            status.swa_ckpt_done.clear()
++            status.swa_rolling_boundary = None
++        self._pending_discards.clear()
+ 
+         # Discard jobs and save job_counter to be able to discard worker responses
+         self._stale_job_threshold = self._job_counter
+--- a/vllm/v1/kv_offload/cpu/manager.py
++++ b/vllm/v1/kv_offload/cpu/manager.py
+@@ -284,6 +284,40 @@
+                 )
+             )
+ 
++    def discard(self, keys: Iterable[OffloadKey]) -> list[OffloadKey]:
++        """[dsv41-offload] Drop idle cached blocks ahead of LRU eviction.
++
++        Used only by the scheduler's ``swa_store_policy="checkpoint"`` mode to
++        free a superseded sliding-window checkpoint. A key is removed only if
++        it is stored, ready and idle (ref_cnt == 0): blocks being loaded are
++        kept. Missing keys are ignored.
++
++        Returns:
++            The keys whose store is still in flight; the caller may retry them
++            once the store completes.
++        """
++        removed: list[OffloadKey] = []
++        still_pending: list[OffloadKey] = []
++        for key in keys:
++            block = self._policy.get(key)
++            if block is None:
++                continue
++            if not block.is_ready:
++                still_pending.append(key)
++                continue
++            if block.ref_cnt != 0:
++                continue
++            self._policy.remove(key)
++            self._num_evictable_cache_blocks -= 1
++            assert self._num_evictable_cache_blocks >= 0
++            self._free_block(block)
++            removed.append(key)
++        if removed and self.events is not None:
++            self.events.append(
++                OffloadingEvent(keys=removed, medium=self.medium, removed=True)
++            )
++        return still_pending
++
+     @override
+     def reset_cache(self) -> None:
+         # Clear ALL blocks unconditionally. The scheduler's _stale_job_threshold
+--- a/vllm/v1/kv_offload/cpu/spec.py
++++ b/vllm/v1/kv_offload/cpu/spec.py
+@@ -162,6 +162,12 @@
+     def _uses_shared_region(self) -> bool:
+         """Whether the worker CPU buffer is the shared mmap region (vs a private
+         per-rank tensor); replicated-layout dedup is gated on this being True."""
++        # [dsv41-offload] kv_connector_extra_config["shared_region"]=false keeps
++        # the host cache in private pinned tensors (torch pin_memory) instead of
++        # a /dev/shm mmap, for hosts whose /dev/shm is smaller than the cache.
++        # Default true: unchanged behaviour.
++        if not bool(self.extra_config.get("shared_region", True)):
++            return False
+         return current_platform.is_cuda_alike()
+ 
+     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:

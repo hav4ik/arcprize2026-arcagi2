@@ -7,6 +7,113 @@ Quality: the 120 ARC-AGI-2 eval tasks with the same harness, full vs pruned on t
 The plan pack (the user's upload, unzipped) is in `plan/` (START_HERE.md, REAP_IMPLEMENTATION_CONTRACT.md,
 TASKS_ENGRAM_FIRST.md, ...). Deployment counterpart: E042 (session dsv4-infer).
 
+## Offline follow-ups after the box (2026-10-25/26; no box, no API spend)
+
+Detailed reports: `analysis/typos/REPORT.md`, `analysis/doubt/REPORT.md`, `analysis/layer_alloc/NOTES.md`.
+
+- **E120 / merging what-ifs.** Method: E042's `deadline_sim.py` (335 pairs, KV ratio 0.83, pod B's thrash), with
+  wrappers `e120_sim.py` and `merge_sim.py` in the session scratchpad.
+  - E042's E112 pool included the anomalous a1/r3 runs. With clean E112 (main a0 + r2), no-deadline pass@2 is
+    76.7 vs 75.2.
+  - An E120 at the E128/E112 midpoint gains about +1.2 pp only under KV thrash, and 0 without it. Not worth a box.
+  - **Redone after E042's L2 (2026-10-26 17:00 UTC)**: thrash is KV-capacity-driven and drops throughput to x0.3,
+    not x0.6. Method: `analysis/e120/` on E046's task-level `multi_sim` (240 tasks, multi-test jobs, KV gate,
+    seeds of `goal75/kvcap.py`, whose 69.2 / 72.5 / 73.3 it reproduces). Best config per row over x32-x64 and
+    gate 0.6/0.7, 60 reps (sd 3-5 per rep, so treat differences below ~1 point as ties).
+    - Pools for E112 and E120 have no multi-test records. They use synthetic multi jobs: every combination of
+      one per-pair record per pair, with tokens x0.715 to match E128's real multi run. Proxy check: the one-attempt
+      ceiling is 71.6 synthetic vs 71.7 real.
+    - E120's accuracy is interpolated in two ways that agree: pooled E128+E112 records (one-attempt ceiling
+      70.2), or E128 records with 2.1% of right answers flipped to wrong (69.9). E128 is 71.6 and E112 68.7.
+    - Results, as the E128-real / synthetic pair or the flip / mix proxies:
+
+      | KV (Kaggle util 0.938) | E128 | E120 | E112 |
+      |---|---|---|---|
+      | own pool (x1.0 / x1.37 / x1.74) | 69.7 / 70.4 | 71.7 / 71.8 | 70.9 |
+      | E128 accuracy at x1.37 | 73.5 / 73.1 | | |
+      | own pool + util 0.97 (+0.37M) | 72.4 / 72.4 | 72.7 / 72.4 | 71.5 |
+      | same, tokens x0.9 | 74.3 / 73.9 | 74.4 / 74.3 | 73.3 |
+
+    - E120's KV is worth +2.7 to +3.8 at E128 accuracy, which agrees with E042. Its −1.5 pp pass@1 takes back
+      about 1.3, leaving +1.3 to +2.1 over E128 today.
+    - The same KV comes free from util 0.97 on E128, if that is stable. With util 0.97, E120 adds only 0 to +0.3,
+      because KV above x1.3 has diminishing returns. Verdict unchanged: not worth a box unless util cannot be
+      raised. Inputs that are estimates: E120 KV (half E112's measured gain), E120 accuracy (no E120 run), and
+      speed s (s 1.04 instead of 1.064 costs 0.4).
+  - The best case for merging (E112 memory, 2.71M KV tokens, at E128 accuracy) is +2.6 to +4.5 pp over E128
+    today. That is a ceiling; the REAP paper found merging worse than pruning on generative tasks.
+- **E050 token buckets, effort 25 vs 50** (`analysis/e050/NOTES.md`).
+  - Effort 25 makes turns 11% shorter, but takes about one more turn and reaches the first passing check later. It
+    then spends 1.9K fewer tokens after the pass.
+  - Net +1.2K [−2.0, +4.6] per task. Thinking share, doubt markers and errors are unchanged.
+  - At effort 50, tokens split into post-pass 14%, never-pass 39%, pre-pass 43% and error recovery 5.6%.
+  - Effort is not a token lever. The post-pass note is the remaining structural candidate.
+- **Typos are a sub-word composition failure** (`analysis/typos/`).
+  - Identifier errors per 100 calls: full 0.2-0.4, E128 8.2, E112 18.7, E96 22.8. Logic errors are not elevated.
+  - 90-94% of misspelled names are multi-token. The first token is right in 86-92%, and the error starts at
+    token index 1 in 82%.
+  - BPE splits a name differently after a space vs after punctuation (` comps` = `Ġcomp|s`, `=comps` = `= com|ps`).
+    The pruned models mix the pieces of the two splits (`com`+`s` -> `coms`): 31-49% of typos, vs 0.2% by chance.
+    `comps` after a space has 0 typos in 5,971 uses.
+  - Typos cost turns (E96: 58 turn-cap stops), not per-attempt accuracy (fixed-effects beta +0.01).
+  - Harness fix, replayed locally: retry once with the unique close name. The cell completes in 61% / 52% / 45%
+    of identifier errors (E128 / E112 / E96), and the rewrite matches the model's own fix 89-93% of the time.
+  - Weighting candidate: word-internal continuation tokens. They cover about 70% of typo loci at 6% of code tokens.
+  - The fix is now a standalone module, `evals/auto_repair.py` (`propose(code, error_text, session_names)`), with
+    tests in `evals/tests/test_auto_repair.py`. dsv4-infer asked for it and integrates it behind an opt-in flag;
+    `run_deepseek_tools.py` is untouched.
+    - It refuses when the part of the cell that ran changed session state.
+    - Against the replay's rules it agrees in 99% of 3,410 errors. With its defaults it keeps 241 of 250 working
+      E128 repairs.
+    - Two rules were added after the disagreement check (`repair_disagreements.py`):
+      - positional `dbool` becomes `dtype=bool`;
+      - names shorter than 4 characters are not repaired.
+    - After that, the rewrite differs from the model's own fix in 1 of 76 labelled E128 cases (before: 12 of 87).
+- **Longer reasoning is more steps, not more doubt** (`analysis/doubt/`).
+  - E128 is +7.8K tokens per attempt vs API full, with the same thinking per turn and +3.1 turns.
+  - Core doubt markers per word are not higher (9.7 vs 10.5 per 1K words). Hedges are ("maybe" +37%, "?" +47%).
+  - Split of the extra tokens:
+
+    | bucket | share |
+    |---|---:|
+    | error recovery | 15-27% |
+    | after the first passing check | 12% |
+    | exploration before it | 33% |
+    | attempts that never pass | 39% |
+
+  - Markers are mostly productive (59-68% in a blind audit). In the full model "Wait" marks the correct attempt
+    (30/37 pairs).
+  - Not recommended: a logit bias on "Wait", and hard caps (60K: -7% tokens for -2.7 pp pass@1).
+- **No quitting; the pruned models fail to give up** (`analysis/giving_up/giving_up.py`).
+  - Not more frequent in pruned models:
+    - giving-up language (E128 16.8% of attempts vs API full 22.5%);
+    - early best-guess submits;
+    - trivial answers (0-1 per model);
+    - stalling before the first train check (that check comes earlier: median turn 0 vs 1);
+    - a drop in effort late in failing attempts (last 3 turns 0.85x of the attempt's mean thinking vs 0.66x).
+  - What does differ: attempts that never pass a check run to a cap instead of submitting.
+
+    | model | never-pass attempts that run to a cap |
+    |---|---:|
+    | API full | 8 of 82 |
+    | E128 | 32 of 91 |
+    | E112 | 47 of 112 |
+    | E96 | 51 of 135 |
+
+  - Cap stops are 23.9% of E128's tokens (full 6.1%), and 1 of 38 is correct.
+  - "Stop if no passing check by 60K": -6.4% tokens, at most 7 correct attempts lost (E128).
+    - dsv4-infer's 12-h Kaggle simulator gives no gain (70.3 -> 69.9-70.1; with tokens x0.85, 77.2 -> 76.2-77.3).
+      The freed tokens only buy low-value second attempts. Not adopted (`E046_multi_test_rollout/goal75/`).
+    - Only shorter attempts that still pass move the projection.
+  - Preloaded helpers would barely shorten attempts. Self-written helper-like functions (components, bbox, crop,
+    flood fill, check) are only 0.4% of E128's output (API full 0.5%).
+- **Per-layer expert counts** (`analysis/layer_alloc/`): +3 to +7 uniform-equivalent experts at equal memory, or
+  2-5% less expert memory at equal loss. The norm-based and selection-based proxies disagree on layers 36-39,
+  where one expert holds 55-80% of the norm. Decode speed is unchanged at equal total experts.
+- **No box needed for new keep sets.** The per-token observer records and token streams on HF
+  (`chankhavu/dsv41-flash1017-e043-pruning-artifacts`: `obs/main` 17.4 GB, `tok/calib` 1.3 GB) allow new token-class
+  weights offline. GPTQ and the eval still need GPUs.
+
 ## Wrap-up (2026-10-24 22:45 UTC)
 
 The 8x box (Vast 57370044) was destroyed at the user's request after the wrap-up (23:09 UTC). Everything needed

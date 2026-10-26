@@ -33,5 +33,21 @@ Known weakness: a program that memorises the training outputs (a lookup table) p
 ## Files
 `gen.py` (sampling, resumable), `validate.py` (sandbox checks, resumable), `score.py`, `scripts/` (box scripts).
 
-## Results
-(pending)
+## Results (2026-10-24): does not work; stopped after the pilot
+- Pilot v1 (6000-token cap): without thinking the model reasons inside code comments ("Let's look at Ex 2 again...
+  WAIT."); 12-26 of 32 samples per request hit the cap. Stopped.
+- Pilot v2 (3000-token cap, "no reasoning inside the code"), 10 random eval tasks x 3 arms x 32 samples = 960:
+
+  | Arm | parsed | hit cap | train-pass | tokens/sample |
+  |---|---|---|---|---|
+  | code | 55.0% | 33.8% | 0.3% | 2,065 |
+  | rulecode | 93.4% | 41.2% | 0.0% | 1,793 |
+  | rulecode_loo | 93.8% | 44.1% | 0.0% | 1,888 |
+
+  **pass@2 0.00 / 10.** 775 unique programs: 670 got zero training pairs right, 38 syntax/indentation errors (cut-off
+  code), the rest runtime errors. Only 1ae2feb7 had partial fits (5 programs; 1 passed all train pairs, wrong on test).
+  LOO: 2 programs fit every shown pair, 0 also fit the held-out pair.
+- Control (10 random ARC-AGI-2 *training* tasks, code arm, 8 samples): 1.00 / 10 (6.2% of samples train-pass), so the
+  pipeline and scoring work; the model cannot write ARC-AGI-2 eval solvers in one shot without thinking.
+- Throughput: ~1,000 tok/s on 4x3090 TP4 (FP8 Marlin), KV 721k tokens. The full 120-task run (~8 h) was not done.
+- The box (Vast 57428605) was destroyed by the user on 2026-10-25; results files are in `results/`.
