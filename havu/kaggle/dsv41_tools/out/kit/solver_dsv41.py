@@ -65,7 +65,7 @@ MAX_TURNS = int(E("ARC_MAX_TURNS", "40"))
 STOP_NEW_S = float(E("ARC_STOP_NEW_S", 10 * 3600 + 50 * 60))
 FORCE_AT_S = float(E("ARC_FORCE_AT_S", 11 * 3600 + 10 * 60))
 HARD_STOP_S = float(E("ARC_HARD_STOP_S", 11 * 3600 + 30 * 60))
-UP_TIMEOUT_S = float(E("ARC_SERVER_UP_TIMEOUT_S", 3000))
+UP_TIMEOUT_S = float(E("ARC_SERVER_UP_TIMEOUT_S", 7200))  # /kaggle/input is FUSE: 131 GB at ~50 MB/s is ~45 min
 MAX_RESTARTS = int(E("ARC_MAX_SERVER_RESTARTS", "1"))
 RESTART_MIN_LEFT_S = float(E("ARC_RESTART_MIN_LEFT_S", 2700))
 JOB_TRIES = int(E("ARC_JOB_TRIES", "2"))
@@ -73,6 +73,10 @@ CONN_TRIES = int(E("ARC_CONN_TRIES", "4"))  # extra re-queues for attempts lost 
 CONN_ERRORS = ("Connection", "ConnectError", "RemoteProtocolError", "ReadError", "Server disconnected",
                "Incomplete stream", "Connection refused", "ReadTimeout")
 TASK_LIMIT = int(E("ARC_TASK_LIMIT", "0"))
+TASK_IDS = [t for t in E("ARC_TASK_IDS", "").split(",") if t]  # smoke tests: these tasks instead of the first N
+# E046 (opt-in): one attempt per task for tasks with several test inputs (all test inputs in one rollout, the answer
+# is a list of grids). On Flash-1017 it ties per-pair attempts (pass@2 82.6% vs 85.9%) at -41% tokens per task.
+MULTI_TEST = E("ARC_MULTI_TEST", "0") == "1"
 ATTEMPTS = int(E("ARC_ATTEMPTS", "2"))
 LOOP_WINDOW = int(E("ARC_LOOP_WINDOW", "1000"))
 LOOP_EVERY = int(E("ARC_LOOP_EVERY", "1000"))
@@ -85,6 +89,11 @@ EXEC_MEM_MB = int(E("ARC_EXEC_MEM_MB", "4096"))
 SALT = E("ARC_CACHE_SALT", "kaggle")
 WRAPUP_S = float(E("ARC_WRAPUP_S", "900"))  # wall-clock note in tool outputs this long before the force deadline
 MIN_ATTEMPT_TOKENS = float(E("ARC_MIN_ATTEMPT_TOKENS", "15000"))  # admission: time left x per-stream rate
+# E042 KV-gated admission (opt-in, 0 = off): above ARC_KV_ADMIT_MIN_WORKERS running, start an attempt only while
+# vLLM's KV usage is below ARC_KV_ADMIT_MAX. Pod B, E128 x 56: at KV ~0.89 the cached prefixes of streams between
+# turns are evicted and every turn re-prefills (381 -> 196 tok/s, uncached 130 -> 438 tok/s).
+KV_ADMIT_MAX = float(E("ARC_KV_ADMIT_MAX", "0"))
+KV_ADMIT_MIN_WORKERS = int(E("ARC_KV_ADMIT_MIN_WORKERS", "16"))
 STAGE_DONE = E("ARC_STAGE_DONE", "")  # marker file written by the notebook's model-staging copy
 STAGE_WAIT_S = float(E("ARC_STAGE_WAIT_S", "2400"))
 BIG = 10 ** 9  # completion tokens reported for a cut stream: the harness then stops on its output budget
@@ -483,7 +492,8 @@ def make_args():
             return {"train_pass": None, "train_frac": None, "train_trace": "skipped_deadline"}
         return orig_tc(*a, **kw)
     h.train_check = train_check
-    return h.parser().parse_args(HARNESS + ["--max-turns", str(MAX_TURNS), "--base-url", URL + "/v1",
+    return h.parser().parse_args(HARNESS + (["--multi-test"] if MULTI_TEST else []) + [
+                                            "--max-turns", str(MAX_TURNS), "--base-url", URL + "/v1",
                                             "--extra-body", json.dumps(EXTRA_BODY), "--sandbox-url", "local",
                                             "--attempts", str(ATTEMPTS)])
 
@@ -501,7 +511,9 @@ def run_attempt(args, task, t, p, a):
     client = GuardedClient(OpenAI(api_key="none", base_url=URL + "/v1", max_retries=0,
                                   timeout=httpx.Timeout(7200, connect=30, read=900)))
     t1 = time.time()
-    trace, result = h.solve(client, args, task, task["test"][p]["input"], session_factory=session_factory)
+    multi = MULTI_TEST and len(task["test"]) > 1
+    trace, result = h.solve(client, args, task, task["test"][p]["input"], session_factory=session_factory,
+                            **({"test_inputs": [x["input"] for x in task["test"]]} if multi else {}))
     result.update({"task_id": t, "pair": p, "attempt": a, "wall_s": round(time.time() - t1, 1),
                    "cuts": client.stats, "t_end_h": round(elapsed() / 3600, 3)})
     if client.stats:
@@ -531,6 +543,16 @@ def pick(queue):
             if k == 0:
                 break
     return best
+
+
+def split_multi(rec, task):
+    """E046: a --multi-test attempt (pred = list of grids, one per test input) as one record per pair; the train
+    label (the program behind test input 0) applies to every pair."""
+    n = rec.get("multi_test")
+    if not n:
+        return [rec]
+    preds = rec["pred"] if isinstance(rec.get("pred"), list) and len(rec["pred"]) == n else [None] * n
+    return [dict(rec, pair=q, pred=preds[q], **({"multi_share": True} if q else {})) for q in range(n)]
 
 
 def score(tasks):
@@ -568,6 +590,27 @@ def server_metrics():
                 except ValueError:
                     pass
     return m
+
+
+def kv_admits(n_running):
+    """KV-gated admission: True if one more attempt may start now. KV usage is re-read at most every 10 s; a launch
+    near the threshold waits for a fresh reading, since the new attempt's prompt is not in KV yet."""
+    if KV_ADMIT_MAX <= 0 or n_running < KV_ADMIT_MIN_WORKERS:
+        return True
+    now = time.time()
+    if now - STATE.get("kv_t", 0) >= 10:
+        m = server_metrics()
+        STATE["kv_t"], STATE["kv"] = now, (m or {}).get("kv_cache_usage_perc")
+        STATE["kv_read"] = STATE["kv"]
+    kv = STATE.get("kv")
+    ok = kv is None or kv < KV_ADMIT_MAX
+    if ok and kv is not None and kv >= KV_ADMIT_MAX - 0.1:
+        STATE["kv"] = KV_ADMIT_MAX  # one launch per reading in the last 10 points below the threshold
+    if not ok and now - STATE.get("kv_gate_logged", 0) >= 300:
+        STATE["kv_gate_logged"] = now
+        log(f"KV gate: usage {STATE.get('kv_read') or kv:.3f} (limit {KV_ADMIT_MAX}); holding new attempts at "
+            f"{n_running} running")
+    return ok
 
 
 def throughput():
@@ -624,6 +667,8 @@ def main():
     # tasks that get attempts.
     all_tasks = json.loads(Path(CHALLENGES).read_text())
     tasks = dict(list(sorted(all_tasks.items()))[:TASK_LIMIT]) if TASK_LIMIT else all_tasks
+    if TASK_IDS:
+        tasks = {t: all_tasks[t] for t in TASK_IDS if t in all_tasks}
     write_fallback(all_tasks)
     n_pairs = sum(len(x["test"]) for x in tasks.values())
     log(f"fallback submission written ({len(all_tasks)} tasks); attempting {len(tasks)} tasks, {n_pairs} pairs; deadlines: stop-new "
@@ -670,7 +715,9 @@ def main():
 
     size = {t: len(json.dumps(x["train"])) + max(len(json.dumps(y["input"])) for y in x["test"]) for t, x in tasks.items()}
     order = sorted(tasks, key=lambda t: size[t])
-    queue = [(t, p, a, 0) for a in range(ATTEMPTS) for t in order for p in range(len(tasks[t]["test"]))]
+    # E046 --multi-test: pair 0's job answers every test input of its task
+    queue = [(t, p, a, 0) for a in range(ATTEMPTS) for t in order
+             for p in range(1 if MULTI_TEST else len(tasks[t]["test"]))]
     running, done, errors = {}, 0, 0
     conn_retries = {}  # (task, pair, attempt) -> re-queues after server-side connection errors
     rates = []  # completion tokens per wall second of finished, uncut attempts
@@ -709,7 +756,7 @@ def main():
             # "connection refused" (T2, 2026-10-24).
             while (queue and len(running) < WORKERS and STATE["server_ok"] and not STATE["forced"]
                    and STATE["server"] is not None and STATE["server"].poll() is None
-                   and elapsed() < STOP_NEW_S and not STATE.get("admission_closed")):
+                   and elapsed() < STOP_NEW_S and not STATE.get("admission_closed") and kv_admits(len(running))):
                 t, p, a, tries = queue.pop(pick(queue))
                 running[pool.submit(run_attempt, args, tasks[t], t, p, a)] = (t, p, a, tries)
             if not running:
@@ -746,7 +793,8 @@ def main():
                 if not rec.get("cuts") and rec.get("wall_s") and rec.get("usage", {}).get("completion"):
                     rates.append(rec["usage"]["completion"] / rec["wall_s"])
                 with LOCK:
-                    RECORDS.setdefault((t, p), []).append(rec)
+                    for r in split_multi(rec, tasks[t]):
+                        RECORDS.setdefault((t, r["pair"]), []).append(r)
                 write_submission(all_tasks)
                 log(f"[{done}] {t}.{p}#{a} pred={'yes' if rec.get('pred') else 'no'} stop={rec.get('stop_reason')} "
                     f"turns={rec.get('turns')} out={rec.get('usage', {}).get('completion')} "

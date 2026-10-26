@@ -1498,3 +1498,246 @@ id −1 → zero row) and a REAP observer on `MarlinExperts.moe_sum`. The export
   pages (reclaimable page cache) plus the destination. vLLM's default load strategy is lazy mmap (prefetch on a
   network FS); only an explicit `--safetensors-load-strategy eager` reads whole files into anonymous memory.
   An earlier warning to E043 about per-worker full copies was retracted.
+
+### TPS round on the eval set (2026-10-25 00:00–03:40 UTC; notebook pipeline, `--token-exact`, 120 tasks / 172 pairs)
+
+Every point is the real notebook path (`kaggle/dsv41_tools`, kit `chankhavu/dsv41-tools-kit-dev`) on the
+competition's evaluation file, with E043's harness (sub80s40 + minimal header).
+
+| run | box | model | streams | gen tok/s at the plateau | hits | KV peak | notes |
+|---|---|---|---:|---|---|---:|---|
+| eval-bench w48 | **Kaggle 4×L4** | E128 | 48 | **322–366, mean ≈ 345** (0.45–1.74 h) | 95–98% | 0.75 | 0 preemptions; server up 635 s; warm-up 122 GiB in 169 s (739 MiB/s) |
+| w64 | pod B (EPYC 7542) | E128 | 64 | peak 401 at 0.5 h, then 387 → 356 → 325 | 93–96% | 0.66 | falls once KV > 0.55 |
+| e112_w96 | pod B | E112 | 96 | peak 429.5, 366–414 | 94–97% | 0.39 | KV 2.57M |
+| **e112_w96_hlin** | pod B | E112 | 96 | **429–449, mean ≈ 434** | 95–97% | 0.40 | `--linear-backend humming`: about +10% vs e112_w96 at equal run age |
+
+- **Kaggle w48 eval result:** 91 attempts, 0 errors. 63 attempts finished (smallest tasks first) and 52 of their
+  answers are correct. 28 were cut at the force deadline as designed. Admission closed at 1.73 h (36 min before
+  force). Uncut mean output was 22.7K tokens.
+- **The steady state is set by prefill/decode interference, not KV.** Across runs, about −60 gen tok/s per
+  +100 tok/s of uncached prefill: a step with a 2048-token chunk takes about 1.5 s while every stream waits.
+  Uncached prefill rises as finished attempts are replaced (first prompts of 4–15K) and tool outputs arrive.
+- **Humming dense (`HummingMxfp8LinearKernel`)** is confirmed active in the log. It costs +0.04 GiB and −2.3% KV, so
+  it is a free ≈ +10% on real traffic. Adopt it for the next submission (E128 at 48: ≈ 345 → ≈ 380 expected).
+- **Rejected:** FP4 KV (the fork refuses it; fp8 already selects V4.1's native mixed FP8/FP4 KV). llama.cpp + CPU
+  expert offload (V4.1 support only in a draft PR; prefix reuse corrupts output, issue #30944; expected 40–100 tok/s
+  aggregate at 48 slots because of CPU bandwidth). Project Maya's DeepSeek engine (one conversation at a time).
+- **Next lever:** CED bounded-replay prefill (`ced_prefill`, ≈ 1.9× prefill in P12b). Its tail buffer is sized
+  128 + vision tokens per sequence (≈ 45 MB/seq/GPU), and it needs MBT ≥ 128 × max_num_seqs. A language-only window
+  plus a cap on requests finishing prefill per step would make it fit.
+- **e112_w128_hlin final** (pod B, E112 × 128, Humming dense, stop-new 75 min): 448–504 tok/s from 0.80 h to the
+  force cut at 1.42 h (468.6 / 476.0 / 468.2 / 476.1 / 416.7 / 447.9 / 470.7 / 504.3), hits 95–98.5%, KV ≤ 0.65,
+  0 preemptions. Admission closed at 0.76 h: its per-stream rate (median tokens / wall time of finished attempts,
+  1.3 tok/s) counts the ~25 min the first 128 attempts queued behind the cold prefills, so at high concurrency it
+  closes far too early. 27 attempts submitted, 105 cut at force (1 of them correct).
+
+### Deadline simulation: can attempts finish in 12 h? (`scripts/deadline_sim.py`, 2026-10-25)
+
+User question: with only ~4–8 tok/s per stream, do attempts finish at all? The script replays E043's real attempts
+(E128: 334, mean 35.2K completion tokens, p90 72.6K, cap 80K; E112: base + r2 + r3) through the solver's schedule
+(smallest tasks first, then second attempts with non-train-passed pairs first; stop-new 10h50, force 11h10;
+15K-token admission rule) on 259 pairs drawn from the eval pairs. Throughput: G(n) = s · D(n) / (1 + 0.4 · D(n) / 507)
+with D(n) = n / (0.058 + 0.0009 n), which fits Kaggle's E128 × 48 plateau (345) and pod B's E128 × 64 (325–401)
+and E112 runs. KV: running contexts beyond the pool stall (no cache-thrash penalty, so optimistic).
+
+- **KV tokens per context token = 0.72** (0.69–0.77), measured at the force cut of e112_w128_hlin: the 105 running
+  attempts held 2.12–2.38M context tokens (last completed turn + a partial turn) against 1.63M KV tokens in use.
+  So E128's pool (1.44M KV tokens; 1.36M with Humming dense) holds ≈ 1.9M context tokens.
+- Simulated mean context per running stream: 25–28K at 1.74 h (Kaggle w48 read KV 0.735 there, still rising),
+  33–48K from 2.5 h on, 50–70K in the last hour (only long attempts left). **Even v3's 48 streams fill E128's KV
+  in mid-run.**
+- Results (60 reps, ratio 0.72; ± is the rep-to-rep sd of the score):
+
+| config | G(W) tok/s | per stream | pass@2 | finished | cut | never started | stalled |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| E128 × 48 (v3 submitted) | 345 | 7.2 | 75.4 ± 3.2 | 320 | 32 | 166 | 3.5% |
+| E128 × 48 + Humming dense | 380 | 7.9 | 77.3 ± 3.7 | 352 | 29 | 137 | 5.7% |
+| E128 × 56 + Humming dense | 404 | 7.2 | 77.9 ± 3.7 | 365 | 31 | 121 | 13.1% |
+| E128 × 56 + Humming dense + 15% KV | 404 | 7.2 | **78.8 ± 3.6** | 388 | 25 | 105 | 5.9% |
+| E128 × 64 + Humming dense + 15% KV | 424 | 6.6 | 79.1 ± 3.6 | 400 | 28 | 90 | 12.0% |
+| E112 × 96 + Humming dense | 458 | 4.8 | 73.1 ± 3.2 | 438 | 40 | 40 | 7.6% |
+| E112 × 128 + Humming dense | 490 | 3.8 | 73.1 ± 3.3 | 441 | 60 | 18 | 22.9% |
+| E128, no deadline | | | 81.3 | | | | |
+
+- **Per-stream speed does not stop attempts finishing:** every first attempt finishes in every config (an 80K
+  attempt takes ≈ 3 h at 7 tok/s, ≈ 6 h at 3.8). The 12-h window costs E128 ≈ 4–6 pp through second attempts that
+  never start, plus 25–32 attempts cut at force (≈ 1M tokens of wasted decode).
+- **Global TPS is not the target.** E112 × 128 has the highest TPS and the lowest score: lower accuracy per
+  attempt, and 23% of its stream-time stalls on KV. For E128 the binding limits are KV, then decode speed.
+- Length-aware admission (skip second attempts whose first attempt is longer than time left × rate; `--fit`):
+  30–50 more finished attempts, 2–5× fewer cuts, but pass@2 moves −0.9 to +1.3 pp (noise): the skipped pairs are
+  the hard ones a second attempt helps. Rejected.
+- Follow-up ordering (`--follow`: attempt 1 right after a non-train-passed attempt 0 ends, so its identical ~7K
+  first prompt still hits the cache): ordering alone −0.4 to −0.7 pp; with the prefill it saves taken as +5%
+  throughput, E128 × 56 + Humming dense + 15% KV goes 78.8 → 79.7. Within noise; not adopted.
+
+### E128 + Humming dense on pod B, profile and kernel checks (2026-10-25 05:19–06:13 UTC)
+
+**e128_w48_hlin_prof** (E128 × 48, `--linear-backend humming`, otherwise submit v3): 366 / 369 / 375 / 366 / 360 /
+367 tok/s at 0.29–0.71 h, then 320 at 0.80 h (uncached 208); hits 90–96%; KV 1,356,050 tokens (Humming dense
+costs 0.13 GiB per GPU = −6% KV on E128, not −2.3% as on E112); KV 0.53 at 0.80 h. Stopped at 0.90 h by SIGTERM
+(clean: final submission written).
+
+Profile at 0.75 h (20 steps, `torch_profiler_with_stack` off; rank 0, ms per step): all-reduce 72.6, Humming
+(experts + dense) 65.8, indexer 22.9, attention (FlashInfer V4.1 kernel) 16.6, all-gather 6.3, the rest ≈ 20.
+Almost all steps were decode-only (48 requests); one carried a 406-token prefill. **The profiler inflates the
+step** (207 ms traced against ≈ 131 ms from 366 tok/s ÷ 48), and the NCCL kernels absorb the other ranks' tracing
+skew, so all-reduce is overstated there. Measured directly:
+
+- **NCCL all-reduce on pod B, idle GPUs** (`nccl_allreduce_bench.py`, bf16 T × 5120): T 32 0.20 ms, 64 0.44,
+  128 0.97, 2048 15.1, 8192 62.4 (bus bandwidth ≈ 2 GB/s: GPU0 is on the other NUMA node, `SYS`). A 48-stream
+  decode step pays ≈ 0.32 × 84 ≈ 27 ms (≈ 20% of the step); a 2048-token prefill chunk pays ≈ 1.27 s.
+  Kaggle's SHM measured 4.9 GB/s, so its share is about half. FP8 all-reduce would halve the bytes but add ≈ 6%
+  relative error per partial sum on every layer; not tried.
+- **Humming experts + dense: 66 ms per step against a ≈ 51 ms weight-read floor** (≈ 115 of 128 experts touched
+  per layer at 48 × 6 routings; 2-bit experts ≈ 13.2 GB per GPU). Little left there.
+- **Indexer logits kernel** (`indexer_blockn_bench.py`, one L4, decode rows 48/56, ctx 16–64K, page 64): the
+  default (BLOCK_N 16, 4 warps, 2 stages) runs at 64–71 GB/s. BLOCK_N 128 is 7–15% faster and not bit-identical;
+  BLOCK_N 32/64 are slower. The kernel is bound by in-register MXFP4 decoding, not by q reloads. At ≈ 23 ms per
+  step the best tile change saves ≈ 2–3 ms. Dropped.
+- **CED prefill reconsidered:** with a prefix hit, the scheduler recomputes the 128 tokens before the new
+  segment through the encoder half (`_CED_PREFIX_REPLAY_WINDOW`), so a typical turn (≈ 250 uncached tokens) costs
+  the same token-layers as without CED. Only first prompts (≈ 58% of uncached tokens) save ≈ 49%: ≈ +5–8%
+  throughput, and the replay is approximate (the fork: "not an equivalence transformation"). Dropped. (The
+  E128 config has no vision fields in its text config, so the tail window is 128 rows, 5.2 MB per sequence.)
+
+**e128_w56_kv** (started 06:15 UTC, stop-new 3.75 h): E128 + Humming dense × 56, `max_cudagraph_capture_size` 64,
+`--max-num-seqs 64`, util 0.945. **KV 1,664,546 tokens (+23% vs 1,356,050)**: graphs 0.28 → 0.15 GiB, peak
+activation 0.51 → 0.43 GiB, KV 2.0 → 2.44 GiB per GPU; headroom 0.66 GiB (v3 on Kaggle: 0.61). Server up in 320 s.
+
+### KV thrash at ~2 h, and harness levers for the Kaggle score (2026-10-25 06:15–08:40 UTC)
+
+**e128_w56_kv** (E128 + Humming dense × 56, KV 1.66M) ran 358–407 tok/s for 2 h (KV 0.42 at 0.6 h, 0.75 at
+1.8 h, 0.85 at 2.0 h, 0 preemptions), then **thrashed**: 281 (KV 0.90), 196, 246, 168 tok/s at 2.07–2.33 h, with
+uncached prefill 130 → 436–639 tok/s and hits 97.5% → 77%, still 0 preemptions. Between turns a stream's context
+sits in the free pool as evictable cache; once running requests hold ~0.88 of KV, those prefixes are evicted and
+each turn re-prefills ~35–40K tokens, which slows every stream further. Stopped at 2.35 h. Submit v3 has the same
+KV per stream (1.44M / 48 ≈ 1.66M / 56 ≈ 30K), so it probably meets the same wall ~2 h into its Kaggle run (the
+2.3-h Kaggle eval-bench never got there: KV peaked at 0.75 when its short deadlines closed admission).
+
+- **KV-gated admission** (`solver_dsv41.py`, opt-in `ARC_KV_ADMIT_MAX`, `ARC_KV_ADMIT_MIN_WORKERS` 16): above 16
+  running, a new attempt starts only while KV usage is below the limit (re-read every 10 s; one launch per reading
+  within 0.1 of it). Default off, so v3 behaviour is unchanged. Mock-tested; **e128_w56_gate** (same settings,
+  limit 0.75, 4 h) started on pod B at 08:37 UTC with the rebuilt dev kit (old kit kept in
+  `/root/kaggle_sim/archive/kit-dev_before_kvgate`).
+
+Harness levers, all checked offline on recorded runs (no API spend):
+- **Shorter budgets lose on Kaggle** (`scripts/config_sim.py`: E030's Flash-1017 API runs, tokens × 1.28 to E128
+  length, v4 server): sub80s40 + header 85.4 simulated; s20x60 + header 79.0 (finishes everything, but pass@1 is
+  6 pp lower); s20x80 79.2; no header 80.8. With train-check priority, a few hundred attempts already cover most
+  of the pass@2 gain, so per-attempt accuracy decides.
+- Only 8.1% of tokens come after the first tool output that shows every training pair passing (10% of correct
+  attempts' tokens, 23% of wrong ones'): an auto-submit would save little.
+- 89% of attempt output is thinking, 11% code; the longest turn holds 36% of an attempt's tokens.
+- **The E128 deadline gap is the train check's precision:** with an oracle (train_pass = correct) E128 simulates
+  81.6 instead of 79.1. Recorded labels: passed 184/216 correct (85%), failed 55/80 (69%), no answer 0/34. A
+  three-level priority (no answer, then failed, then passed) is worth +0.2–0.3 pp on E128 and on E112 (holdout).
+- **Offline re-check** (`scripts/train_check_recheck.py`: rebuild each session from its trace in a LocalExecutor
+  with Kaggle's tool packages, numpy 2.2.6 / scipy 1.15.3 / scikit-image 0.25.2; reproduces all 296 / 275
+  recorded labels). Two opt-in `train_check` options: `reject_constant` (a path that returns the test answer for
+  every training input is not a program, e.g. a last cell `answer = cands[0]` that only prints test_input) and
+  `transcript_fallback` (replay the whole transcript when no path passes). They change 1 of 296 E128 labels and
+  1 of 275 E112 labels. The other 54 correct-but-failed E128 attempts are test-specific constructions
+  (`solve(test_input, 8)` with the test's separator colour, pieces placed at hand-typed coordinates), which no
+  check can verify. Not adopted.
+
+### Does v3 finish one attempt per pair if it thrashes? (2026-10-25 14:15 UTC)
+
+`scripts/deadline_sim.py --thrash U:M` (new): while running contexts exceed U of the KV pool, throughput × M.
+New columns: `a0-missed` (attempt 0 cut or never started), `none-done` (no finished attempt), `thrash_at`
+(first hour above U), `thrash_h` (hours above U). Calibration: KV ratio 0.83 puts pod B's E128 × 56 (1.66M) over
+0.88 at 2.01 h (measured ~2.07 h; ratio 0.72 gives 2.56 h), and 0.83 also matches v3's Kaggle eval-bench (KV 0.735
+at 1.74 h). M = 0.6 is pod B's measured thrash (281, 196, 246, 168 of ~380 tok/s). 200 reps, 259 pairs, ratio 0.83:
+
+| config | thrash | pass@2 (sim) | pairs with no finished attempt | thrash from / hours |
+|---|---|---|---|---|
+| v3 (E128 × 48, KV 1.44M) | none | 74.5 | 0 | — |
+| v3 | × 0.6 (measured) | 65.0 | 26.5 | 2.1 h / 8.4 h |
+| v3 | × 0.45 | 54.0 | 67.5 | 2.1 h / 8.5 h |
+| v3 kit × 40 / 36 / 32 | × 0.6 | 69.9 / 71.8 / 72.4 | 9.9 / 3.2 / 1.0 | 3.0 / 3.8 / 5.8 h |
+| v4 settings (Humming dense, KV 1.66M) × 48 | none / × 0.6 | 77.0 / 72.5 | 0 / 2.1 | 2.5 h |
+| v4 settings × 44 / 40 / 36 / 32 | × 0.6 | 73.4 / 74.1 / 74.4 / 73.9 | 0.3 / 0 / 0 / 0 | 3.0 / 3.9 / 6.5 / 10.3 h |
+
+If Kaggle thrashes like pod B, v3's attempt-0 pass (smallest tasks first) does not finish: ~26 pairs (10%), the
+largest, get no finished attempt and the score falls ~9 pp. Fixed 36–40 workers on v4 settings are robust
+(74–75, every pair done); a working KV gate keeps ~48 streams' throughput (77). The thrash multiplier was
+measured over 15 min only; it may settle or worsen.
+
+### The private test set has ~335 pairs (2026-10-25)
+
+A teammate's LB probing: the private test set has ~330–340 test pairs over its 240 tasks, not the public file's 259.
+That is the eval set's ratio (120 tasks, 172 pairs; drawing 240 tasks from E128's 167 recorded eval pairs gives
+~334). The solver runs attempts per (task, pair), so there are ~29% more attempts to fit in the same 12 h.
+
+`deadline_sim.py --pairs 335`, KV ratio 0.83 (200 reps):
+
+| config | no thrash: sim / pairs with no finished attempt | thrash × 0.6: sim / pairs with none |
+|---|---|---|
+| v3 (E128 × 48, KV 1.44M) | 71.4 / 5.6 | 52.7 / 90.8 |
+| v4 settings × 48 | 73.1 / 0.2 | 63.9 / 38.4 |
+| v4 settings × 44 / 40 | 72.9 / 0.4, 72.4 / 1.4 | 68.0 / 20.7, 71.0 / 7.4 |
+| v4 settings × 36 / 32 | 71.8 / 3.6, 70.3 / 9.2 | 71.3 / 5.6, 70.1 / 10.1 |
+
+**Sibling transfer** (`scripts/sibling_transfer.py`, `scripts/sibling_report.py`; offline, no model calls): run a
+finished attempt's answer path (the train check's expr / cell / fn / transcript) on the task's other test inputs.
+In E128's 45 multi-pair eval tasks (92 pairs, 59% of all tokens; 31 tasks solved on every pair, 8 on some, 6 on
+none), 99 sibling answers came from attempts that were correct and passed the train check; 67 were right (13 crashed,
+19 gave another grid). Every chosen path had train_frac 1.0, so the programs fit train and their own test input but
+not the other test input. Answer selection over the 167 pairs, no deadline: own attempts only 136; own, then
+transfers into a free slot 138 (+1.2 pp); train-passing own > transfers > other own 135; transfers alone right on
+46 of 92 multi-pair pairs (own pass@2 72). So a transfer cannot replace a sibling's own attempts, only fill an
+empty slot (free tokens, most useful for pairs whose own attempts never finish).
+
+**Shorter budgets at 335 pairs** (`config_sim.py --pairs 335 --ratio 0.83 [--thrash 0.88:0.6]`, v4 server, 60 reps;
+API rows rank configs and do not predict E128's score; E128 row = the measured Kaggle harness):
+
+| config (sim pass@2) | × 36 | × 36, thrash | × 48 | × 48, thrash |
+|---|---|---|---|---|
+| sub80s40 + header (Kaggle's, API) | 77.4 | 76.4 | 80.2 | 68.6 (30.7 pairs with none) |
+| s20x60 + header (API) | 75.4 | 75.4 | 77.7 | 76.0 (0) |
+| E128 sub80s40 + header (E043) | 71.9 | 71.4 | 73.3 | 64.1 (38.0) |
+
+s20x60 + header never reaches the thrash point (shorter attempts hold less KV), so it is the robust pick at 48
+streams; at 36 streams the Kaggle harness ties or wins either way. Worst cases: sub80s40 + header × 36 76.4,
+s20x60 + header × 48 76.0. E128's accuracy at s20x60 is unmeasured (pruned models may lose more under budget
+pressure), so v4 = the measured harness at 36 streams (no new kit), or the KV gate if pod B confirms it.
+
+### Submit v3 scored 50.9 (2026-10-25)
+
+dsv41-tools-submit Version 3 (E128 × 48, KV 1.44M) scored **50.9** on the LB. `deadline_sim.py --pairs 335`
+predicted 52.7 with pod B's thrash (× 0.6 above KV 0.88, from ~2.1 h; ~91 pairs with no finished attempt) and 71.4
+without it, so the score fits KV thrash, not a worse model (the rerun's logs are not visible). Staged, not pushed:
+- `kaggle/dsv41_tools/out/nb_submit_v4`: v3's exact notebook and kit + one settings cell: **36 workers**, Humming
+  dense, capture ≤ 64, max-num-seqs 64, util 0.945 (KV ~1.66M). Sim 71.3–71.8 with or without thrash.
+- `kaggle/dsv41_tools/out/nb_evalbench-v4`: that notebook on the 120 eval tasks (stop-new 1.5 h, kill 2 h), on the
+  submit kit `chankhavu/dsv41-tools-kit`, to check Kaggle's memory at util 0.945 and the tok/s at 36.
+
+**Submit v4 = dsv41-tools-submit Version 5** (pushed 21:45 UTC 2026-10-25; smoke commit passed: server up in 620 s,
+Humming dense active, **KV 1,554,183 tokens on Kaggle** (+8% vs v3's 1.44M; pod B 1.66M), 6/6 smoke attempts
+submitted). Sim at Kaggle's KV, 335 pairs: × 36 71.8 (no thrash) / 70.4 (thrash from 5.3 h).
+With E046's one rollout per task (multi-pair tasks × 0.59 tokens, `deadline_sim.py --multi-scale 0.59`, v4 KV
+1.66M): × 36 75.6 / 75.6, × 44 77.9 / 77.1, × 48 78.7 / 76.2 (no thrash / thrash), every pair done.
+
+### 2026-10-25/26 night: submit Version 5, Humming parity, KV offload, Kaggle mount threads
+
+- **Submitted dsv41-tools-submit Version 5** (~23:55 UTC). Kaggle bench of its settings (chankhavu/dsv41-tools-
+  bench30-cap64, 36 streams): 306–324 tok/s at 0.32–0.49 h, hits 0.92–0.96, KV 0.205 at 0.49 h, 0 preemptions;
+  ~8.7 tok/s per stream vs v3's 7.3 at 48. Graph capture sizes [1..64] (11 graphs), so the cap only drops >64.
+  Version 6 = Version 5 without Humming dense (Ada dense kernel), smoke passed, KV 1,615,809. Two adversarial
+  audits: Version 5 "safe", Version 6 "safest" (fewest untested parts).
+- **Humming dense vs Ada dense parity** (`scripts/mxfp8_dense_parity.py`, L4, random MXFP8 weights at V4.1 dense
+  shapes, M 1–2048): relative error vs the exact fp32 product with bf16 inputs: Ada 2.6–2.7e-2 (it quantizes
+  activations to MXFP8, W8A8), Humming 1.8–3.3e-3 (W8A16, bf16 activations). Humming is ~10× closer to full
+  precision; the two differ by Ada's activation quantization.
+- **KV CPU offload does not work with V4.1 on this fork:** `--kv-offloading-size 32` fails at startup:
+  `tokens_per_block=8 not divisible by tokens_per_hash=32` (a non-prefix-cacheable 8-token group); with
+  `--prefix-match-unit 8` the offload scheduler then asserts `isinstance(kv_cache_spec, FullAttentionSpec)` in
+  `get_sliding_window_size_in_chunks` (V4.1's special cache specs). Needs vLLM patches; dropped.
+- **Kaggle mount threads** (ARC-AGI-2 751344, ARC-AGI-3 751598, 752147; sub-agent read them): two infra failures
+  through 10-24/25: ERRORED_MOUNTING_DATASET (poisoned cache entries per region; hits Models; clusters on new
+  versions) and slow FUSE reads (0.00 or −5–10 pts). Mitigation adopted: keep the inputs exactly Version 5's; the
+  multi-test candidate chankhavu/dsv41-tools-submit-mtf carries its two changed files in a notebook cell (cell 0b,
+  sha256-checked; on failure falls back to v3 per-pair at 36 workers) instead of a new kit dataset.
+- **Pods (Kaggle KV, eval set, full Kaggle pipeline via `local_run.py` + `podrun.sh`):** 137m3l13x3ei2n mt44b
+  (multi-test 44, fixed kit), 23jiwzwlii3uoa v5_w36 (Version 5's config), sltm3bor1tz1t8 mt36, v5xar1dvzy3bx3
+  mt52_gate75 (multi-test 52 + KV gate 0.75). KV pinned via util 0.938 → 1,556,850 tokens (Kaggle 1,554,183).

@@ -91,7 +91,9 @@ V5_PROMPTS = {"lean2roles"}
 # v6 (E029) is recorded when an E029 option or prompt is active; it adds the keys below to the config.
 HARNESS_VERSION_V6 = "persistent-v6"
 V6_DEFAULTS = {"turns_note": 0, "fallback_solve": False, "cap_nudge": False, "effort_header": "", "grid_format": "json",
-               "image_cell": 32, "openrouter_provider": "", "or_reasoning": ""}
+               "image_cell": 32, "openrouter_provider": "", "or_reasoning": "", "multi_test": False,
+               "multi_budget": 0.0, "multi_prompt": "note", "context_limit": 0,
+               "prior_mode": ""}
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 V6_PROMPTS = {"lean2code"}
 HELPERS_SRC = (Path(__file__).resolve().parent / "arc_helpers.py").read_text()
@@ -134,6 +136,8 @@ def tools_for(args):
     descriptions = {"run_python": (
         "Execute a Python cell in your persistent IPython session. Variables/functions persist. "
         "Preloaded: train (list of {'input': grid, 'output': grid}), test_input (grid), numpy as np. "
+        + ("test_inputs: list of every test input grid of the task (test_input is test_inputs[0]). "
+           if getattr(args, "multi_test", False) else "") +
         f"scipy is available. No internet or host files. Timeout {args.tool_timeout}s. "
         "Use print() to inspect results. Check transformations on all training pairs."
         + (HELPERS_DOC if getattr(args, "helpers", False) else "")
@@ -144,6 +148,8 @@ def tools_for(args):
             "e.g. solve(test_input) or answer, giving a rectangular grid of ints 0-9 (list or numpy array); "
             "statements that set a variable `answer` also work. The harness reads the grid directly: do not "
             "retype it. Invalid grids return an error and the attempt continues."
+            + (" When the task has several test inputs, the expression must give a list with one grid per test "
+               "input, in order, e.g. [solve(t) for t in test_inputs]." if getattr(args, "multi_test", False) else "")
         )
     if args.mode == "code":
         descriptions["submit_solution"] = (
@@ -211,30 +217,39 @@ _arc_run()
     return json.dumps({"accepted": True, "pred": outputs[-1]}), outputs[-1]
 
 
-def submit_answer(session, code):
+def submit_answer(session, code, n=None):
     """Evaluate the model's answer expression in its own persistent session and return (feedback, grid|None).
+    n (E046 --multi-test): the value must be a list of n grids, one per test input; returns that list.
 
     `code` is an expression (e.g. solve(test_input)) or statements that set `answer`. Printed output from
     the evaluation is captured so only the marker line comes back. The session never holds test answers."""
     marker = f"ARC_ANSWER_{uuid4().hex}:"
+    # Nested numpy rows / grids (e.g. [solve(t) for t in test_inputs], or a solve that returns a list of numpy rows)
+    # have no .tolist() at the top and json.dumps(default=int) then fails ("only length-1 arrays"): convert nested
+    # values first. Values that already serialize are unchanged (E046 run 7: a single-test fallback failed on this).
+    plain = ("\n        def _plain(v):\n            if _b.hasattr(v, 'tolist'):\n                return v.tolist()\n"
+             "            return [_plain(x) for x in v] if _b.isinstance(v, (_b.list, _b.tuple)) else v\n"
+             "        value = _plain(value)")
+    # Built-ins via the builtins module: the model's session may define its own eval / compile / exec (E046 run 3:
+    # a session function named eval(grid, H, bg) broke the answer and fallback-solve paths of 4e34c42c).
     cell = f'''
 def _arc_answer():
-    import contextlib, io, json
+    import builtins as _b, contextlib, io, json
     _src = {code!r}
     with contextlib.redirect_stdout(io.StringIO()):
         try:
-            _expr = compile(_src, '<answer>', 'eval')
-        except SyntaxError:
+            _expr = _b.compile(_src, '<answer>', 'eval')
+        except _b.SyntaxError:
             _expr = None
         if _expr is not None:
-            value = eval(_expr, globals())
+            value = _b.eval(_expr, _b.globals())
         else:
-            exec(compile(_src, '<answer>', 'exec'), globals())
-            if 'answer' not in globals():
-                raise NameError('code did not define answer')
-            value = globals()['answer']
-        if hasattr(value, 'tolist'):
-            value = value.tolist()
+            _b.exec(_b.compile(_src, '<answer>', 'exec'), _b.globals())
+            if 'answer' not in _b.globals():
+                raise _b.NameError('code did not define answer')
+            value = _b.globals()['answer']
+        if _b.hasattr(value, 'tolist'):
+            value = value.tolist(){plain}
         text = json.dumps(value, default=int)
     print({marker!r} + text)
 try:
@@ -256,6 +271,14 @@ finally:
             return "[answer not accepted] no value returned", None
     else:
         return tool_output(result, session.max_output)[:2000] + "\n[answer not accepted]", None
+    if n is not None:
+        if not (isinstance(grid, list) and len(grid) == n and all(valid_grid(g) for g in grid)):
+            bad = (f"a list of {len(grid)} items" if isinstance(grid, list) and not valid_grid(grid)
+                   else "one grid" if valid_grid(grid) else type(grid).__name__)
+            return (f"[answer not accepted] this task has {n} test inputs: give a list of {n} rectangular 1-30 by "
+                    f"1-30 grids of ints 0-9, one per test input in order (e.g. [solve(t) for t in test_inputs]); "
+                    f"got {bad}"), None
+        return f"[answer accepted: {n} grids, " + ", ".join(f"{len(g)}x{len(g[0])}" for g in grid) + "]", grid
     if not valid_grid(grid):
         shape = (f"{len(grid)} rows, row lengths {sorted({len(r) for r in grid if isinstance(r, list)})}"
                  if isinstance(grid, list) else type(grid).__name__)
@@ -277,13 +300,13 @@ def check_answer_on_train(session, code):
     inputs = [pair["input"] for pair in session.train]
     cell = f'''
 def _arc_check():
-    import contextlib, io, json
-    _expr = compile({code!r}, '<answer>', 'eval')
+    import builtins as _b, contextlib, io, json
+    _expr = _b.compile({code!r}, '<answer>', 'eval')
     outs = []
     with contextlib.redirect_stdout(io.StringIO()):
         for _inp in json.loads({json.dumps(inputs)!r}):
             try:
-                v = eval(_expr, {{**globals(), 'test_input': _inp}})
+                v = _b.eval(_expr, {{**_b.globals(), 'test_input': _inp}})
                 if hasattr(v, 'tolist'):
                     v = v.tolist()
                 outs.append(json.loads(json.dumps(v, default=int)))
@@ -449,6 +472,14 @@ def compat_extra_body(args, think):
     """--base-url (OpenAI-compatible self-hosted server): request extras from --extra-body / --extra-body-nothink."""
     body = dict(json.loads(args.extra_body or "{}") if think else json.loads(args.extra_body_nothink or args.extra_body or "{}"))
     return body
+
+
+class ContextFull(RuntimeError):
+    """E046 --context-limit: the next turn's prompt leaves less than CONTEXT_MIN_ROOM tokens before the server's
+    max-model-len; the attempt ends like an output-budget stop (session-answer fallback) instead of a 400 error."""
+
+
+CONTEXT_MIN_ROOM = 1024
 
 
 class TurnError(RuntimeError):
@@ -664,6 +695,12 @@ def turn_token_exact(client, args, messages, max_tokens, tok):
         else:
             ids = full
             tok["rerenders"] += 1
+    limit = getattr(args, "context_limit", 0)
+    if limit:  # E046: never request past the server's max-model-len (prompt + max_tokens), which fails the attempt
+        room = limit - len(ids) - 16
+        if room < CONTEXT_MIN_ROOM:
+            raise ContextFull(f"prompt {len(ids)} tokens, limit {limit}")
+        max_tokens = min(max_tokens, room)
     text, sampled, usage, finish, failure, stream = [], [], None, None, None, None
     try:
         stream = client.completions.create(
@@ -768,7 +805,115 @@ def turns_note(args, index):
             "or at least set `answer`.]")
 
 
-def solve(client, args, task, test_input, session_factory=SandboxSession):
+def build_prompt_multi(train, test_inputs):
+    """E046 --multi-test: the ARC Prize prompt with every test input of the task, numbered."""
+    tests = "\n\n".join(f"--Test input {i}--\n\n{json.dumps(g)}" for i, g in enumerate(test_inputs))
+    return build_prompt(train, [[0]]).replace(json.dumps([[0]]) + "\n--End of Test Input--", tests + "\n--End of Test Input--")
+
+
+MULTI_NOTE = ("\n\nThis task has {n} test inputs, shown above in order and preloaded in the session as `test_inputs` "
+              "(a list of {n} grids; test_input is test_inputs[0]). One rule must work for all of them: check its "
+              "assumptions on every test input. Submit a list with one output grid per test input, in order, e.g. "
+              "submit_answer with `[solve(t) for t in test_inputs]`, and keep `answer` as that list.")
+
+
+# E046 --multi-prompt: other wordings of the multi-test note ("note" = MULTI_NOTE). "first" shows only test input 0 in
+# the prompt (the others are in the session only), for a shorter prompt and less KV per attempt.
+MULTI_NOTES = {
+    "note": MULTI_NOTE,
+    "lean": ("\n\nThis task has {n} test inputs, preloaded as `test_inputs` (test_input is test_inputs[0]). Submit "
+             "`[solve(t) for t in test_inputs]`."),
+    "early": MULTI_NOTE + (" Define solve(grid) as soon as you have a rule and set `answer = [solve(t) for t in "
+                           "test_inputs]` after every fix, so an answer always exists."),
+    "first": ("\n\nThis task has {n} test inputs. Only test input 0 is shown above; all {n} are preloaded in the session "
+              "as `test_inputs` (test_input is test_inputs[0]). Print the others' sizes and grids if you need them. One "
+              "rule must work for all of them. Submit a list with one output grid per test input, in order, e.g. "
+              "submit_answer with `[solve(t) for t in test_inputs]`, and keep `answer` as that list."),
+}
+
+
+# E047 --prior-mode: attempts >= 1 see attempt 0's answer (from --prior-file). {status} is filled only when attempt 0's
+# program passed the host's train check (the check misses many correct answers, so a fail is not reported).
+PRIOR_NOTES = {
+    "verify": ("\n\nA previous attempt at this task submitted the answer below{status}. It may be right or wrong. "
+               "Check it against the training pairs and the test input{s}: if you confirm it, resubmit it (that is "
+               "cheap); if you find an error, solve the task and submit your corrected answer.\n\n{grids}"),
+    # verifycode: the same, plus the program behind the answer (rebuilt from the transcript; never the thinking)
+    "verifycode": ("\n\nA previous attempt at this task submitted the answer below{status}. It may be right or wrong. "
+                   "Its program and answer follow; the program is not loaded in your session. Check the rule against "
+                   "the training pairs and the test input{s}: if you confirm it, resubmit the answer (that is cheap); if "
+                   "you find an error, fix the rule and submit your corrected answer.\n\n{program}{grids}"),
+    # verifytest (used by hybrid when the train check passed): the rule fits training, so audit its test extension
+    "verifytest": ("\n\nA previous attempt at this task submitted the answer below. Its program, shown below, reproduces "
+                   "every training pair, so any error is in how the rule extends to the test input{s}. The program is "
+                   "not loaded in your session. Compare the test input{s} with the training inputs: look for anything "
+                   "the training pairs never show (new colours, sizes, counts, overlaps, edge contact) where the rule "
+                   "has to guess. If you find such a case, decide the most plausible behaviour from the training pairs "
+                   "and submit the corrected answer; otherwise resubmit the answer (that is cheap).\n\n{program}{grids}"),
+    "differ": ("\n\nThis is the second of two attempts; the task counts as solved if either answer is right. The first "
+               "attempt submitted the answer below{status}. Assume it is wrong: find the most plausible rule that fits "
+               "every training pair but gives a different test output, and submit that. If after checking you find "
+               "no such rule, resubmit the first answer.\n\n{grids}"),
+}
+
+
+def prior_note(mode, preds, train_pass, program=None):
+    """E047: the note for attempt >= 1; preds = attempt 0's grids, one per test input shown in this attempt."""
+    if not preds or any(g is None for g in preds):
+        return ""
+    if mode == "hybrid":  # E047: train check passed -> audit the test extension; else check and fix the rule
+        mode = "verifytest" if train_pass else "verifycode"
+    if mode in ("verifycode", "verifytest") and not program:
+        mode = "verify"
+    grids = "\n\n".join((f"--Previous answer for test input {i}--\n\n" if len(preds) > 1 else "--Previous answer--\n\n")
+                         + json.dumps(g) for i, g in enumerate(preds))
+    status = " (its program reproduced every training pair)" if train_pass else ""
+    program = f"--Previous program--\n\n```python\n{program}\n```\n\n" if program else ""
+    return PRIOR_NOTES[mode].format(status=status, s="s" if len(preds) > 1 else "", grids=grids, program=program)
+
+
+def load_prior(path, programs=False):
+    """E047 --prior-file: {(task, pair): (pred, train_pass, program)} from attempt 0 records (latest record wins).
+    programs (verifycode): the answer program rebuilt from the pair's transcript (evals/answer_program.py)."""
+    prior = {}
+    for r in map(json.loads, open(path)):
+        if "task_id" in r and r.get("attempt") == 0 and "error" not in r:
+            prior[r["task_id"], r["pair"]] = (r.get("pred"), bool(r.get("train_pass")), r.get("trace_path"))
+    if programs:
+        from answer_program import answer_program
+        for k, (pred, tp, trace) in prior.items():
+            try:
+                with gzip.open(trace, "rt") as f:
+                    prior[k] = (pred, tp, answer_program(json.load(f)["messages"]))
+            except (OSError, ValueError, KeyError, TypeError):
+                prior[k] = (pred, tp, None)
+    return {k: (v[0], v[1], v[2] if programs else None) for k, v in prior.items()}
+
+
+def prior_for(args, task_id, task, pair, attempt, multi):
+    """E047: attempt 0's grids for this attempt's test inputs, or None (attempt 0, option off, or no prior)."""
+    if attempt < 1 or not getattr(args, "prior_mode", "") or getattr(args, "_prior", None) is None:
+        return None
+    ps = range(len(task["test"])) if multi else [pair]
+    got = [args._prior.get((task_id, q)) for q in ps]
+    if any(g is None for g in got):
+        return None
+    return {"preds": [g[0] for g in got], "train_pass": got[0][1], "program": got[0][2]}
+
+
+def solve(client, args, task, test_input, session_factory=SandboxSession, test_inputs=None, prior=None):
+    multi = len(test_inputs) if test_inputs is not None and len(test_inputs) > 1 else None  # E046 --multi-test
+    if multi and getattr(args, "multi_budget", 0):
+        # E046 --multi-budget f: one rollout answers n test inputs, so it gets (1 + f (n - 1)) x the output budget,
+        # the soft budget and the turn cap (E128 run 1: 19 of 90 multi attempts hit the 80k budget with no answer)
+        import copy
+        scale = 1 + args.multi_budget * (multi - 1)
+        args = copy.copy(args)
+        args.max_total_output = int(args.max_total_output * scale)
+        args.budget_soft = int(args.budget_soft * scale) if args.budget_soft else args.budget_soft
+        args.max_turns = int(round(args.max_turns * scale))
+    if multi:
+        test_input = test_inputs[0]
     extra = PROMPT_SUFFIXES[args.prompt]
     if args.mode == "code":
         extra += "\n\nUse run_python to investigate; submit self-contained transform(grid) code with submit_solution."
@@ -780,7 +925,12 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
         # E033: the same prompt with every JSON grid replaced by an image (one model patch token per cell).
         prompt = build_image_prompt(ARC_TEMPLATE, task["train"], test_input, args.image_cell, suffix=extra)
     else:
-        prompt = build_prompt(task["train"], test_input) + extra
+        mp = getattr(args, "multi_prompt", "note")
+        prompt = (build_prompt_multi(task["train"], test_inputs[:1] if mp == "first" else test_inputs) + extra
+                  + MULTI_NOTES[mp].format(n=multi) if multi
+                  else build_prompt(task["train"], test_input) + extra)
+    if prior:  # E047 --prior-mode
+        prompt += prior_note(args.prior_mode, prior["preds"], prior["train_pass"], prior.get("program"))
     messages = [{"role": "user", "content": prompt}]
     if getattr(args, "effort_header", ""):
         messages.insert(0, {"role": "system", "content": EFFORT_HEADERS[args.effort_header]})
@@ -801,6 +951,9 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
     auto_price = getattr(args, "auto_peak_price", False)
     cost = {"total": 0.0, "peak": 0.0, "peak_turns": 0}
     extra = {"prelude_extra": HELPERS_SRC} if getattr(args, "helpers", False) else {}
+    if multi:
+        extra = {"prelude_extra": extra.get("prelude_extra", "")
+                 + f"\nimport json as _arc_json\ntest_inputs = _arc_json.loads({json.dumps(test_inputs)!r})\n"}
     try:
         with session_factory(args.sandbox_url, task["train"], test_input,
                              args.tool_timeout, args.max_tool_output, **extra) as session:
@@ -825,6 +978,11 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                 try:
                     think = args.think_turns < 0 or index < args.think_turns
                     msg, usage, finish = turn(client, args, messages, cap, final, think, tok)
+                except ContextFull as exc:
+                    n_turns -= 1
+                    events.append({"turn": n_turns + 1, "context_full": str(exc)})
+                    stop = "context"
+                    break
                 except TurnError as exc:
                     messages.append(exc.assistant)
                     if exc.usage:
@@ -878,7 +1036,9 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                     candidate = parse(content)
                     pred = candidate if valid_grid(candidate) else None
                     source = "parse" if pred is not None else None
-                    if pred is None and getattr(args, "lenient_parse", False):
+                    if multi:
+                        pred, source = None, None  # a text answer gives one grid; the session fallback below
+                    if pred is None and getattr(args, "lenient_parse", False) and not multi:
                         pred = lenient_parse(content)
                         source = "lenient" if pred is not None else None
                     if finish == "length" and not final:
@@ -920,8 +1080,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                             status = "completed" if accepted is not None else "rejected"
                         elif name == "submit_answer" and getattr(args, "answer_tool", False):
                             executed.append((name, code))
-                            output, accepted = submit_answer(session, code)
-                            if accepted is not None and getattr(args, "verify_submit", False):
+                            output, accepted = submit_answer(session, code, multi) if multi else submit_answer(session, code)
+                            if accepted is not None and getattr(args, "verify_submit", False) and not multi:
                                 check = check_answer_on_train(session, code)
                                 verified = None if check is None else not check[0]
                                 if check and check[0] and code not in forced:
@@ -953,22 +1113,25 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
                     break
             else:
                 stop = "max_turns"
-            if session_final and pred is None and stop in {"output_budget", "max_turns", "length", "final"}:
+            if session_final and pred is None and stop in {"output_budget", "max_turns", "length", "final", "context"}:
                 # Budget or turns ran out without an answer: take the session's `answer` if it is a valid grid.
-                output, grid = submit_answer(session, "answer")
+                output, grid = submit_answer(session, "answer", multi) if multi else submit_answer(session, "answer")
                 events.append({"fallback": "session_answer", "accepted": grid is not None, "output": output[:300]})
                 if grid is not None:
                     pred, content, source, submit_code = grid, json.dumps(grid), "session", "answer"
                 elif getattr(args, "fallback_solve", False):
                     # E029: no valid `answer`; evaluate the session's solve on the test input, if defined.
-                    output, grid = submit_answer(session, "solve(test_input)")
+                    expr = "[solve(t) for t in test_inputs]" if multi else "solve(test_input)"
+                    output, grid = submit_answer(session, expr, multi) if multi else submit_answer(session, expr)
                     events.append({"fallback": "session_solve", "accepted": grid is not None, "output": output[:300]})
                     if grid is not None:
-                        pred, content, source, submit_code = grid, json.dumps(grid), "session_solve", "solve(test_input)"
+                        pred, content, source, submit_code = grid, json.dumps(grid), "session_solve", expr
             if getattr(args, "train_check", False) and pred is not None:
                 # E017: label the answer program on the training pairs (no model tokens; host compares hashes).
                 try:
-                    labels = train_check(session, executed, pred, submit_code, submit=submit_answer,
+                    # multi: label the program behind test input 0's grid (session functions, cells)
+                    labels = train_check(session, executed, pred[0] if multi else pred,
+                                         None if multi else submit_code, submit=submit_answer,
                                          replay_session=lambda grid: session_factory(
                                              args.sandbox_url, task["train"], grid, args.tool_timeout,
                                              args.max_tool_output, **extra))
@@ -981,6 +1144,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession):
               "turns": n_turns, "usage": total, "finish_reason": finish, "stop_reason": stop,
               "usage_complete": error is None, "est_cost_usd": round(cost["total"], 6),
               "seconds": round(time.monotonic() - t0, 1)}
+    if multi:
+        result["multi_test"] = multi
     if auto_price:
         result.update(est_cost_peak_usd=round(cost["peak"], 6), peak_turns=cost["peak_turns"])
     if getattr(args, "cap_nudge", False):
@@ -1141,6 +1306,29 @@ def parser():
     ap.add_argument("--cap-nudge", action="store_true",
                     help="E030: when a turn hits --max-tokens, keep its reasoning and close it with a synthetic run_python "
                          "call whose output tells the model to test its hypothesis in code (per-turn thinking cap)")
+    ap.add_argument("--multi-test", action="store_true",
+                    help="E046: one attempt per task for tasks with several test inputs: the prompt shows all of them, "
+                         "the session has test_inputs, and the answer is a list of grids (one record per pair; the "
+                         "attempt's usage is on pair 0, the other pairs carry multi_share)")
+    ap.add_argument("--context-limit", type=int, default=0,
+                    help="E046 (--token-exact): the server's max-model-len; each turn's max_tokens is capped to the room "
+                         "left, and an attempt with less than 1024 tokens of room ends like an output-budget stop "
+                         "(session-answer fallback) instead of a context-length error")
+    ap.add_argument("--multi-budget", type=float, default=0.0,
+                    help="E046: with --multi-test, scale a multi-input task's output budget, soft budget and turn cap "
+                         "by 1 + f x (n - 1)")
+    ap.add_argument("--multi-prompt", choices=["note", "lean", "early", "first"], default="note",
+                    help="E046: wording of the --multi-test note (note = the E046 note; lean = one line; early = note + "
+                         "define solve and set answer early; first = only test input 0 in the prompt, the rest in "
+                         "the session)")
+    ap.add_argument("--prior-mode", choices=["", "verify", "verifycode", "hybrid", "differ"], default="",
+                    help="E047: attempts >= 1 see attempt 0's answer from --prior-file, never its thinking (verify = "
+                         "check it, resubmit or fix; verifycode = verify + the program behind the answer; hybrid = "
+                         "verifycode when attempt 0 failed the train check, else a test-extension audit with the "
+                         "program; differ = "
+                         "assume it is wrong and look for a different rule)")
+    ap.add_argument("--prior-file", type=Path,
+                    help="E047: jsonl whose attempt-0 records give the prior answers (not part of the config)")
     ap.add_argument("--fallback-solve", action="store_true",
                     help="E029: with --final-mode session, if `answer` is not a valid grid, try solve(test_input)")
     ap.add_argument("--auto-peak-price", action="store_true",
@@ -1184,6 +1372,10 @@ def main():
         ap.error("--budget-soft needs --budget-notes and must be below --max-total-output")
     if not 0 <= args.budget_notes < 1 or not 0 < args.budget_warn <= 1:
         ap.error("--budget-notes must be in [0, 1) and --budget-warn in (0, 1]")
+    if bool(args.prior_mode) != bool(args.prior_file):
+        ap.error("--prior-mode and --prior-file go together")
+    args._prior = (load_prior(args.prior_file, args.prior_mode in ("verifycode", "hybrid")) if args.prior_file
+                   else None)
     tasks = load_tasks(args.challenges, args.solutions)
     pairs = None
     if args.pairs:
@@ -1228,6 +1420,8 @@ def main():
 
     jobs = [(t, p, a) for t, task in tasks.items() for p in range(len(task["test"]))
             for a in range(args.attempts) if (t, p, a) not in latest or "error" in latest[t, p, a]]
+    if args.multi_test:  # E046: pair 0's job covers every pair of its task
+        jobs = [job for job in jobs if job[1] == 0 or len(tasks[job[0]]["test"]) == 1]
     if pairs is not None:
         jobs = [job for job in jobs if job[:2] in pairs]
     if policy:
@@ -1294,19 +1488,22 @@ def main():
                    "price_multiplier": "auto" if args.auto_peak_price else args.price_multiplier}
             if a >= args.attempts:
                 rec["policy_extra"] = True
-            trace, result = solve(client, args, task, task["test"][p]["input"])
+            multi = args.multi_test and len(task["test"]) > 1
+            trace, result = solve(client, args, task, task["test"][p]["input"],
+                                  **({"test_inputs": [x["input"] for x in task["test"]]} if multi else {}),
+                                  prior=prior_for(args, t, task, p, a, multi))
             if "error" in result:
                 result["error"] = result["error"].replace(key, "[redacted]")
             path = trace_dir / f"{t}_p{p}_a{a}_{uuid4().hex[:8]}.messages.json.gz"
             with gzip.open(path, "wt") as f:
                 json.dump(trace, f)
             rec.update(result, trace_path=str(path))
-            if "output" in task["test"][p]:
-                rec["correct"] = rec["pred"] == task["test"][p]["output"]
+            recs = pair_records(rec, task, multi)
             with lock, out.open("a") as f:
-                f.write(json.dumps(rec) + "\n")
+                for r in recs:
+                    f.write(json.dumps(r) + "\n")
                 f.flush()
-            return rec
+            return recs
 
         with ThreadPoolExecutor(args.workers) as executor:
             futures = {executor.submit(work, *job): job for job in jobs}
@@ -1315,9 +1512,13 @@ def main():
                 finished, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for future in finished:
                     futures.pop(future)
-                    rec = future.result()
-                    if rec is None:
+                    recs = future.result()
+                    if recs is None:
                         continue
+                    for rec in recs[1:]:
+                        records.append(rec)
+                        latest[rec["task_id"], rec["pair"], rec["attempt"]] = rec
+                    rec = recs[0]
                     index += 1
                     records.append(rec)
                     latest[rec["task_id"], rec["pair"], rec["attempt"]] = rec
@@ -1327,6 +1528,24 @@ def main():
                         total_jobs += 1
                     report(rec, index, total_jobs)
     summarize(records, tasks, args.attempts)
+
+
+def pair_records(rec, task, multi):
+    """One scored record per test pair. E046 --multi-test: the attempt's list of grids becomes one record per pair;
+    the attempt's usage and cost stay on pair 0's record, the others carry multi_share and zero usage."""
+    recs = [rec]
+    if multi:
+        preds = rec["pred"] if isinstance(rec["pred"], list) else [None] * len(task["test"])
+        recs = []
+        for q in range(len(task["test"])):
+            r = dict(rec, pair=q, pred=preds[q])
+            if q:
+                r.update(usage={"prompt": 0, "cache_hit": 0, "completion": 0}, est_cost_usd=0.0, multi_share=True)
+            recs.append(r)
+    for r in recs:
+        if "output" in task["test"][r["pair"]]:
+            r["correct"] = r["pred"] == task["test"][r["pair"]]["output"]
+    return recs
 
 
 def run_compat(args, tasks, jobs, records, latest, out, config, policy, needs_extra):
@@ -1344,24 +1563,27 @@ def run_compat(args, tasks, jobs, records, latest, out, config, policy, needs_ex
         client = clients[int(hashlib.md5(f"{t}:{p}:{a}".encode()).hexdigest(), 16) % len(clients)]
         rec = {"task_id": t, "pair": p, "attempt": a, "model": args.model, "effort": args.effort, "mode": args.mode,
                "config": config, "base_url": str(client.base_url)}
-        trace, result = solve(client, args, task, task["test"][p]["input"])
+        multi = getattr(args, "multi_test", False) and len(task["test"]) > 1
+        trace, result = solve(client, args, task, task["test"][p]["input"],
+                              **({"test_inputs": [x["input"] for x in task["test"]]} if multi else {}),
+                              prior=prior_for(args, t, task, p, a, multi))
         path = trace_dir / f"{t}_p{p}_a{a}_{uuid4().hex[:8]}.messages.json.gz"
         with gzip.open(path, "wt") as f:
             json.dump(trace, f)
         rec.update(result, trace_path=str(path))
-        if "output" in task["test"][p]:
-            rec["correct"] = rec["pred"] == task["test"][p]["output"]
+        recs = pair_records(rec, task, multi)
         with lock, out.open("a") as f:
-            f.write(json.dumps(rec) + "\n")
+            for r in recs:
+                f.write(json.dumps(r) + "\n")
             f.flush()
-        return rec
+        return recs
 
     with ThreadPoolExecutor(args.workers) as executor:
         futures = [executor.submit(work, *job) for job in jobs]
         for i, fut in enumerate(as_completed(futures), 1):
-            rec = fut.result()
-            records.append(rec)
-            report(rec, i, len(jobs))
+            recs = fut.result()
+            records.extend(recs)
+            report(recs[0], i, len(jobs))
     for c in clients:
         c.close()
     summarize(records, tasks, args.attempts)

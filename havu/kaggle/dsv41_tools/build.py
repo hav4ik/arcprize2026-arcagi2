@@ -18,6 +18,7 @@
 """
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -25,7 +26,8 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 OUT = HERE / "out"
 USER = "chankhavu"
-KIT_SLUG = "dsv41-tools-kit"
+# The submission's rerun pins chankhavu/dsv41-tools-kit: experiments use their own kit dataset (ARC_KIT_SLUG).
+KIT_SLUG = os.environ.get("ARC_KIT_SLUG", "dsv41-tools-kit")
 NB_SLUG = "dsv41-tools-submit"
 WHEELS_KERNEL = "chankhavu/dsv41-sm89-fork-py312-cu130"
 COMPETITION = "arc-prize-2026-arc-agi-2"
@@ -53,14 +55,20 @@ def find_one(pattern):
     hits = sorted(glob.glob(pattern, recursive=True))
     return hits[0] if hits else None
 
-# Every cache under SCRATCH: /root/.cache was read-only in smoke v2 (uv could not unpack wheels there).
+# Every cache and HOME under SCRATCH (defensive). The read-only failures of 2026-10-24 (smoke v2, bench v1: uv
+# "Read-only file system" in /root/.cache/uv) came with the 131 GB staging copy to /tmp; without the copy, both the
+# setdefault variant (submit v3 / bench v2) and this forced variant (submit v4 / bench v3) installed fine.
+# HOME is changed only for the subprocesses (install, solver, server), not this kernel.
 _C = f"{SCRATCH}/cache"
+SUB_HOME = f"{SCRATCH}/home"
+os.makedirs(SUB_HOME, exist_ok=True)
 for _k, _v in (("UV_CACHE_DIR", f"{_C}/uv"), ("XDG_CACHE_HOME", _C), ("VLLM_CACHE_ROOT", f"{_C}/vllm"),
                ("TRITON_CACHE_DIR", f"{_C}/triton"), ("TORCHINDUCTOR_CACHE_DIR", f"{_C}/inductor"),
                ("FLASHINFER_WORKSPACE_BASE", _C), ("TORCH_EXTENSIONS_DIR", f"{_C}/torch_ext"),
                ("HF_HOME", f"{_C}/hf"), ("CUDA_CACHE_PATH", f"{_C}/nv")):
-    os.environ.setdefault(_k, _v)
-    os.makedirs(os.environ[_k], exist_ok=True)
+    os.environ[_k] = _v
+    os.makedirs(_v, exist_ok=True)
+os.environ.pop("UV_NO_CACHE", None)
 CHALLENGES = os.environ.get("ARC_CHALLENGES") or find_one(f"{INPUT}/**/arc-agi_test_challenges.json")
 os.environ["ARC_CHALLENGES"] = CHALLENGES
 _tasks = json.load(open(CHALLENGES))
@@ -93,6 +101,9 @@ CELL_STAGE = r'''
 # Cell 1: stage the checkpoint to local disk in the background (stage_model.py), while vLLM installs.
 # "warm" (read the mount once, no writes): smoke v2 (2026-10-24) with "copy" hit "Read-only file system" on the
 # root overlay during the install while 131 GB were being written to /tmp.
+# Never "copy" on Kaggle: writing the 131 GB checkpoint to /tmp turned the root filesystem read-only (smoke v2,
+# bench v1). "warm" (read the mount once, no writes) is what the submitted v3 ran: on bench v2 it put the whole
+# model in the page cache in ~5 min (FUSE ~450 MB/s) and the server came up in 685 s. "none" = pre-flight only.
 STAGE_MODE = os.environ.get("ARC_STAGE_MODE", "warm")
 STAGE_DONE = f"{SCRATCH}/stage_done"
 if MODE != "fallback" and MODEL_SRC:
@@ -125,12 +136,16 @@ if MODE != "fallback" and not os.environ.get("ARC_SKIP_INSTALL"):
         os.environ["LD_PRELOAD"] = real + "/libcuda.so"
     WHEELS = os.path.dirname(find_one(f"{INPUT}/**/vllm-0.28.1rc1*.whl"))
     t = time.time()
+    _uvc = os.environ["UV_CACHE_DIR"]
+    _ienv = dict(os.environ, HOME=SUB_HOME, UV_CACHE_DIR=_uvc, TMPDIR=f"{SCRATCH}/tmp")
+    os.makedirs(f"{SCRATCH}/tmp", exist_ok=True)
     if shutil.which("uv"):
-        rc, out = sh(f"uv venv --python {sys.executable} {V} && uv pip install --python {PY} --no-index --no-deps "
-                     f"--find-links {WHEELS} -r {WHEELS}/requirements.lock", timeout=3600)
+        rc, out = sh(f"uv venv --cache-dir {_uvc} --python {sys.executable} {V} && uv pip install --cache-dir {_uvc} "
+                     f"--python {PY} --no-index --no-deps --find-links {WHEELS} -r {WHEELS}/requirements.lock",
+                     timeout=3600, env=_ienv)
     else:
-        rc, out = sh(f"{sys.executable} -m venv {V} && {PY} -m pip install --no-index --no-deps --find-links {WHEELS} "
-                     f"-r {WHEELS}/requirements.lock", timeout=3600)
+        rc, out = sh(f"{sys.executable} -m venv {V} && {PY} -m pip install --no-cache-dir --no-index --no-deps "
+                     f"--find-links {WHEELS} -r {WHEELS}/requirements.lock", timeout=3600, env=_ienv)
     print(f"offline install rc {rc} in {time.time() - t:.0f}s", out[-800:], flush=True)
     assert rc == 0, "vLLM install failed"
     with tarfile.open(f"{KIT}/vllm_overlay_rw.tgz") as tf:
@@ -182,6 +197,7 @@ if MODE != "fallback":
     except Exception as exc:
         print("tool python check failed:", exc, flush=True)
 BASE_ENV.pop("DSV41_SYNTH_INIT", None)  # the overlay's synthetic init must stay off for real weights
+BASE_ENV["HOME"] = SUB_HOME  # /root/.cache is read-only on Kaggle with a model attached
 # FlashInfer's sampling module cannot JIT on the Kaggle image (E042 K-runs); vLLM's PyTorch sampler instead.
 BASE_ENV["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
 '''
@@ -266,6 +282,20 @@ for _k, _v in (("ARC_COMMIT_MODE", "smoke"), ("ARC_TASK_LIMIT", "40"), ("ARC_STO
                ("ARC_RESTART_MIN_LEFT_S", "1800"), ("ARC_WRAPUP_S", "600")):
     os.environ.setdefault(_k, _v)
 '''
+# Eval-set bench: the competition's own evaluation file (120 ARC-AGI-2 tasks, 172 pairs, with solutions), all tasks,
+# W workers, ~2.5 h (stop-new 2 h, force 2 h 20, hard 2 h 30, kill 2 h 40): realistic TPS and accuracy on Kaggle.
+EVALBENCH_ENV = r'''
+import glob, os
+_hits = lambda p: sorted(glob.glob(f"/kaggle/input/**/{p}", recursive=True))
+for _k, _v in (("ARC_COMMIT_MODE", "smoke"), ("ARC_TASK_LIMIT", "0"), ("ARC_WORKERS", "__W__"),
+               ("ARC_CHALLENGES", (_hits("arc-agi_evaluation_challenges.json") or [""])[0]),
+               ("ARC_SOLUTIONS", (_hits("arc-agi_evaluation_solutions.json") or [""])[0]),
+               ("ARC_STAGE_MODE", "warm"), ("ARC_STOP_NEW_S", "7200"), ("ARC_FORCE_AT_S", "8400"),
+               ("ARC_HARD_STOP_S", "9000"), ("ARC_KILL_AT_S", "9600"), ("ARC_RESTART_MIN_LEFT_S", "1800"),
+               ("ARC_CACHE_SALT", "evalbench__W__")):
+    os.environ.setdefault(_k, _v)
+print("evalbench:", {k: os.environ[k] for k in ("ARC_WORKERS", "ARC_CHALLENGES", "ARC_SOLUTIONS")}, flush=True)
+'''
 MODEL_SOURCES = ["chankhavu/dsv41-flash-1017-arc-tool-e128-2bit/pyTorch/default/1"]
 
 
@@ -302,11 +332,13 @@ def build_kit():
 
 
 def build_notebook(variant="submit", with_model=True):
-    slug = {"submit": NB_SLUG, "smoke": "dsv41-tools-smoke", "bench": "dsv41-tools-bench"}[variant]
+    slug = {"submit": NB_SLUG, "smoke": "dsv41-tools-smoke", "bench": "dsv41-tools-bench"}.get(
+        variant, f"dsv41-tools-{variant}")
     nb = OUT / f"nb_{variant}"
     shutil.rmtree(nb, ignore_errors=True)
     nb.mkdir(parents=True)
-    cells_src = {"submit": [], "smoke": [SMOKE_ENV], "bench": [BENCH_ENV]}[variant] + CELLS
+    pre = {"submit": [], "smoke": [SMOKE_ENV], "bench": [BENCH_ENV]}
+    cells_src = (pre[variant] if variant in pre else [EVALBENCH_ENV.replace("__W__", variant.split("w")[-1])]) + CELLS
     cells = [{"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
               "source": c.strip("\n").splitlines(keepends=True)} for c in cells_src]
     (nb / f"{slug}.ipynb").write_text(json.dumps({
@@ -331,6 +363,8 @@ def main():
     build_notebook("submit", with_model)
     build_notebook("smoke", with_model)
     build_notebook("bench", with_model)
+    for w in os.environ.get("ARC_EVALBENCH_WORKERS", "48,64").split(","):
+        build_notebook(f"evalbench-w{w}", with_model)
     print(f"kit: {len(manifest)} files -> {OUT / 'kit'}; notebook -> {OUT / 'nb'}; local runner -> {OUT / 'local_run.py'}")
     print(f"model sources: {MODEL_SOURCES if with_model else 'none (--no-model)'}")
 

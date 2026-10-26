@@ -611,6 +611,18 @@ class DockerTests(unittest.TestCase):
         with self.session() as fresh:
             self.assertIsNone(submit_answer(fresh, "answer")[1])
 
+    def test_multi_submit_numpy_grids(self):
+        # E046 --multi-test: a list of numpy grids (the prompt's own example) is accepted, nested arrays too
+        with self.session() as session:
+            session.execute("import numpy as np\ntest_inputs = [[[3, 4]], [[5, 6, 7]]]\n"
+                            "def solve(g):\n    return np.array(g)[:, ::-1]\nanswer = [solve(t) for t in test_inputs]")
+            for code in ("[solve(t) for t in test_inputs]", "answer", "[list(solve(t)) for t in test_inputs]"):
+                feedback, grids = submit_answer(session, code, 2)
+                self.assertEqual(grids, [[[4, 3]], [[7, 6, 5]]], code)
+            feedback, grids = submit_answer(session, "solve(test_input)", 2)
+            self.assertIsNone(grids)
+            self.assertIn("2 test inputs", feedback)
+
     def test_check_answer_on_train_real_session(self):
         with self.session() as session:
             session.execute("def solve(g):\n    return [r[::-1] for r in g]\ndef bad(g):\n    return g")

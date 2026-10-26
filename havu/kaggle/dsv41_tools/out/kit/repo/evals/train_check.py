@@ -207,11 +207,17 @@ def stored_names(src):
     return stores, loads
 
 
-def train_check(session, executed, pred, code, replay_session=None, submit=None, transcript_limit=300):
+def train_check(session, executed, pred, code, replay_session=None, submit=None, transcript_limit=300,
+                reject_constant=False, transcript_fallback=False):
     """Label one finished attempt. `executed`: [(tool name, code)] in execution order; `pred`: the scored grid;
     `code`: the accepted submit_answer code ('answer' for the session fallback; None for a text answer).
     `replay_session(test_input)` opens a fresh session (transcript path); `submit` is run_deepseek_tools'
-    submit_answer. Returns {train_pass, train_frac, train_trace, train_paths, train_check_seconds}."""
+    submit_answer. Returns {train_pass, train_frac, train_trace, train_paths, train_check_seconds}.
+    reject_constant (E042, opt-in): an expr/cell/fn path that returns the test answer for every training input
+    does not read its input (e.g. a last cell `answer = cands[0]` that only prints test_input), so it is not
+    counted, and the check falls through to the next path (in the end the transcript replay).
+    transcript_fallback (E042, opt-in): also replay the transcript when the other paths exist but none passes every
+    training pair (a last cell that reads test_input but also values earlier cells derived from it scores ~0)."""
     t0 = time.monotonic()
     outs = [grid_hash(p["output"]) for p in session.train]
     n, ph = len(outs), grid_hash(pred)
@@ -220,11 +226,14 @@ def train_check(session, executed, pred, code, replay_session=None, submit=None,
     def score(preds):
         return sum(a == b for a, b in zip(preds[:-1], outs))
 
+    def constant(preds):
+        return reject_constant and all(p == ph for p in preds[:-1]) and ph not in outs
+
     def done():
         return any(k == n for k, _, _ in paths)
 
     data = probe(session, code, ph)
-    if data.get("expr") is not None and data["expr"][-1] == ph:
+    if data.get("expr") is not None and data["expr"][-1] == ph and not constant(data["expr"]):
         paths.append((score(data["expr"]), 3, "expr"))
     if not done():
         cells = [c for name, c in executed if name == "run_python"]
@@ -234,17 +243,18 @@ def train_check(session, executed, pred, code, replay_session=None, submit=None,
                 if var in stores:
                     if "test_input" in loads:
                         res = cell_eval(session, src, var, ph)
-                        if res[-1] == ph:
+                        if res[-1] == ph and not constant(res):
                             paths.append((score(res), 2, "cell"))
                     break  # only the last assigning cell counts
             if any(p[2] == "cell" for p in paths):
                 break
     if not done():
-        fns = probe(session, None, ph, do_expr=False, do_fns=True).get("fns", [])
+        fns = [f for f in probe(session, None, ph, do_expr=False, do_fns=True).get("fns", [])
+               if not constant(f["preds"])]
         if fns:
             paths.append((max(score(f["preds"]) for f in fns), 1, "fn"))
     label = {}
-    if not paths and replay_session is not None and submit is not None:
+    if (not paths or (transcript_fallback and not done())) and replay_session is not None and submit is not None:
         read = code if code not in (None, "answer") else ("answer" if "answer" in data.get("vars", []) else
                                                           (data.get("vars") or [None])[0])
         if read and len(executed) <= 120:
