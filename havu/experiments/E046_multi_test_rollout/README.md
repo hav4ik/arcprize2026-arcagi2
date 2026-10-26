@@ -383,3 +383,8 @@ remote boxes: `--token-exact` uploads ~1–2 MB per turn; a single lossy SSH tun
 - Kaggle `dsv41-tools-mtf-bench` V1 (`kaggle_bench/`): gate at 1.96 h, max KV 0.727, 0 errors / preemptions, force
   cut + final submission + exit 0; 72.2% vs E043 75.6% on 90 pairs.
 - Verdict: submit `dsv41-tools-submit-mtf` Version 6. Details: `notes/2026-10-26_dsv41_kaggle_inference_findings.md`.
+- Correction (adversarial reviews): the 72.2% vs 75.6% and 77.1% vs 80.1% comparisons come from a flawed
+  `bench_accuracy.py` (mismatched references and pair keys); matched properly there is no L4 gap for V6. Submitted
+  2026-10-26 ~10:30 UTC; review summary in the findings note, section 10.
+
+Fixes required before the next dsv41 candidate: `kaggle/dsv41_tools/next_candidate_fixes.md`.

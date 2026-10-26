@@ -857,7 +857,7 @@ PRIOR_NOTES = {
 }
 
 
-# E048 --alt-answer: attempt 0 may record a second guess in `alt_answer` (Kaggle scores two tries per test output).
+# E049 --alt-answer: attempt 0 may record a second guess in `alt_answer` (Kaggle scores two tries per test output).
 ALT_NOTES = {
     "passive": ("\n\nOptional second guess: if you meet a different rule that also reproduces every training pair but "
                 "gives a different test output, set `alt_answer` to that output (same format as your answer) before "
@@ -943,7 +943,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession, test_i
         prompt = (build_prompt_multi(task["train"], test_inputs[:1] if mp == "first" else test_inputs) + extra
                   + MULTI_NOTES[mp].format(n=multi) if multi
                   else build_prompt(task["train"], test_input) + extra)
-    if getattr(args, "alt_answer", ""):  # E048
+    if getattr(args, "alt_answer", ""):  # E049
         prompt += ALT_NOTES[args.alt_answer]
     if prior:  # E047 --prior-mode
         prompt += prior_note(args.prior_mode, prior["preds"], prior["train_pass"], prior.get("program"))
@@ -954,7 +954,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession, test_i
     n_tools, n_errors, n_turns, finish, stop, pred = 0, 0, 0, None, None, None
     n_nudges = 0  # E030 --cap-nudge
     n_rescues = 0  # E043 --rescue-code
-    alt_pred = None  # E048 --alt-answer
+    alt_pred = None  # E049 --alt-answer
     n_nudge_rescues = 0
     # E043 --token-exact: the attempt's exact token history (prompt + sampled ids) and counters
     tok = ({"ids": None, "n": 0, "prev_len": 0, "prev_sampled": [], "resync": False, "turns": 0, "breaks": 0,
@@ -1144,7 +1144,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession, test_i
                     if grid is not None:
                         pred, content, source, submit_code = grid, json.dumps(grid), "session_solve", expr
             if getattr(args, "alt_answer", "") and pred is not None:
-                # E048: the session's optional second guess (no model tokens); kept only if valid and different
+                # E049: the session's optional second guess (no model tokens); kept only if valid and different
                 output, grid = (submit_answer(session, "alt_answer", multi) if multi
                                 else submit_answer(session, "alt_answer"))
                 alt_pred = grid if grid is not None and grid != pred else None
@@ -1346,7 +1346,7 @@ def parser():
                          "define solve and set answer early; first = only test input 0 in the prompt, the rest in "
                          "the session)")
     ap.add_argument("--alt-answer", choices=["", "passive", "active"], default="",
-                    help="E048: the prompt invites an optional second guess in `alt_answer`, read from the session "
+                    help="E049: the prompt invites an optional second guess in `alt_answer`, read from the session "
                          "after the attempt (alt_pred / alt_correct; passive = only if met, active = briefly check)")
     ap.add_argument("--prior-mode", choices=["", "verify", "verifycode", "hybrid", "split", "differ"], default="",
                     help="E047: attempts >= 1 see attempt 0's answer from --prior-file, never its thinking (verify = "
@@ -1566,7 +1566,7 @@ def pair_records(rec, task, multi):
         recs = []
         for q in range(len(task["test"])):
             r = dict(rec, pair=q, pred=preds[q])
-            if "alt_pred" in rec:  # E048: a list of n grids, or None
+            if "alt_pred" in rec:  # E049: a list of n grids, or None
                 r["alt_pred"] = rec["alt_pred"][q] if isinstance(rec["alt_pred"], list) else None
             if q:
                 r.update(usage={"prompt": 0, "cache_hit": 0, "completion": 0}, est_cost_usd=0.0, multi_share=True)
