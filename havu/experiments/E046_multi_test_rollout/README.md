@@ -374,3 +374,12 @@ remote boxes: `--token-exact` uploads ~1–2 MB per turn; a single lossy SSH tun
 - `pods/pods_timeline.md`: the fleet timeline and summaries; `pods/runs/hist_<run>.txt`: per-run metric histories.
 - `heavy60_ids.txt` (60 largest eval tasks, the heavy-phase stress test), `multi_ids.txt` (45 multi-pair tasks).
 - Summary of all inference findings: `notes/2026-10-26_dsv41_kaggle_inference_findings.md`.
+
+## Final stress-test results (2026-10-26)
+
+- Pods (7 tests on the candidate x 36 + gate 0.6 + multi-budget 0.5 + context limit): all PASS; max KV 0.714 (full
+  pool), 0.792 (90% pool), 0.731 / 0.775 (heavy tasks full / 90%), 0.695 (throttled); server kill and deadline paths
+  clean; host memory <= 116 GiB. Accuracy 327/424 = 77.1% vs E043 80.1% on the same pairs.
+- Kaggle `dsv41-tools-mtf-bench` V1 (`kaggle_bench/`): gate at 1.96 h, max KV 0.727, 0 errors / preemptions, force
+  cut + final submission + exit 0; 72.2% vs E043 75.6% on 90 pairs.
+- Verdict: submit `dsv41-tools-submit-mtf` Version 6. Details: `notes/2026-10-26_dsv41_kaggle_inference_findings.md`.

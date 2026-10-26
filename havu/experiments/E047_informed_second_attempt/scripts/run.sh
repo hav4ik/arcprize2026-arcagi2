@@ -1,7 +1,7 @@
 #!/bin/bash
 # E047: later attempts informed by attempt 0's answer (--prior-mode; never its thinking), all 120 eval tasks, Flash-1017.
 # Attempt 0 is reused from E046 e046p_note_all (DeepSeek API; seeded into the new file); attempts 1..ATTEMPTS-1 run.
-# Usage (repo root): [PROVIDER=DeepInfra] [ATTEMPTS=3] run.sh <ctrl|verify|verifycode|hybrid|differ>
+# Usage (repo root): [PROVIDER=DeepInfra] [ATTEMPTS=3] run.sh <ctrl|verify|verifycode|hybrid|split|differ>
 #   PROVIDER unset = DeepSeek API (tag e047_<mode>); else OpenRouter, that provider pinned (tag e047or_<mode>).
 set -e
 M=$1; R=evals/results; P=$R/tools_persistent_grid_lean2sub_

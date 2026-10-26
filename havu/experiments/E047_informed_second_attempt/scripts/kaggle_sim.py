@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "experiments/E042_d
 import multi_sim as ms
 
 VC = {"on": False, "tok": 0.575, "turns": 0.68, "rho": 0.6}
+# --split: per-class ratios by attempt 0's train check (E047 OpenRouter runs; fail = verifycode, pass = verify)
+SPLIT = None  # {False: (tok, turns, rho), True: (tok, turns, rho)}
 
 
 def transform(att, rng):
@@ -18,9 +20,10 @@ def transform(att, rng):
         return att
     out = {}
     for i, (r0, r1) in att.items():
-        c = [bool(a or (b and rng.random() < VC["rho"])) for a, b in zip(r0["correct"], r1["correct"])]
-        out[i] = (r0, dict(r1, tokens=max(1, int(r1["tokens"] * VC["tok"])),
-                           turns=max(1, round(r1["turns"] * VC["turns"])), correct=c))
+        tok, turns, rho = SPLIT[bool(r0["train_pass"])] if SPLIT else (VC["tok"], VC["turns"], VC["rho"])
+        c = [bool(a or (b and rng.random() < rho)) for a, b in zip(r0["correct"], r1["correct"])]
+        out[i] = (r0, dict(r1, tokens=max(1, int(r1["tokens"] * tok)),
+                           turns=max(1, round(r1["turns"] * turns)), correct=c))
     return out
 
 
@@ -34,11 +37,14 @@ ms.simulate = ns["simulate"]
 
 if __name__ == "__main__":
     args = sys.argv[1:]
+    if "--split" in args:  # --split fail_tok,fail_turns,fail_rho:pass_tok,pass_turns,pass_rho
+        j = args.index("--split"); f, g = args[j + 1].split(":"); del args[j:j + 2]
+        SPLIT = {False: tuple(map(float, f.split(","))), True: tuple(map(float, g.split(",")))}
     for k in ("tok", "turns", "rho"):
         if f"--{k}" in args:
             j = args.index(f"--{k}"); VC[k] = float(args[j + 1]); del args[j:j + 2]
     for on in (False, True):
         VC["on"] = on
-        print(f"=== attempt 1 = {'verifycode check (tok x%.3f, turns x%.2f, rho %.2f)' % (VC['tok'], VC['turns'], VC['rho']) if on else 'fresh (as submitted)'}")
+        print(f"=== attempt 1 = {('split ' + str(SPLIT)) if on and SPLIT else ''}{'verifycode check (tok x%.3f, turns x%.2f, rho %.2f)' % (VC['tok'], VC['turns'], VC['rho']) if on else 'fresh (as submitted)'}")
         sys.argv = [sys.argv[0]] + args
         ms.main()

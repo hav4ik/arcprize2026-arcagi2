@@ -106,13 +106,16 @@ Pods ran the full Kaggle pipeline (`local_run.py`, `pods/podrun.sh`) on the eval
 | x 52 + gate 0.75 | 0.925 | thrash from 1.65 h |
 | x 44 + gate 0.6 | 0.716 | 3.8 h clean; running 21-44; attempts/h equal to ungated x 36 |
 | x 44 + gate 0.6, 90% KV | 0.804 | crossed 0.80 at 1.36 h, gate pulled it back to 0.62 (running 44 -> 25) |
-| **x 36 + gate 0.6 (candidate)** | 0.714-0.724 | full pool, 90% KV, heavy-only (60 largest tasks) at full and 90%: clean so far |
+| **x 36 + gate 0.6 (candidate)** | 0.714-0.792 | full pool 0.714, 90% KV 0.792, heavy-only (60 largest tasks) 0.731, heavy + 90% 0.775, throttled pod 0.695: 3-4 h each, no thrash, 0 preemptions |
 
 - The gate (`ARC_KV_ADMIT_MAX`, min 16 running) bounds KV whatever the task mix by letting concurrency drift down
   when attempts are long; the cost is ~15-30% tok/s in heavy phases and refill bursts when several attempts finish.
-- Failure-mode tests on the candidate: **vLLM killed mid-run** -> "server died", restart in 175 s (pod), 36
-  in-flight attempts re-queued, submission.json valid throughout: PASS. Deadline path (short deadlines) and slow
-  hardware (thermally throttled pod) running at the time of writing.
+- Failure-mode tests on the candidate, all PASS: **vLLM killed mid-run** -> "server died", restart in 175 s (pod),
+  36 in-flight attempts re-queued, submission.json valid throughout; **deadline path** (stop-new 1 h, force 1.17 h):
+  admission closed at 0.67 h, 19 streams cut at the force deadline (2 multi-test cuts kept session answers), final
+  submission valid, exit 0 before the hard stop; **throttled pod** (190-215 tok/s): KV 0.695, 1 gate hold.
+- Accuracy of finished attempts, pods tests 1-5: 327/424 = 77.1% vs E043 (8x box) 80.1% on the same pairs.
+- On 90% pools the late KV peak creeps to 0.78-0.79 (the gate only stops admissions); thrash onset is ~0.82+.
 - Host RAM stays at 105-114 GiB (Kaggle cgroup 173 GiB). The Engram table pins 23.6 GiB per rank.
 
 ## 7. Throughput facts
@@ -138,9 +141,17 @@ Pods ran the full Kaggle pipeline (`local_run.py`, `pods/podrun.sh`) on the eval
 - Cell 0b checks sha256, required features and the settings: in the **commit run** a failure raises with
   "E046 CHECK FAILED"; in the **competition rerun** it restores v3's kit files and runs per pair at 36 workers
   ("E046 FALLBACK"). Smoke commit: "E046 CHECK OK", 6/6 submitted.
-- Kaggle stress test `chankhavu/dsv41-tools-mtf-bench` (same cells, eval set, 3.25 h): at 1.11 h KV 0.428,
-  284-302 tok/s, 22 attempts, 0 errors (~15% slower KV growth than the pods at 50 W).
-- Projection: **~67-72 (central ~69-70)** vs ~65-68 for Version 5; residual uncertainty = private-set difficulty.
+- Kaggle stress test `chankhavu/dsv41-tools-mtf-bench` V1 (same cells + bench settings: eval set, force 3.0 h;
+  outputs in `experiments/E046_multi_test_rollout/kaggle_bench/`): "E046 CHECK OK"; server up in 590 s, KV 1,554,183;
+  295-319 tok/s at full concurrency, hits 0.94-0.99; KV gate first held at 1.96 h (KV 0.609; pods 1.41 h), running
+  29-35 while gated; **max KV 0.727**; 0 preemptions, 0 errors; admission closed at 2.48 h, force cut of 11 streams at
+  3.00 h, final submission valid (120/120), solver exit 0. 90 pairs answered: 72.2% correct vs E043 75.6% on the same
+  pairs (pod test 1: 75.4% vs 78.7%; 88 shared attempts 65 vs 68).
+- **L4 per-attempt accuracy is ~3 pp (~4% relative) below the 8x-box E128 records** on Kaggle and on the pods
+  (borderline significant; Version 5's per-pair pod run showed -8 pp). The simulator uses the 8x-box records, so
+  scale its 70.3 +- 4.4 (x 36 multi, gate 0.6) by ~0.96.
+- Projection: **~67-68 central (range ~63-72)**; Version 5 lower by a few points under the same adjustment.
+  Residual uncertainty: private-set difficulty and Kaggle infrastructure (mounts).
 
 ## 9. Process notes
 

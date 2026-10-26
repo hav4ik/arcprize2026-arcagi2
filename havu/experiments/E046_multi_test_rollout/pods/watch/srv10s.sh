@@ -1,0 +1,2 @@
+# usage: bash -s <run> <regex of HH:MM>  -> 10-s engine stats (every other line)
+grep -E "loggers.py.*Engine 000" /root/runs/$1/out/dsv41_logs/server.log | grep -E "10-26 ($2)" | sed -E "s/.*10-26 ([0-9:]+).*Avg prompt throughput: ([0-9.]+) tokens\/s, Avg generation throughput: ([0-9.]+) tokens\/s, Running: ([0-9]+) reqs, Waiting: ([0-9]+) reqs, GPU KV cache usage: ([0-9.]+)%, Prefix cache hit rate: ([0-9.]+)%.*/\1 p\2 g\3 r\4 w\5 kv\6 hit\7/" | tr "\n" ";"

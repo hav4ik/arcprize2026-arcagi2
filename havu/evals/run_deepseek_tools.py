@@ -93,7 +93,7 @@ HARNESS_VERSION_V6 = "persistent-v6"
 V6_DEFAULTS = {"turns_note": 0, "fallback_solve": False, "cap_nudge": False, "effort_header": "", "grid_format": "json",
                "image_cell": 32, "openrouter_provider": "", "or_reasoning": "", "multi_test": False,
                "multi_budget": 0.0, "multi_prompt": "note", "context_limit": 0,
-               "prior_mode": ""}
+               "prior_mode": "", "alt_answer": ""}
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 V6_PROMPTS = {"lean2code"}
 HELPERS_SRC = (Path(__file__).resolve().parent / "arc_helpers.py").read_text()
@@ -857,12 +857,26 @@ PRIOR_NOTES = {
 }
 
 
+# E048 --alt-answer: attempt 0 may record a second guess in `alt_answer` (Kaggle scores two tries per test output).
+ALT_NOTES = {
+    "passive": ("\n\nOptional second guess: if you meet a different rule that also reproduces every training pair but "
+                "gives a different test output, set `alt_answer` to that output (same format as your answer) before "
+                "submitting. It is scored as a second try, so record it only when it is a real alternative; do not "
+                "spend extra effort looking for one."),
+    "active": ("\n\nYou get two tries per test output. Before submitting, briefly ask whether a different rule also "
+               "reproduces every training pair but gives a different test output; if so, set `alt_answer` to that "
+               "output (same format as your answer). Your main answer is still the one you submit."),
+}
+
+
 def prior_note(mode, preds, train_pass, program=None):
     """E047: the note for attempt >= 1; preds = attempt 0's grids, one per test input shown in this attempt."""
     if not preds or any(g is None for g in preds):
         return ""
     if mode == "hybrid":  # E047: train check passed -> audit the test extension; else check and fix the rule
         mode = "verifytest" if train_pass else "verifycode"
+    if mode == "split":  # E047: train check passed -> answer only (verify); else answer + program (verifycode)
+        mode = "verify" if train_pass else "verifycode"
     if mode in ("verifycode", "verifytest") and not program:
         mode = "verify"
     grids = "\n\n".join((f"--Previous answer for test input {i}--\n\n" if len(preds) > 1 else "--Previous answer--\n\n")
@@ -929,6 +943,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession, test_i
         prompt = (build_prompt_multi(task["train"], test_inputs[:1] if mp == "first" else test_inputs) + extra
                   + MULTI_NOTES[mp].format(n=multi) if multi
                   else build_prompt(task["train"], test_input) + extra)
+    if getattr(args, "alt_answer", ""):  # E048
+        prompt += ALT_NOTES[args.alt_answer]
     if prior:  # E047 --prior-mode
         prompt += prior_note(args.prior_mode, prior["preds"], prior["train_pass"], prior.get("program"))
     messages = [{"role": "user", "content": prompt}]
@@ -938,6 +954,7 @@ def solve(client, args, task, test_input, session_factory=SandboxSession, test_i
     n_tools, n_errors, n_turns, finish, stop, pred = 0, 0, 0, None, None, None
     n_nudges = 0  # E030 --cap-nudge
     n_rescues = 0  # E043 --rescue-code
+    alt_pred = None  # E048 --alt-answer
     n_nudge_rescues = 0
     # E043 --token-exact: the attempt's exact token history (prompt + sampled ids) and counters
     tok = ({"ids": None, "n": 0, "prev_len": 0, "prev_sampled": [], "resync": False, "turns": 0, "breaks": 0,
@@ -1126,6 +1143,11 @@ def solve(client, args, task, test_input, session_factory=SandboxSession, test_i
                     events.append({"fallback": "session_solve", "accepted": grid is not None, "output": output[:300]})
                     if grid is not None:
                         pred, content, source, submit_code = grid, json.dumps(grid), "session_solve", expr
+            if getattr(args, "alt_answer", "") and pred is not None:
+                # E048: the session's optional second guess (no model tokens); kept only if valid and different
+                output, grid = (submit_answer(session, "alt_answer", multi) if multi
+                                else submit_answer(session, "alt_answer"))
+                alt_pred = grid if grid is not None and grid != pred else None
             if getattr(args, "train_check", False) and pred is not None:
                 # E017: label the answer program on the training pairs (no model tokens; host compares hashes).
                 try:
@@ -1150,6 +1172,8 @@ def solve(client, args, task, test_input, session_factory=SandboxSession, test_i
         result.update(est_cost_peak_usd=round(cost["peak"], 6), peak_turns=cost["peak_turns"])
     if getattr(args, "cap_nudge", False):
         result["cap_nudges"] = n_nudges
+    if getattr(args, "alt_answer", ""):
+        result["alt_pred"] = alt_pred
     if getattr(args, "rescue_code", False):
         result["rescues"] = n_rescues
     if tok is not None:
@@ -1321,11 +1345,14 @@ def parser():
                     help="E046: wording of the --multi-test note (note = the E046 note; lean = one line; early = note + "
                          "define solve and set answer early; first = only test input 0 in the prompt, the rest in "
                          "the session)")
-    ap.add_argument("--prior-mode", choices=["", "verify", "verifycode", "hybrid", "differ"], default="",
+    ap.add_argument("--alt-answer", choices=["", "passive", "active"], default="",
+                    help="E048: the prompt invites an optional second guess in `alt_answer`, read from the session "
+                         "after the attempt (alt_pred / alt_correct; passive = only if met, active = briefly check)")
+    ap.add_argument("--prior-mode", choices=["", "verify", "verifycode", "hybrid", "split", "differ"], default="",
                     help="E047: attempts >= 1 see attempt 0's answer from --prior-file, never its thinking (verify = "
                          "check it, resubmit or fix; verifycode = verify + the program behind the answer; hybrid = "
                          "verifycode when attempt 0 failed the train check, else a test-extension audit with the "
-                         "program; differ = "
+                         "program; split = verifycode when attempt 0 failed the train check, else verify; differ = "
                          "assume it is wrong and look for a different rule)")
     ap.add_argument("--prior-file", type=Path,
                     help="E047: jsonl whose attempt-0 records give the prior answers (not part of the config)")
@@ -1374,7 +1401,7 @@ def main():
         ap.error("--budget-notes must be in [0, 1) and --budget-warn in (0, 1]")
     if bool(args.prior_mode) != bool(args.prior_file):
         ap.error("--prior-mode and --prior-file go together")
-    args._prior = (load_prior(args.prior_file, args.prior_mode in ("verifycode", "hybrid")) if args.prior_file
+    args._prior = (load_prior(args.prior_file, args.prior_mode in ("verifycode", "hybrid", "split")) if args.prior_file
                    else None)
     tasks = load_tasks(args.challenges, args.solutions)
     pairs = None
@@ -1539,12 +1566,16 @@ def pair_records(rec, task, multi):
         recs = []
         for q in range(len(task["test"])):
             r = dict(rec, pair=q, pred=preds[q])
+            if "alt_pred" in rec:  # E048: a list of n grids, or None
+                r["alt_pred"] = rec["alt_pred"][q] if isinstance(rec["alt_pred"], list) else None
             if q:
                 r.update(usage={"prompt": 0, "cache_hit": 0, "completion": 0}, est_cost_usd=0.0, multi_share=True)
             recs.append(r)
     for r in recs:
         if "output" in task["test"][r["pair"]]:
             r["correct"] = r["pred"] == task["test"][r["pair"]]["output"]
+            if "alt_pred" in r:
+                r["alt_correct"] = r["alt_pred"] is not None and r["alt_pred"] == task["test"][r["pair"]]["output"]
     return recs
 
 
