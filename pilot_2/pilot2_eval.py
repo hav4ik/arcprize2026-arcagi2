@@ -789,9 +789,14 @@ def run_pairs_on_llm(
             or st.cum_gen_tokens >= st.cfg.total_token_budget - 512
         )
         if hit_cap:
+          if st.sandbox.use_e031_ipython_mode:
+            st.sandbox.finalize_e031_session_fallback(
+                st.turn_idx, st.cum_gen_tokens
+            )
           if (
               st.cfg.use_two_stage_think_nudge
               and st.sandbox.first_tp_pred is None
+              and st.sandbox.submitted_answer_grid is None
               and st.nudge_stage != 3
           ):
             st.transcript = (
@@ -899,8 +904,11 @@ def run_pairs_on_llm(
           combined_text = st.partial_turn_text + gen_text
           combined_toks = st.partial_turn_tokens + gen_toks
 
+          has_complete_tool_call = (
+              "</tool_call>" in combined_text or "</function>" in combined_text
+          )
           if (
-              "<tool_call>" not in combined_text
+              not has_complete_tool_call
               and str(comp.finish_reason) == "length"
               and (
                   st.cum_gen_tokens + combined_toks + 512
@@ -908,7 +916,11 @@ def run_pairs_on_llm(
               )
           ):
             if st.cfg.use_two_stage_think_nudge:
-              if st.nudge_stage == 0 and "</think>" not in combined_text:
+              if (
+                  st.nudge_stage == 0
+                  and "</think>" not in combined_text
+                  and "<tool_call>" not in combined_text
+              ):
                 st.nudge_stage = 1
                 st.in_nudge_continuation = True
                 st.partial_turn_text = (
@@ -918,24 +930,37 @@ def run_pairs_on_llm(
                 st.partial_turn_tokens = combined_toks
                 _enqueue_generation(st, is_nudge_grace=True)
                 continue
-              if st.nudge_stage == 1:
+              if st.nudge_stage < 2:
                 st.nudge_stage = 2
                 st.in_nudge_continuation = True
-                force_act = (
-                    prompts_and_selector.XML_COMMIT_FORCE_ACT_STAGE2
-                    if (
-                        st.cum_gen_tokens + combined_toks >= 20000
-                        and not st.sandbox.has_defined_solve
-                    )
-                    else prompts_and_selector.XML_THINK_FORCE_ACT_STAGE2
-                )
-                st.partial_turn_text = combined_text + force_act
+                if "<tool_call>" in combined_text:
+                  st.partial_turn_text = combined_text
+                elif "</think>" in combined_text:
+                  st.partial_turn_text = (
+                      combined_text
+                      + "\n\n<tool_call>\n<function=run_python>\n<parameter=code>\n"
+                  )
+                else:
+                  force_act = (
+                      prompts_and_selector.XML_COMMIT_FORCE_ACT_STAGE2
+                      if (
+                          not st.sandbox.use_e031_ipython_mode
+                          and st.cum_gen_tokens + combined_toks >= 20000
+                          and not st.sandbox.has_defined_solve
+                      )
+                      else prompts_and_selector.XML_THINK_FORCE_ACT_STAGE2
+                  )
+                  st.partial_turn_text = combined_text + force_act
                 st.partial_turn_tokens = combined_toks
                 _enqueue_generation(st, is_nudge_grace=True)
                 continue
             elif not st.in_nudge_continuation:
               st.in_nudge_continuation = True
-              st.partial_turn_text = combined_text + fb["think_nudge"]
+              st.partial_turn_text = (
+                  combined_text
+                  if "<tool_call>" in combined_text
+                  else combined_text + fb["think_nudge"]
+              )
               st.partial_turn_tokens = combined_toks
               _enqueue_generation(st, is_nudge_grace=True)
               continue
@@ -1244,6 +1269,23 @@ def main(argv: list[str]) -> None:
         if is_nudge_grace
         else min(st.cfg.turn_think_cap, remaining_budget)
     )
+    prompt_to_send = (
+        st.transcript + st.partial_turn_text if is_nudge_grace else st.transcript
+    )
+    engine_max_len = 131072
+    prompt_toks = _count_prompt_tokens_safe(llm, prompt_to_send)
+    if prompt_toks + max_toks > engine_max_len - 256:
+      st.transcript = prompts_and_selector.compact_chatml_transcript(
+          st.transcript, keep_recent_turns=1, max_old_tool_chars=500
+      )
+      prompt_to_send = (
+          st.transcript + st.partial_turn_text
+          if is_nudge_grace
+          else st.transcript
+      )
+      prompt_toks = _count_prompt_tokens_safe(llm, prompt_to_send)
+      max_toks = max(1, min(int(max_toks), engine_max_len - 256 - prompt_toks))
+
     sp = vllm.SamplingParams(
         temperature=st.cfg.temperature,
         top_p=st.cfg.top_p,
@@ -1253,9 +1295,6 @@ def main(argv: list[str]) -> None:
         include_stop_str_in_output=True,
     )
     sp.output_kind = final_only_kind
-    prompt_to_send = (
-        st.transcript + st.partial_turn_text if is_nudge_grace else st.transcript
-    )
     rids = llm.enqueue([prompt_to_send], [sp], use_tqdm=False)
     internal = str(rids[0])
     external = internal.rsplit("-", 1)[0] if "-" in internal else internal
@@ -1566,9 +1605,14 @@ def main(argv: list[str]) -> None:
             or st.cum_gen_tokens >= st.cfg.total_token_budget - 512
         )
         if hit_turn_or_budget_cap:
+          if st.sandbox.use_e031_ipython_mode:
+            st.sandbox.finalize_e031_session_fallback(
+                st.turn_idx, st.cum_gen_tokens
+            )
           if (
               st.cfg.use_two_stage_think_nudge
               and st.sandbox.first_tp_pred is None
+              and st.sandbox.submitted_answer_grid is None
               and st.nudge_stage != 3
           ):
             st.transcript = prompts_and_selector.append_turn_to_chatml_transcript(
@@ -1675,13 +1719,20 @@ def main(argv: list[str]) -> None:
           combined_text = st.partial_turn_text + gen_text
           combined_toks = st.partial_turn_tokens + gen_toks
 
+          has_complete_tool_call = (
+              "</tool_call>" in combined_text or "</function>" in combined_text
+          )
           if (
-              "<tool_call>" not in combined_text
+              not has_complete_tool_call
               and str(comp.finish_reason) == "length"
               and (st.cum_gen_tokens + combined_toks + 512 < st.cfg.total_token_budget)
           ):
             if st.cfg.use_two_stage_think_nudge:
-              if st.nudge_stage == 0 and "</think>" not in combined_text:
+              if (
+                  st.nudge_stage == 0
+                  and "</think>" not in combined_text
+                  and "<tool_call>" not in combined_text
+              ):
                 st.nudge_stage = 1
                 st.in_nudge_continuation = True
                 st.partial_turn_text = (
@@ -1690,25 +1741,37 @@ def main(argv: list[str]) -> None:
                 st.partial_turn_tokens = combined_toks
                 _enqueue_generation(st, is_nudge_grace=True)
                 continue
-              if st.nudge_stage == 1:
+              if st.nudge_stage < 2:
                 st.nudge_stage = 2
                 st.in_nudge_continuation = True
-                force_act = (
-                    prompts_and_selector.XML_COMMIT_FORCE_ACT_STAGE2
-                    if (
-                        not st.sandbox.use_e031_ipython_mode
-                        and st.cum_gen_tokens + combined_toks >= 20000
-                        and not st.sandbox.has_defined_solve
-                    )
-                    else prompts_and_selector.XML_THINK_FORCE_ACT_STAGE2
-                )
-                st.partial_turn_text = combined_text + force_act
+                if "<tool_call>" in combined_text:
+                  st.partial_turn_text = combined_text
+                elif "</think>" in combined_text:
+                  st.partial_turn_text = (
+                      combined_text
+                      + "\n\n<tool_call>\n<function=run_python>\n<parameter=code>\n"
+                  )
+                else:
+                  force_act = (
+                      prompts_and_selector.XML_COMMIT_FORCE_ACT_STAGE2
+                      if (
+                          not st.sandbox.use_e031_ipython_mode
+                          and st.cum_gen_tokens + combined_toks >= 20000
+                          and not st.sandbox.has_defined_solve
+                      )
+                      else prompts_and_selector.XML_THINK_FORCE_ACT_STAGE2
+                  )
+                  st.partial_turn_text = combined_text + force_act
                 st.partial_turn_tokens = combined_toks
                 _enqueue_generation(st, is_nudge_grace=True)
                 continue
             elif not st.in_nudge_continuation:
               st.in_nudge_continuation = True
-              st.partial_turn_text = combined_text + fb["think_nudge"]
+              st.partial_turn_text = (
+                  combined_text
+                  if "<tool_call>" in combined_text
+                  else combined_text + fb["think_nudge"]
+              )
               st.partial_turn_tokens = combined_toks
               _enqueue_generation(st, is_nudge_grace=True)
               continue

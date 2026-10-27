@@ -41,6 +41,9 @@ py_library(
     deps = [
         ":prompts_and_selector",
         ":sandbox_verifier",
+        "//experimental/users/arazdai/kaggle/arc_agi_2/pilot_1/setB/tpu_vllm:prompts_and_voting",
+        "//experimental/users/arazdai/kaggle/arc_agi_2/pilot_1/setB/tpu_vllm:sandbox",
+        "//experimental/users/arazdai/kaggle/sft:export_and_quantize_lib",
         "//pyglib:gfile",
         "//third_party/py/absl/flags",
         "//third_party/py/jax",
@@ -67,6 +70,7 @@ py_binary(
     deps = [
         ":prompts_and_selector",
         ":sandbox_verifier",
+        "//experimental/users/arazdai/kaggle/sft:export_and_quantize_lib",
         "//pyglib:gfile",
         "//third_party/py/absl/flags",
         "//third_party/py/jax",

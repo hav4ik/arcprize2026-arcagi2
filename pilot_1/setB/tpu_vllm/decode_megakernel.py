@@ -2594,12 +2594,12 @@ def _indexer_step_core_jax(
 
 
 # Smallest Indexer scan length and growth factor of the static scan ladder.
-_INDEXER_SCAN_MIN_LEN = 8192
-_INDEXER_SCAN_GROWTH = 4
+_INDEXER_SCAN_MIN_LEN = 4096
+_INDEXER_SCAN_GROWTH = 2
 # Each scan length past the first adds a lax.switch to every Indexer call (about
 # 45 us on Ghostfish). A shorter scan length is kept only if it skips at least
 # this many (query row, key) scores per device.
-_INDEXER_SCAN_MIN_SKIPPED_SCORES = 1 << 20
+_INDEXER_SCAN_MIN_SKIPPED_SCORES = 4096
 
 
 def _indexer_scan_buckets(
@@ -2644,7 +2644,7 @@ def _indexer_scan_buckets(
       return True  # every populated block is a candidate
     if local_t >= 16384 and loc_blocks > min(kc, local_t):
       return True  # int32 top local block ids (pre_top_bidx)
-    return loc_blocks == kc  # positional bool block mask of width kc
+    return loc_blocks <= kc  # positional bool block mask padded to width kc
 
   if not _ok(max_comp):
     return (max_comp,)
@@ -2665,10 +2665,17 @@ def _uniform_candidates(
   """Encodes per-device candidate blocks as int32 [B, S, width] (-1 = none)."""
   if cand is None:
     return jnp.full((bsz, seqlen, width), -1, dtype=I32)
+  if cand.dtype == jnp.bool_:
+    loc_b = cand.shape[-1]
+    if loc_b > width:
+      raise ValueError(f"bool candidate width {loc_b} > {width}")
+    enc = jnp.where(cand, jnp.arange(loc_b, dtype=I32), -1)
+    if loc_b < width:
+      pad = jnp.full((bsz, seqlen, width - loc_b), -1, dtype=I32)
+      enc = jnp.concatenate([enc, pad], axis=-1)
+    return enc
   if cand.shape[-1] != width:
     raise ValueError(f"candidate width {cand.shape[-1]} != {width}")
-  if cand.dtype == jnp.bool_:
-    return jnp.where(cand, jnp.arange(width, dtype=I32), -1)
   return cand.astype(I32)
 
 
@@ -2685,7 +2692,7 @@ def _decode_candidates(
     return None
   if local_t >= 16384 and loc_blocks > min(c.index_topk, local_t):
     return cand
-  return cand >= 0
+  return cand[..., :loc_blocks] >= 0
 
 
 def _indexer_step_jax(
@@ -3270,10 +3277,15 @@ def encoder_macrokernel(
 
           if seqlen >= 16 and seqlen % 2 == 0 and ratio == 2:
             half_s = seqlen // 2
+            k_even = k_all[:, 0::2, :]
             k_odd = k_all[:, 1::2, :]
+            lat_even = rot_lat_all[:, 0::2, :]
             lat_odd = rot_lat_all[:, 1::2, :]
             for b_i in range(bsz):
-              g_s0 = jnp.clip(g_idx[b_i, 1], 0, max(0, max_m2_comp - half_s))
+              starts_odd = (pos_seq[b_i, 0] % 2) == 1
+              g_s0 = jnp.clip(g_idx[b_i, 0], 0, max(0, max_m2_comp - half_s))
+              k_sel = jnp.where(starts_odd, k_even[b_i], k_odd[b_i])
+              lat_sel = jnp.where(starts_odd, lat_even[b_i], lat_odd[b_i])
               old_ik = lax.dynamic_slice(
                   comp_m2_idx_k,
                   (jnp.int32(b_i), jnp.int32(m2_slot), g_s0, jnp.int32(0)),
@@ -3286,12 +3298,12 @@ def encoder_macrokernel(
               )
               new_ik = jnp.where(
                   active_b[b_i],
-                  k_odd[b_i].reshape(1, 1, half_s, c.index_head_dim),
+                  k_sel.reshape(1, 1, half_s, c.index_head_dim),
                   old_ik,
               )
               new_kv = jnp.where(
                   active_b[b_i],
-                  lat_odd[b_i].reshape(1, 1, half_s, c.head_dim),
+                  lat_sel.reshape(1, 1, half_s, c.head_dim),
                   old_kv,
               )
               comp_m2_idx_k = lax.dynamic_update_slice(
@@ -3588,6 +3600,10 @@ def decoder_macrokernel(
     max_total_seq: int | None = None,
     simulate_full_43_blocks: bool = False,
     valid_len: jax.Array | int | None = None,
+    temperature: float = 0.0,
+    top_k: int = 20,
+    rng_seed: jax.Array | None = None,
+    draft_ids: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, DeviceDecodeCaches]:
   """Macro-Kernel 2: 20-Layer Decoder (L_dec..n_layers-1) + Hierarchical Indexer + Head.
 
@@ -3852,7 +3868,7 @@ def decoder_macrokernel(
   normed = _rms_norm_jax(h_collapsed, w["norm"], c.norm_eps)
   s_out = normed.shape[1]
 
-  # Sharded LM Head + distributed peer argmax
+  # Sharded LM Head + distributed peer argmax / stochastic Gumbel-max top-k sampling
   logits_sharded = _dot_f32(
       normed.reshape(bsz * s_out, c.dim), w["head"]
   ).reshape(bsz, s_out, lay.vocab_shard)
@@ -3862,17 +3878,124 @@ def decoder_macrokernel(
   logits_sharded = jnp.where(
       (v_iota < c.vocab_size)[None, None, :], logits_sharded, -jnp.inf
   )
-  local_max = jnp.max(logits_sharded, axis=-1)
-  local_arg = v0 + jnp.argmax(logits_sharded, axis=-1).astype(I32)
-  if lay.num_devices > 1:
-    loc_both = jnp.concatenate([local_max, local_arg.astype(F32)], axis=-1)
-    all_both = _vmem_all_gather_axis0(loc_both, lay.num_devices)
-    all_max = all_both[..., :s_out]
-    all_arg = all_both[..., s_out:].astype(I32)
-    best_rank = jnp.argmax(all_max, axis=0)
-    output_ids = jnp.take_along_axis(all_arg, best_rank[None, ...], axis=0)[0]
+  if temperature > 0.0 and rng_seed is not None:
+    k_loc = max(1, min(int(top_k), vs))
+    loc_vals, loc_idx = lax.top_k(logits_sharded, k_loc)
+    loc_ids = v0 + loc_idx.astype(I32)
+    if lay.num_devices > 1:
+      loc_pkt = jnp.concatenate(
+          [
+              loc_vals.reshape(bsz, s_out * k_loc),
+              loc_ids.astype(F32).reshape(bsz, s_out * k_loc),
+          ],
+          axis=-1,
+      )
+      all_pkt = _vmem_all_gather_axis0(loc_pkt, lay.num_devices)
+      all_vals = (
+          all_pkt[:, :, : s_out * k_loc]
+          .reshape(lay.num_devices, bsz, s_out, k_loc)
+          .transpose(1, 2, 0, 3)
+          .reshape(bsz, s_out, lay.num_devices * k_loc)
+      )
+      all_ids = (
+          all_pkt[:, :, s_out * k_loc :]
+          .astype(I32)
+          .reshape(lay.num_devices, bsz, s_out, k_loc)
+          .transpose(1, 2, 0, 3)
+          .reshape(bsz, s_out, lay.num_devices * k_loc)
+      )
+      g_vals, g_idx = lax.top_k(all_vals, k_loc)
+      g_ids = jnp.take_along_axis(all_ids, g_idx, axis=-1)
+    else:
+      g_vals, g_ids = loc_vals, loc_ids
+    scaled_vals = g_vals / jnp.float32(temperature)
+    max_v = jnp.max(scaled_vals, axis=-1, keepdims=True)
+    probs = jnp.exp(scaled_vals - max_v)
+    probs = probs / jnp.maximum(jnp.sum(probs, axis=-1, keepdims=True), 1e-12)
+    sorted_p, sort_idx = lax.top_k(probs, k_loc)
+    cum_p = jnp.cumsum(sorted_p, axis=-1)
+    keep_sorted = (cum_p - sorted_p) < jnp.float32(0.95)
+    keep_sorted = keep_sorted.at[..., 0].set(True)
+    inv_perm = jnp.argsort(sort_idx, axis=-1)
+    keep_mask = jnp.take_along_axis(keep_sorted, inv_perm, axis=-1)
+    masked_vals = jnp.where(keep_mask, scaled_vals, -jnp.inf)
+    seed_b = jnp.broadcast_to(jnp.asarray(rng_seed, dtype=I32), (bsz,))
+    pos_s = (
+        pos_seq[:, -1:]
+        if not full_logits
+        else pos_seq[:, :s_out]
+    )
+    h_key = (
+        jnp.uint32(seed_b[:, None, None]) * jnp.uint32(0x9E3779B9)
+        ^ jnp.uint32(pos_s[:, :, None]) * jnp.uint32(0x85EBCA6B)
+        ^ (
+            jnp.arange(k_loc, dtype=jnp.uint32)[None, None, :]
+            * jnp.uint32(0xC2B2AE35)
+        )
+    )
+    h_key = (h_key ^ (h_key >> jnp.uint32(16))) * jnp.uint32(0x7FEB352D)
+    h_key = (h_key ^ (h_key >> jnp.uint32(15))) * jnp.uint32(0x846CA68B)
+    h_key = h_key ^ (h_key >> jnp.uint32(16))
+    u = (
+        (h_key >> jnp.uint32(8)).astype(F32) + jnp.float32(0.5)
+    ) / jnp.float32(16777216.0)
+    gumbel = -jnp.log(-jnp.log(jnp.clip(u, 1e-6, 1.0 - 1e-6)))
+    chosen_k = jnp.argmax(masked_vals + gumbel, axis=-1)[..., None]
+    gumbel_ids = jnp.take_along_axis(g_ids, chosen_k, axis=-1)[..., 0]
+    if full_logits and draft_ids is not None:
+      # Exact lossless speculative rejection + residual distribution sampling
+      # for a deterministic drafter (Leviathan et al., 2023):
+      #   1. Normalized target distribution after top-k + top-p=0.95 filtering:
+      #      norm_p(x) = probs(x) * keep_mask(x) / sum_{x'} probs(x') * keep_mask(x')
+      #   2. For position j in 0..s_out-2 with greedy draft token d_j = draft_ids[:, j]:
+      #      Accept d_j iff u_acc < norm_p(d_j).
+      #   3. On rejection at position j, sample the bonus token from the residual
+      #      distribution proportional to max(0, norm_p(x) - 1[x == d_j]) =
+      #      norm_p(x) * 1[x != d_j] (falling back to norm_p if norm_p(d_j) == 1).
+      #   4. Position s_out - 1 (bonus token when all blk-1 draft tokens are accepted)
+      #      samples directly from norm_p via gumbel_ids[:, -1:].
+      kept_p = jnp.where(keep_mask, probs, jnp.float32(0.0))
+      norm_p = kept_p / jnp.maximum(
+          jnp.sum(kept_p, axis=-1, keepdims=True), jnp.float32(1e-12)
+      )
+      is_draft = g_ids[:, :-1, :] == draft_ids[:, :, None]
+      p_draft = jnp.sum(
+          jnp.where(is_draft, norm_p[:, :-1, :], jnp.float32(0.0)), axis=-1
+      )
+      h_acc = (
+          jnp.uint32(seed_b[:, None]) * jnp.uint32(0xD1B54A35)
+          ^ jnp.uint32(pos_s[:, :-1]) * jnp.uint32(0x94D049BB)
+          ^ jnp.uint32(0x517CC1B7)
+      )
+      h_acc = (h_acc ^ (h_acc >> jnp.uint32(16))) * jnp.uint32(0x7FEB352D)
+      h_acc = (h_acc ^ (h_acc >> jnp.uint32(15))) * jnp.uint32(0x846CA68B)
+      h_acc = h_acc ^ (h_acc >> jnp.uint32(16))
+      u_acc = (
+          (h_acc >> jnp.uint32(8)).astype(F32) + jnp.float32(0.5)
+      ) / jnp.float32(16777216.0)
+      accepted = u_acc < p_draft
+
+      res_vals = jnp.where(is_draft, -jnp.inf, masked_vals[:, :-1, :])
+      has_alt = jnp.any(jnp.isfinite(res_vals), axis=-1, keepdims=True)
+      res_vals = jnp.where(has_alt, res_vals, masked_vals[:, :-1, :])
+      res_k = jnp.argmax(res_vals + gumbel[:, :-1, :], axis=-1)[..., None]
+      res_ids = jnp.take_along_axis(g_ids[:, :-1, :], res_k, axis=-1)[..., 0]
+      spec_pred = jnp.where(accepted, draft_ids, res_ids)
+      output_ids = jnp.concatenate([spec_pred, gumbel_ids[:, -1:]], axis=1)
+    else:
+      output_ids = gumbel_ids
   else:
-    output_ids = local_arg
+    local_max = jnp.max(logits_sharded, axis=-1)
+    local_arg = v0 + jnp.argmax(logits_sharded, axis=-1).astype(I32)
+    if lay.num_devices > 1:
+      loc_both = jnp.concatenate([local_max, local_arg.astype(F32)], axis=-1)
+      all_both = _vmem_all_gather_axis0(loc_both, lay.num_devices)
+      all_max = all_both[..., :s_out]
+      all_arg = all_both[..., s_out:].astype(I32)
+      best_rank = jnp.argmax(all_max, axis=0)
+      output_ids = jnp.take_along_axis(all_arg, best_rank[None, ...], axis=0)[0]
+    else:
+      output_ids = local_arg
   if not full_logits:
     output_ids = output_ids[:, 0]
 
@@ -4331,6 +4454,9 @@ def speculative_verify_and_draft_step(
     lay: layout_lib.DeviceLayout,
     interpret: bool = False,
     simulate_full_43_blocks: bool = False,
+    temperature: float = 0.0,
+    top_k: int = 20,
+    rng_seed: jax.Array | None = None,
 ) -> tuple[
     jax.Array,
     jax.Array,
@@ -4389,6 +4515,10 @@ def speculative_verify_and_draft_step(
       full_logits=True,
       interpret=interpret,
       simulate_full_43_blocks=simulate_full_43_blocks,
+      temperature=temperature,
+      top_k=top_k,
+      rng_seed=rng_seed,
+      draft_ids=candidate_ids[:, 1:],
   )
 
   # 2. Longest accepted prefix match: draft j matches target_pred[:, j].

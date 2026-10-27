@@ -1,83 +1,165 @@
 # ARC-AGI-2: Agentic Python Synthesis + Qwen3.8-27B Full FSDP2 & LoRA SFT
 
-How far can a single open-weights 27B model go on **ARC-AGI-2** (`120` public evaluation tasks, `167` test pairs) when combined with self-verifying Python synthesis and supervised fine-tuning (SFT) on 3-gate verified trajectories?
+How far can a single open-weights 27B model go on **ARC-AGI-2** (`120` official evaluation tasks, `167` test pairs) when combined with self-verifying Python synthesis and supervised fine-tuning (SFT) on 3-gate verified trajectories?
 
-1. **Pure Harness Engineering (`pilot_2`, `N=4` 2-Wave Gated)**: Scaled **`Qwen3.8-27B-FP8`** from **`19.17%` $\to$ `49.15%` Official Task Pass@2** (`57.49%` Pair Pass@2 across our multi-view ensemble).
-2. **Qwen3.8-27B LoRA SFT & Full 27B FSDP2 SFT ([`sft/`](sft/), `N=2` Comparable `lean2sub` Harness)**:
-   - **LoRA SFT (`r=64`, Step 150)**: Boosted `N=2` Official Task Pass@2 from **`38.94%` $\to$ `46.94%` (`+8.00 pp`)** and Pass@1 from **`36.39%` $\to$ `42.29%` (`+5.90 pp`)**, outperforming even the `N=4` `h6` Hybrid Ensemble (`36.50%`) with half the attempts.
-   - **Full-Parameter 26.9B FSDP2 SFT (`Step 100` at 40k Cap)**: Achieved **`40.76%` Official Task Pass@2** (`+1.82 pp` over the `38.94%` baseline) while generating **`10.35M` total tokens (`~4.6h` on `4×L4`)**—comfortably inside Kaggle's **6-hour (`13.6M` token) budget** and reaching the lowest held-out validation loss of any run (**`0.7549`** at Step 192 in just **75.5 minutes** on `8×B200` via custom Triton Gated DeltaNet kernels).
-
-📄 **Full Interactive HTML Benchmark Report**: **[`sft/qwen_sft_lora_report.html`](sft/qwen_sft_lora_report.html)** (also at root: **[`qwen_sft_lora_report.html`](qwen_sft_lora_report.html)**)
+1. **Qwen3.8-27B Full-Parameter FSDP2 SFT (`26.9B`, Block-FP8 Weights) + Fixed `E031` Harness**:
+   - **Full SFT Step 100 (`60k` Cap, `N=2`)**: Reached **`55.00%` Official Kaggle Pass@2** (`66.0/120` tasks; **`50.00%` Pass@1**) and **`51.50%` Pair-Level Pass@2** (`86/167` pairs; **`47.31%` Pass@1**) — a **+14.24 percentage point** jump after fixing the evaluation harness, outperforming both LoRA SFT (`47.08%`) and collaborator Vu's best pure-Qwen `E031/E032` baseline (`49.17%`).
+   - **Full SFT Step 192 Final (`42k` Fast `<6h` Cap, `N=2`)**: Reached **`44.86%` Official Kaggle Pass@2** (`53.8/120` tasks; **`44.03%` Pass@1**) and **`44.91%` Pair-Level Pass@2** in **`10.93M` total tokens (`~4.8 hours` on 4×L4 GPUs)** — comfortably inside Kaggle's **6-hour (`13.6M` token) runtime limit**.
+2. **LoRA SFT (`r=64, α=128`, `435M` Trainable Params, Block-FP8 Weights)**:
+   - Reached **`47.08%` Official Kaggle Pass@2** (`42.08%` Pass@1) at the `60k` cap and **`43.19%` Official Kaggle Pass@2** (`41.67%` Pass@1) at the fast `42k` `<6h` cap (`11.21M` tokens).
+3. **Pure Base Model Harness Progression (`pilot_2`, `N=4` 2-Wave Gated)**:
+   - Scaled unmodified `Qwen3.8-27B-FP8` from **`19.17%` $\to$ `49.15%` Official Task Pass@2** (`h1` $\to$ `h8`).
 
 ---
 
-## 1. Qwen3.8-27B Full SFT vs. LoRA SFT vs. Comparable Baseline (`sft/`)
+## 📊 Reports (`reports/`)
 
-All runs below are evaluated on all **120 official ARC-AGI-2 tasks (`167` test pairs)** using the **Comparable SFT-Aligned (`lean2sub`) Harness** ($N=2$ attempts per pair, `334` total attempts, native XML `<function=run_python>` + `<function=submit_answer>`):
+All experiment reports and catalogs are organized in the **[`reports/`](reports/)** folder:
 
-| Model / Run | Train Loss | Held-Out Val Loss (PPL) | **Official Kaggle Pass@1** | **Official Kaggle Pass@2** | Median Tokens / Try *(Solved)* | Total Tokens (`167×2` tries) | Fits Kaggle 6h (`4×L4` $\le 13.6\text{M}$)? |
+* **[`reports/qwen_sft_harness_fix_mini_report.html`](reports/qwen_sft_harness_fix_mini_report.html)** & **[`reports/qwen_sft_harness_fix_mini_report.md`](reports/qwen_sft_harness_fix_mini_report.md)** — **Post-Harness Fix Mini-Report (`55.00%` Official Kaggle Pass@2 / `51.50%` Pair Pass@2)**: Compares Comparable Baselines, LoRA SFT, and Full SFT (all in Block-FP8 at `N=2`), includes median token counts, and explains the 5 evaluation harness fixes in plain English.
+* **[`reports/qwen_sft_lora_report.html`](reports/qwen_sft_lora_report.html)** — Comprehensive interactive HTML report on Full FSDP2 SFT vs. LoRA SFT training architecture, Triton Gated DeltaNet kernels, validation loss curves, and baseline ablations.
+* **[`reports/PILOT_2_EXPERIMENTS.md`](reports/PILOT_2_EXPERIMENTS.md)** — Controlled 8-stage (`h1`–`h8`) pure-model harness progression on `Qwen3.8-27B-FP8`.
+* **[`reports/ARC_AGI2_SFT_DATA_CATALOG.md`](reports/ARC_AGI2_SFT_DATA_CATALOG.md)** — 26-dataset SFT catalog, 3-gate rollout verification stats, and Top-10K candidate selection breakdown.
+* **[`reports/ARC_AGI2_EXPERIMENTS_FINDINGS.md`](reports/ARC_AGI2_EXPERIMENTS_FINDINGS.md)** & **[`reports/arc_agi_2_gemma4_eval_report.md`](reports/arc_agi_2_gemma4_eval_report.md)** — Initial `EXP-00`–`EXP-19` exploration and Gemma-4 (`31B Dense` & `26B MoE`) evaluation report.
+
+---
+
+## 1. Scoreboard: Comparable Baselines vs. LoRA SFT vs. Full SFT (`N=2`, Block-FP8 Weights)
+
+All runs below use **Block-FP8 (`FP8 E4M3`, `128×128` block scales) model weights** and **2 attempts per puzzle (`N=2`)** across all **120 ARC-AGI-2 tasks (`167` test pairs)**:
+
+| Model / Checkpoint (`FP8` Weights) | Token Cap | Official Kaggle Pass@1 (120 Tasks) | Official Kaggle Pass@2 (120 Tasks) | Pair-Level Pass@1 (167 Pairs) | Pair-Level Pass@2 (167 Pairs) | Median Tokens / Try *(Solved Median)* | Total Eval Tokens |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Pure Qwen3.8-27B Baseline** *(Comparable `lean2sub`)* | — | `0.8719` (`2.392`) | `36.39%` (`42.9/118`) | **`38.94%`** (`46.0/118`) | `25,008` *(`16,133`)* | `11.16M` | **YES (`~4.9h`, `82%` cap)** |
-| **Best LoRA SFT (`Step 150`, `r=64`)** *(80k Cap)* | `0.5800` | `0.7859` (`2.194`) | **`42.29%`** (`50.3/119`) | **`46.94%`** (`55.9/119`) | `56,423` *(`26,349`)* | `16.84M` | **NO (`~7.4h`, `124%` cap)** |
-| **Best Full SFT (`Step 100`, `26.9B`)** *(40k Cap)* | `0.6254` | `0.7689` (`2.157`) *(Step 192: `0.7549`)* | `37.17%` (`42.0/113`) | **`40.76%`** (`46.1/113`) | `39,713` *(`17,578`)* | **`10.35M`** | **YES (`~4.6h`, `76%` cap)** |
-
-### SFT Codebase & Scripts ([`sft/`](sft/))
-* **[`sft/train_full_sft.py`](sft/train_full_sft.py)** — **8×B200 Native PyTorch `FSDP2` (`fully_shard`) Full-Parameter (`26.9B`) Trainer**: `MixedPrecisionPolicy(param_dtype=bf16, reduce_dtype=fp32)`, DTensor `foreach=True` AdamW (`lr=2e-5`), global token-weighted loss reduction, distributed checkpoints, and parallel 8-GPU Block-128 FP8 export (`75.5 min` for 192 steps).
-* **[`sft/fast_deltanet.py`](sft/fast_deltanet.py)** — **Custom `@triton.jit` Fused Chunk-Recurrent Gated DeltaNet Kernels (`BT=64`)**: Replaces HuggingFace's sequential Python loop across Qwen3.8's 48 linear-attention layers with a vectorized cuBLAS triangular solver and fused forward/backward Triton state recurrence (`5–8×` speedup).
-* **[`sft/train_sft.py`](sft/train_sft.py)** — **1×B200 LoRA SFT (`r=64, alpha=128`) Trainer**: Targets all 10 attention, Gated DeltaNet, and MLP projections (`435.2M` trainable params) with FP32 master weights and chunked cross-entropy (`chunk_size=2048`).
-* **[`sft/audit_and_prepare_data.py`](sft/audit_and_prepare_data.py)** & **[`sft/data_pipeline.py`](sft/data_pipeline.py)** — 3-gate rollout verification (`correct & train_pass & submit`), $D_8$+color isomorphism eval de-contamination, parent-grouped 90/10 split (`0` parent overlap), and token-exact assistant-only loss mask verification (`verify_token_loss_mask`).
-* **[`sft/export_and_quantize.py`](sft/export_and_quantize.py)** & **[`sft/sft_test.py`](sft/sft_test.py)** — Official $128\times 128$ block-wise FP8 (`float8_e4m3fn`) merger/quantizer and end-to-end unit test suite.
-* **[`sft/qwen_sft_lora_report.html`](sft/qwen_sft_lora_report.html)** — Complete interactive HTML report with all tables, SVG plots, training architecture details, and comparison to Havu's Tinker API experiments (`E028` / `E032`).
+| **1. Comparable Baseline (`h1`, Base FP8)** | `48k` | `18.33%` (`22.0/120`) | **`19.17%`** (`23.0/120`) | `16.77%` (`28/167`) | `17.96%` (`30/167`) | `25,015` *(`28,649`)* | `8.82M` |
+| **2. Collaborator Base (`E020 v4`, Base FP8)** | `48k` | `34.17%` (`41.0/120`) | **`37.08%`** (`44.5/120`) | — | — | `~31,400` | `10.50M` |
+| **3. Collaborator Base (`E031/E032`, Base FP8)** | `60k` | `42.92%` (`51.5/120`) | **`49.17%`** (`59.0/120`) | — | — | `~38,900` | `13.00M` |
+| **4. LoRA SFT Step 150 (`r=64`, FP8)** | `60k` | `37.92%` (`45.5/120`) | **`43.61%`** (`52.3/120`) | `37.72%` (`63/167`) | `43.11%` (`72/167`) | `59,842` *(`25,490`)* | `15.59M` |
+| **5. LoRA SFT Step 191 Final (`r=64`, FP8)** | `60k` | `42.08%` (`50.5/120`) | **`47.08%`** (`56.5/120`) | `40.12%` (`67/167`) | `44.91%` (`75/167`) | `59,652` *(`21,301`)* | `14.88M` |
+| **6. Full SFT Step 192 Final (`26.9B`, FP8)** | `60k` | `44.17%` (`53.0/120`) | **`50.00%`** (`60.0/120`) | `43.11%` (`72/167`) | `49.10%` (`82/167`) | `46,879` *(`21,376`)* | `13.58M` |
+| **7. Full SFT Step 100 (`26.9B`, FP8) ★ BEST** | `60k` | **`50.00%`** (`60.0/120`) | **`55.00%`** (`66.0/120`) | **`47.31%`** (`79/167`) | **`51.50%`** (`86/167`) | `53,478` *(`22,818`)* | `14.41M` |
+| **8. Full SFT Step 192 Final (Fast `<6h` Cap)** | `42k` | **`44.03%`** (`52.8/120`) | **`44.86%`** (`53.8/120`) | **`43.71%`** (`73/167`) | **`44.91%`** (`75/167`) | `41,744` *(`18,002`)* | **`10.93M`** (`~4.8h`) |
+| **9. LoRA SFT Step 191 Final (Fast `<6h` Cap)** | `42k` | `41.67%` (`50.0/120`) | **`43.19%`** (`51.8/120`) | `40.12%` (`67/167`) | `42.51%` (`71/167`) | `41,886` *(`21,689`)* | **`11.21M`** (`~4.9h`) |
 
 ---
 
-## 2. Pure Model Harness Progression (`pilot_2`: `Qwen3.8-27B-FP8` on All 120 Tasks)
+## 2. Repository Structure
 
-Each row in `pilot_2` locks the exact same model and sampling parameters (`temperature=1.0`, `top_p=0.95`, `top_k=20`, `131k` context) and changes **one controlled axis at a time**:
-
-| Stage | What We Changed | Attempts | Turns | **Task Pass@1** | **Task Pass@2 (Kaggle)** | Fits `4×L4` (`6h` = `13.6M`)? |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
-| **`h1` Baseline** | Basic Python REPL (`lean2prog` raw grids, JSON tool calls) | `2` | `20` | `18.3%` | **`19.2%`** (`23.0/120`) | Yes (`8.00M` / `~3.5h`) |
-| **`h2` + Attempts** | Double candidate trajectories (`N=2 -> N=4`) + majority vote | `4` | `20` | `24.3%` | **`26.4%`** (`31.7/120`) | No (`15.96M` / `~7.0h`) |
-| **`h3` + 40 Turns** | **40-turn loop + auto `check(solve)` cell-coordinate diffs** | `4` | `40` | `32.2%` | **`33.3%`** (`40.0/120`) | No (`21.48M` / `~9.5h`) |
-| **`h4` Homogeneous DSL** | Pre-computed CC/symmetry summary + `arc_helpers` on *all 4* | `4` | `40` | `26.0%` | **`28.8%`** *(hurt diversity)* | No (`22.66M` / `~10.0h`) |
-| **`h5` Homogeneous Roles**| Role-based falsification (`lean2progroles`, `64k` cap) on *all 4* | `4` | `40` | `28.3%` | **`31.9%`** (`38.3/120`) | No (`28.05M` / `~12.4h`) |
-| **`h6` Hybrid Ensemble** | **2× Fast Raw + 2× Deep Role/DSL + $D_8$/Color Equivariance** | `4` | `40` | `35.3%` | **`36.5%`** (`43.8/120`) | No (`25.25M` / `~11.1h`) |
-| **`h7` Native XML** | **Native XML `<function=run_python>` + 2-Stage Graceful Nudge** | `4` | `40` | **`43.8%`** | **`47.4%`** (`53.5/113`) | No (`36.93M` / `~16.3h`) |
-| **`h8` 2-Wave Repair** | **Wave-2 Evolutionary Near-Miss Code Repair + `<think>` Compaction** | `4` | `40` | `41.9%` | **`49.2%`** (`57.5/117`) | No (`31.49M` / `~13.9h`) |
-| **`EXP-19` Multi-View** | Offline 12-attempt Text + Multimodal RGB Pool + Smart Rating | `12` | `16–40`| **`49.7%`** *(pair)* | **`57.5%`** *(96/167 pairs)* | Offline (`12×48k`) |
+```text
+.
+├── README.md                          # Overview, scoreboard, repository layout & CLI commands
+├── BUILD                              # Bazel/Blaze build targets for GPU/TPU Colab kernels & shims
+├── vllm_cuda_shim.py                  # Custom CUDA/FlashAttn/Triton shim for Qwen3.8-27B on H100/B200
+├── vllm_fla_triton_ops.py             # Fused Triton linear-attention ops for vLLM inference
+├── vllm_h100_gpu_test.py              # Smoke test for Qwen3.8-27B vLLM GPU inference
+│
+├── reports/                           # All Markdown & Interactive HTML Experiment Reports
+│   ├── qwen_sft_harness_fix_mini_report.html   # Mini-report: 55.0% Pass@2 SFT results & 5 harness fixes
+│   ├── qwen_sft_harness_fix_mini_report.md     # Markdown version of the post-fix mini-report
+│   ├── qwen_sft_lora_report.html               # Full interactive SFT & baseline benchmark report
+│   ├── PILOT_2_EXPERIMENTS.md                  # Controlled h1-h8 harness engineering report
+│   ├── ARC_AGI2_SFT_DATA_CATALOG.md            # SFT dataset catalog & 3-gate verification audit
+│   ├── ARC_AGI2_EXPERIMENTS_FINDINGS.md        # Pilot 1 (EXP-00 to EXP-19) findings
+│   ├── arc_agi2_experiments_report_mistake_analysis.html
+│   ├── arc_agi_2_gemma4_eval_report.md         # Gemma-4 31B Dense vs 26B MoE benchmark
+│   └── arc_agi2_gemma4_experiment_report.html
+│
+├── sft/                               # Qwen3.8-27B Full FSDP2 SFT & LoRA SFT Pipeline
+│   ├── BUILD                          # Blaze targets for data prep, training, FP8 export & tests
+│   ├── README.md                      # Detailed SFT architecture & training documentation
+│   ├── data_pipeline.py               # 3-gate filtering, D8 de-contamination, 90/10 split & ChatML
+│   ├── audit_and_prepare_data.py      # CLI to build train/val Parquet & JSONL datasets
+│   ├── fast_deltanet.py               # Custom @triton.jit chunk-recurrent Gated DeltaNet kernels
+│   ├── train_full_sft.py              # 8×B200 Native PyTorch FSDP2 (26.9B) trainer + parallel FP8 export
+│   ├── train_sft.py                   # 1×B200 LoRA (r=64, α=128) trainer with chunked cross-entropy
+│   ├── export_and_quantize.py         # FP32 merge + 128×128 block-wise FP8 (float8_e4m3fn) quantizer
+│   ├── launch_full_sft_b200_xm.py     # XManager launcher for 8×B200 Full FSDP2 SFT
+│   ├── launch_sft_b200_xm.py          # XManager launcher for B200 LoRA SFT
+│   ├── e031_audit_summary.json        # Verified dataset audit summary
+│   └── sft_test.py                    # Unit tests for loss masking, split isolation & FP8 quantization
+│
+├── pilot_2/                           # Main Agentic Python Evaluation Harness (TPU & GPU vLLM)
+│   ├── BUILD                          # Blaze targets for pilot2_eval, launch_pilot2_xm & pilot2_test
+│   ├── prompts_and_selector.py        # System/user prompts (tier=xhigh, XML tools) & candidate selector
+│   ├── sandbox_verifier.py            # Stateful IPython sandbox, verify_submit & session salvage
+│   ├── arc_dsl_and_summary.py         # Grid connected-components/symmetry analyzer & DSL helpers
+│   ├── pilot2_eval.py                 # Async vLLM multi-turn evaluation loop (2-stage nudge, compaction)
+│   ├── launch_pilot2_xm.py            # XManager multi-shard TPU evaluation launcher
+│   └── pilot2_test.py                 # Unit tests for prompts, XML parser, sandbox & selector
+│
+├── pilot_1/                           # Pilot 1 Harnesses & DeepSeek-V4.1-Flash Rollout Generators
+│   └── setB/
+│       ├── eval_qwen_vllm_h100.py     # H100 vLLM evaluation script
+│       ├── launch_qwen_arc_h100_xm.py # H100 XManager launcher
+│       ├── run_arc_eval.py            # Multi-model API & vLLM runner
+│       └── tpu_vllm/                  # TPU vLLM & DeepSeek-V4.1-Flash-1017 Top-10K rollout generator
+│
+└── notebooks/                         # Kaggle 4×L4 Submission Notebooks & Scheduler Patches
+    ├── arc2-qwen38-e032-sft-minimal.ipynb
+    ├── arc2-qwen38-e032-sft-ensemble4.ipynb
+    ├── arc2_qwen38_tools_v3_ensemble.ipynb
+    └── cell21_patch.py
+```
 
 ---
 
-## 3. Gemma-4 (`31B Dense` & `26B MoE`) vs. Qwen3.8-27B
+## 3. How to Run Commands (Unit Tests, Data Prep, SFT Training, FP8 Export & Evaluation)
 
-We also benchmarked **Gemma-4** (`31B Dense` and `26B MoE` with `4B` active parameters) across all 120 tasks:
+All commands below are run from the `google3/` workspace root using `/google/bin/releases/arca9-local-blaze-cli/blaze-for-agents` and `/google/bin/releases/xmanager/cli/xmanager.par`.
 
-| Run | Model | Setup | **Pair Pass@1 / Pass@2** | **Task Pass@1 / Pass@2** | Key Finding |
-| :--- | :--- | :--- | :---: | :---: | :--- |
-| **Run 1** | `Gemma-4 26B MoE` (`4B` active) | High Thinking, No Tools (`N=2`) | `1.2% / 1.8%` | `1.1% / 1.9%` | `4B` active params cannot track 2D grid coordinates in working memory. |
-| **Run 3** | `Gemma-4 31B Dense` | High Thinking, No Tools (`N=2`) | `6.0% / 8.4%` | `6.5% / 9.3%` | Dense 31B solves `5×` more tasks, but stops thinking around `~11k` tokens. |
-| **Run 4** | `Gemma-4 31B Dense` | High Thinking + Continuation (`196k`) | `7.8% / 10.8%` | `7.5% / 11.7%` | Extra token budget alone barely moves accuracy without code execution. |
-| **Run 5** | `Gemma-4 31B Dense` | **Python REPL + Train Check** (`N=2`) | `16.2% / 21.6%` | `16.8% / 22.1%` | **2× jump**: testing `solve(grid)` on `train` pairs doubles accuracy. |
-| **Run 6** | `Gemma-4 31B Dense` | Python REPL + Homogeneous Prompt Tricks | `13.2% / 16.2%` | `12.1% / 15.8%` | Over-prompting increases `train` overfitting (`58% -> 45%` test precision). |
-| **Run 8** | `Gemma-4 31B Dense` | **RGB Image + Python REPL + `scipy` (`N=3`)** | **`25.3% / 27.3%`** | **`26.3% / 28.7%`** | **Best Gemma-4 setup**: 2D RGB grid images unlock `+6.6 pp` over text REPL. |
+### A. Run Unit Tests (`pilot_2` Harness & `sft` Pipeline)
+```bash
+/google/bin/releases/arca9-local-blaze-cli/blaze-for-agents test \
+  //experimental/users/arazdai/kaggle/arc_agi_2/pilot_2:pilot2_test \
+  //experimental/users/arazdai/kaggle/sft:sft_test
+```
 
----
+### B. Audit & Prepare SFT Training Data (`1,535` Train / `64` Val Verified Trajectories)
+```bash
+/google/bin/releases/arca9-local-blaze-cli/blaze-for-agents run \
+  //experimental/users/arazdai/kaggle/sft:audit_and_prepare_data -- \
+  --input_parquet=/cns/lu-d/home/arazdai/kaggle/arc_agi_2/sft_data/e031_deepseek_rollouts.parquet \
+  --output_dir=/cns/lu-d/home/arazdai/kaggle/sft/prepared_e031
+```
 
-## 4. DeepSeek-V4.1-Flash (`DeepSeek-V4.1-Flash-1017` Full-Precision BF16$\to$FP32) on All 120 Tasks
+### C. Launch 8×B200 Full-Parameter FSDP2 SFT (`26.9B` Params, `75.5 min` for 192 Steps + Auto Block-FP8 Export)
+```bash
+/google/bin/releases/xmanager/cli/xmanager.par launch \
+  //experimental/users/arazdai/kaggle/sft:launch_full_sft_b200_xm -- \
+  --noxm_monitor_on_launch \
+  --xm_resource_alloc=group:research-mm/genai-lti-lh-tasks \
+  --xm_skip_launch_confirmation \
+  --exp_name=qwen38_27b_arc_agi2_e031_full_sft_8xb200
+```
 
-We evaluated **`DeepSeek-V4.1-Flash-1017`** (`40`-layer Causal Encoder-Decoder + `196.6B` Engram conditional memory at `L1`/`L14` + `3`-layer DSpark `1+5` MTP drafter, full-precision `BF16 -> FP32` MXU accumulation, `Reasoning Effort: 100`) across all **`120` ARC-AGI-2 public evaluation tasks (`167` test pairs)** in two controlled stages ([`deepseek_v41_arc2_eval.py`](pilot_1/setB/tpu_vllm/deepseek_v41_arc2_eval.py)):
+### D. Launch B200 LoRA SFT (`r=64, α=128`, `435M` Params)
+```bash
+/google/bin/releases/xmanager/cli/xmanager.par launch \
+  //experimental/users/arazdai/kaggle/sft:launch_sft_b200_xm -- \
+  --noxm_monitor_on_launch \
+  --xm_resource_alloc=group:research-mm/genai-lti-lh-tasks \
+  --xm_skip_launch_confirmation \
+  --exp_name=qwen38_27b_arc_agi2_e031_lora_r64
+```
 
-1. **`v1` SFT-Trace Extraction Harness**: Replicated the 5-turn SFT trace-extraction harness, reaching **`8.98%` Pair Pass@1 & Pass@2** (`15 / 167`) and **`9.17%` Task Pass@1 & Pass@2** (`11.00 / 120`).
-   * **Root-Cause Diagnosis (`v1` vs. `Qwen3.8` `pilot_2`)**: Whenever `DeepSeek-V4.1-Flash` verified a candidate program on `train` (`train_passed=True`), held-out test accuracy was **`92.9%` (`13 / 14` pairs)**—higher than `Qwen3.8-27B` (`~68%`). However, **`77.2%` (`258 / 334`) of attempts never defined `def solve(grid):`** due to: (a) Turn 2+ Qwen ChatML `<|im_start|>`/`<|im_end|>` token pollution instead of native `<｜end▁of▁sentence｜><｜User｜><tool_result>`, (b) missing stop strings on `</tool_call>`/`</｜DSML｜ calls>` causing `30.8%` of attempts to hallucinate fake turns after tool calls, (c) `74.9%` of attempts hitting the `16,384` context window with uncompacted prior `<think>` blocks and spaced grids, and (d) `max_turns=5` with `0` repair rounds and `turn_think_cap=8000`.
-2. **`v3` Native DS4.1 Agentic Harness (`ds41_fp_native_v3`)**: Fixed all multi-turn harness bugs while keeping **100% identical model weights, full precision (`BF16 -> FP32`), and `Reasoning Effort: 100`**, jumping accuracy **2.20×–2.60×** to **`19.76%` Pair Pass@1 / `23.35%` Pair Pass@2** (`33` / `39` of `167` pairs) and **`20.42%` Task Pass@1 / `23.75%` Task Pass@2** (`24.50` / `28.50` of `120` tasks).
+### E. Standalone Merge & Export Any Checkpoint to Block-FP8 (`float8_e4m3fn`, `128×128` Blocks)
+```bash
+/google/bin/releases/arca9-local-blaze-cli/blaze-for-agents run \
+  //experimental/users/arazdai/kaggle/sft:export_and_quantize -- \
+  --base_model_path=/cns/lu-d/home/arazdai/models/Qwen3.8-27B \
+  --adapter_or_ckpt_path=/cns/lu-d/home/arazdai/kaggle/sft/checkpoints/step-00100 \
+  --output_fp8_dir=/cns/lu-d/home/arazdai/kaggle/sft/exported_fp8/step-00100
+```
 
----
-
-## 5. Repository Map
-
-* **[`sft/`](sft/)** — **Qwen3.8-27B Full FSDP2 SFT & LoRA SFT Codebase** (`train_full_sft.py`, `train_sft.py`, `fast_deltanet.py`, `data_pipeline.py`, `audit_and_prepare_data.py`, `export_and_quantize.py`, `sft_test.py`) + Interactive HTML Report ([`sft/qwen_sft_lora_report.html`](sft/qwen_sft_lora_report.html) & [`sft/README.md`](sft/README.md)).
-* **[`pilot_2/`](pilot_2/)** — Clean, unit-tested TPU/GPU vLLM harness (`pilot2_eval.py`, `prompts_and_selector.py`, `sandbox_verifier.py`, `arc_dsl_and_summary.py`) and full `h1`–`h8` report ([`PILOT_2_EXPERIMENTS.md`](pilot_2/PILOT_2_EXPERIMENTS.md)).
-* **[`pilot_1/`](pilot_1/)** — Initial `EXP-00`–`EXP-19` exploration ([`ARC_AGI2_EXPERIMENTS_FINDINGS.md`](pilot_1/setB/ARC_AGI2_EXPERIMENTS_FINDINGS.md)), Gemma-4 API benchmark ([`arc_agi_2_gemma4_eval_report.md`](pilot_1/setB/results_gemma_api/arc_agi_2_gemma4_eval_report.md)), and `DeepSeek-V4.1-Flash-1017` trace generator.
-* **[`ARC_AGI2_SFT_DATA_CATALOG.md`](ARC_AGI2_SFT_DATA_CATALOG.md)** — 26-dataset SFT catalog, 3-level verification stats, and Top-10K candidate selection breakdown.
-* **[`arc2_qwen38_tools_v3_ensemble.ipynb`](arc2_qwen38_tools_v3_ensemble.ipynb)** · **[`arc2-qwen38-e032-sft-ensemble4.ipynb`](arc2-qwen38-e032-sft-ensemble4.ipynb)** · **[`cell21_patch.py`](cell21_patch.py)** — Kaggle `4×L4` notebooks and 2-Wave Gated scheduler.
+### F. Launch Multi-Shard ARC-AGI-2 Evaluation (`e031_deepseek_teaching` & `e031_deepseek_teaching_fast`)
+```bash
+/google/bin/releases/xmanager/cli/xmanager.par launch \
+  //experimental/users/arazdai/kaggle/arc_agi_2/pilot_2:launch_pilot2_xm -- \
+  --noxm_monitor_on_launch \
+  --xm_resource_alloc=group:research-mm/genai-lti-lh-tasks \
+  --xm_skip_launch_confirmation \
+  --experiment_title=arc_agi2_full_sft_step100_xhigh_e031 \
+  --exp_ids=e031_deepseek_teaching,e031_deepseek_teaching_fast \
+  --num_shards=14 \
+  --model_path=/cns/lu-d/home/arazdai/kaggle/sft/checkpoints_full_sft_v2/xid_304470493_qwen38_27b_arc_agi2_e031_full_sft_8xb200_v3/wu_1/fp8_checkpoints/step-00100 \
+  --cns_output_root=/cns/lu-d/home/arazdai/kaggle/arc_agi_2/eval_runs/full_sft_step100
+```

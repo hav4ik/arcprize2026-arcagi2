@@ -59,7 +59,10 @@ from absl import logging
 import numpy as np
 import torch
 
-from google3.experimental.users.arazdai.kaggle import vllm_cuda_shim
+try:
+  from google3.experimental.users.arazdai.kaggle.arc_agi_2 import vllm_cuda_shim
+except ImportError:
+  from google3.experimental.users.arazdai.kaggle import vllm_cuda_shim
 from google3.pyglib import gfile
 
 FLAGS = flags.FLAGS

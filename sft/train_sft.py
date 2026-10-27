@@ -111,6 +111,26 @@ flags.DEFINE_bool(
     True,
     "Automatically spawn 1 DDP worker per visible GPU when torch.cuda.device_count() > 1.",
 )
+flags.DEFINE_string(
+    "init_adapter_path",
+    "",
+    "Optional CNS path to an existing LoRA adapter directory (e.g. Epoch 1 final_adapter) to initialize from when starting a new run (resumed_step == 0).",
+)
+flags.DEFINE_float(
+    "loss_weight_gamma",
+    0.0,
+    "Exponent gamma >= 0 for per-example loss reweighting w_i = clip((loss_i / ema_loss)**gamma, min_w, max_w), normalized within each step so mean weight = 1.0 (0.0 = uniform).",
+)
+flags.DEFINE_float(
+    "loss_weight_min",
+    0.25,
+    "Minimum unnormalized per-example weight when loss_weight_gamma > 0.",
+)
+flags.DEFINE_float(
+    "loss_weight_max",
+    3.0,
+    "Maximum unnormalized per-example weight when loss_weight_gamma > 0.",
+)
 
 
 class PackedTrajectoryDataset(Dataset):
@@ -328,6 +348,62 @@ def maybe_resume_from_checkpoint(
         return 0
 
 
+def compute_example_loss_weight(
+    sample_loss: float,
+    ema_loss: float,
+    gamma: float,
+    min_weight: float = 0.25,
+    max_weight: float = 3.0,
+) -> float:
+    """Computes a focal/power loss weight for a trajectory based on its per-token NLL relative to ema_loss."""
+    if gamma <= 0.0:
+        return 1.0
+    ref_loss = max(float(ema_loss), 1e-4)
+    ratio = max(float(sample_loss), 0.0) / ref_loss
+    raw_weight = ratio ** float(gamma)
+    return float(max(min_weight, min(max_weight, raw_weight)))
+
+
+def load_initial_lora_adapter(model: torch.nn.Module, adapter_dir: str) -> None:
+    """Loads initial PEFT LoRA adapter weights from a CNS or local directory (without optimizer state)."""
+    if not adapter_dir:
+        return
+    if not gfile.Exists(adapter_dir):
+        raise FileNotFoundError(f"Initial LoRA adapter directory does not exist: {adapter_dir}")
+
+    with tempfile.TemporaryDirectory(prefix="sft_lora_init_") as tmp_dir:
+        for fname in ["adapter_model.safetensors", "adapter_model.bin", "adapter_config.json"]:
+            src = os.path.join(adapter_dir, fname)
+            if gfile.Exists(src):
+                dst = os.path.join(tmp_dir, fname)
+                with gfile.Open(src, "rb") as f_in, open(dst, "wb") as f_out:
+                    while True:
+                        buf = f_in.read(16 * 1024 * 1024)
+                        if not buf:
+                            break
+                        f_out.write(buf)
+
+        adapter_safetensors = os.path.join(tmp_dir, "adapter_model.safetensors")
+        adapter_bin = os.path.join(tmp_dir, "adapter_model.bin")
+        if os.path.exists(adapter_safetensors):
+            from safetensors.torch import load_file
+            peft_weights = load_file(adapter_safetensors, device="cpu")
+            peft.set_peft_model_state_dict(model, peft_weights)
+            del peft_weights
+        elif os.path.exists(adapter_bin):
+            peft_weights = torch.load(adapter_bin, map_location="cpu")
+            peft.set_peft_model_state_dict(model, peft_weights)
+            del peft_weights
+        else:
+            raise FileNotFoundError(
+                f"Neither adapter_model.safetensors nor adapter_model.bin found in {adapter_dir}"
+            )
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"Loaded initial LoRA adapter weights from {adapter_dir}.")
+
+
 @torch.no_grad()
 def evaluate_validation_loss(
     model: torch.nn.Module,
@@ -542,7 +618,8 @@ def _train_worker(rank: int, world_size: int, flag_dict: dict[str, Any] | None =
         print(
             f"Training plan: {len(train_dataset)} samples/epoch, world_size={world_size}, "
             f"local_grad_accum={local_grad_accum}, effective_batch={effective_batch}, "
-            f"steps_per_epoch={steps_per_epoch}, total_steps={total_steps}, warmup_steps={warmup_steps}"
+            f"steps_per_epoch={steps_per_epoch}, total_steps={total_steps}, warmup_steps={warmup_steps}, "
+            f"loss_weight_gamma={FLAGS.loss_weight_gamma} [{FLAGS.loss_weight_min}, {FLAGS.loss_weight_max}]"
         )
         gfile.MakeDirs(FLAGS.output_dir)
 
@@ -564,7 +641,10 @@ def _train_worker(rank: int, world_size: int, flag_dict: dict[str, Any] | None =
         device=device,
     )
 
+    ema_loss = 0.7627
     if resumed_step == 0:
+        if FLAGS.init_adapter_path:
+            load_initial_lora_adapter(model, FLAGS.init_adapter_path)
         if is_main:
             print("Evaluating baseline (step 0) validation loss...")
         val0 = evaluate_validation_loss(
@@ -576,7 +656,15 @@ def _train_worker(rank: int, world_size: int, flag_dict: dict[str, Any] | None =
             max_samples=FLAGS.max_eval_samples,
             chunk_size=FLAGS.logits_chunk_size,
         )
-        log_event({"step": 0, "phase": "eval", **val0})
+        ema_loss = float(val0["val_loss"])
+        log_event(
+            {
+                "step": 0,
+                "phase": "eval",
+                "init_adapter_path": FLAGS.init_adapter_path,
+                **val0,
+            }
+        )
 
     rng = np.random.default_rng(FLAGS.seed)
     global_step = 0
@@ -605,6 +693,13 @@ def _train_worker(rank: int, world_size: int, flag_dict: dict[str, Any] | None =
 
             local_loss_sum = 0.0
             local_tokens = 0
+            local_weight_sum = 0.0
+            local_weighted_sample_loss_sum = 0.0
+            local_valid_samples = 0
+            local_min_w = float("inf")
+            local_max_w = 0.0
+            local_min_sample_loss = float("inf")
+            local_max_sample_loss = 0.0
 
             for sample_idx in rank_indices:
                 sample = train_dataset[int(sample_idx)]
@@ -620,10 +715,25 @@ def _train_worker(rank: int, world_size: int, flag_dict: dict[str, Any] | None =
                     chunk_size=FLAGS.logits_chunk_size,
                 )
                 if n_valid > 0:
-                    scaled_loss = (loss_sum / float(n_valid)) / float(effective_batch)
+                    sample_loss = float(loss_sum.item()) / float(n_valid)
+                    w_raw = compute_example_loss_weight(
+                        sample_loss=sample_loss,
+                        ema_loss=ema_loss,
+                        gamma=FLAGS.loss_weight_gamma,
+                        min_weight=FLAGS.loss_weight_min,
+                        max_weight=FLAGS.loss_weight_max,
+                    )
+                    scaled_loss = w_raw * (loss_sum / float(n_valid)) / float(effective_batch)
                     scaled_loss.backward()
                     local_loss_sum += float(loss_sum.item())
                     local_tokens += n_valid
+                    local_weight_sum += w_raw
+                    local_weighted_sample_loss_sum += w_raw * sample_loss
+                    local_valid_samples += 1
+                    local_min_w = min(local_min_w, w_raw)
+                    local_max_w = max(local_max_w, w_raw)
+                    local_min_sample_loss = min(local_min_sample_loss, sample_loss)
+                    local_max_sample_loss = max(local_max_sample_loss, sample_loss)
 
             if world_size > 1 and dist.is_initialized():
                 # All-reduce gradients across all B200 ranks (already divided by effective_batch)
@@ -640,14 +750,39 @@ def _train_worker(rank: int, world_size: int, flag_dict: dict[str, Any] | None =
                     p.grad = g_sync
 
                 metrics_tensor = torch.tensor(
-                    [local_loss_sum, float(local_tokens)], dtype=torch.float64, device=device
+                    [
+                        local_loss_sum,
+                        float(local_tokens),
+                        local_weight_sum,
+                        local_weighted_sample_loss_sum,
+                        float(local_valid_samples),
+                    ],
+                    dtype=torch.float64,
+                    device=device,
                 )
                 dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
                 step_loss_sum = float(metrics_tensor[0].item())
                 step_tokens = int(round(float(metrics_tensor[1].item())))
+                step_weight_sum = float(metrics_tensor[2].item())
+                step_weighted_sample_loss_sum = float(metrics_tensor[3].item())
+                step_valid_samples = int(round(float(metrics_tensor[4].item())))
             else:
                 step_loss_sum = local_loss_sum
                 step_tokens = local_tokens
+                step_weight_sum = local_weight_sum
+                step_weighted_sample_loss_sum = local_weighted_sample_loss_sum
+                step_valid_samples = local_valid_samples
+
+            mean_w = (
+                step_weight_sum / float(step_valid_samples)
+                if step_valid_samples > 0 and step_weight_sum > 0.0
+                else 1.0
+            )
+            if FLAGS.loss_weight_gamma > 0.0 and mean_w > 0.0:
+                inv_mean_w = 1.0 / mean_w
+                for p in trainable_params:
+                    if p.grad is not None:
+                        p.grad.mul_(inv_mean_w)
 
             lr = get_cosine_lr(
                 step=global_step,
@@ -667,6 +802,12 @@ def _train_worker(rank: int, world_size: int, flag_dict: dict[str, Any] | None =
             global_step += 1
 
             step_loss = step_loss_sum / max(1, step_tokens)
+            weighted_sample_loss = (
+                step_weighted_sample_loss_sum / max(1e-8, step_weight_sum)
+                if step_weight_sum > 0.0
+                else step_loss
+            )
+            ema_loss = 0.95 * ema_loss + 0.05 * step_loss
             step_elapsed = time.time() - step_t0
             max_mem_gb = (
                 torch.cuda.max_memory_allocated(device) / (1024**3)
@@ -675,6 +816,8 @@ def _train_worker(rank: int, world_size: int, flag_dict: dict[str, Any] | None =
             )
 
             if global_step % FLAGS.log_every_steps == 0:
+                norm_min_w = (local_min_w / mean_w) if local_valid_samples > 0 else 1.0
+                norm_max_w = (local_max_w / mean_w) if local_valid_samples > 0 else 1.0
                 log_event(
                     {
                         "step": global_step,
@@ -682,6 +825,16 @@ def _train_worker(rank: int, world_size: int, flag_dict: dict[str, Any] | None =
                         "epoch": epoch,
                         "phase": "train",
                         "train_loss": round(step_loss, 5),
+                        "weighted_sample_loss": round(weighted_sample_loss, 5),
+                        "ema_loss": round(ema_loss, 5),
+                        "norm_weight_min": round(norm_min_w, 3),
+                        "norm_weight_max": round(norm_max_w, 3),
+                        "sample_loss_min": round(
+                            local_min_sample_loss if local_valid_samples > 0 else 0.0, 4
+                        ),
+                        "sample_loss_max": round(
+                            local_max_sample_loss if local_valid_samples > 0 else 0.0, 4
+                        ),
                         "train_ppl": round(math.exp(min(step_loss, 20.0)), 4),
                         "lr": round(lr, 8),
                         "grad_norm": round(grad_norm, 4),
@@ -775,6 +928,7 @@ def main(argv: list[str]) -> None:
             "model_path",
             "data_dir",
             "output_dir",
+            "init_adapter_path",
             "lora_r",
             "lora_alpha",
             "lora_dropout",
@@ -784,6 +938,9 @@ def main(argv: list[str]) -> None:
             "weight_decay",
             "warmup_ratio",
             "max_grad_norm",
+            "loss_weight_gamma",
+            "loss_weight_min",
+            "loss_weight_max",
             "num_epochs",
             "max_steps",
             "grad_accum_steps",

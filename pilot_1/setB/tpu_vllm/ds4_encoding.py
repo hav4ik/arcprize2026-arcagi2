@@ -486,6 +486,7 @@ REASONING_EFFORT_TEMPLATE = (
 )
 
 REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
+    "none": 0,
     "low": 50,
     "high": 75,
     "max": 100,
@@ -502,13 +503,15 @@ def render_reasoning_effort(
   if effort is None:
     effort = DEFAULT_REASONING_EFFORT
   assert (
-      type(effort) is int and 1 <= effort <= 100
+      type(effort) is int and 0 <= effort <= 100
   ) or effort in REASONING_EFFORT_MAPPINGS, (
       f"Invalid reasoning effort for deepseek_v41: {effort}, should be int"
-      f" within [1,100] or {list(REASONING_EFFORT_MAPPINGS)}"
+      f" within [0,100] or {list(REASONING_EFFORT_MAPPINGS)}"
   )
   if type(effort) is str:
     effort = REASONING_EFFORT_MAPPINGS[effort]
+  if effort == 0:
+    return ""
   if index == 0 and thinking_mode == "thinking":
     return REASONING_EFFORT_TEMPLATE.format(budget=effort)
   return ""

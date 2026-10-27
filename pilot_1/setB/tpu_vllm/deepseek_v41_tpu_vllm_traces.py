@@ -122,6 +122,7 @@ class CompatSamplingParams:
   repetition_penalty: float = 1.0
   max_tokens: int = 4096
   stop: list[str] | None = None
+  seed: int = 0
 
 
 @dataclasses.dataclass

@@ -20,9 +20,9 @@ from google3.pyglib import gfile
 # up to D8 symmetry + color permutation.
 KNOWN_CONTAMINATED_TASKS: frozenset[str] = frozenset({"2753e76c", "81c0276b"})
 
-# Official E031 / E028 system prompt and tool schemas (lean2sub + minimal effort header).
+# Official E031 / E028 system prompt and tool schemas (lean2sub + xhigh tier + minimal effort header).
 LEAN2SUB_SYSTEM = (
-    "You are solving an ARC-AGI-2 puzzle. Use `python_exec` to inspect the "
+    "You are solving an ARC-AGI-2 puzzle. Use `run_python` to inspect the "
     "training pairs, form a hypothesis, and test it on EVERY training pair "
     "before generating the test output. You have up to {max_turns} tool "
     "calls; do not submit until your rule reproduces all training outputs "
@@ -31,30 +31,35 @@ LEAN2SUB_SYSTEM = (
     "`submit_answer` with `[grid_1, grid_2]` to use both competition attempts."
 )
 
-MINIMAL_EFFORT_HEADER = "Think briefly before each tool call. Put your effort into code."
+TIER_SYSTEM_XHIGH = (
+    "Reasoning effort is set to xhigh. Please think carefully through the task, "
+    "validate key assumptions, consider plausible alternatives, and prioritize "
+    "correctness, consistency, and clarity in the final answer."
+)
+
+MINIMAL_EFFORT_HEADER = (
+    "Reasoning Effort: Minimal. Keep your thinking short and terse: write brief notes, not full sentences. "
+    "Do not restate the task, do not re-read or re-derive what code has already printed, and do not re-verify "
+    "what has already been checked. Test ideas with small code experiments instead of long deliberation, and "
+    "submit as soon as the rule reproduces every training pair."
+)
 
 TOOL_SPECS_LEAN2SUB = [
     {
         "type": "function",
         "function": {
-            "name": "python_exec",
+            "name": "run_python",
             "description": (
-                "Execute Python 3 code in a persistent stateful session. "
-                "`task` (dict with 'train' and 'test' lists of {'input': 2D list, 'output': 2D list}), "
-                "`train` (`task['train']`), `test_in` (`task['test'][0]['input']`), "
-                "and `np` (numpy) are pre-loaded. Variables, functions, and imports "
-                "persist across calls. Returns combined stdout and stderr. Print "
-                "concisely; output is truncated at 16000 chars."
+                "Execute a Python cell in your persistent IPython session. Variables/functions persist. "
+                "Preloaded: train (list of {'input': grid, 'output': grid}), test_input (grid), numpy as np. "
+                "scipy is available. No internet or host files. Timeout 30s. "
+                "Use print() to inspect results. Check transformations on all training pairs."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "code": {
-                        "type": "string",
-                        "description": "Python 3 source code to execute.",
-                    },
-                },
+                "properties": {"code": {"type": "string"}},
                 "required": ["code"],
+                "additionalProperties": False,
             },
         },
     },
@@ -63,26 +68,16 @@ TOOL_SPECS_LEAN2SUB = [
         "function": {
             "name": "submit_answer",
             "description": (
-                "Submit your final predicted test output grid(s) and end the episode. "
-                "Call this only after verifying your transformation rule on all training "
-                "pairs in `python_exec`. Pass `code` that sets `answer` to either:\n"
-                "  - a single 2D list/ndarray of ints 0-9 (used as both attempt_1 and attempt_2), OR\n"
-                "  - a list `[grid_1, grid_2]` of two 2D grids of ints 0-9 (your primary "
-                "prediction and a backup second hypothesis)."
+                "End this attempt with your test output. `code` is a Python expression evaluated in your session, "
+                "e.g. solve(test_input) or answer, giving a rectangular grid of ints 0-9 (list or numpy array); "
+                "statements that set a variable `answer` also work. The harness reads the grid directly: do not "
+                "retype it. Invalid grids return an error and the attempt continues."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "code": {
-                        "type": "string",
-                        "description": (
-                            "Python code executed in the persistent session that assigns "
-                            "the variable `answer` (e.g. `answer = predict(test_in)` or "
-                            "`answer = [pred1, pred2]`)."
-                        ),
-                    },
-                },
+                "properties": {"code": {"type": "string"}},
                 "required": ["code"],
+                "additionalProperties": False,
             },
         },
     },
@@ -99,10 +94,10 @@ LEAK_MARKERS = ("<|im_start|>", "<|im_end|>", "<tool_call>", "</tool_call>", "<f
 
 
 def build_qwen_system_prompt(max_turns: int = 40) -> str:
-    """Renders the exact Qwen3.8 system prompt block matching E031 / agent_qwen.py."""
-    sys_content = LEAN2SUB_SYSTEM.format(max_turns=max_turns)
+    """Renders the exact Qwen3.8 system prompt block matching E031 / prompts_and_selector.py."""
+    del max_turns
     parts = [
-        f"{SYS_PREFIX}{sys_content}\n\n# Tools\n\n"
+        f"{SYS_PREFIX}{TIER_SYSTEM_XHIGH}\n\n# Tools\n\n"
         "You have access to the following functions:\n\n<tools>"
     ]
     for tool in TOOL_SPECS_LEAN2SUB:
@@ -114,7 +109,8 @@ def build_qwen_system_prompt(max_turns: int = 40) -> str:
         "value_1\n</parameter>\n<parameter=example_parameter_2>\n"
         "This is the value for the second parameter\nthat can span\nmultiple lines\n"
         "</parameter>\n</function>\n</tool_call>\n\n"
-        "<Reminder>\n"
+        "<IMPORTANT>\n"
+        "Reminder:\n"
         "- Function calls MUST follow the specified format: an inner <function=...></function> "
         "block must be nested within <tool_call></tool_call> XML tags\n"
         "- Required parameters MUST be specified\n"
@@ -122,9 +118,9 @@ def build_qwen_system_prompt(max_turns: int = 40) -> str:
         "BEFORE the function call, but NOT after\n"
         "- If there is no function call available, answer the question like normal with your "
         "current knowledge and do not tell the user about function calls\n"
-        "</Reminder>"
+        "</IMPORTANT>\n\n"
+        f"{MINIMAL_EFFORT_HEADER}"
     )
-    parts.append(f"\n\n{MINIMAL_EFFORT_HEADER}")
     parts.append(SUFFIX)
     return "".join(parts)
 

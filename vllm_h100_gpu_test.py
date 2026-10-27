@@ -9,8 +9,8 @@ import tempfile
 from absl.testing import absltest
 import torch
 
-from google3.experimental.users.arazdai.kaggle import vllm_cuda_shim
-from google3.experimental.users.arazdai.kaggle import vllm_fla_triton_ops
+from google3.experimental.users.arazdai.kaggle.arc_agi_2 import vllm_cuda_shim
+from google3.experimental.users.arazdai.kaggle.arc_agi_2 import vllm_fla_triton_ops
 
 
 class VllmH100GpuTest(absltest.TestCase):
@@ -120,6 +120,30 @@ class VllmH100GpuTest(absltest.TestCase):
           "video_token_id": 151656,
           "vision_start_token_id": 151652,
           "vision_end_token_id": 151653,
+          "quantization_config": {
+              "activation_scheme": "dynamic",
+              "fmt": "e4m3",
+              "quant_method": "fp8",
+              "weight_block_size": [128, 128],
+              "modules_to_not_convert": [
+                  "visual",
+                  "model.visual",
+                  "lm_head",
+                  "model.embed_tokens",
+                  "model.language_model.layers.0.linear_attn.conv1d",
+                  "model.language_model.layers.0.linear_attn.in_proj_ba",
+                  "model.language_model.layers.0.linear_attn.in_proj_b",
+                  "model.language_model.layers.0.linear_attn.in_proj_a",
+                  "model.language_model.layers.1.linear_attn.conv1d",
+                  "model.language_model.layers.1.linear_attn.in_proj_ba",
+                  "model.language_model.layers.1.linear_attn.in_proj_b",
+                  "model.language_model.layers.1.linear_attn.in_proj_a",
+                  "model.language_model.layers.2.linear_attn.conv1d",
+                  "model.language_model.layers.2.linear_attn.in_proj_ba",
+                  "model.language_model.layers.2.linear_attn.in_proj_b",
+                  "model.language_model.layers.2.linear_attn.in_proj_a",
+              ],
+          },
           "vision_config": {
               "model_type": "qwen3_5",
               "depth": 2,

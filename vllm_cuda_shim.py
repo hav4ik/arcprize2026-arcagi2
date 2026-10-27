@@ -34,7 +34,10 @@ os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_TMP_BASE, "xdg_cache"))
 import torch
 import torch.nn.functional as F
 
-from google3.experimental.users.arazdai.kaggle import vllm_fla_triton_ops
+try:
+  from google3.experimental.users.arazdai.kaggle.arc_agi_2 import vllm_fla_triton_ops
+except ImportError:
+  from google3.experimental.users.arazdai.kaggle import vllm_fla_triton_ops
 
 _SHIM_INSTALLED = False
 
@@ -64,12 +67,51 @@ def _patch_metadata_versions_early() -> None:
       return "9.9.9"
 
   importlib.metadata.version = _mock_version
+  if "vllm._version" not in sys.modules:
+    ver_mod = types.ModuleType("vllm._version")
+    setattr(ver_mod, "version", "0.24.0")
+    setattr(ver_mod, "__version__", "0.24.0")
+    setattr(ver_mod, "__version_tuple__", (0, 24, 0))
+    setattr(ver_mod, "commit_id", "google3")
+    sys.modules["vllm._version"] = ver_mod
 
 
 def _install_cuda_platform() -> None:
   """Restores vllm.platforms.cuda.CudaPlatform (excluded in //third_party/py/vllm/copy.bara.sky)."""
-  import vllm.platforms
+  import vllm
+  vllm_platforms = importlib.import_module("vllm.platforms")
+  setattr(vllm, "platforms", vllm_platforms)
   from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
+
+  # Disable tpu_platform_plugin BEFORE importing AttentionBackendEnum (which
+  # accesses vllm.platforms.current_platform and would otherwise trigger
+  # tpu_platform_plugin() -> import tpu_inference -> import torch_xla2).
+  vllm_platforms.tpu_platform_plugin = lambda: None
+  if hasattr(vllm_platforms, "builtin_platform_plugins"):
+    vllm_platforms.builtin_platform_plugins["tpu"] = lambda: None
+    vllm_platforms.builtin_platform_plugins["cuda"] = (
+        lambda: "vllm.platforms.cuda.CudaPlatform"
+    )
+
+  # Stub vllm.platforms.rocm (excluded by Copybara) so functions like
+  # fp8_utils.w8a8_triton_block_scaled_mm (`from vllm.platforms.rocm import on_gfx1250`)
+  # work cleanly on CUDA.
+  class _RocmStubModule(types.ModuleType):
+
+    def __getattr__(self, name: str) -> Any:
+      if name.startswith("__") and name.endswith("__"):
+        raise AttributeError(name)
+      if name.startswith("_ON_"):
+        return False
+      if name == "get_cdna_version":
+        return lambda *a, **k: 0
+      return lambda *a, **k: False
+
+  rocm_stub = _RocmStubModule("vllm.platforms.rocm")
+  rocm_stub.__file__ = "/dev/null"
+  sys.modules["vllm.platforms.rocm"] = rocm_stub
+  setattr(vllm_platforms, "rocm", rocm_stub)
+
   from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
   torch.backends.cuda.enable_cudnn_sdp(False)
@@ -299,12 +341,15 @@ def _install_cuda_platform() -> None:
   cuda_platform = Google3CudaPlatform()
   vllm.platforms.current_platform = cuda_platform
 
-  # Update any already-imported vllm submodules holding UnspecifiedPlatform
-  for mod in list(sys.modules.values()):
-    if mod is not None and getattr(mod, "current_platform", None) is not None:
+  # Update any already-imported vllm submodules holding UnspecifiedPlatform or TpuPlatform
+  for mod_name, mod in list(sys.modules.items()):
+    if (
+        mod is not None
+        and mod_name.startswith("vllm")
+        and getattr(mod, "current_platform", None) is not None
+    ):
       try:
-        if getattr(mod.current_platform, "device_type", "") == "":
-          setattr(mod, "current_platform", cuda_platform)
+        setattr(mod, "current_platform", cuda_platform)
       except Exception:
         pass
 
@@ -808,6 +853,62 @@ def _install_custom_ops_and_c_fallbacks() -> None:
     if key is not None and k_out is not None:
       key.copy_(k_out)
 
+  def _c_per_token_group_fp8_quant(
+      x: torch.Tensor,
+      x_q: torch.Tensor,
+      x_s: torch.Tensor,
+      group_size: int,
+      eps: float,
+      fp8_min: float,
+      fp8_max: float,
+      use_ue8m0: bool = False,
+      column_major_scales: bool = False,
+      tma_aligned_scales: bool = False,
+  ) -> None:
+    del tma_aligned_scales
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+    from vllm.triton_utils import triton
+
+    m = x.numel() // group_size
+    block = triton.next_power_of_2(group_size)
+    num_warps = min(max(block // 256, 1), 8)
+    num_stages = 1
+    num_cols = x.shape[-1]
+    row_stride = x.stride(-2) if x.ndim >= 2 else num_cols
+    if column_major_scales:
+      fp8_utils._per_token_group_quant_fp8_colmajor[(m,)](
+          x,
+          x_q,
+          x_s,
+          group_size,
+          num_cols,
+          row_stride,
+          x_s.stride(-1),
+          eps,
+          fp8_min=fp8_min,
+          fp8_max=fp8_max,
+          use_ue8m0=use_ue8m0,
+          BLOCK=block,
+          num_warps=num_warps,
+          num_stages=num_stages,
+      )
+    else:
+      fp8_utils._per_token_group_quant_fp8[(m,)](
+          x,
+          x_q,
+          x_s,
+          group_size,
+          num_cols,
+          row_stride,
+          eps,
+          fp8_min=fp8_min,
+          fp8_max=fp8_max,
+          use_ue8m0=use_ue8m0,
+          BLOCK=block,
+          num_warps=num_warps,
+          num_stages=num_stages,
+      )
+
   torch.ops._C.weak_ref_tensor = _c_weak_ref_tensor
   torch.ops._C.rms_norm = _c_rms_norm
   torch.ops._C.fused_add_rms_norm = _c_fused_add_rms_norm
@@ -815,6 +916,7 @@ def _install_custom_ops_and_c_fallbacks() -> None:
   torch.ops._C.gelu_and_mul = _c_gelu_and_mul
   torch.ops._C.gelu_tanh_and_mul = _c_gelu_tanh_and_mul
   torch.ops._C.rotary_embedding = _c_rotary_embedding
+  torch.ops._C.per_token_group_fp8_quant = _c_per_token_group_fp8_quant
   torch.ops._C.apply_repetition_penalties_ = (
       _custom_ops.apply_repetition_penalties_torch
   )
@@ -844,12 +946,413 @@ def _install_custom_ops_and_c_fallbacks() -> None:
     pass
 
 
+def _install_fp8_triton_linear_shim() -> None:
+  """Wires vllm's Fp8LinearMethod to native Triton 128x128 block-FP8 GEMM on H100."""
+  from vllm.model_executor.layers.quantization.utils import fp8_utils
+
+  class _CutlassFP8ScaledMMLinearKernel:
+    pass
+
+  class _MarlinFP8ScaledMMLinearKernel:
+    pass
+
+  class Google3TritonFP8LinearKernel:
+    """Executes 128x128 block-FP8 (and per-tensor FP8) linear layers via Triton on H100."""
+
+    def __init__(
+        self,
+        activation_quant_key: Any = None,
+        weight_quant_key: Any = None,
+        weight_shape: Any = None,
+        input_dtype: torch.dtype | None = None,
+        out_dtype: torch.dtype | None = None,
+        module_name: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+      self.activation_quant_key = activation_quant_key
+      self.weight_quant_key = weight_quant_key
+      self.weight_shape = weight_shape
+      self.input_dtype = input_dtype
+      self.out_dtype = out_dtype
+      self.module_name = module_name
+      self.extra_kwargs = kwargs
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+      if hasattr(layer, "weight") and isinstance(layer.weight, torch.nn.Parameter):
+        if not layer.weight.data.is_contiguous():
+          layer.weight.data = layer.weight.data.contiguous()
+      if hasattr(layer, "weight_scale_inv") and isinstance(
+          layer.weight_scale_inv, torch.nn.Parameter
+      ):
+        if not layer.weight_scale_inv.data.is_contiguous():
+          layer.weight_scale_inv.data = layer.weight_scale_inv.data.contiguous()
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+      out_dtype = self.out_dtype if self.out_dtype is not None else x.dtype
+      block_size = getattr(layer, "weight_block_size", None)
+      if block_size is not None:
+        block_n, block_k = int(block_size[0]), int(block_size[1])
+        x_2d = x.contiguous().view(-1, x.shape[-1])
+        x_q, x_s = fp8_utils.per_token_group_quant_fp8(
+            x_2d,
+            group_size=block_k,
+            column_major_scales=False,
+            tma_aligned_scales=False,
+            use_ue8m0=False,
+        )
+        out_2d = fp8_utils.w8a8_triton_block_scaled_mm(
+            A=x_q,
+            B=layer.weight,
+            As=x_s,
+            Bs=layer.weight_scale_inv,
+            block_size=[block_n, block_k],
+            output_dtype=out_dtype,
+        )
+        out = out_2d.view(*x.shape[:-1], layer.weight.shape[0])
+        if bias is not None:
+          out = out + bias
+        return out
+
+      # Per-tensor / per-channel fallback (layer.weight was transposed to [K, N] in fp8.py:404)
+      w_fp8 = layer.weight.to(out_dtype)
+      w_scale = getattr(layer, "weight_scale", None)
+      if w_scale is not None:
+        w_s = w_scale.to(out_dtype)
+        if w_s.numel() == 1:
+          w_deq = w_fp8 * w_s
+        elif w_s.ndim == 1 and w_s.shape[0] == w_fp8.shape[1]:
+          w_deq = w_fp8 * w_s.unsqueeze(0)
+        elif w_s.ndim == 1 and w_s.shape[0] == w_fp8.shape[0]:
+          w_deq = w_fp8 * w_s.unsqueeze(1)
+        else:
+          w_deq = w_fp8 * w_s
+      else:
+        w_deq = w_fp8
+      return torch.nn.functional.linear(x.to(out_dtype), w_deq.t(), bias)
+
+  def _init_fp8_linear_kernel(*args: Any, **kwargs: Any) -> Google3TritonFP8LinearKernel:
+    return Google3TritonFP8LinearKernel(*args, **kwargs)
+
+  from vllm.g3_integration import patchers
+
+  importlib.import_module("vllm.model_executor.kernels")
+  for mod_name in (
+      "vllm.model_executor.kernels.linear",
+      "vllm.model_executor.kernels.linear.scaled_mm",
+  ):
+    try:
+      mod = importlib.import_module(mod_name)
+    except Exception:
+      mod = patchers.MockModule()
+      mod.__name__ = mod_name
+      mod.__path__ = []
+      sys.modules[mod_name] = mod
+    setattr(mod, "init_fp8_linear_kernel", _init_fp8_linear_kernel)
+    setattr(mod, "CutlassFP8ScaledMMLinearKernel", _CutlassFP8ScaledMMLinearKernel)
+    setattr(mod, "MarlinFP8ScaledMMLinearKernel", _MarlinFP8ScaledMMLinearKernel)
+    setattr(mod, "Google3TritonFP8LinearKernel", Google3TritonFP8LinearKernel)
+
+  for quant_mod_name in (
+      "vllm.model_executor.layers.quantization.fp8",
+      "vllm.model_executor.layers.quantization.modelopt",
+      "vllm.model_executor.layers.quantization.online.fp8",
+      "vllm.model_executor.layers.quantization.fbgemm_fp8",
+  ):
+    try:
+      qmod = importlib.import_module(quant_mod_name)
+      setattr(qmod, "init_fp8_linear_kernel", _init_fp8_linear_kernel)
+      if hasattr(qmod, "CutlassFP8ScaledMMLinearKernel"):
+        setattr(qmod, "CutlassFP8ScaledMMLinearKernel", _CutlassFP8ScaledMMLinearKernel)
+      if hasattr(qmod, "MarlinFP8ScaledMMLinearKernel"):
+        setattr(qmod, "MarlinFP8ScaledMMLinearKernel", _MarlinFP8ScaledMMLinearKernel)
+    except Exception:
+      pass
+
+
+
+def _patch_torch_accelerator_for_cuda() -> None:
+  """Forces torch.accelerator and C++ deviceFromLong(int) to use CUDA on GPU runtimes."""
+  import ctypes
+  import struct
+  import torch.accelerator
+  import torch.accelerator._utils
+  import torch.accelerator.memory
+  import torch.accelerator.random
+  import torch.utils._device
+
+  if not torch.cuda.is_available():
+    return
+
+  # 0. Prevent future imports of torch_xla2 / tpu_inference from registering
+  #    "jax" as the PrivateUse1 backend on a CUDA machine.
+  try:
+    torch.utils.rename_privateuse1_backend = lambda *a, **k: None
+    torch._C._rename_privateuse1_backend = lambda *a, **k: None
+    _orig_reg_dev_mod = getattr(
+        torch, "_g3_orig_register_device_module", torch._register_device_module
+    )
+    setattr(torch, "_g3_orig_register_device_module", _orig_reg_dev_mod)
+
+    def _safe_register_device_module(device_type: Any, module: Any) -> Any:
+      if str(device_type) in ("jax", "tpu", "privateuseone"):
+        return None
+      return _orig_reg_dev_mod(device_type, module)
+
+    torch._register_device_module = _safe_register_device_module
+  except Exception:
+    pass
+
+  # 1. If pkg_colab_binary or torch_xla2 already autoloaded "jax" onto
+  #    PrivateUse1, clear C++ privateuse1_backend_name_set atomic bool in .bss
+  #    across the global symbol table and any loaded libc10.so so C++
+  #    at::getAccelerator() and deviceFromLong(0) return kCUDA.
+  candidate_libs = [None]
+  try:
+    with open("/proc/self/maps", "r", encoding="utf-8") as f:
+      for line in f:
+        if "libc10.so" in line or "libtorch_cpu.so" in line:
+          parts = line.strip().split()
+          if len(parts) >= 6 and parts[-1].startswith("/"):
+            if parts[-1] not in candidate_libs:
+              candidate_libs.append(parts[-1])
+  except Exception:
+    pass
+
+  for lib_path in candidate_libs:
+    try:
+      lib = ctypes.CDLL(lib_path)
+      fn_sym = getattr(lib, "_ZN3c1032is_privateuse1_backend_registeredEv", None)
+      if fn_sym is None:
+        continue
+      fn_ptr = ctypes.cast(fn_sym, ctypes.c_void_p).value
+      if fn_ptr:
+        code = (ctypes.c_uint8 * 16).from_address(fn_ptr)
+        if (
+            code[0] == 0x0F
+            and code[1] == 0xB6
+            and code[2] == 0x05
+            and code[7] == 0xC3
+        ):
+          disp = struct.unpack("<i", bytes(code[3:7]))[0]
+          ctypes.c_uint8.from_address(fn_ptr + 7 + disp).value = 0
+        elif code[0] == 0x8A and code[1] == 0x05:
+          disp = struct.unpack("<i", bytes(code[2:6]))[0]
+          ctypes.c_uint8.from_address(fn_ptr + 6 + disp).value = 0
+    except Exception:
+      pass
+
+  # 1b. Also patch torch.utils._device.DeviceContext so that any integer device
+  #     (e.g. device=0 from RMSNormGated) or 'jax'/'privateuseone' device inside
+  #     a `with torch.device(...):` block is normalized to torch.device("cuda", idx).
+  try:
+    _dev_constructors = torch.utils._device._device_constructors
+
+    def _normalize_cuda_device(dev: Any) -> Any:
+      if isinstance(dev, int) and not isinstance(dev, bool):
+        return torch.device("cuda", dev)
+      if isinstance(dev, str) and dev.startswith(("jax", "privateuseone", "tpu")):
+        return torch.device("cuda", torch.cuda.current_device())
+      if isinstance(dev, torch.device) and dev.type in (
+          "jax",
+          "privateuseone",
+          "tpu",
+      ):
+        return torch.device(
+            "cuda",
+            dev.index if dev.index is not None else torch.cuda.current_device(),
+        )
+      return dev
+
+    def _patched_device_ctx_init(self, device: Any) -> None:
+      self.device = torch.device(_normalize_cuda_device(device))
+
+    def _patched_device_ctx_torch_function(
+        self, func: Any, types: Any, args: Any = (), kwargs: Any = None
+    ) -> Any:
+      kwargs = kwargs or {}
+      if func in _dev_constructors():
+        if kwargs.get("device") is None:
+          kwargs["device"] = _normalize_cuda_device(self.device)
+        else:
+          kwargs["device"] = _normalize_cuda_device(kwargs["device"])
+      return func(*args, **kwargs)
+
+    torch.utils._device.DeviceContext.__init__ = _patched_device_ctx_init
+    torch.utils._device.DeviceContext.__torch_function__ = (
+        _patched_device_ctx_torch_function
+    )
+  except Exception:
+    pass
+
+  # 2. Explicitly route torch.accelerator.*, torch.accelerator.memory.*,
+  #    torch.accelerator._utils.*, and torch._C._accelerator_* to torch.cuda.
+  def _cuda_get_device_index(device: Any = None, optional: bool = False) -> int:
+    if device is None:
+      if not optional:
+        raise ValueError(
+            "Expected a torch.device with a specified index or an integer, but"
+            f" got:{device}"
+        )
+      return torch.cuda.current_device()
+    if isinstance(device, int):
+      return device
+    if isinstance(device, str):
+      device = torch.device(device)
+    if isinstance(device, torch.device):
+      if device.index is None:
+        if not optional:
+          raise ValueError(
+              "Expected a torch.device with a specified index or an integer,"
+              f" but got:{device}"
+          )
+        return torch.cuda.current_device()
+      return device.index
+    return torch.cuda._utils._get_device_index(device, optional=optional)
+
+  def _cuda_current_accelerator(
+      check_available: bool = False,
+  ) -> torch.device | None:
+    if check_available and not torch.cuda.is_available():
+      return None
+    return torch.device("cuda")
+
+  def _cuda_set_device_index(device: Any, /) -> None:
+    idx = _cuda_get_device_index(device, optional=False)
+    if idx >= 0:
+      torch.cuda.set_device(idx)
+
+  def _cuda_current_stream(device: Any = None, /):
+    return torch.cuda.current_stream(
+        _cuda_get_device_index(device, optional=True)
+    )
+
+  def _cuda_synchronize(device: Any = None, /) -> None:
+    torch.cuda.synchronize(_cuda_get_device_index(device, optional=True))
+
+  class _CudaDeviceIndexCtx:
+
+    def __init__(self, device: int | None, /) -> None:
+      self.idx = device
+      self.prev_idx = -1
+
+    def __enter__(self) -> None:
+      if self.idx is not None:
+        self.prev_idx = torch._C._cuda_exchangeDevice(self.idx)
+
+    def __exit__(self, *exc_info: object) -> None:
+      if self.idx is not None:
+        torch._C._cuda_maybeExchangeDevice(self.prev_idx)
+
+  _empty_host_cache = getattr(torch.cuda, "empty_host_cache", lambda: None)
+  _memory_stats = lambda d=None: torch.cuda.memory_stats(
+      _cuda_get_device_index(d, optional=True)
+  )
+  _memory_allocated = lambda d=None: torch.cuda.memory_allocated(
+      _cuda_get_device_index(d, optional=True)
+  )
+  _max_memory_allocated = lambda d=None: torch.cuda.max_memory_allocated(
+      _cuda_get_device_index(d, optional=True)
+  )
+  _memory_reserved = lambda d=None: torch.cuda.memory_reserved(
+      _cuda_get_device_index(d, optional=True)
+  )
+  _max_memory_reserved = lambda d=None: torch.cuda.max_memory_reserved(
+      _cuda_get_device_index(d, optional=True)
+  )
+  _reset_accumulated = lambda d=None: torch.cuda.reset_accumulated_memory_stats(
+      _cuda_get_device_index(d, optional=True)
+  )
+  _reset_peak = lambda d=None: torch.cuda.reset_peak_memory_stats(
+      _cuda_get_device_index(d, optional=True)
+  )
+  _get_memory_info = lambda d=None: torch.cuda.mem_get_info(
+      _cuda_get_device_index(d, optional=True)
+  )
+
+  torch.accelerator._utils._get_device_index = _cuda_get_device_index
+  torch.accelerator._get_device_index = _cuda_get_device_index
+  torch.accelerator.memory._get_device_index = _cuda_get_device_index
+  torch.accelerator.random._get_device_index = _cuda_get_device_index
+
+  torch.accelerator.current_accelerator = _cuda_current_accelerator
+  torch.accelerator.is_available = torch.cuda.is_available
+  torch.accelerator.device_count = torch.cuda.device_count
+  torch.accelerator.current_device_index = torch.cuda.current_device
+  torch.accelerator.current_device_idx = torch.cuda.current_device
+  torch.accelerator.set_device_index = _cuda_set_device_index
+  torch.accelerator.set_device_idx = _cuda_set_device_index
+  torch.accelerator.current_stream = _cuda_current_stream
+  torch.accelerator.set_stream = torch.cuda.set_stream
+  torch.accelerator.synchronize = _cuda_synchronize
+  torch.accelerator.device_index = _CudaDeviceIndexCtx
+
+  for mod in (torch.accelerator, torch.accelerator.memory):
+    mod.empty_cache = torch.cuda.empty_cache
+    mod.empty_host_cache = _empty_host_cache
+    mod.memory_stats = _memory_stats
+    mod.memory_allocated = _memory_allocated
+    mod.max_memory_allocated = _max_memory_allocated
+    mod.memory_reserved = _memory_reserved
+    mod.max_memory_reserved = _max_memory_reserved
+    mod.reset_accumulated_memory_stats = _reset_accumulated
+    mod.reset_peak_memory_stats = _reset_peak
+    mod.get_memory_info = _get_memory_info
+
+  try:
+    torch._C._accelerator_getAccelerator = lambda: torch.device("cuda")
+    torch._C._accelerator_getDeviceIndex = torch.cuda.current_device
+    torch._C._accelerator_setDeviceIndex = (
+        lambda idx: torch.cuda.set_device(idx) if idx >= 0 else None
+    )
+    torch._C._accelerator_getStream = torch.cuda.current_stream
+    torch._C._accelerator_setStream = torch.cuda.set_stream
+    torch._C._accelerator_synchronizeDevice = torch.cuda.synchronize
+    torch._C._accelerator_exchangeDevice = torch._C._cuda_exchangeDevice
+    torch._C._accelerator_maybeExchangeDevice = (
+        torch._C._cuda_maybeExchangeDevice
+    )
+    torch._C._accelerator_isAllocatorInitialized = torch.cuda.is_initialized
+    torch._C._accelerator_emptyCache = torch.cuda.empty_cache
+    torch._C._accelerator_emptyHostCache = _empty_host_cache
+    torch._C._accelerator_getMemoryInfo = torch.cuda.mem_get_info
+    torch._C._accelerator_resetAccumulatedStats = (
+        torch.cuda.reset_accumulated_memory_stats
+    )
+    torch._C._accelerator_resetPeakStats = torch.cuda.reset_peak_memory_stats
+  except Exception:
+    pass
+
+  # 3. Ensure torch.Event() defaults to CUDA when device=None
+  orig_event = getattr(torch, "_g3_orig_Event", torch.Event)
+  setattr(torch, "_g3_orig_Event", orig_event)
+
+  class _CudaDefaultEvent(orig_event):
+
+    def __new__(cls, device: Any = None, **kwargs: Any):
+      if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+      return orig_event.__new__(cls, device=device, **kwargs)
+
+  torch.Event = _CudaDefaultEvent
+  try:
+    torch.get_device_module.cache_clear()
+  except Exception:
+    pass
+
+
 def install_google3_vllm_cuda_shim() -> None:
   """Installs all shims needed to run //third_party/py/vllm on H100 CUDA in Google3."""
   global _SHIM_INSTALLED
   if _SHIM_INSTALLED:
+    _patch_torch_accelerator_for_cuda()
     return
 
+  os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
   os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
   os.environ["VLLM_NO_USAGE_STATS"] = "1"
   os.environ["TEST_TARGET"] = "1"
@@ -858,8 +1361,9 @@ def install_google3_vllm_cuda_shim() -> None:
   os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
   os.environ["VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER"] = "0"
 
-  # 0. Mock importlib.metadata versions FIRST before importing vllm
+  # 0. Mock importlib.metadata versions & force torch.accelerator to CUDA
   _patch_metadata_versions_early()
+  _patch_torch_accelerator_for_cuda()
 
   # 1. Run Google3's base vllm patchers (CNS bridge, metadata versions, mocks)
   from vllm.g3_integration import cns_bridge
@@ -876,16 +1380,31 @@ def install_google3_vllm_cuda_shim() -> None:
 
   # 2. Restore vllm.platforms.cuda.CudaPlatform and set current_platform
   _install_cuda_platform()
+  # Re-run after _install_cuda_platform() in case importing vllm.platforms.tpu
+  # imported tpu_inference -> torch_xla2 and registered 'jax' on PrivateUse1.
+  _patch_torch_accelerator_for_cuda()
 
   # 3. Install real vllm.vllm_flash_attn and vllm.third_party.flash_linear_attention
   _install_vllm_flash_attn_shim()
   _install_fla_triton_modules()
 
-  # 4. Install PyTorch/Triton fallbacks for torch.ops._C and _C_cache_ops
+  # 4. Install PyTorch/Triton fallbacks for torch.ops._C, _C_cache_ops, and FP8 Linear
   _install_custom_ops_and_c_fallbacks()
+  _install_fp8_triton_linear_shim()
 
-  # 5. Patch model registry subprocess inspection in-process
+  # 5. Patch model registry subprocess inspection in-process & Colab suppress_stdout
   patchers.apply_single_process_patches()
+  try:
+    import contextlib
+    from vllm.distributed import parallel_state
+    from vllm.distributed import utils as vllm_dist_utils
+    from vllm.utils import system_utils as vllm_sys_utils
+
+    vllm_sys_utils.suppress_stdout = contextlib.nullcontext
+    parallel_state.suppress_stdout = contextlib.nullcontext
+    vllm_dist_utils.suppress_stdout = contextlib.nullcontext
+  except Exception:
+    pass
 
   # 6. Patch Qwen GatedDeltaNet prefill backend on Hopper (SM90) to use Triton/FLA
   #    instead of FlashInfer (which is not packaged in Google3).
@@ -909,4 +1428,20 @@ def install_google3_vllm_cuda_shim() -> None:
   qwen_gdn_linear_attn.l2norm_fwd = vllm_fla_triton_ops.l2norm_fwd
   qwen_gdn_linear_attn.FLA_CHUNK_SIZE = vllm_fla_triton_ops.FLA_CHUNK_SIZE
 
+  _orig_rmsnorm_gated = getattr(
+      qwen_gdn_linear_attn,
+      "_g3_orig_RMSNormGated",
+      qwen_gdn_linear_attn.RMSNormGated,
+  )
+  setattr(qwen_gdn_linear_attn, "_g3_orig_RMSNormGated", _orig_rmsnorm_gated)
+
+  def _cuda_rmsnorm_gated(*args: Any, **kwargs: Any) -> Any:
+    dev = kwargs.get("device")
+    if isinstance(dev, int) and not isinstance(dev, bool):
+      kwargs["device"] = torch.device("cuda", dev)
+    return _orig_rmsnorm_gated(*args, **kwargs)
+
+  qwen_gdn_linear_attn.RMSNormGated = _cuda_rmsnorm_gated
+
+  _patch_torch_accelerator_for_cuda()
   _SHIM_INSTALLED = True

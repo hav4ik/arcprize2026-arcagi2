@@ -305,72 +305,74 @@ PILOT2_HYPOTHESES: dict[str, Pilot2HypothesisConfig] = {
     ),
     "e031_deepseek_teaching": Pilot2HypothesisConfig(
         exp_id="e031_deepseek_teaching",
-        title="E031 DeepSeek Teaching Interface (lean2sub + Minimal Effort + IPython run_python & submit_answer, N=2)",
+        title="E031 DeepSeek Teaching Interface (lean2sub + xhigh Tier + Minimal Effort Header + 8k 2-Stage Think Nudge, N=2)",
         hypothesis_summary=(
-            "Exact E031 / E032 DeepSeek teaching harness: ARC Prize user prompt + lean2sub suffix, "
-            "native Qwen3.8 XML tool calls (`run_python` / `submit_answer` evaluating expressions or `answer` in "
-            "persistent IPython session), `minimal` effort header, s20x60 strong budget notes, turns_note=5 at "
-            "40 turns, and 3-tier session fallback (`answer` -> `solve(test_input)` -> `salvage_answer`)."
+            "Optimal E031 / E032 DeepSeek teaching harness: ARC Prize user prompt + lean2sub suffix, "
+            "Qwen3.8 native `xhigh` tier header + `minimal` effort header after tools, native XML tool calls "
+            "(`run_python` / `submit_answer` in persistent IPython session), 8k per-turn thinking cap with "
+            "2-stage graceful think nudge, one-time train-check verification on `submit_answer`, "
+            "equivariance tie-breaking, and `force_submit_last` 3-tier session fallback."
         ),
         num_attempts=2,
         max_turns=40,
         total_token_budget=60000,
         soft_token_target=20000,
-        turn_think_cap=16384,
+        turn_think_cap=8192,
         attempt_prompt_styles=("lean2sub", "lean2sub"),
         attempt_include_task_summary=(False, False),
         use_arc_helpers=False,
         auto_check_on_solve=False,
         use_falsification_protocol=False,
-        use_equivariance_audit=False,
+        use_equivariance_audit=True,
         use_native_xml_tools=True,
-        use_two_stage_think_nudge=False,
+        use_two_stage_think_nudge=True,
         use_evolutionary_two_wave=False,
         use_transcript_compaction=True,
     ),
     "e031_deepseek_teaching_bo4": Pilot2HypothesisConfig(
         exp_id="e031_deepseek_teaching_bo4",
-        title="E031 DeepSeek Teaching Interface (lean2sub + Minimal Effort + IPython run_python & submit_answer, N=4)",
+        title="E031 DeepSeek Teaching Interface (lean2sub + xhigh Tier + 8k 2-Stage Think Nudge, N=4)",
         hypothesis_summary=(
-            "Exact E031 / E032 DeepSeek teaching harness with N=4 attempts per test pair and train-verified "
-            "selection + 3-tier session fallback (`answer` -> `solve(test_input)` -> `salvage_answer`)."
+            "Optimal E031 / E032 DeepSeek teaching harness with N=4 attempts per test pair, `xhigh` tier header, "
+            "8k 2-stage graceful think nudge, train-verified selection, equivariance tie-breaking, and "
+            "3-tier session fallback (`answer` -> `solve(test_input)` -> `salvage_answer`)."
         ),
         num_attempts=4,
         max_turns=40,
         total_token_budget=60000,
         soft_token_target=20000,
-        turn_think_cap=16384,
+        turn_think_cap=8192,
         attempt_prompt_styles=("lean2sub", "lean2sub", "lean2sub", "lean2sub"),
         attempt_include_task_summary=(False, False, False, False),
         use_arc_helpers=False,
         auto_check_on_solve=False,
         use_falsification_protocol=False,
-        use_equivariance_audit=False,
+        use_equivariance_audit=True,
         use_native_xml_tools=True,
-        use_two_stage_think_nudge=False,
+        use_two_stage_think_nudge=True,
         use_evolutionary_two_wave=False,
         use_transcript_compaction=True,
     ),
     "e031_deepseek_teaching_fast": Pilot2HypothesisConfig(
         exp_id="e031_deepseek_teaching_fast",
-        title="Fast E031 DeepSeek Teaching Interface (lean2sub + Minimal Effort + 40k/32t Single-Wave + Final Submit Rescue, N=2)",
+        title="Fast E031 DeepSeek Teaching Interface (lean2sub + xhigh Tier + 42k/36t + 8k 2-Stage Nudge, N=2)",
         hypothesis_summary=(
-            "Fast, single-wave E031 DeepSeek teaching harness (`lean2sub`, `minimal` effort, persistent IPython "
-            "`run_python` & `submit_answer`) with 40k token budget (covers >96% of solved attempts empirically, "
-            "where median=15.5k and p90=34.3k tokens), 32 max turns, 10k per-turn think cap, and final-turn "
-            "forced `submit_answer` rescue (`use_two_stage_think_nudge=True`)."
+            "Fast Kaggle-6h compliant E031 DeepSeek teaching harness (`lean2sub`, `xhigh` tier + `minimal` effort "
+            "header, persistent IPython `run_python` & `submit_answer`) with 42k token budget, 36 max turns, "
+            "8k per-turn think cap with 2-stage graceful nudge, equivariance tie-breaking, and `force_submit_last` "
+            "session fallback."
         ),
         num_attempts=2,
-        max_turns=32,
-        total_token_budget=40000,
-        soft_token_target=18000,
-        turn_think_cap=10240,
+        max_turns=36,
+        total_token_budget=42000,
+        soft_token_target=20000,
+        turn_think_cap=8192,
         attempt_prompt_styles=("lean2sub", "lean2sub"),
         attempt_include_task_summary=(False, False),
         use_arc_helpers=False,
         auto_check_on_solve=False,
         use_falsification_protocol=False,
-        use_equivariance_audit=False,
+        use_equivariance_audit=True,
         use_native_xml_tools=True,
         use_two_stage_think_nudge=True,
         use_evolutionary_two_wave=False,
@@ -466,11 +468,13 @@ E031_TOOLS_FOOTER = (
     "</IMPORTANT>"
 )
 
-E031_TIER_MINIMAL = (
-    "Reasoning effort is set to minimal. Keep your thinking short and terse: brief notes, not full sentences. "
-    "Test ideas with small code experiments instead of long deliberation, and submit as soon as the rule "
-    "reproduces every training pair."
+TIER_SYSTEM_XHIGH = (
+    "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, "
+    "consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final "
+    "answer."
 )
+
+E031_TIER_MINIMAL = TIER_SYSTEM_XHIGH
 
 E031_EFFORT_HEADER_MINIMAL = (
     "Reasoning Effort: Minimal. Keep your thinking short and terse: write brief notes, not full sentences. "
@@ -497,6 +501,7 @@ def format_e031_budget_and_turns_note(
     cum_gen_tokens: int | None = None,
     turn_idx_after_tool: int | None = None,
     hard_budget: int | None = None,
+    stated_hard_cap: int = 60000,
 ) -> str:
   """Format exact E031 / E032 budget and turns-left notes appended inside `<tool_response>`."""
   toks = int(cum_gen_tokens if cum_gen_tokens is not None else (used_tokens or 0))
@@ -505,19 +510,20 @@ def format_e031_budget_and_turns_note(
       if turn_idx_after_tool is not None
       else (turn_idx_1based or 0)
   )
-  h_cap = int(hard_budget if hard_budget is not None else hard_cap)
+  real_cap = int(hard_budget if hard_budget is not None else hard_cap)
+  display_cap = max(real_cap, int(stated_hard_cap))
   note = ""
-  if toks >= int(0.01 * h_cap):
+  if toks >= int(0.01 * real_cap):
     note = (
         f"\n[budget: {toks / 1000:.0f}k output tokens used; aim to finish within "
-        f"{soft_target / 1000:.0f}k (hard limit {h_cap / 1000:.0f}k)]"
+        f"{soft_target / 1000:.0f}k (hard limit {display_cap / 1000:.0f}k)]"
     )
-    if soft_target <= toks < int(0.75 * h_cap):
+    if soft_target <= toks < int(0.75 * real_cap):
       note += (
           " Past the target: submit your best answer now with submit_answer, unless one more experiment "
           "will very likely make every training pair pass."
       )
-    elif toks >= int(0.75 * h_cap):
+    elif toks >= int(0.75 * real_cap):
       note += (
           " Budget nearly spent: submit your best answer now with submit_answer "
           "(or at least set `answer`)."
@@ -598,7 +604,6 @@ TOOLS_SPEC_JSON = [
     },
 ]
 
-
 XML_TOOLS_FOOTER = (
     "\n</tools>\n\n"
     "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
@@ -650,7 +655,7 @@ def build_system_prompt(cfg: Pilot2HypothesisConfig, attempt_idx: int) -> str:
         "\n" + json.dumps(t, ensure_ascii=False) for t in E031_TOOLS_SPEC_JSON
     )
     return (
-        f"{E031_TIER_MINIMAL}\n\n"
+        f"{TIER_SYSTEM_XHIGH}\n\n"
         "# Tools\n\nYou have access to the following functions:\n\n<tools>"
         f"{e031_tools_lines}{E031_TOOLS_FOOTER}\n\n"
         f"{E031_EFFORT_HEADER_MINIMAL}"
@@ -716,6 +721,7 @@ def build_system_prompt(cfg: Pilot2HypothesisConfig, attempt_idx: int) -> str:
 
   if cfg.use_native_xml_tools:
     return (
+        f"{TIER_SYSTEM_XHIGH}\n\n"
         f"{core_instructions}"
         f"{helpers_doc}\n"
         "# Tools\n\n"
@@ -824,6 +830,16 @@ def append_turn_to_chatml_transcript(
   clean_assistant = assistant_output
   if clean_assistant.endswith("<|im_end|>"):
     clean_assistant = clean_assistant[: -len("<|im_end|>")]
+  if use_native_xml_tools and "</think>" not in clean_assistant:
+    if "<tool_call>" in clean_assistant:
+      tc_idx = clean_assistant.find("<tool_call>")
+      clean_assistant = (
+          clean_assistant[:tc_idx].rstrip()
+          + "\n</think>\n\n"
+          + clean_assistant[tc_idx:]
+      )
+    else:
+      clean_assistant = clean_assistant.rstrip() + "\n</think>"
   clean_note = budget_note.lstrip("\n") if budget_note else ""
   note_suffix = f"\n{clean_note}" if clean_note else ""
   assistant_prefix = (

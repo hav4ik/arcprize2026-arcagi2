@@ -42,9 +42,23 @@ flags.DEFINE_string(
     "",
     "Optional existing CNS experiment output_dir (containing wu_1/checkpoint-latest) to resume in-place.",
 )
+flags.DEFINE_string(
+    "init_adapter_path",
+    "",
+    "Optional initial PEFT LoRA adapter directory on CNS to initialize weights from at step 0 (without optimizer state).",
+)
 flags.DEFINE_integer("lora_r", 64, "LoRA rank.")
 flags.DEFINE_integer("lora_alpha", 128, "LoRA alpha.")
 flags.DEFINE_float("learning_rate", 1e-4, "Peak learning rate.")
+flags.DEFINE_float("min_lr_ratio", 0.1, "Minimum learning rate ratio at end of cosine schedule.")
+flags.DEFINE_float(
+    "loss_weight_gamma",
+    0.0,
+    "Focal/power exponent for per-example loss reweighting (0.0 = uniform; > 0 upweights higher-loss trajectories).",
+)
+flags.DEFINE_float("loss_weight_min", 0.25, "Minimum raw loss weight clamp.")
+flags.DEFINE_float("loss_weight_max", 3.0, "Maximum raw loss weight clamp.")
+flags.DEFINE_integer("seed", 42, "Random seed for data permutation.")
 flags.DEFINE_integer("num_epochs", 1, "Number of epochs.")
 flags.DEFINE_integer("max_steps", -1, "Optional max optimizer steps override (-1 = full num_epochs).")
 flags.DEFINE_integer("grad_accum_steps", 8, "Gradient accumulation micro-steps.")
@@ -115,9 +129,15 @@ def main(argv: list[str]) -> None:
                 "model_path": FLAGS.model_path,
                 "data_dir": FLAGS.data_dir,
                 "output_dir": f"{output_dir}/wu_{wu.work_unit_id}",
+                "init_adapter_path": FLAGS.init_adapter_path,
                 "lora_r": FLAGS.lora_r,
                 "lora_alpha": FLAGS.lora_alpha,
                 "learning_rate": FLAGS.learning_rate,
+                "min_lr_ratio": FLAGS.min_lr_ratio,
+                "loss_weight_gamma": FLAGS.loss_weight_gamma,
+                "loss_weight_min": FLAGS.loss_weight_min,
+                "loss_weight_max": FLAGS.loss_weight_max,
+                "seed": FLAGS.seed,
                 "num_epochs": FLAGS.num_epochs,
                 "max_steps": FLAGS.max_steps,
                 "grad_accum_steps": FLAGS.grad_accum_steps,
@@ -148,6 +168,7 @@ def main(argv: list[str]) -> None:
             args={
                 "lora_r": FLAGS.lora_r,
                 "lr": FLAGS.learning_rate,
+                "gamma": FLAGS.loss_weight_gamma,
                 "max_seq_len": FLAGS.max_seq_len,
                 "num_b200": FLAGS.num_b200,
                 "fast_deltanet": FLAGS.use_fast_deltanet,

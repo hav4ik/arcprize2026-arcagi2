@@ -763,6 +763,81 @@ class SftPipelineTest(googletest.TestCase):
                 )
                 self.assertGreater(int(loss_mask.sum()), 0)
 
+    def test_compute_example_loss_weight_and_load_initial_lora_adapter(self):
+        import peft
+
+        # 1. Verify gamma == 0 returns uniform 1.0
+        self.assertEqual(
+            train_sft.compute_example_loss_weight(1.2, 0.6, gamma=0.0), 1.0
+        )
+        # 2. Verify higher loss gets higher weight and clamping works
+        w_low = train_sft.compute_example_loss_weight(
+            0.40, 0.80, gamma=1.5, min_weight=0.25, max_weight=3.0
+        )
+        w_mid = train_sft.compute_example_loss_weight(
+            0.80, 0.80, gamma=1.5, min_weight=0.25, max_weight=3.0
+        )
+        w_high = train_sft.compute_example_loss_weight(
+            1.20, 0.80, gamma=1.5, min_weight=0.25, max_weight=3.0
+        )
+        self.assertLess(w_low, w_mid)
+        self.assertAlmostEqual(w_mid, 1.0, places=5)
+        self.assertGreater(w_high, w_mid)
+        self.assertAlmostEqual(w_high, 1.5 ** 1.5, places=5)
+
+        w_clamped_min = train_sft.compute_example_loss_weight(
+            0.05, 0.80, gamma=1.5, min_weight=0.25, max_weight=3.0
+        )
+        w_clamped_max = train_sft.compute_example_loss_weight(
+            5.0, 0.80, gamma=1.5, min_weight=0.25, max_weight=3.0
+        )
+        self.assertEqual(w_clamped_min, 0.25)
+        self.assertEqual(w_clamped_max, 3.0)
+
+        # 3. Verify load_initial_lora_adapter restores saved PEFT weights
+        text_cfg = transformers.Qwen3_5TextConfig(
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+        )
+        cfg = transformers.Qwen3_5Config(text_config=text_cfg)
+        lora_cfg = peft.LoraConfig(
+            r=4,
+            lora_alpha=8,
+            target_modules=["in_proj_qkv", "out_proj"],
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        m1 = peft.get_peft_model(
+            transformers.Qwen3_5ForConditionalGeneration(cfg), lora_cfg
+        )
+        with torch.no_grad():
+            for n, p in m1.named_parameters():
+                if "lora_" in n:
+                    p.fill_(0.125)
+
+        with tempfile.TemporaryDirectory(prefix="init_lora_test_") as tmp_dir:
+            m1.save_pretrained(tmp_dir)
+            m2 = peft.get_peft_model(
+                transformers.Qwen3_5ForConditionalGeneration(cfg), lora_cfg
+            )
+            train_sft.load_initial_lora_adapter(m2, tmp_dir)
+            for (n1, p1), (n2, p2) in zip(
+                m1.named_parameters(), m2.named_parameters()
+            ):
+                if "lora_" in n1:
+                    self.assertEqual(n1, n2)
+                    self.assertTrue(torch.allclose(p1, p2))
+
 
 if __name__ == "__main__":
     googletest.main()

@@ -255,6 +255,7 @@ class Pilot2AttemptSandbox:
     self.submitted_answer_grid: Grid | None = None
     self.submitted_answer_turn: int | None = None
     self.submitted_answer_gen_tokens: int | None = None
+    self._rejected_submit_codes: set[str] = set()
 
     self.env: dict[str, Any] = {
         "__builtins__": __builtins__,
@@ -926,9 +927,59 @@ class Pilot2AttemptSandbox:
 
     total = max(1, len(self._train_np))
     test_names = ("test_in", "test_input")
-    call_fn = None
+
+    def _eval_candidate_fn(cand_fn: Any) -> tuple[bool, int, float]:
+      passed = 0
+      cell_accs: list[float] = []
+      for pair in self._train_np:
+        try:
+          try:
+            got_raw = cand_fn(copy.deepcopy(to_grid(pair["input"])))
+          except Exception:
+            got_raw = cand_fn(pair["input"].copy())
+          if not is_valid_grid(got_raw):
+            cell_accs.append(0.0)
+            continue
+          got_arr = np.asarray(got_raw, dtype=int)
+          exp_arr = pair["output"]
+          if got_arr.shape == exp_arr.shape and np.array_equal(got_arr, exp_arr):
+            passed += 1
+            cell_accs.append(1.0)
+          elif got_arr.shape == exp_arr.shape:
+            cell_accs.append(float(np.mean(got_arr == exp_arr)))
+          else:
+            cell_accs.append(0.0)
+        except Exception:
+          cell_accs.append(0.0)
+      mean_acc = float(np.mean(cell_accs)) if cell_accs else 0.0
+      return (passed == len(self._train_np)), passed, mean_acc
+
+    best_res: tuple[bool, int, float] = (False, 0, 0.0)
+
+    # 1. If `code` is an expression referencing `test_input` or `test_in`, evaluate it directly on each train pair.
+    stripped_code = code.strip()
+    if any(tn in stripped_code for tn in test_names):
+      try:
+        comp_expr = compile(stripped_code, "<train_check_expr>", "eval")
+
+        def _expr_runner(inp_grid: Any) -> Any:
+          local_env = dict(self.env)
+          local_env["test_input"] = inp_grid
+          local_env["test_in"] = inp_grid
+          return eval(comp_expr, local_env)  # pylint: disable=eval-used
+
+        tp, p_cnt, m_acc = _eval_candidate_fn(_expr_runner)
+        if tp:
+          return True, p_cnt, m_acc
+        if (p_cnt, m_acc) > (best_res[1], best_res[2]):
+          best_res = (tp, p_cnt, m_acc)
+      except SyntaxError:
+        pass
+
+    # 2. Check explicit single-arg call AST or `solve` or recent 1-arg user functions in session.
+    candidate_fns: list[Any] = []
     try:
-      tree = ast.parse(code.strip(), mode="eval")
+      tree = ast.parse(stripped_code, mode="eval")
       if (
           isinstance(tree.body, ast.Call)
           and len(tree.body.args) == 1
@@ -939,52 +990,33 @@ class Pilot2AttemptSandbox:
       ):
         cand = self.env.get(tree.body.func.id)
         if callable(cand):
-          call_fn = cand
+          candidate_fns.append(cand)
     except SyntaxError:
       pass
 
-    if call_fn is None and callable(self.env.get("solve")):
-      call_fn = self.env.get("solve")
+    if callable(self.env.get("solve")):
+      candidate_fns.append(self.env.get("solve"))
 
-    if call_fn is None:
-      user_fns = [
-          v
-          for k, v in self.env.items()
-          if isinstance(v, types.FunctionType)
-          and not k.startswith("_")
-          and getattr(v, "__code__", None) is not None
-          and v.__code__.co_argcount >= 1
-      ]
-      if user_fns:
-        call_fn = user_fns[-1]
+    user_fns = [
+        v
+        for k, v in self.env.items()
+        if isinstance(v, types.FunctionType)
+        and not k.startswith("_")
+        and getattr(v, "__code__", None) is not None
+        and v.__code__.co_argcount >= 1
+    ]
+    for u_fn in reversed(user_fns[-8:]):
+      if u_fn not in candidate_fns:
+        candidate_fns.append(u_fn)
 
-    if call_fn is None:
-      return False, 0, 0.0
+    for cand_fn in candidate_fns:
+      tp, p_cnt, m_acc = _eval_candidate_fn(cand_fn)
+      if tp:
+        return True, p_cnt, m_acc
+      if (p_cnt, m_acc) > (best_res[1], best_res[2]):
+        best_res = (tp, p_cnt, m_acc)
 
-    passed = 0
-    cell_accs: list[float] = []
-    for pair in self._train_np:
-      try:
-        try:
-          got_raw = call_fn(copy.deepcopy(to_grid(pair["input"])))
-        except Exception:
-          got_raw = call_fn(pair["input"].copy())
-        if not is_valid_grid(got_raw):
-          cell_accs.append(0.0)
-          continue
-        got_arr = np.asarray(got_raw, dtype=int)
-        exp_arr = pair["output"]
-        if got_arr.shape == exp_arr.shape and np.array_equal(got_arr, exp_arr):
-          passed += 1
-          cell_accs.append(1.0)
-        elif got_arr.shape == exp_arr.shape:
-          cell_accs.append(float(np.mean(got_arr == exp_arr)))
-        else:
-          cell_accs.append(0.0)
-      except Exception:
-        cell_accs.append(0.0)
-    mean_acc = float(np.mean(cell_accs)) if cell_accs else 0.0
-    return (passed == len(self._train_np)), passed, mean_acc
+    return best_res
 
   def _run_with_hard_timeout(
       self,
@@ -1140,6 +1172,31 @@ class Pilot2AttemptSandbox:
             cum_gen_tokens=cum_gen_tokens,
         )
     )
+
+    # E031 `verify_submit`: if a candidate rule/function in the session failed to reproduce all
+    # training outputs, reject the submission ONCE so the model can inspect the failure and fix it,
+    # while keeping `submitted_answer_grid` and `best_partial_pred` saved as fallback.
+    norm_code = code.strip()
+    has_testable_fn = (
+        any(tn in norm_code for tn in ("test_in", "test_input"))
+        or callable(self.env.get("solve"))
+        or passed_cnt > 0
+        or mean_acc > 0.0
+    )
+    if (
+        not train_pass
+        and has_testable_fn
+        and norm_code not in self._rejected_submit_codes
+    ):
+      self._rejected_submit_codes.add(norm_code)
+      total_tr = len(self.train_pairs)
+      return (
+          f"[submission rejected: your rule only matched {passed_cnt}/{total_tr} training pairs "
+          f"(mean cell accuracy {100.0 * mean_acc:.1f}%). Inspect the failing training pairs in "
+          "`run_python`, fix your rule so it reproduces ALL training outputs, and call `submit_answer` again.]",
+          False,
+      )
+
     if secondary_grid is not None:
       return (
           f"[2 answers accepted: {len(primary_grid)}x{len(primary_grid[0])} and "
@@ -1210,7 +1267,10 @@ class Pilot2AttemptSandbox:
         ok_fn = True
         for pair in self._train_np:
           try:
-            got_raw = fn(copy.deepcopy(to_grid(pair["input"])))
+            try:
+              got_raw = fn(copy.deepcopy(to_grid(pair["input"])))
+            except Exception:
+              got_raw = fn(pair["input"].copy())
           except Exception:
             ok_fn = False
             break
@@ -1230,7 +1290,10 @@ class Pilot2AttemptSandbox:
         score = (n_exact, sim_sum / max(1, len(self._train_np)), idx)
         if score > best_score:
           try:
-            test_raw = fn(copy.deepcopy(to_grid(self._test_np)))
+            try:
+              test_raw = fn(copy.deepcopy(to_grid(self._test_np)))
+            except Exception:
+              test_raw = fn(self._test_np.copy())
             if is_valid_grid(test_raw):
               best_score = score
               best_grid = to_grid(test_raw)

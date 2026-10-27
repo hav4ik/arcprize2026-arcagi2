@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Qwen3.8-27B-FP8 SFT Evaluation Mini-Report (Post-Harness Fix)</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --bg-alt: #f8fafc;
+      --bg-header: #f1f5f9;
+      --border: #e2e8f0;
+      --border-strong: #cbd5e1;
+      --text: #0f172a;
+      --text-secondary: #334155;
+      --text-muted: #64748b;
+      --blue: #0284c7;
+      --blue-bg: #f0f9ff;
+      --blue-border: #bae6fd;
+      --green: #059669;
+      --green-bg: #ecfdf5;
+      --green-border: #a7f3d0;
+      --amber: #d97706;
+      --amber-bg: #fffbeb;
+      --amber-border: #fde68a;
+      --purple: #7c3aed;
+      --purple-bg: #f5f3ff;
+      --purple-border: #ddd6fe;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      line-height: 1.55;
+      font-size: 14px;
+    }
+
+    .container {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 28px 24px 64px;
+    }
+
+    header.hero {
+      background: var(--bg-alt);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px 28px;
+      margin-bottom: 24px;
+    }
+
+    .eyebrow {
+      display: inline-block;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--blue);
+      background: var(--blue-bg);
+      border: 1px solid var(--blue-border);
+      padding: 3px 10px;
+      border-radius: 999px;
+      margin-bottom: 10px;
+    }
+
+    header.hero h1 {
+      margin: 0 0 8px 0;
+      font-size: 25px;
+      font-weight: 800;
+      color: var(--text);
+      letter-spacing: -0.02em;
+    }
+
+    header.hero p.subtitle {
+      margin: 0 0 18px 0;
+      color: var(--text-secondary);
+      font-size: 14.5px;
+      max-width: 1020px;
+    }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 12px;
+    }
+
+    .kpi {
+      background: #ffffff;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+
+    .kpi-label {
+      font-size: 11.5px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+
+    .kpi-val {
+      font-family: var(--font-mono);
+      font-size: 23px;
+      font-weight: 800;
+      color: var(--text);
+    }
+
+    .kpi-sub {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+
+    section {
+      margin-bottom: 32px;
+    }
+
+    .section-title {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+      border-bottom: 2px solid var(--border);
+      padding-bottom: 8px;
+      margin-bottom: 14px;
+    }
+
+    .section-title h2 {
+      margin: 0;
+      font-size: 18.5px;
+      font-weight: 700;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .num-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      background: var(--text);
+      color: #ffffff;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .section-meta {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .callout {
+      background: var(--bg-alt);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--blue);
+      border-radius: 8px;
+      padding: 13px 16px;
+      margin-bottom: 16px;
+      font-size: 13.5px;
+      color: var(--text-secondary);
+    }
+
+    .callout.green {
+      background: var(--green-bg);
+      border-color: var(--green-border);
+      border-left-color: var(--green);
+    }
+
+    .callout strong { color: var(--text); }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--border-strong);
+      border-radius: 10px;
+      background: #ffffff;
+      margin-bottom: 18px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13.5px;
+      text-align: left;
+    }
+
+    thead th {
+      background: var(--bg-header);
+      color: var(--text-secondary);
+      font-weight: 700;
+      font-size: 11.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 11px 13px;
+      border-bottom: 1px solid var(--border-strong);
+      white-space: nowrap;
+    }
+
+    tbody td {
+      padding: 11px 13px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+      color: var(--text-secondary);
+    }
+
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr:hover { background: #f8fafc; }
+
+    tr.row-best { background: #ecfdf5; }
+    tr.row-best:hover { background: #d1fae5; }
+    tr.row-sft { background: #f0f9ff; }
+    tr.row-sft:hover { background: #e0f2fe; }
+    tr.row-base { background: #fafafa; }
+
+    .mono { font-family: var(--font-mono); font-size: 12.5px; }
+    .num { font-family: var(--font-mono); text-align: right; white-space: nowrap; }
+    .center { text-align: center; }
+
+    .score-lg {
+      font-family: var(--font-mono);
+      font-size: 15.5px;
+      font-weight: 800;
+      color: var(--text);
+    }
+
+    .sub {
+      display: block;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      margin-top: 2px;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .badge-yes { background: var(--green-bg); color: var(--green); border: 1px solid var(--green-border); }
+    .badge-info { background: var(--blue-bg); color: var(--blue); border: 1px solid var(--blue-border); }
+    .badge-warn { background: var(--amber-bg); color: var(--amber); border: 1px solid var(--amber-border); }
+
+    .fix-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 14px;
+    }
+
+    .fix-card {
+      background: #ffffff;
+      border: 1px solid var(--border-strong);
+      border-radius: 10px;
+      padding: 16px 18px;
+    }
+
+    .fix-card h3 {
+      margin: 0 0 8px 0;
+      font-size: 14.5px;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .fix-card p {
+      margin: 0 0 8px 0;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .fix-card p:last-child { margin-bottom: 0; }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      background: var(--bg-header);
+      border: 1px solid var(--border);
+      padding: 1px 5px;
+      border-radius: 4px;
+      color: #0f172a;
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <header class="hero">
+    <div class="eyebrow">ARC-AGI-2 Mini-Report &bull; Block-FP8 Weights &bull; Post-Harness Fix</div>
+    <h1>Qwen3.8-27B-FP8 SFT Evaluation After Harness &amp; Prompt Fixes</h1>
+    <p class="subtitle">
+      All models below are evaluated in <strong>Block-FP8 precision (<code>FP8 E4M3</code>, 128&times;128 block scales, ~27 GB)</strong> at <strong>N=2 attempts per puzzle</strong> across all <strong>120 ARC-AGI-2 evaluation tasks (167 test pairs)</strong>. Fixing 5 evaluation harness bugs unlocked the true capacity of our 26.9B Full-Parameter SFT model, jumping its score from <strong>40.76% &rarr; 55.00% Official Kaggle Pass@2</strong> (<strong>51.50% Pair-Level Pass@2</strong>).
+    </p>
+
+    <div class="kpi-grid">
+      <div class="kpi">
+        <div class="kpi-label">Comparable Baseline (h1, FP8)</div>
+        <div class="kpi-val" style="color:var(--text-muted);">19.17%</div>
+        <div class="kpi-sub">23.0 / 120 tasks &bull; Med: 25.0k tok</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Collaborator Base (E020 / E031, FP8)</div>
+        <div class="kpi-val" style="color:var(--purple);">37.1% / 49.2%</div>
+        <div class="kpi-sub">44.5 &amp; 59.0 / 120 tasks (No SFT)</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Best LoRA SFT (Step 191, FP8)</div>
+        <div class="kpi-val" style="color:var(--blue);">47.08%</div>
+        <div class="kpi-sub">56.5 / 120 tasks (44.91% pairs)</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Best Full SFT (Step 100, FP8) ★</div>
+        <div class="kpi-val" style="color:var(--green);">55.00% <span style="font-size:14px;">(+14.2%)</span></div>
+        <div class="kpi-sub">66.0 / 120 tasks (51.50% pairs)</div>
+      </div>
+    </div>
+  </header>
+
+  <!-- SECTION 1: MAIN COMPARISON TABLE -->
+  <section id="main-results">
+    <div class="section-title">
+      <h2><span class="num-badge">1</span> Main Comparison: Comparable Baselines vs. LoRA SFT vs. Full SFT (All FP8, N=2)</h2>
+      <span class="section-meta">120 Tasks (167 Test Pairs) &bull; Official Task Score &amp; Pair-Level Score &bull; Median Tokens Included</span>
+    </div>
+
+    <div class="callout green">
+      <strong>Key Result:</strong> Once evaluated with the corrected harness (<code>tier=xhigh</code>, 8k 2-stage graceful nudge, no mid-code truncation, 1-time unverified submit rejection, and session salvage before forced submit), <strong>Full SFT Step 100 (FP8)</strong> jumps from <strong>40.76% &rarr; 55.00% Official Kaggle Pass@2</strong> (<strong>50.00% Pass@1</strong>) and <strong>51.50% Pair-Level Pass@2</strong> (<strong>47.31% Pass@1</strong>), outperforming both LoRA SFT and collaborator Vu's best pure-Qwen harnesses (<code>E020 v4</code> at <code>37.08%</code> and <code>E031/E032</code> at <code>49.17%</code>).
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Model / Checkpoint (All Block-FP8)</th>
+            <th>Setup Summary</th>
+            <th class="center">Token Cap</th>
+            <th class="num">Official Kaggle<br>Pass@1 (120 Tasks)</th>
+            <th class="num">Official Kaggle<br>Pass@2 (120 Tasks)</th>
+            <th class="num">Pair-Level<br>Pass@1 (167 Pairs)</th>
+            <th class="num">Pair-Level<br>Pass@2 (167 Pairs)</th>
+            <th class="num">Median Tokens / Try<br><span style="font-weight:400;text-transform:none;">(Solved Median)</span></th>
+            <th class="num">Total Eval<br>Tokens</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class="row-base">
+            <td><strong>1. Comparable Baseline (<code>h1</code>)</strong><span class="sub">Pure Qwen3.8-27B-FP8</span></td>
+            <td>Original Python sandbox (JSON tool calls, no <code>xhigh</code> tier)</td>
+            <td class="center mono">48k</td>
+            <td class="num"><span class="score-lg" style="color:var(--text-muted);">18.33%</span><span class="sub">22.0 / 120</span></td>
+            <td class="num"><span class="score-lg" style="color:var(--text-muted);">19.17%</span><span class="sub">23.0 / 120</span></td>
+            <td class="num">16.77%<span class="sub">28 / 167</span></td>
+            <td class="num">17.96%<span class="sub">30 / 167</span></td>
+            <td class="num"><span class="mono">25,015</span><span class="sub">Solved: 28,649</span></td>
+            <td class="num"><span class="mono">8.82M</span></td>
+          </tr>
+          <tr class="row-base">
+            <td><strong>2. Collaborator Base (<code>E020 v4</code>)</strong><span class="sub">Pure Qwen3.8-27B-FP8</span></td>
+            <td>Native XML tools + <code>tier=xhigh</code> + 8k nudge</td>
+            <td class="center mono">48k</td>
+            <td class="num"><span class="score-lg" style="color:var(--text-muted);">34.17%</span><span class="sub">41.0 / 120</span></td>
+            <td class="num"><span class="score-lg" style="color:var(--text-muted);">37.08%</span><span class="sub">44.5 / 120</span></td>
+            <td class="num">&mdash;</td>
+            <td class="num">&mdash;</td>
+            <td class="num"><span class="mono">~31,400</span><span class="sub">Mean / try</span></td>
+            <td class="num"><span class="mono">10.50M</span></td>
+          </tr>
+          <tr class="row-base">
+            <td><strong>3. Collaborator Base (<code>E031 / E032</code>)</strong><span class="sub">Pure Qwen3.8-27B-FP8</span></td>
+            <td><code>lean2sub</code> prompt + <code>tier=xhigh</code> + <code>verify_submit</code></td>
+            <td class="center mono">60k</td>
+            <td class="num"><span class="score-lg" style="color:var(--purple);">42.92%</span><span class="sub">51.5 / 120</span></td>
+            <td class="num"><span class="score-lg" style="color:var(--purple);">49.17%</span><span class="sub">59.0 / 120</span></td>
+            <td class="num">&mdash;</td>
+            <td class="num">&mdash;</td>
+            <td class="num"><span class="mono">~38,900</span><span class="sub">Mean / try</span></td>
+            <td class="num"><span class="mono">13.00M</span></td>
+          </tr>
+          <tr>
+            <td><strong>4. LoRA SFT Step 150</strong><span class="sub">LoRA r=64, &alpha;=128 &rarr; FP8</span></td>
+            <td>Fixed <code>E031</code> harness (<code>tier=xhigh</code> + 8k 2-stage nudge)</td>
+            <td class="center mono">60k</td>
+            <td class="num"><span class="score-lg">37.92%</span><span class="sub">45.5 / 120</span></td>
+            <td class="num"><span class="score-lg">43.61%</span><span class="sub">52.3 / 120</span></td>
+            <td class="num">37.72%<span class="sub">63 / 167</span></td>
+            <td class="num">43.11%<span class="sub">72 / 167</span></td>
+            <td class="num"><span class="mono">59,842</span><span class="sub">Solved: 25,490</span></td>
+            <td class="num"><span class="mono">15.59M</span></td>
+          </tr>
+          <tr class="row-sft">
+            <td><strong>5. LoRA SFT Step 191 (Final)</strong><span class="sub">LoRA r=64, &alpha;=128 &rarr; FP8</span></td>
+            <td>Fixed <code>E031</code> harness (<code>tier=xhigh</code> + 8k 2-stage nudge)</td>
+            <td class="center mono">60k</td>
+            <td class="num"><span class="score-lg" style="color:var(--blue);">42.08%</span><span class="sub">50.5 / 120</span></td>
+            <td class="num"><span class="score-lg" style="color:var(--blue);">47.08%</span><span class="sub">56.5 / 120</span></td>
+            <td class="num"><strong>40.12%</strong><span class="sub">67 / 167</span></td>
+            <td class="num"><strong>44.91%</strong><span class="sub">75 / 167</span></td>
+            <td class="num"><span class="mono">59,652</span><span class="sub">Solved: 21,301</span></td>
+            <td class="num"><span class="mono">14.88M</span></td>
+          </tr>
+          <tr class="row-sft">
+            <td><strong>6. Full SFT Step 192 (Final)</strong><span class="sub">Full 26.9B FSDP2 &rarr; FP8</span></td>
+            <td>Fixed <code>E031</code> harness (lowest val loss <code>0.7549</code>)</td>
+            <td class="center mono">60k</td>
+            <td class="num"><span class="score-lg" style="color:var(--blue);">44.17%</span><span class="sub">53.0 / 120</span></td>
+            <td class="num"><span class="score-lg" style="color:var(--blue);">50.00%</span><span class="sub">60.0 / 120</span></td>
+            <td class="num"><strong>43.11%</strong><span class="sub">72 / 167</span></td>
+            <td class="num"><strong>49.10%</strong><span class="sub">82 / 167</span></td>
+            <td class="num"><span class="mono">46,879</span><span class="sub">Solved: 21,376</span></td>
+            <td class="num"><span class="mono">13.58M</span></td>
+          </tr>
+          <tr class="row-best">
+            <td><strong>7. Full SFT Step 100 ★ BEST</strong><span class="sub">Full 26.9B FSDP2 &rarr; FP8</span></td>
+            <td>Fixed <code>E031</code> harness (best generalization &mdash; <strong>+14.2% vs old eval</strong>)</td>
+            <td class="center mono">60k</td>
+            <td class="num"><span class="score-lg" style="color:var(--green);">50.00%</span><span class="sub">60.0 / 120</span></td>
+            <td class="num"><span class="score-lg" style="color:var(--green);">55.00%</span><span class="sub">66.0 / 120</span></td>
+            <td class="num"><strong style="color:var(--green);">47.31%</strong><span class="sub">79 / 167</span></td>
+            <td class="num"><strong style="color:var(--green);">51.50%</strong><span class="sub">86 / 167</span></td>
+            <td class="num"><span class="mono">53,478</span><span class="sub" style="color:var(--green);"><strong>Solved: 22,818</strong></span></td>
+            <td class="num"><span class="mono">14.41M</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 style="margin: 18px 0 8px 0; font-size: 15.5px;">Fast Kaggle &lt;6-Hour Mode (<code>42k</code> Token Cap, N=2 Attempts, Block-FP8 Weights)</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Model / Checkpoint (Block-FP8)</th>
+            <th class="center">Token Cap</th>
+            <th class="num">Official Kaggle<br>Pass@1 (120 Tasks)</th>
+            <th class="num">Official Kaggle<br>Pass@2 (120 Tasks)</th>
+            <th class="num">Pair-Level<br>Pass@1 (167 Pairs)</th>
+            <th class="num">Pair-Level<br>Pass@2 (167 Pairs)</th>
+            <th class="num">Median Tokens / Try<br><span style="font-weight:400;text-transform:none;">(Solved Median)</span></th>
+            <th class="num">Total Eval<br>Tokens</th>
+            <th class="center">Fits Kaggle &lt;6h<br>(13.6M Limit)?</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class="row-best">
+            <td><strong>Full SFT Step 192 (Final) ★ Best &lt;6h</strong></td>
+            <td class="center mono">42k</td>
+            <td class="num"><strong style="color:var(--green);">44.03%</strong> <span class="sub">52.8 / 120</span></td>
+            <td class="num"><strong class="score-lg" style="color:var(--green);">44.86%</strong> <span class="sub">53.8 / 120</span></td>
+            <td class="num"><strong>43.71%</strong> <span class="sub">73 / 167</span></td>
+            <td class="num"><strong>44.91%</strong> <span class="sub">75 / 167</span></td>
+            <td class="num"><span class="mono">41,744</span> <span class="sub">Solved: 18,002</span></td>
+            <td class="num"><span class="mono"><strong>10.93M</strong></span></td>
+            <td class="center"><span class="badge badge-yes">YES (~4.8h)</span></td>
+          </tr>
+          <tr class="row-sft">
+            <td><strong>LoRA SFT Step 191 (Final)</strong></td>
+            <td class="center mono">42k</td>
+            <td class="num"><strong>41.67%</strong> <span class="sub">50.0 / 120</span></td>
+            <td class="num"><strong class="score-lg" style="color:var(--blue);">43.19%</strong> <span class="sub">51.8 / 120</span></td>
+            <td class="num">40.12% <span class="sub">67 / 167</span></td>
+            <td class="num">42.51% <span class="sub">71 / 167</span></td>
+            <td class="num"><span class="mono">41,886</span> <span class="sub">Solved: 21,689</span></td>
+            <td class="num"><span class="mono"><strong>11.21M</strong></span></td>
+            <td class="center"><span class="badge badge-yes">YES (~4.9h)</span></td>
+          </tr>
+          <tr>
+            <td><strong>Full SFT Step 100</strong></td>
+            <td class="center mono">42k</td>
+            <td class="num">38.75% <span class="sub">46.5 / 120</span></td>
+            <td class="num"><strong>42.92%</strong> <span class="sub">51.5 / 120</span></td>
+            <td class="num">36.53% <span class="sub">61 / 167</span></td>
+            <td class="num">40.12% <span class="sub">67 / 167</span></td>
+            <td class="num"><span class="mono">42,000</span> <span class="sub">Solved: 20,058</span></td>
+            <td class="num"><span class="mono"><strong>11.17M</strong></span></td>
+            <td class="center"><span class="badge badge-yes">YES (~4.9h)</span></td>
+          </tr>
+          <tr>
+            <td><strong>LoRA SFT Step 150</strong></td>
+            <td class="center mono">42k</td>
+            <td class="num">31.25% <span class="sub">37.5 / 120</span></td>
+            <td class="num"><strong>33.75%</strong> <span class="sub">40.5 / 120</span></td>
+            <td class="num">30.54% <span class="sub">51 / 167</span></td>
+            <td class="num">32.93% <span class="sub">55 / 167</span></td>
+            <td class="num"><span class="mono">42,000</span> <span class="sub">Solved: 17,562</span></td>
+            <td class="num"><span class="mono"><strong>11.61M</strong></span></td>
+            <td class="center"><span class="badge badge-yes">YES (~5.1h)</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- SECTION 2: WHAT WAS FIXED IN SIMPLE WORDS -->
+  <section id="what-was-fixed">
+    <div class="section-title">
+      <h2><span class="num-badge">2</span> What Was Fixed in the Evaluation Harness (In Plain English)</h2>
+      <span class="section-meta">Why Full SFT Jumped from 40.76% &rarr; 55.00% Official Kaggle Pass@2</span>
+    </div>
+
+    <div class="callout">
+      <strong>Why did Full SFT benefit so much more from these fixes than LoRA?</strong><br>
+      Full SFT updated 100% of Qwen's <code>26.9B</code> parameters (reaching a lower validation loss of <code>0.7549</code> vs. LoRA's <code>0.7627</code>). Because Full SFT adapted more strongly to the training format, it was hurt much more when our old evaluation harness had prompt mismatches, mid-code cutoffs, and premature unverified exits. Fixing these 5 issues immediately unlocked Full SFT's true performance.
+    </div>
+
+    <div class="fix-grid">
+      <div class="fix-card">
+        <h3>1. Restored Qwen's Built-In <code>tier=xhigh</code> System Sentence</h3>
+        <p><strong>What was broken:</strong> Qwen3.8-27B was pre-trained by Alibaba with a specific magic sentence at the very start of the system prompt: <code>"Reasoning effort is set to xhigh. Please think carefully through the task..."</code>. Our old eval accidentally replaced that sentence with a custom string (<code>"Reasoning Effort: Minimal"</code>).</p>
+        <p><strong>The fix:</strong> We restored Qwen's exact pre-trained <code>tier=xhigh</code> sentence at the top of the system prompt while keeping the brief-code instruction at the bottom of the tool block, eliminating the system prompt mismatch.</p>
+      </div>
+
+      <div class="fix-card">
+        <h3>2. Capped Single-Turn Thinking at 8k + 2-Stage Graceful Nudge</h3>
+        <p><strong>What was broken:</strong> The old eval allowed the model to think for up to <code>32,000</code> tokens in a single turn without running any Python code. On hard puzzles, the model got stuck over-thinking in <code>&lt;think&gt;...&lt;/think&gt;</code> and burned half its budget before testing a single line of Python.</p>
+        <p><strong>The fix:</strong> When thinking hits <code>8,192</code> tokens, <strong>Stage 1</strong> appends a gentle wrap-up note (<code>"...Wrapping up my reasoning cleanly so I can test in Python.\n&lt;/think&gt;\n\n"</code>) and gives <code>2,048</code> grace tokens. If it still doesn't call a tool, <strong>Stage 2</strong> opens <code>&lt;tool_call&gt;\n&lt;function=run_python&gt;</code> directly so it immediately writes code.</p>
+      </div>
+
+      <div class="fix-card">
+        <h3>3. Fixed Mid-<code>&lt;tool_call&gt;</code> Python Code Truncation</h3>
+        <p><strong>What was broken:</strong> When a turn hit the token cap, the old harness checked <code>if "&lt;tool_call&gt;" not in text:</code>. If the model finished <code>&lt;/think&gt;</code> near token 8,000 and was <em>halfway through writing Python code</em> inside <code>&lt;tool_call&gt;</code> when token 8,192 hit, the harness sent the half-written code to Python, causing an instant <code>SyntaxError</code>.</p>
+        <p><strong>The fix:</strong> We now check whether the XML tool call is <em>actually closed</em> (<code>"&lt;/tool_call&gt;" in text</code>). If the model is cut off mid-code, we grant <code>2,048</code> grace tokens so it finishes writing its Python script cleanly.</p>
+      </div>
+
+      <div class="fix-card">
+        <h3>4. One-Time Rejection of Unverified Submissions (<code>verify_submit</code>)</h3>
+        <p><strong>What was broken:</strong> If the model called <code>submit_answer(solve(test_input))</code> with a buggy <code>solve()</code> function that failed on the training examples, the old harness accepted the grid immediately and ended the attempt—throwing away all remaining budget.</p>
+        <p><strong>The fix:</strong> When <code>submit_answer</code> is called, the harness automatically tests the rule on all training pairs. If it fails on any training pair, the harness <strong>rejects the submission once</strong> and tells the model how many training pairs matched so it can keep debugging in Python (while keeping the grid saved as a backup).</p>
+      </div>
+
+      <div class="fix-card">
+        <h3>5. Salvaging Working Session Code Before Forced Guesses</h3>
+        <p><strong>What was broken:</strong> When an attempt ran out of budget without calling <code>submit_answer</code>, the old harness forced a last-second 1-line <code>submit_answer</code> guess <em>before</em> checking Python memory, which overwrote working functions the model had already defined.</p>
+        <p><strong>The fix:</strong> At timeout, we <strong>first</strong> check live Python memory for <code>answer</code>, <code>solve(test_input)</code>, or any helper function (accepting either Python lists or NumPy arrays) that reproduces the training pairs, and only ask for a forced last-second guess if no working function exists.</p>
+      </div>
+    </div>
+  </section>
+
+</div>
+</body>
+</html>

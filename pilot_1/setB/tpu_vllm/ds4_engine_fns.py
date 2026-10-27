@@ -158,6 +158,8 @@ def make_ds4_engine_functions(
     max_seq_len: int,
     steps_per_call: int = 1,
     interpret: bool = False,
+    temperature: float = 0.0,
+    top_k: int = 20,
 ):
   """Builds `(prefill, generate, insert, state_init, state_shard, prefix_state_shard)`."""
   cfg = lay.cfg
@@ -186,6 +188,7 @@ def make_ds4_engine_functions(
             "candidates": jnp.zeros((b_sz, verify_len), dtype=jnp.int32),
             "token": jnp.zeros((b_sz,), dtype=jnp.int32),
             "position": pos,
+            "rng_seed": jnp.zeros((b_sz,), dtype=jnp.int32),
         }
     )
 
@@ -205,6 +208,7 @@ def make_ds4_engine_functions(
             "candidates": rep_spec,
             "token": rep_spec,
             "position": rep_spec,
+            "rng_seed": rep_spec,
         }
     )
 
@@ -226,22 +230,11 @@ def make_ds4_engine_functions(
     def _copy_kv_prefix(
         dst_arr: jax.Array, src_arr: jax.Array, valid_pos: jax.Array
     ) -> jax.Array:
+      del valid_pos
       max_len = min(src_arr.shape[2], dst_arr.shape[2])
-      blk = 1024 if (max_len >= 1024 and max_len % 1024 == 0) else max_len
-      if blk == max_len:
-        return lax.dynamic_update_slice_in_dim(
-            dst_arr, src_arr[:1, :, :max_len], slot_i, axis=0
-        )
-      n_blks = jnp.clip((valid_pos + blk - 1) // blk, 1, max_len // blk)
-
-      def _blk_body(b_idx, acc_dst):
-        start = b_idx * jnp.int32(blk)
-        chunk = lax.dynamic_slice_in_dim(src_arr[:1], start, blk, axis=2)
-        return lax.dynamic_update_slice(
-            acc_dst, chunk, (slot_i, jnp.int32(0), start, jnp.int32(0))
-        )
-
-      return lax.fori_loop(jnp.int32(0), n_blks, _blk_body, dst_arr)
+      return lax.dynamic_update_slice_in_dim(
+          dst_arr, src_arr[:1, :, :max_len], slot_i, axis=0
+      )
 
     updated = {}
     for k, dst_arr in dst.items():
@@ -262,8 +255,12 @@ def make_ds4_engine_functions(
       per_request_hyperparams: Any = None,
       history_length: Any = None,
   ) -> tuple[jnp.ndarray, jnp.ndarray, Ds4GemaxState]:
-    del per_request_hyperparams
     tokens, true_length = prompt
+    req_seed = (
+        jnp.asarray(per_request_hyperparams, jnp.int32).reshape((1,))
+        if per_request_hyperparams is not None
+        else jnp.zeros((1,), dtype=jnp.int32)
+    )
     weights = Ds4WeightsModule(lay=lay, max_seq_len=max_seq_len, name="ds4")()
     prev_state = (
         state.state
@@ -295,7 +292,7 @@ def make_ds4_engine_functions(
           else jnp.asarray(ps_pad["position"][0], jnp.int32).reshape(())
       )
 
-    def _per_dev(w_dev, c_in, tl_in, sp_in, p_in, t_len):
+    def _per_dev(w_dev, c_in, tl_in, sp_in, p_in, t_len, sd_in):
       w_d = jax.tree.map(lambda a: a[0], w_dev)
       cs_d = w_d["cos_swa"]
       ss_d = w_d["sin_swa"]
@@ -346,6 +343,9 @@ def make_ds4_engine_functions(
             full_logits=False,
             interpret=interpret,
             valid_len=eff_t_len,
+            temperature=temperature,
+            top_k=top_k,
+            rng_seed=sd_in,
         )
         dec_sp = sp_in
         dec_vlen = eff_t_len
@@ -414,6 +414,9 @@ def make_ds4_engine_functions(
             full_logits=False,
             interpret=interpret,
             valid_len=dec_vlen,
+            temperature=temperature,
+            top_k=top_k,
+            rng_seed=sd_in,
         )
 
       end_pos = sp_in + eff_t_len
@@ -442,10 +445,11 @@ def make_ds4_engine_functions(
             P(),
             P(),
             P(),
+            P(),
         ),
         out_specs=(P(), P(), P(), P(), P()),
         check_vma=False,
-    )(weights, caches0, tail0, start_pos, prompt_2d, true_len)
+    )(weights, caches0, tail0, start_pos, prompt_2d, true_len, req_seed)
 
     new_state = Ds4GemaxState(
         value={
@@ -463,6 +467,7 @@ def make_ds4_engine_functions(
             "position": jnp.reshape(
                 jnp.asarray(end_pos_out, dtype=jnp.int32), (1,)
             ),
+            "rng_seed": req_seed,
         }
     )
     scores = jnp.zeros((prompt_2d.shape[1],), dtype=jnp.float32)
@@ -485,6 +490,7 @@ def make_ds4_engine_functions(
         .at[:, 0]
         .set(jnp.where(is_active, s["token"], jnp.int32(0)))
     )
+    rng_seed_in = s.get("rng_seed", jnp.zeros((batch_size,), dtype=jnp.int32))
     caches_in = mk.DeviceDecodeCaches(
         window_kv=s["window_kv"],
         mtp_window_kv=s["mtp_window_kv"],
@@ -496,7 +502,7 @@ def make_ds4_engine_functions(
         comp_m1_idx_k=s["comp_m1_idx_k"],
     )
 
-    def _per_dev(w_dev, c_in, cd_in, pos_in, tl_in):
+    def _per_dev(w_dev, c_in, cd_in, pos_in, tl_in, sd_in):
       w_d = jax.tree.map(lambda a: a[0], w_dev)
       cs_d = w_d["cos_swa"]
       ss_d = w_d["sin_swa"]
@@ -525,6 +531,9 @@ def make_ds4_engine_functions(
                 eh_d,
                 lay=lay,
                 interpret=interpret,
+                temperature=temperature,
+                top_k=top_k,
+                rng_seed=sd_in,
             )
         )
         tl_next = mk.advance_engram_tail_jax(
@@ -556,6 +565,9 @@ def make_ds4_engine_functions(
             eh_s,
             lay=lay,
             interpret=interpret,
+            temperature=temperature,
+            top_k=top_k,
+            rng_seed=sd_in,
         )
         ntl_s = mk.advance_engram_tail_jax(
             cur_cd, cur_tl, ec_s, cur_pos >= 0, engram_tbl
@@ -593,10 +605,11 @@ def make_ds4_engine_functions(
                 P(),
                 P(),
                 P(),
+                P(),
             ),
             out_specs=(P(), P(), P(), P(), P(), P()),
             check_vma=False,
-        )(weights, caches_in, cand_in, active_pos, s["engram_tail"])
+        )(weights, caches_in, cand_in, active_pos, s["engram_tail"], rng_seed_in)
     )
 
     last_tok = next_cand[:, 0]
@@ -614,6 +627,7 @@ def make_ds4_engine_functions(
             "candidates": next_cand,
             "token": jnp.where(is_active, last_tok, s["token"]),
             "position": next_pos,
+            "rng_seed": rng_seed_in,
         }
     )
     out = Ds4StepOutput(

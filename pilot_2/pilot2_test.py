@@ -53,10 +53,14 @@ class Pilot2Test(googletest.TestCase):
     cfg = prompts_and_selector.PILOT2_HYPOTHESES["e031_deepseek_teaching"]
     sys_p = prompts_and_selector.build_system_prompt(cfg, 0)
     usr_p = prompts_and_selector.build_user_prompt(self.train_pairs, self.test_input, cfg, 0)
-    self.assertIn("Reasoning Effort: Minimal", sys_p)
+    self.assertIn("Reasoning effort is set to xhigh.", sys_p)
+    self.assertIn("Reasoning Effort: Minimal.", sys_p)
     self.assertIn('"name": "submit_answer"', sys_p)
     self.assertIn("--Training Examples--", usr_p)
     self.assertIn("You have a Python tool. The variables `train`", usr_p)
+    self.assertTrue(cfg.use_two_stage_think_nudge)
+    self.assertEqual(cfg.turn_think_cap, 8192)
+    self.assertTrue(cfg.use_equivariance_audit)
 
     sb = sandbox_verifier.Pilot2AttemptSandbox(
         train_pairs=self.train_pairs,
@@ -86,6 +90,17 @@ class Pilot2Test(googletest.TestCase):
         ),
         seed=10001,
     )
+    # Test one-time verify_submit rejection when solve fails on train
+    msg_bad = (
+        "Let me submit an unverified identity function.\n</think>\n\n"
+        "<tool_call>\n<function=submit_answer>\n<parameter=code>\n"
+        "test_input\n"
+        "</parameter>\n</function>\n</tool_call>"
+    )
+    resp_bad, done_bad, _ = pilot2_eval.execute_tool_for_attempt(st, msg_bad, 100)
+    self.assertFalse(done_bad)
+    self.assertIn("[submission rejected:", resp_bad)
+
     msg1 = (
         "Let me define solve and test on train.\n</think>\n\n"
         "<tool_call>\n<function=run_python>\n<parameter=code>\n"
