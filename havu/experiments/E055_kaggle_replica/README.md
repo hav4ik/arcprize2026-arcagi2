@@ -47,3 +47,33 @@ concurrency (no gate), random ids, no accuracy; complements, does not replace, t
 Private dataset `livobereshka/arc-agi2-dsv41-e128-candb32-replica`: the complete `candBf_x2t` run (attempts, 346 traces,
 metrics, solver/server logs, submission), the `evalx2t_s2026` workload with solutions and idmap, the replica report, and
 the pinned code. Secret scan (incl. extracted traces) 0 hits before upload.
+
+## Provenance audit: are the V5 / V6 replicas genuine, or fitted to the leaderboard? (2026-10-27 18:35 UTC)
+Checked because a replica that "matches" the LB is only evidence if nothing in it was tuned to the LB.
+
+| item | how it was set | LB-independent? |
+|---|---|---|
+| Code | each replica ran the exact frozen notebook code, hash-checked: V5 = Kaggle V5 kit (`/root/kit_v5`, V5_GAP section 1); V6 = Kaggle V5 kit + V6's pinned solver 4b344011 / harness a8a5b665, kit train_check 44c4d210, kit overlay 377d83e0 (`launch_v6rep_x2t.sh`) | yes |
+| Settings | copied from the submitted notebooks: V5 = 36 workers, per pair, no gate; V6 = 36 workers, multi-test 0.5, context limit 163840, gate 0.6/16 (both replicas' `env.txt`) | yes |
+| KV pool | GPU util 0.938 so the pool equals Kaggle's 1,554,183 tokens (from V5/V6 Kaggle server logs) | yes (hardware match) |
+| Workload | 120 public eval tasks ×2 (V5: identical copies, built before the toolkit; V6 and B32: `evalx2t_s2026`, seeded transforms) | yes |
+| Kaggle-clock factors (prefill ×1.45, decode ×0.94, server up at +0.24 h) | measured on one throughput twin pair (Kaggle bench V1 vs pod `mt36_b05_gate60`, same V6 settings, 3 h, token counts), `calibrate_twin.py` | yes (no score enters; in-sample on that pair) |
+| Metric | task-weighted, identified because 58.19 and 50.97 are exact multiples of 1/(3·240) | the metric's definition only |
+| Scoring code | `toolkit/replica_report.py`: the only LB numbers in the toolkit are in that metric explanation (grep) | yes |
+| Independent re-score | scoring each run's own `submission.json` against the solutions with a 10-line script: V5 57.57, B32 79.10, identical to the report | yes |
+| Timing | V5's replica launched 21:43 UTC 10-26, ~13 min after V5's LB (58.19) was known, but with nothing chosen after it; B32's replica launched 04:08 UTC 10-27, before V6's LB was known; V6's replica launched 10:03 UTC 10-27, after V6's LB | — |
+
+Where judgment still enters (disclosed, not hidden):
+- **The Kaggle clock decides where V5 and V6 are cut.** V5 was stopped at pod hour 9.99, after the central clock's force point (9.88); its
+  raw and central scores are both 57.57 (identical at 9.87 h and 9.99 h, so the stop time was not picked). Under the
+  pessimistic clock (prefill ×1.6) V5 scores 55.9; under the optimistic clock (×1.3, decode ×1.0) the force point is at pod
+  10.67 h, which this run never reached, so V5's optimistic score is unmeasured and would be a few points higher. So V5's
+  match within 0.6 depends on the central clock, which came from the throughput twin, not from the LB.
+- **B32 depends far less on the clock than V5 or V6:** it finishes every first attempt by pod 8.63 h, so slowdowns from ×1.0 to
+  ×1.3 move it only 79.1 → ~77.0. V5 and V6 are deadline-bound and much more clock-sensitive.
+- **V6 projections changed** (52-56 at 6.1 h, then 61-66 at 8.1 h) because the data changed; no parameter was retuned.
+
+**Pre-registered now, before V6's measured value (pod 9.78 h, ~19:50 UTC):**
+1. V6's calibration number = `replica_report.py`'s central Kaggle-clock score of `v6rep_x2t`, with no re-choice of clock or stop time.
+2. B32's estimate = B32's central Kaggle-clock score (77.43) + the mean (LB − replica) gap of V5 (+0.62) and V6, with the
+   ±range from two draws (replica sd ~3.1-4.2 per run, LB draw sd ~4). Nothing else is adjusted.

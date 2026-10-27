@@ -71,6 +71,7 @@ full data: HF `livobereshka/arc-agi2-dsv41-e128-candb32-replica`.
 | E059 server restart under load (forced TP1 worker kill at +1.5 h, 2-s memory sampling), 32 GiB on L4 | **PASS**: old memory released in ~16-56 s before the new server allocated; restart peak 1.05x steady (151.7 vs 144.4 GiB); all in-flight jobs re-queued (S15), 0 lost; server up again 140 s after restart start; >= 90% throughput 19 min after the kill | `experiments/E059_restart_under_load/README.md` |
 | E059 twin, 16 GiB on 4090 57983124 | running | same |
 | Solver failure paths (server death, restarts, re-queue, deadlines, garbled metrics, missing KV readings) | unit-tested (stage 1) | `kaggle/dsv41_tools/tests/test_solver.py` |
+| OOM kill order under a memory-limited cgroup (tool cells overrunning the limit while the server holds most memory) | **PASS**: the kernel kills sandboxes (oom_score_adj 1000), never the server; sessions restart | `experiments/E059_restart_under_load/oom_order_test.py` |
 
 ## Stage 6. Kaggle smokes (user-approved)
 | run | what | result |
@@ -80,7 +81,7 @@ full data: HF `livobereshka/arc-agi2-dsv41-e128-candb32-replica`.
 
 ## Stage 7. Score estimate
 Kaggle-clock replica 77.4. Calibration: V5's replica 57.6 vs LB 58.19; V6's replica (running on wd44, Kaggle-clock point
-~12:50 PDT) projects to ~52-56 vs LB 61.94. Realistic projection ~74 (80% range 67-80); see the notes file.
+~12:50 PDT) projects to 61-66 (most likely 63-64) vs LB 61.94 at hour 8.1. Realistic projection ~74 (80% range 67-80); see the notes file.
 
 ## Sign-off
 - [x] Version 2 smoke passed (integrity OK, sandbox OK, host restores ran, valid submission; preemption and force cut covered by the L4 replica)

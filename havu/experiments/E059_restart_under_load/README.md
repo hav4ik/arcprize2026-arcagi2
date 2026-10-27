@@ -31,3 +31,6 @@ Logging gap found: the first metrics window after a restart shows negative rates
 
 Fix during the run: killer.sh's fallback looked for the solver as `$3` (`python <path>`), but the notebook runs
 `python -u <path>`; it now matches the last field, and the L4 run got its `solver.pid` written by hand before the kill.
+
+## OOM kill-order test (local, cgroup v2): PASS
+`systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=0 .venv/bin/python oom_order_test.py`: a stand-in server (3.5 GiB shared + 0.5 GiB anon, oom_score_adj 0) and 4 real `LocalExecutor` sandboxes (oom_score_adj 1000) each allocating 1.2 GiB at once (9.3 GiB > 6 GiB): sandboxes 0-2 OOM-killed and restarted, sandbox 3 held its memory, the server stayed alive, all sessions worked afterwards.
