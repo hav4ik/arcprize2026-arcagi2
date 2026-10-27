@@ -6,8 +6,8 @@ E128 2-bit tool model, one rollout per multi-input task, new harness code + auto
 hold, 32 GiB KV CPU offload, fork PR #156 indexer skip, prefix-cache retention 512, Kaggle KV pool. Lineage and results:
 `notes/2026-10-27_candidate_b32.md`; rebuild and re-run: `kaggle/dsv41_tools/REPLICATE.md`.
 
-Status as of 2026-10-27 10:15 PDT: stages 0-5 passed; stage 6 (Kaggle smoke of Version 2) running; stage 5 restart test
-and stage 7 calibration pending.
+Status as of 2026-10-27 10:15 PDT: stages 0-5 passed (restart test on L4 PASS; 16 GiB twin on 4090 pending); stage 6
+(Kaggle smoke of Version 2) running; stage 7 calibration pending.
 
 ## Stage 0. Frozen code
 | item | value |
@@ -68,7 +68,7 @@ full data: HF `livobereshka/arc-agi2-dsv41-e128-candb32-replica`.
 ## Stage 5. Failure paths
 | test | status | where |
 |---|---|---|
-| E059 server restart under load (forced TP1 worker kill at +1.5 h, 2-s memory sampling), 32 GiB on L4 | kill fired 16:52 UTC; analysis pending | `experiments/E059_restart_under_load/` |
+| E059 server restart under load (forced TP1 worker kill at +1.5 h, 2-s memory sampling), 32 GiB on L4 | **PASS**: old memory released in ~16-56 s before the new server allocated; restart peak 1.05x steady (151.7 vs 144.4 GiB); all in-flight jobs re-queued (S15), 0 lost; server up again 140 s after restart start; >= 90% throughput 19 min after the kill | `experiments/E059_restart_under_load/README.md` |
 | E059 twin, 16 GiB on 4090 57983124 | running | same |
 | Solver failure paths (server death, restarts, re-queue, deadlines, garbled metrics, missing KV readings) | unit-tested (stage 1) | `kaggle/dsv41_tools/tests/test_solver.py` |
 
@@ -84,5 +84,5 @@ Kaggle-clock replica 77.4. Calibration: V5's replica 57.6 vs LB 58.19; V6's repl
 
 ## Sign-off
 - [ ] Version 2 smoke passed (integrity OK, sandbox OK, coverage shows host restores and preemptions, valid submission)
-- [ ] E059 restart test passed (restart peak ≤ ~1.1× steady memory)
+- [x] E059 restart test passed on L4 with 32 GiB (restart peak 1.05x steady); 16 GiB twin on 4090 pending
 - [ ] User approves the submission
