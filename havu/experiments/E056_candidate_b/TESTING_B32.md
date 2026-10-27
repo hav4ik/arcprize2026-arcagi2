@@ -86,4 +86,10 @@ Kaggle-clock replica 77.4. Calibration: V5's replica 57.6 vs LB 58.19; V6's repl
 ## Sign-off
 - [x] Version 2 smoke passed (integrity OK, sandbox OK, host restores ran, valid submission; preemption and force cut covered by the L4 replica)
 - [x] E059 restart test passed on L4 with 32 GiB (restart peak 1.05x steady); 16 GiB twin on 4090 pending
-- [ ] User approves the submission
+- [x] Team approved the submission (2026-10-27): Version 2
+
+## Final risk review (2026-10-27 12:20 PDT)
+- vLLM's own protection (`notes/2026-10-27_vllm_hang_protection.md`): a stuck worker / NCCL collective is turned into an engine death by `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` (300 s, default in B32), which B32's restart path handles (E059). Not caught: a wedged engine loop, an API server that stops answering, and the upstream OffloadingConnector async-load deadlock under KV pressure (fixed in vLLM 0.31 #58947, not in the fork).
+- Our logs: 30 offload server logs (~49 h of serving) show no 'Running 0 with requests waiting' streak longer than 10 s; 47 runs (~145 h) show no hung window. Accepted risk ~1-3% per run, expected cost ~1 point.
+- The hour-9 +13 GiB memory jump on hegn was another tenant (container RSS flat); OOM kill order tested (sandboxes first).
+- Decision (team): submit Version 2 as is; B32.1 (S20 watchdog on + #58947) for the next submission.

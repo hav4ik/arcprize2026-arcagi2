@@ -628,6 +628,41 @@ class MainLoop(unittest.TestCase):
         self.assertEqual(launches.count(("aaaa0001", 0, 0)), 2)  # re-queued after the death, not dropped
         self.assertIn("re-queue aaaa0001.0#0 after a server-side error", log_text(work))
 
+    def test_s20_hung_server_is_restarted(self):
+        # S20 (fails before: a server whose process stays alive but generates nothing was never restarted)
+        holder, calls = {}, {}
+
+        def hung_metrics():  # flat until the watchdog restarts the server, then generating again
+            s = holder["s"]
+            gen = 100.0 if s.STATE["restarts"] == 0 else 100.0 + 50 * time.time()
+            return {"generation_tokens_total": gen, "num_requests_running": 3.0, "t": time.time()}
+
+        def attempt(args, task, t, p, a):
+            calls[(t, a)] = calls.get((t, a), 0) + 1
+            s = holder["s"]
+            if s.STATE["restarts"] == 0:  # blocked on the hung server until the watchdog restarts it
+                for _ in range(600):
+                    if s.STATE["restarts"] > 0:
+                        break
+                    time.sleep(0.1)
+                return {"pred": None, "error": "TurnError: Connection refused", "stop_reason": "error",
+                        "usage": {"completion": 0}, "task_id": t, "pair": p, "attempt": a, "cuts": {}}
+            return harness_like(args, task, t, p, a)
+
+        def setup(s):
+            holder["s"] = s
+        s, launches, sub, work, starts = run_main({**NB_ENV, "ARC_WORKERS": "2", "ARC_STALL_RESTART_S": "2"}, TASKS,
+                                                  attempt, metrics=hung_metrics, setup=setup)
+        self.assertEqual(starts[:2], [0, 1])
+        self.assertIn("server stalled: no generated tokens for", log_text(work))
+        self.assertIn("re-queue aaaa0001.0#0 after a server-side error", log_text(work))
+        self.assertEqual(launches.count(("aaaa0001", 0, 0)), 2)  # re-run on the restarted server
+        self.assertEqual(log_text(work).count("server stalled"), 1)
+
+    def test_s20_off_by_default(self):
+        s = C.load_solver(NB_ENV)
+        self.assertEqual(s.STALL_RESTART_S, 0)
+
     def test_s6_restart_time_rule(self):
         s = C.load_solver({"ARC_STOP_NEW_S": "3600", "ARC_HARD_STOP_S": "7200", "ARC_RESTART_MIN_LEFT_S": "1800"})
         self.assertTrue(s.restart_allowed(0))

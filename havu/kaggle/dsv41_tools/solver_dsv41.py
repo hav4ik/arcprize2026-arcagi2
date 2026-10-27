@@ -181,6 +181,11 @@ KV_MISSING_WORKERS = env_num("ARC_KV_MISSING_WORKERS", 32, int)
 # still queues requests, and the gate admitted more attempts into an oversubscribed pool (832 preemptions, server
 # queue 11-22). With ARC_ADMIT_MAX_WAITING=N > 0 the gate also holds while the server has >= N waiting requests.
 ADMIT_MAX_WAITING = env_num("ARC_ADMIT_MAX_WAITING", 0, int)
+# S20 (2026-10-27 debugging of B32): the watchdog only noticed a server whose process EXITED. A server that hangs (process
+# alive, e.g. a stuck collective; or an API server that stops answering) would stall the run until the deadlines. With
+# ARC_STALL_RESTART_S=N > 0, no generated tokens (server counter) for N s while attempts run counts as a dead server:
+# its process group is stopped and the normal restart path runs (in-flight attempts are re-queued as server-side errors).
+STALL_RESTART_S = env_num("ARC_STALL_RESTART_S", 0)
 STAGE_DONE = E("ARC_STAGE_DONE", "")  # marker file written by the notebook's model-staging copy
 STAGE_WAIT_S = env_num("ARC_STAGE_WAIT_S", 2400)
 PREFLIGHT_RETRY_S = env_num("ARC_PREFLIGHT_RETRY_S", 300)  # S7: re-run a failed checkpoint pre-flight this long
@@ -819,6 +824,27 @@ def kv_admits(n_running):
     return ok
 
 
+def stall_check(now, n_running):
+    """S20: mark the server dead when its generated-token counter has not moved for STALL_RESTART_S while attempts run
+    (an unreadable /metrics counts as no progress). Checked every min(30 s, STALL_RESTART_S / 4)."""
+    if now - STATE.get("stall_check_t", -1e9) < max(1.0, min(30.0, STALL_RESTART_S / 4)):
+        return
+    STATE["stall_check_t"] = now
+    STATE.setdefault("stall_t", now)
+    m = server_metrics()
+    gen = (m or {}).get("generation_tokens_total")
+    # idle (nothing to generate) only when no request is running OR waiting: requests stuck on KV-offload loads count
+    # as waiting (vllm v1/metrics/loggers.py), and those must still trip the watchdog
+    idle = not ((m or {}).get("num_requests_running") or (m or {}).get("num_requests_waiting"))
+    if gen is not None and (gen > STATE.get("stall_gen", -1.0) or idle):
+        STATE["stall_gen"], STATE["stall_t"] = gen, now
+    elif now - STATE["stall_t"] >= STALL_RESTART_S:
+        log(f"server stalled: no generated tokens for {now - STATE['stall_t']:.0f} s with {n_running} attempts running"
+            f" ({'no /metrics' if m is None else 'counter flat'}); treating it as dead")
+        STATE["server_ok"] = False
+        STATE["stall_t"] = now
+
+
 def throughput():
     """Generated tok/s and prefix-cache hit rate since the previous call (TPS log every METRICS_EVERY_S). S16: with KV
     offload, tokens the connector restores from host (`external_prefix_cache_hits_total`) are not GPU prefix hits but
@@ -951,11 +977,14 @@ def main():
                     STATE["server_ok"] = False
                     log(f"server died (code {proc.returncode}); "
                         f"tail: {tail(STATE.get('server_log') or LOG / 'server.log')}")
+                if STALL_RESTART_S and STATE["server_ok"] and not STATE["forced"] and running:
+                    stall_check(now, len(running))
                 if not STATE["server_ok"] and not STATE["forced"]:
                     if restart_allowed(now):  # S6: up to MAX_RESTARTS, while the time left allows
                         STATE["restarts"] += 1
                         stop_server()
                         start_server()
+                        STATE["stall_t"], STATE["stall_gen"] = elapsed(), -1.0
                     elif not running:
                         log("server down and no restart left; finishing with what we have")
                         break

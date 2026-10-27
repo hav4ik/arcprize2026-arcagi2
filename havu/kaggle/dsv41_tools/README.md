@@ -1,6 +1,7 @@
 # DeepSeek-V4.1 tool solver for Kaggle 4×L4 (E042 RW / E043 tool E128)
 
-Replicating candidate B32 end to end (artifacts, code, notebook build, local replica): see `REPLICATE.md`.
+**Current candidate: B32** (submitted 2026-10-27): start at `CANDIDATE_B32.md`. Replicating it end to end: `REPLICATE.md`.
+Every submission follows `../SUBMISSION_TESTING_PROTOCOL.md`.
 
 Build with `.venv/bin/python kaggle/dsv41_tools/build.py` (add `--no-model` to leave model_sources empty). It writes:
 - `out/kit_ds/`: the dataset `chankhavu/dsv41-tools-kit`.
