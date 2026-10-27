@@ -3,6 +3,7 @@ live solver and harness, executed against a copy of the Kaggle kit of Version 5 
 1ad5ee24) in the commit / rerun x pass / fail cases (no Kaggle, no GPU). Ported from the 2026-10-26 deep audit
 (../tests_mtf_v6/test_notebook_cells.py, which read the built V6 notebook), plus the S10 regression tests."""
 import argparse
+import sys
 import json
 import time
 import hashlib
@@ -451,3 +452,119 @@ class PinsDataset(unittest.TestCase):
         cell, _ = B.code_cell(FILES, EXPECT)
         for need in B.SOLVER_NEED + B.HARNESS_NEED + B.FALLBACK_DROP:
             self.assertIn(f'"{need}"', cell)
+
+
+class StressSmoke(unittest.TestCase):
+    """--smoke-stress: commit runs get 24 tasks, a ~220k-token GPU KV pool and the sandbox check cell; the competition
+    rerun sees none of it."""
+    A = argparse.Namespace(**{**vars(A_B), "smoke_stress": True})
+
+    def exec_settings(self, rerun):
+        log = Path(tempfile.mkdtemp(prefix="smoke_", dir=C.SCRATCH)) / "smoke_env.jsonl"
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("ARC_", "KAGGLE_"))}
+        env["ARC_SMOKE_ENV_LOG"] = str(log)
+        if rerun:
+            env["KAGGLE_IS_COMPETITION_RERUN"] = "1"
+        with patch.dict(os.environ, env, clear=True), redirect_stdout(io.StringIO()):
+            exec(compile(B.settings_cell(self.A), "cell00", "exec"), {})
+            return {k: v for k, v in os.environ.items() if k.startswith("ARC_")}
+
+    def test_commit_gets_tasks_and_small_kv_pool(self):
+        env = self.exec_settings(False)
+        self.assertEqual(env["ARC_TASK_IDS"].split(","), B.SMOKE_STRESS_TASKS)
+        extra = json.loads(env["ARC_SERVER_EXTRA_ARGS"])
+        self.assertEqual(extra[-2:], ["--num-gpu-blocks-override", str(B.SMOKE_KV_BLOCKS)])
+        self.assertIn("--kv-transfer-config", extra)
+        self.assertEqual(env["ARC_SMOKE_SANDBOXES"], "56")
+
+    def test_rerun_keeps_the_production_pool(self):
+        env = self.exec_settings(True)
+        self.assertNotIn("--num-gpu-blocks-override", env["ARC_SERVER_EXTRA_ARGS"])
+        self.assertNotIn("ARC_TASK_IDS", env)
+        self.assertNotIn("ARC_SMOKE_SANDBOXES", env)
+
+    def test_sandbox_cell_skips_the_rerun(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            exec(compile(B.SANDBOX_CELL.read_text(), "cell2b", "exec"),
+                 {"KIT": "/nonexistent", "MODE": "submit", "RERUN": True, "TOOL_PY": sys.executable})
+        self.assertEqual(out.getvalue(), "")
+
+    def test_sandbox_cell_runs_against_the_kit_executor(self):
+        if importlib.util.find_spec("scipy") is None:
+            self.skipTest("scipy not installed")
+        out = io.StringIO()
+        with patch.dict(os.environ, {"ARC_SMOKE_SANDBOXES": "4", "ARC_SMOKE_SANDBOX_TIMEOUT": "3"}), redirect_stdout(out):
+            exec(compile(B.SANDBOX_CELL.read_text(), "cell2b", "exec"),
+                 {"KIT": str(C.V3), "MODE": "smoke", "RERUN": False, "TOOL_PY": sys.executable})
+        self.assertIn("SANDBOX CHECK OK", out.getvalue())
+        self.assertIn("allocation in one session: blocked", out.getvalue())
+
+
+class InputIntegrity(unittest.TestCase):
+    """--smoke-integrity: cell 1b hashes every model file against the pre-upload manifest (after "server up") and
+    checks the competition files and the wheel set in a background thread; the report cell fails the commit run on any
+    mismatch. Built on a fake /kaggle/input tree."""
+
+    def setup_tree(self, corrupt=False):
+        root = Path(tempfile.mkdtemp(prefix="integ_", dir=C.SCRATCH))
+        inp, work, model = root / "input", root / "working", root / "input" / "models" / "e128"
+        comp, wheels = inp / "competitions" / "arc", inp / "kernels" / "wheels"
+        for d in (comp, wheels, model, work / "dsv41_logs"):
+            d.mkdir(parents=True)
+        (comp / "arc-agi_test_challenges.json").write_text(json.dumps({"aaaa0001": {}, "bbbb0002": {}}))
+        whl = wheels / "vllm-0.28.1rc1-cp312-linux_x86_64.whl"
+        whl.write_bytes(b"wheel")
+        (wheels / "SHA256SUMS").write_text(f"{hashlib.sha256(b'wheel').hexdigest()}  {whl.name}\n")
+        entries = []
+        for i in range(3):
+            data = bytes([i]) * (1000 + i)
+            (model / f"model-{i}.safetensors").write_bytes(data)
+            entries.append({"path": f"model-{i}.safetensors", "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+        if corrupt:
+            (model / "model-1.safetensors").write_bytes(b"\x07" * 1001)  # same size, different bytes
+        manifest = root / "manifest.json"
+        manifest.write_text(json.dumps({"entries": entries}))
+        (work / "dsv41_logs" / "solver.log").write_text("[00:10:00 +0.20h] server up after 600s\n")
+        return root, inp, work, model, manifest
+
+    def run_cell(self, corrupt=False):
+        root, inp, work, model, manifest = self.setup_tree(corrupt)
+        import glob as _glob
+        ns = {"T0": time.time(), "INPUT": str(inp), "WORK": str(work), "KIT": "/kit", "MODEL_SRC": str(model),
+              "MODE": "smoke", "RERUN": False, "find_one": lambda p: (sorted(_glob.glob(p, recursive=True)) or [None])[0]}
+        with redirect_stdout(io.StringIO()):
+            exec(compile(B.integrity_cell(manifest), "cell1b", "exec"), ns)
+        for _ in range(100):
+            st = json.loads((work / "smoke_integrity.json").read_text())
+            if st.get("done") or st.get("error"):
+                break
+            time.sleep(0.1)
+        return st, work
+
+    def test_clean_inputs_pass(self):
+        st, work = self.run_cell()
+        self.assertTrue(st.get("done"), st)
+        self.assertEqual(st["competition"], {"arc-agi_test_challenges.json": 2})
+        self.assertEqual(st["wheels"], {"checked": 1, "bad": []})
+        self.assertEqual((st["model"]["checked"], st["model"]["sha_mismatch"], st["model"]["missing"]), (3, [], []))
+        out = io.StringIO()
+        with patch.dict(os.environ, {"ARC_OUT": str(work), "ARC_SMOKE_ENV_LOG": str(work / "none.jsonl")}), redirect_stdout(out):
+            exec(compile(B.SMOKE_REPORT_CELL, "cell5", "exec"), {})
+        self.assertIn("INPUT INTEGRITY OK", out.getvalue())
+
+    def test_corrupted_model_file_fails_the_commit(self):
+        st, work = self.run_cell(corrupt=True)
+        self.assertEqual(st["model"]["sha_mismatch"], ["model-1.safetensors"])
+        with patch.dict(os.environ, {"ARC_OUT": str(work), "ARC_SMOKE_ENV_LOG": str(work / "none.jsonl")}), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                exec(compile(B.SMOKE_REPORT_CELL, "cell5", "exec"), {})
+
+    def test_rerun_skips(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            exec(compile(B.integrity_cell(self.setup_tree()[4]), "cell1b", "exec"),
+                 {"T0": time.time(), "INPUT": "/x", "WORK": "/x", "KIT": "", "MODEL_SRC": "", "MODE": "submit",
+                  "RERUN": True, "find_one": lambda p: None})
+        self.assertEqual(out.getvalue(), "")

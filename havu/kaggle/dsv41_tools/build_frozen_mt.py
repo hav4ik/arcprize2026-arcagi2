@@ -121,6 +121,14 @@ def smoke_block(a):
     dl = {"ARC_STOP_NEW_S": (n - 5) * 60, "ARC_FORCE_AT_S": (n - 3) * 60, "ARC_HARD_STOP_S": (n - 2) * 60,
           "ARC_KILL_AT_S": int((n - 0.5) * 60)}
     sets = "".join(f'    os.environ.setdefault("{k}", "{v}")\n' for k, v in dl.items())
+    if getattr(a, "smoke_stress", False):
+        # 24 tasks (31 pairs, 6 multi-input) and a GPU KV pool cut to ~220k tokens, so the gate, preemption, the KV
+        # offload store AND load paths, the force cut and the final write all run in a 30-min smoke
+        sets += (f'    os.environ["ARC_TASK_IDS"] = "{",".join(SMOKE_STRESS_TASKS)}"\n'
+                 f'    os.environ.setdefault("ARC_SMOKE_SANDBOXES", "{a.workers}")\n'
+                 '    _sx = json.loads(os.environ["ARC_SERVER_EXTRA_ARGS"])\n'
+                 '    if "--num-gpu-blocks-override" not in _sx:\n'
+                 f'        os.environ["ARC_SERVER_EXTRA_ARGS"] = json.dumps(_sx + ["--num-gpu-blocks-override", "{SMOKE_KV_BLOCKS}"])\n')
     return f'''    # smoke within {n} min of the first cell: model load, generation, force cut and final write all run
 {sets}    import shutil, subprocess, threading, time as _st
     os.environ.setdefault("ARC_SMOKE_ENV_LOG", "/kaggle/working/smoke_env.jsonl")
@@ -146,6 +154,13 @@ def smoke_block(a):
                                                 capture_output=True, text=True, timeout=20).stdout.strip().splitlines()
                 except Exception:
                     rec["gpu"] = []
+                _sb_n, _sb_kb = 0, 0
+                for _p in os.listdir("/proc"):
+                    if _p.isdigit() and _rd(f"/proc/{{_p}}/oom_score_adj") == "1000":  # tool sandbox sessions
+                        _sb_n += 1
+                        _sb_kb += int(next((l.split()[1] for l in (_rd(f"/proc/{{_p}}/status") or "").splitlines()
+                                            if l.startswith("VmRSS:")), 0))
+                rec["sandbox"] = {{"n": _sb_n, "rss_gib": round(_sb_kb / 2**20, 2)}}
                 rec["disk_free_gib"] = {{d: round(shutil.disk_usage(d).free / 2**30, 1)
                                         for d in ("/kaggle/working", "/kaggle/temp", "/kaggle/tmp", "/tmp", "/dev/shm")
                                         if os.path.exists(d)}}
@@ -196,8 +211,44 @@ if not os.environ.get("KAGGLE_IS_COMPETITION_RERUN") and os.environ.get("ARC_SMO
             for k, v in r.get("disk_free_gib", {}).items():
                 _df[k] = min(_df.get(k, v), v)
         print("  lowest free disk (GiB):", _df, flush=True)
+        _sb = [r.get("sandbox", {}) for r in _recs]
+        print("  tool sandboxes: peak", max((s.get("n", 0) for s in _sb), default=0), "processes,",
+              max((s.get("rss_gib", 0) for s in _sb), default=0), "GiB RSS", flush=True)
     except Exception as exc:
         print("smoke report failed:", type(exc).__name__, exc, flush=True)
+    try:  # which code paths the smoke exercised (solver log + server metrics)
+        _lg = f"{os.environ.get('ARC_OUT', '/kaggle/working')}/dsv41_logs"
+        _m = [json.loads(l) for l in open(f"{_lg}/metrics.jsonl") if l.strip()]
+        _s = open(f"{_lg}/solver.log").read()
+        _host = sum((x.get("host_tok_s") or 0) * (x.get("window_s") or 0) for x in _m)
+        print("smoke coverage:", {"KV max": max((x.get("kv") or 0) for x in _m), "server running max":
+              max((x.get("srv_running") or 0) for x in _m), "preemptions": max((x.get("preemptions") or 0) for x in _m),
+              "tokens restored from host (KV offload loads)": int(_host), "KV gate holds logged": _s.count("KV gate:"),
+              "server restarts": _s.count("server start (restart"), "attempts done": _s.count(" stop="),
+              "force cut": "force deadline:" in _s, "final write": "submission written (final)" in _s}, flush=True)
+    except Exception as exc:
+        print("smoke coverage failed:", type(exc).__name__, exc, flush=True)
+    _integrity_bad = None
+    _ip = f"{os.environ.get('ARC_OUT', '/kaggle/working')}/smoke_integrity.json"
+    if os.path.exists(_ip):  # cell 1b's background check of every input (model hashed after the server came up)
+        import time as _it
+        for _ in range(48):  # wait up to 4 min for the model hash to finish
+            _ig = json.load(open(_ip))
+            if _ig.get("done") or _ig.get("error"):
+                break
+            _it.sleep(5)
+        _md = _ig.get("model", {})
+        print("input integrity: competition files", _ig.get("competition"), "| kit:", _ig.get("kit"), "| wheels:",
+              _ig.get("wheels"), "| model:", {k: _md.get(k) for k in ("files", "checked", "missing", "size_mismatch",
+              "sha_mismatch", "started_min", "minutes")}, "| error:", _ig.get("error"), flush=True)
+        _mbad = any(_md.get(k) for k in ("missing", "size_mismatch", "sha_mismatch"))
+        if _ig.get("error") or not _ig.get("done") or _mbad or (_ig.get("wheels") or {}).get("bad"):
+            _integrity_bad = "INPUT INTEGRITY FAILED or incomplete: see the line above"
+        else:
+            print("INPUT INTEGRITY OK: every model file matches its sha256", flush=True)
+    if _integrity_bad:
+        print("=" * 100, _integrity_bad, "=" * 100, sep=chr(10), flush=True)
+        raise RuntimeError(_integrity_bad)
 '''
 
 
@@ -248,6 +299,21 @@ FALLBACK_DROP = ["ARC_MULTI_TEST", "ARC_MULTI_BUDGET", "ARC_KV_ADMIT_MAX", "ARC_
                  "ARC_BEST_GUESS_AT", "ARC_BEST_GUESS_TURNS", "ARC_POST_PASS_NOTE", "ARC_REASONING_EFFORT",
                  "ARC_ADMIT_MAX_WAITING"]
 PINS_ARCHIVE = "dsv41_pins.tgz"
+SANDBOX_CELL = HERE / "cells/cell2b_sandbox_check.py"
+SMOKE_KV_BLOCKS = 4500  # ~333k KV tokens (74 per block on this stack): 2x max-model-len 163,840, far below 1.55M
+INTEGRITY_CELL = HERE / "cells/cell1b_integrity.py"
+
+
+def integrity_cell(manifest):
+    """Cell 1b: cells/cell1b_integrity.py with the model manifest (path -> [size, sha256]) filled in."""
+    m = json.load(open(manifest))
+    data = {"model": {e["path"]: [e["size"], e["sha256"]] for e in m["entries"]}}
+    text = INTEGRITY_CELL.read_text()
+    assert text.count('"""__INTEGRITY__"""') == 1
+    return text.replace('"""__INTEGRITY__"""', '"""' + json.dumps(data, sort_keys=True) + '"""')
+SMOKE_STRESS_TASKS = ["25ff71a9", "27a28665", "00576224", "337b420f", "25c199f5", "12997ef3", "2ccd9fef", "0ca9ddb6",
+                      "412b6263", "351d6448", "178fcbfb", "137f0df0", "2204b7a8", "22eb0ac0", "292dd178", "05f2a901",
+                      "2c737e39", "230f2e48", "20fb2937", "3bdb4ada", "2753e76c", "20818e16", "41e4d17e", "13f06aa5"]
 PINS_CELL = HERE / "cells/cell0b_pins.py"
 PINS_MTIME = 1793059200  # 2026-10-27 00:00 UTC: fixed member mtime, so a rebuild gives the same archive
 
@@ -390,6 +456,10 @@ def main():
     ap.add_argument("--server-extra", default="", help="JSON list of extra vLLM server flags (appended)")
     ap.add_argument("--admit-max-waiting", type=int, default=0, help="ARC_ADMIT_MAX_WAITING (S17: gate holds while "
                     "the server has >= N waiting requests)")
+    ap.add_argument("--smoke-integrity", type=Path, help="model manifest (entries: path, size, sha256): commit runs hash "
+                    "every model file and check every other input in the background (cell 1b)")
+    ap.add_argument("--smoke-stress", action="store_true", help="with --smoke-minutes: 24 tasks, a ~220k-token GPU KV "
+                    "pool (gate, preemption, offload loads), and a tool-sandbox check cell (commit runs only)")
     ap.add_argument("--smoke-minutes", type=int, default=0, help="commit-run smoke ends within N min (deadlines + "
                     "environment sampler + report cell); 0: Version 5's smoke deadlines")
     ap.add_argument("--pins-dataset", default="", help="ship the pinned files as this private dataset (folder written to "
@@ -433,6 +503,16 @@ def main():
         assert a.smoke_minutes >= 20, "the model alone takes ~15 min to load on Kaggle"
         nb["cells"].append({"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
                             "source": SMOKE_REPORT_CELL.splitlines(keepends=True)})
+    if a.smoke_integrity:
+        assert a.smoke_minutes, "--smoke-integrity needs --smoke-minutes"
+        i = next(i for i, c in enumerate(nb["cells"]) if "".join(c["source"]).startswith("# Cell 1: stage the checkpoint"))
+        nb["cells"].insert(i + 1, {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+                                   "source": integrity_cell(a.smoke_integrity).splitlines(keepends=True)})
+    if a.smoke_stress:
+        assert a.smoke_minutes, "--smoke-stress needs --smoke-minutes"
+        i = next(i for i, c in enumerate(nb["cells"]) if "".join(c["source"]).startswith("# Cell 3: the solver"))
+        nb["cells"].insert(i, {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+                               "source": SANDBOX_CELL.read_text().splitlines(keepends=True)})
     out = a.out or HERE / f"out/nb_{a.slug}"
     out.mkdir(parents=True, exist_ok=True)
     json.dump(nb, open(out / f"{a.slug}.ipynb", "w"), indent=1, ensure_ascii=False)
