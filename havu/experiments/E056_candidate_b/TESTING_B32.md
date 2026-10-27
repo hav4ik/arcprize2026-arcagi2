@@ -93,3 +93,4 @@ Kaggle-clock replica 77.4. Calibration: V5's replica 57.6 vs LB 58.19; V6's repl
 - Our logs: 30 offload server logs (~49 h of serving) show no 'Running 0 with requests waiting' streak longer than 10 s; 47 runs (~145 h) show no hung window. Accepted risk ~1-3% per run, expected cost ~1 point.
 - The hour-9 +13 GiB memory jump on hegn was another tenant (container RSS flat); OOM kill order tested (sandboxes first).
 - Decision (team): submit Version 2 as is; B32.1 (S20 watchdog on + #58947) for the next submission.
+- V6 calibration point measured (20:00 UTC): replica 64.93 vs LB 61.94; B32 estimate by the pre-registered rule **76.2** (80% ~69-83), `experiments/E055_kaggle_replica/README.md`.

@@ -34,3 +34,9 @@ Fix during the run: killer.sh's fallback looked for the solver as `$3` (`python 
 
 ## OOM kill-order test (local, cgroup v2): PASS
 `systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=0 .venv/bin/python oom_order_test.py`: a stand-in server (3.5 GiB shared + 0.5 GiB anon, oom_score_adj 0) and 4 real `LocalExecutor` sandboxes (oom_score_adj 1000) each allocating 1.2 GiB at once (9.3 GiB > 6 GiB): sandboxes 0-2 OOM-killed and restarted, sandbox 3 held its memory, the server stayed alive, all sessions worked afterwards.
+
+## Result: 16 GiB on Vast 4x4090 57983124 (`README_b16_4090.md`): PASS
+Restart memory 0.98x steady (old Engram + pinned pool gone 7 s after the kill, new allocation from +45 s); server up again 125 s after the kill; all 38 in-flight jobs re-queued (0 tries spent, 0 jobs lost); >= 90% throughput 9.8 min after the kill. Cost of a death: the killed attempts' 1.31M generated tokens (~35 min of generation) are discarded. New issues: a re-launch race onto the dying server (S21) and a post-restart admission burst that ran the next hour much hotter (S22). The box has ~20.5 effective CPUs and the run used ~5.5 cores, so CPU is not a bottleneck (Kaggle has 46).
+
+## Hang rehearsal for B32.1 on the 4090 (`hang_4090/README.md`): PASS
+A frozen engine (SIGSTOP on VLLM::EngineCore, the hang vLLM itself does not detect) was flagged by the S20 watchdog 65 s later (smoke setting 60 s), the server was restarted (up again 3 min 25 s after the freeze), all 48 in-flight attempts were re-queued without spending job tries, the S22 ramp admitted 16 then 32, and the run ended 31/31 pairs with a valid submission. Restart memory 0.99x steady.

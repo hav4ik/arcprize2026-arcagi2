@@ -77,3 +77,12 @@ Where judgment still enters (disclosed, not hidden):
 1. V6's calibration number = `replica_report.py`'s central Kaggle-clock score of `v6rep_x2t`, with no re-choice of clock or stop time.
 2. B32's estimate = B32's central Kaggle-clock score (77.43) + the mean (LB − replica) gap of V5 (+0.62) and V6, with the
    ±range from two draws (replica sd ~3.1-4.2 per run, LB draw sd ~4). Nothing else is adjusted.
+
+**Result (2026-10-27 20:00 UTC, rule applied as written):**
+- V6's calibration number: **64.93** (`toolkit/reports/v6rep_x2t_kclock.md`; the run reached the central clock's force
+  point at pod 9.77 h; optimistic 65.35, pessimistic 63.26). LB 61.94, so the replica is **2.99 points optimistic** for V6.
+- Gaps (LB − replica): V5 +0.62, V6 −2.99; mean **−1.19**.
+- **B32's estimate: 77.43 − 1.19 = 76.2.** Spread: replica sd ~3.6 + LB draw sd ~4 → ~±5.4 (1 sd), 80% range ~69-83.
+  The two calibration gaps differ by 3.6 points, about one replica sd, so the mean gap itself is uncertain by ~±2.
+- For comparison, the judgment-based "realistic ~74 (67-80)" given before this point stays inside the range; the
+  pre-registered number is the one to quote.

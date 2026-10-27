@@ -77,6 +77,12 @@ def opt_env(a):
         env.append(("ARC_POST_PASS_NOTE", "1"))
     if g("admit_max_waiting"):
         env.append(("ARC_ADMIT_MAX_WAITING", str(g("admit_max_waiting"))))
+    if g("stall_restart"):
+        env.append(("ARC_STALL_RESTART_S", str(g("stall_restart"))))
+    if g("conn_hold"):
+        env.append(("ARC_CONN_HOLD", "1"))
+    if g("restart_ramp"):
+        env.append(("ARC_RESTART_RAMP", str(g("restart_ramp"))))
     return env
 
 
@@ -95,6 +101,10 @@ def opt_need(a):
         need.setdefault(solver, []).append("ARC_REASONING_EFFORT")
     if g("admit_max_waiting"):
         need.setdefault(solver, []).append("ARC_ADMIT_MAX_WAITING")
+    for key, var in (("stall_restart", "ARC_STALL_RESTART_S"), ("conn_hold", "ARC_CONN_HOLD"),
+                     ("restart_ramp", "ARC_RESTART_RAMP")):
+        if g(key):
+            need.setdefault(solver, []).append(var)
     return need
 
 
@@ -229,6 +239,22 @@ if not os.environ.get("KAGGLE_IS_COMPETITION_RERUN") and os.environ.get("ARC_SMO
     except Exception as exc:
         print("smoke coverage failed:", type(exc).__name__, exc, flush=True)
     _integrity_bad = None
+    _hp = f"{os.environ.get('ARC_OUT', '/kaggle/working')}/smoke_hang.json"
+    if os.path.exists(_hp):  # cell 2c: a deliberate engine hang; the solver's watchdog must restart the server
+        _hg = json.load(open(_hp))
+        try:
+            _hs = open(f"{os.environ.get('ARC_OUT', '/kaggle/working')}/dsv41_logs/solver.log").read()
+        except OSError:
+            _hs = ""
+        _after = _hs.split("server stalled", 1)[1] if "server stalled" in _hs else ""
+        print("hang test:", _hg, "| watchdog fired:", "server stalled" in _hs, "| restarts:", _hs.count("server start (restart"),
+              "| re-queued after the stall:", _after.count("re-queue "), "| attempts finished after the stall:",
+              _after.count(" stop="), "| conn retries spent on a dead server:", _after.count("(2):") + _after.count("(3):"),
+              flush=True)
+        if _hg.get("error") or _hg.get("resumed_without_restart") or "server stalled" not in _hs:
+            _integrity_bad = "HANG TEST FAILED: the watchdog did not restart the frozen server (see the line above)"
+        else:
+            print("HANG TEST OK: frozen engine detected and the server restarted", flush=True)
     _ip = f"{os.environ.get('ARC_OUT', '/kaggle/working')}/smoke_integrity.json"
     if os.path.exists(_ip):  # cell 1b's background check of every input (model hashed after the server came up)
         import time as _it
@@ -300,6 +326,7 @@ FALLBACK_DROP = ["ARC_MULTI_TEST", "ARC_MULTI_BUDGET", "ARC_KV_ADMIT_MAX", "ARC_
                  "ARC_ADMIT_MAX_WAITING"]
 PINS_ARCHIVE = "dsv41_pins.tgz"
 SANDBOX_CELL = HERE / "cells/cell2b_sandbox_check.py"
+HANG_CELL = HERE / "cells/cell2c_hang_test.py"
 SMOKE_KV_BLOCKS = 4500  # ~333k KV tokens (74 per block on this stack): 2x max-model-len 163,840, far below 1.55M
 INTEGRITY_CELL = HERE / "cells/cell1b_integrity.py"
 
@@ -458,6 +485,11 @@ def main():
                     "the server has >= N waiting requests)")
     ap.add_argument("--smoke-integrity", type=Path, help="model manifest (entries: path, size, sha256): commit runs hash "
                     "every model file and check every other input in the background (cell 1b)")
+    ap.add_argument("--stall-restart", type=int, default=0, help="ARC_STALL_RESTART_S (S20 progress watchdog)")
+    ap.add_argument("--conn-hold", action="store_true", help="ARC_CONN_HOLD=1 (S21 re-launch hold)")
+    ap.add_argument("--restart-ramp", default="", help="ARC_RESTART_RAMP start,per_min (S22)")
+    ap.add_argument("--smoke-hang", action="store_true", help="commit runs: freeze the engine after server up "
+                    "(cells/cell2c_hang_test.py) to exercise the watchdog, restart and ramp")
     ap.add_argument("--smoke-stress", action="store_true", help="with --smoke-minutes: 24 tasks, a ~220k-token GPU KV "
                     "pool (gate, preemption, offload loads), and a tool-sandbox check cell (commit runs only)")
     ap.add_argument("--smoke-minutes", type=int, default=0, help="commit-run smoke ends within N min (deadlines + "
@@ -508,6 +540,11 @@ def main():
         i = next(i for i, c in enumerate(nb["cells"]) if "".join(c["source"]).startswith("# Cell 1: stage the checkpoint"))
         nb["cells"].insert(i + 1, {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
                                    "source": integrity_cell(a.smoke_integrity).splitlines(keepends=True)})
+    if a.smoke_hang:
+        assert a.smoke_minutes >= 32 and a.stall_restart, "--smoke-hang needs --smoke-minutes >= 32 (a restart must fit before stop-new) and --stall-restart"
+        i = next(i for i, c in enumerate(nb["cells"]) if "".join(c["source"]).startswith("# Cell 3: the solver"))
+        nb["cells"].insert(i, {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+                               "source": HANG_CELL.read_text().splitlines(keepends=True)})
     if a.smoke_stress:
         assert a.smoke_minutes, "--smoke-stress needs --smoke-minutes"
         i = next(i for i, c in enumerate(nb["cells"]) if "".join(c["source"]).startswith("# Cell 3: the solver"))

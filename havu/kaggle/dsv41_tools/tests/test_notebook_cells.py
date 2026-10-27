@@ -11,6 +11,7 @@ import importlib.util
 import io
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -567,4 +568,50 @@ class InputIntegrity(unittest.TestCase):
             exec(compile(B.integrity_cell(self.setup_tree()[4]), "cell1b", "exec"),
                  {"T0": time.time(), "INPUT": "/x", "WORK": "/x", "KIT": "", "MODEL_SRC": "", "MODE": "submit",
                   "RERUN": True, "find_one": lambda p: None})
+        self.assertEqual(out.getvalue(), "")
+
+
+class HangCell(unittest.TestCase):
+    """cells/cell2c_hang_test.py: freezes this kernel's own VLLM::EngineCore descendant after "server up" and records
+    whether the solver restarted the server; resumes it if not. Exercised on a fake process tree."""
+
+    def test_freezes_own_engine_and_sees_restart(self):
+        import signal as _sig
+        work = Path(tempfile.mkdtemp(prefix="hang_", dir=C.SCRATCH))
+        (work / "dsv41_logs").mkdir()
+        log = work / "dsv41_logs" / "solver.log"
+        log.write_text("[x] server up after 300s\n")
+        eng = subprocess.Popen(["bash", "-c", "exec -a VLLM::EngineCore sleep 60"])
+        try:
+            ns = {"T0": time.time(), "WORK": str(work), "MODE": "smoke", "RERUN": False, "BASE_ENV": {}}
+            with patch.dict(os.environ, {"ARC_SMOKE_HANG_AFTER_S": "0", "ARC_SMOKE_HANG_MAX_S": "30"}), \
+                    redirect_stdout(io.StringIO()):
+                exec(compile(B.HANG_CELL.read_text(), "cell2c", "exec"), ns)
+            for _ in range(100):
+                st = json.loads((work / "smoke_hang.json").read_text())
+                if st.get("engine_pid"):
+                    break
+                time.sleep(0.1)
+            self.assertEqual(st["engine_pid"], eng.pid)
+            with open(f"/proc/{eng.pid}/stat") as f:
+                self.assertEqual(f.read().rsplit(")", 1)[1].split()[0], "T")  # stopped
+            with open(log, "a") as f:
+                f.write("[y] server start (restart 1): model m\n")
+            for _ in range(150):
+                st = json.loads((work / "smoke_hang.json").read_text())
+                if "restart_seen_after_s" in st:
+                    break
+                time.sleep(0.1)
+            self.assertIn("restart_seen_after_s", st)
+            self.assertEqual(ns["BASE_ENV"]["ARC_STALL_RESTART_S"], "60")
+        finally:
+            eng.send_signal(_sig.SIGCONT)
+            eng.kill()
+            eng.wait()
+
+    def test_rerun_does_nothing(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            exec(compile(B.HANG_CELL.read_text(), "cell2c", "exec"),
+                 {"T0": time.time(), "WORK": "/nonexistent", "MODE": "submit", "RERUN": True, "BASE_ENV": {}})
         self.assertEqual(out.getvalue(), "")

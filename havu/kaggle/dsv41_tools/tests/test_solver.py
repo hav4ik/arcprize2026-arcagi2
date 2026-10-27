@@ -663,6 +663,66 @@ class MainLoop(unittest.TestCase):
         s = C.load_solver(NB_ENV)
         self.assertEqual(s.STALL_RESTART_S, 0)
 
+    def test_s21_conn_hold_until_server_answers(self):
+        s = C.load_solver({**NB_ENV, "ARC_CONN_HOLD": "1"})
+        now, alive = [1000.0], [False]
+        with patch.object(s.time, "time", lambda: now[0]), patch.object(s, "server_alive", lambda: alive[0]):
+            self.assertFalse(s.conn_hold())  # no server-side error yet
+            s.STATE["conn_error_t"] = now[0]
+            self.assertTrue(s.conn_hold())  # server not answering: hold
+            alive[0] = True
+            now[0] += 2
+            self.assertTrue(s.conn_hold())  # re-probed at most every 5 s
+            now[0] += 5
+            self.assertFalse(s.conn_hold())  # answers again: launches resume
+            self.assertIsNone(s.STATE["conn_error_t"])
+        self.assertFalse(C.load_solver(NB_ENV).conn_hold())  # off by default
+
+    def test_s22_restart_ramp(self):
+        s = C.load_solver({**NB_ENV, "ARC_WORKERS": "56", "ARC_RESTART_RAMP": "16,8"})
+        self.assertEqual(s.RESTART_RAMP, (16, 8))
+        t = [100.0]
+        with patch.object(s, "elapsed", lambda: t[0]):
+            self.assertEqual(s.worker_cap(), 56)  # no restart yet
+            s.STATE["ramp_t0"] = t[0]
+            self.assertEqual(s.worker_cap(), 16)
+            t[0] += 125
+            self.assertEqual(s.worker_cap(), 32)
+            t[0] += 300
+            self.assertEqual(s.worker_cap(), 56)
+            self.assertIsNone(s.STATE["ramp_t0"])
+        self.assertIsNone(C.load_solver(NB_ENV).RESTART_RAMP)
+
+    def test_s20_s21_s22_together(self):
+        holder = {}
+
+        def hung_metrics():
+            s = holder["s"]
+            gen = 100.0 if s.STATE["restarts"] == 0 else 100.0 + 50 * time.time()
+            return {"generation_tokens_total": gen, "num_requests_running": 2.0, "t": time.time()}
+
+        def attempt(args, task, t, p, a):
+            s = holder["s"]
+            if s.STATE["restarts"] == 0:
+                for _ in range(600):
+                    if s.STATE["restarts"] > 0:
+                        break
+                    time.sleep(0.1)
+                return {"pred": None, "error": "TurnError: Connection refused", "stop_reason": "error",
+                        "usage": {"completion": 0}, "task_id": t, "pair": p, "attempt": a, "cuts": {}}
+            return harness_like(args, task, t, p, a)
+
+        def setup(s):
+            holder["s"] = s
+            s.server_alive = lambda: True
+        s, launches, sub, work, starts = run_main({**NB_ENV, "ARC_WORKERS": "2", "ARC_STALL_RESTART_S": "2",
+                                                   "ARC_CONN_HOLD": "1", "ARC_RESTART_RAMP": "1,60"}, TASKS, attempt,
+                                                  metrics=hung_metrics, setup=setup)
+        self.assertEqual(starts[:2], [0, 1])
+        self.assertEqual(log_text(work).count("server stalled"), 1)
+        self.assertTrue(all(len(sub[t]) == len(TASKS[t]["test"]) for t in TASKS))
+        self.assertIn("submission written (final)", log_text(work))
+
     def test_s6_restart_time_rule(self):
         s = C.load_solver({"ARC_STOP_NEW_S": "3600", "ARC_HARD_STOP_S": "7200", "ARC_RESTART_MIN_LEFT_S": "1800"})
         self.assertTrue(s.restart_allowed(0))

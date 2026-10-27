@@ -186,6 +186,15 @@ ADMIT_MAX_WAITING = env_num("ARC_ADMIT_MAX_WAITING", 0, int)
 # ARC_STALL_RESTART_S=N > 0, no generated tokens (server counter) for N s while attempts run counts as a dead server:
 # its process group is stopped and the normal restart path runs (in-flight attempts are re-queued as server-side errors).
 STALL_RESTART_S = env_num("ARC_STALL_RESTART_S", 0)
+# S21 (E059 B16 run): jobs re-queued after a server-side error were launched again within the same second against the
+# dying server, each spending one of its CONN_TRIES. ARC_CONN_HOLD=1: after a server-side error, no new launch until the
+# server answers /v1/models again (checked at most every 5 s).
+CONN_HOLD = env_num("ARC_CONN_HOLD", 0, int)
+# S22 (E059 B16 run): after a restart the gate admitted every worker at once into the empty KV pool, mostly long re-queued
+# attempts that then grew together (KV > 0.95 half of the next hour, 464 preemptions). ARC_RESTART_RAMP="start,per_min":
+# after a restart at most start + per_min x minutes attempts run until WORKERS is reached.
+_ramp = [int(x) for x in os.environ.get("ARC_RESTART_RAMP", "").split(",") if x.strip()]
+RESTART_RAMP = tuple(_ramp) if len(_ramp) == 2 else None
 STAGE_DONE = E("ARC_STAGE_DONE", "")  # marker file written by the notebook's model-staging copy
 STAGE_WAIT_S = env_num("ARC_STAGE_WAIT_S", 2400)
 PREFLIGHT_RETRY_S = env_num("ARC_PREFLIGHT_RETRY_S", 300)  # S7: re-run a failed checkpoint pre-flight this long
@@ -824,6 +833,30 @@ def kv_admits(n_running):
     return ok
 
 
+def conn_hold():
+    """S21: True while a recent server-side error is not yet followed by a server that answers /v1/models."""
+    if not CONN_HOLD or not STATE.get("conn_error_t"):
+        return False
+    if time.time() - STATE.get("conn_probe_t", 0) < 5:
+        return STATE.get("conn_hold", True)
+    STATE["conn_probe_t"] = time.time()
+    STATE["conn_hold"] = not server_alive()
+    if not STATE["conn_hold"]:
+        STATE["conn_error_t"] = None
+    return STATE["conn_hold"]
+
+
+def worker_cap():
+    """S22: WORKERS, or the post-restart ramp start + per_min x minutes since the restart."""
+    if not RESTART_RAMP or STATE.get("ramp_t0") is None:
+        return WORKERS
+    cap = RESTART_RAMP[0] + RESTART_RAMP[1] * int((elapsed() - STATE["ramp_t0"]) / 60)
+    if cap >= WORKERS:
+        STATE["ramp_t0"] = None
+        return WORKERS
+    return cap
+
+
 def stall_check(now, n_running):
     """S20: mark the server dead when its generated-token counter has not moved for STALL_RESTART_S while attempts run
     (an unreadable /metrics counts as no progress). Checked every min(30 s, STALL_RESTART_S / 4)."""
@@ -985,6 +1018,7 @@ def main():
                         stop_server()
                         start_server()
                         STATE["stall_t"], STATE["stall_gen"] = elapsed(), -1.0
+                        STATE["ramp_t0"] = elapsed()
                     elif not running:
                         log("server down and no restart left; finishing with what we have")
                         break
@@ -997,7 +1031,8 @@ def main():
                             f"< {MIN_ATTEMPT_TOKENS:.0f} tokens; {len(queue)} jobs left unstarted")
                 # Only while the server process is alive: an attempt started against a dead server fails in 0.2 s with
                 # "connection refused" (T2, 2026-10-24).
-                while (queue and len(running) < WORKERS and STATE["server_ok"] and not STATE["forced"]
+                while (queue and len(running) < worker_cap() and STATE["server_ok"] and not STATE["forced"]
+                       and not conn_hold()
                        and STATE["server"] is not None and STATE["server"].poll() is None
                        and elapsed() < STOP_NEW_S and not STATE.get("admission_closed") and kv_admits(len(running))):
                     t, p, a, tries = queue.pop(pick(queue))
@@ -1026,6 +1061,7 @@ def main():
                                 # Lost to the server (died, restarting, or dropped the stream): re-queue without using
                                 # a try.
                                 conn_retries[key] = conn_retries.get(key, 0) + 1
+                                STATE["conn_error_t"] = time.time()  # S21: hold launches until the server answers
                                 requeue = ((t, p, a, tries),
                                            f"re-queue {t}.{p}#{a} after a server-side error ({conn_retries[key]})")
                             elif tries + 1 < JOB_TRIES:

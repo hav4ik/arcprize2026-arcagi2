@@ -34,12 +34,34 @@ P=kaggle/dsv41_tools/pinned_candb
 KVT='{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":34359738368,"offload_prompt_only":false,"swa_store_policy":"checkpoint","shared_region":false,"eviction_policy":"lru"}}'
 EXTRA=$(python3 -c "import json,sys; print(json.dumps(['--kv-transfer-config', sys.argv[1]]))" "$KVT")
 .venv/bin/python kaggle/dsv41_tools/build_frozen_mt.py --slug dsv41-tools-submit-candb --out kaggle/dsv41_tools/out/nb_candb32 \
-  --workers 56 --budget 0.5 --gate 0.85 --retention 512 --util 0.945 --auto-repair --admit-max-waiting 1 --smoke-minutes 30 \
+  --workers 56 --budget 0.5 --gate 0.85 --retention 512 --util 0.945 --auto-repair --admit-max-waiting 1 \
+  --smoke-minutes 40 --smoke-stress --smoke-integrity experiments/E043_dsv41_real_pruning/results/kaggle_e128_manifest.json \
   --solver $P/solver_dsv41.py --harness $P/run_deepseek_tools.py --train-check $P/train_check.py \
   --overlay experiments/E056_candidate_b/kit --server-extra "$EXTRA"
 ```
+The submitted notebook itself is `out/nb_candb32/` (git tag `b32-submission`). Rebuilding with today's builder gives the
+same cells except two inert differences: the gzip timestamp inside cell 0b's payload (same file hashes) and the smoke
+report's hang-test section, which only runs when a hang-test cell wrote `smoke_hang.json`.
+
+### B32.1 (B32 + failure handling; the handoff notebook)
+Same model, overlay and settings as B32, plus the solver's S20 progress watchdog (600 s), S21 re-launch hold and S22
+post-restart ramp (16 + 8 per minute). The pinned files ship as the private dataset `chankhavu/dsv41-candb1-pins`
+(`--pins-dataset`; no base64 in the notebook). Its commit run is a 32-min smoke that freezes the engine on purpose
+(`cells/cell2c_hang_test.py`) to exercise the watchdog, restart and ramp; the competition rerun does not.
+```bash
+P=kaggle/dsv41_tools/pinned_candb1
+.venv/bin/python kaggle/dsv41_tools/build_frozen_mt.py --slug dsv41-tools-submit-candb1 --out kaggle/dsv41_tools/out/nb_candb1 \
+  --pins-dataset dsv41-candb1-pins \
+  --workers 56 --budget 0.5 --gate 0.85 --retention 512 --util 0.945 --auto-repair --admit-max-waiting 1 \
+  --stall-restart 600 --conn-hold --restart-ramp 16,8 \
+  --smoke-minutes 32 --smoke-stress --smoke-hang \
+  --smoke-integrity experiments/E043_dsv41_real_pruning/results/kaggle_e128_manifest.json \
+  --solver $P/solver_dsv41.py --harness $P/run_deepseek_tools.py --train-check $P/train_check.py \
+  --overlay experiments/E056_candidate_b/kit --server-extra "$EXTRA"
+# upload the pins folder once (private): kaggle datasets create -p kaggle/dsv41_tools/out/pins_dsv41-candb1-pins
+```
 The notebook keeps Version 5's inputs (competition, kit dataset, wheel kernel, model) and carries the pinned files in
-cell 0b (or, with `--pins-dataset <slug>`, in a small attached dataset). The commit run is a ≤ 30 min smoke; the
+cell 0b (or, with `--pins-dataset <slug>`, in a small attached dataset). The commit run is a smoke (B32: 40 min, ~46 min of session; B32.1: 32 min); the
 competition rerun runs the full solver. The builder refuses pinned files whose imports the kit cannot satisfy.
 Kaggle needs the competition attached to get 4×L4 (otherwise 2×T4).
 
