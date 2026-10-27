@@ -1,6 +1,6 @@
 #!/bin/bash
 # E055 poll: both 12 h replicas; mirror attempts/metrics, print score so far (eval x2 solutions), KV/tok/s, restarts
-D=/tmp/claude-1000/-home-vu-Workspace-ARC-AGI-2/81e68821-e1f4-4b05-bad6-9a606f77ad54/scratchpad/l2
+D=$(cd "$(dirname "$0")" && pwd)/mirror
 X=/home/vu/Workspace/ARC-AGI-2/experiments/E055_kaggle_replica
 for b in "30092 root@213.173.105.28 v5rep_x2" "43647 root@157.157.221.29 candB_x2"; do
   set -- $b; S="ssh -o ConnectTimeout=15 -o ServerAliveInterval=10 -o BatchMode=yes -p $1 $2"; M=$D/mirror_$3; mkdir -p $M
@@ -16,5 +16,5 @@ if w:
     kv = max(x.get("kv", 0) for x in w); low = [x for x in w if x.get("elapsed_h", 0) > 0.4 and (x.get("prefix_hit") or 1) < 0.85 and x.get("uncached_tok_s", 0) > 500]
     print(f"windows {len(w)}, max KV {kv:.3f}, thrash-signature windows {len(low)}, mean gen tok/s {sum(x['gen_tok_s'] for x in w)/len(w):.0f}")
 PY
-  python3 $D/score.py $M/attempts.jsonl $X/eval_x2_challenges.json $X/eval_x2_challenges.json $X/eval_x2_solutions.json 2>/dev/null | head -3
+  python3 $X/score.py $M/attempts.jsonl $X/eval_x2_challenges.json $X/eval_x2_challenges.json $X/eval_x2_solutions.json 2>/dev/null | head -3
 done

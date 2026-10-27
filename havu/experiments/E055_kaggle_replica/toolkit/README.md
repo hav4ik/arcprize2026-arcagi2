@@ -217,3 +217,6 @@ workload.
 4. **Determinism.** The stack is not run-to-run deterministic, so every replica is one draw.
 5. **Power cap.** Untested whether Runpod lets `nvidia-smi -pl 50` through; if it does, the hardware gap closes at the
    source.
+
+## Note on toolkit/runs/
+Live mirrors used for reports during runs; finished runs are archived in `../runs/<name>/` (with traces).

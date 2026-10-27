@@ -32,6 +32,46 @@ def render(grid, cell=32):
     return buf.getvalue()
 
 
+# DeepSeek V4.1 vision (E058): 14-px patches merged 3x3, so one LLM token covers a 42x42-pixel tile. The API rescales
+# images to >= ~169 tiles (min_pixels 295,936) and <= ~1,024 tiles, and charges tiles_w * tiles_h + tiles_h + 2
+# tokens (one per tile, one per tile row, two markers; measured 2026-10-26). A cell side of 42*k px with
+# k = ceil(sqrt(169 / cells)) keeps every cell exactly k x k tokens and avoids any rescale for grids up to 30x30.
+DS_TILE, DS_MIN_TILES, DS_MAX_TILES = 42, 169, 1024
+# Qwen3.8 Flash via OpenRouter -> Alibaba (E058, measured 2026-10-27): 16-px patches merged 2x2 = 32-px tiles; images are
+# rescaled to >= 64 tiles (256^2 px) and <= ~2,500 tiles; charged tiles + 2 tokens.
+ALIGN = {"deepseek": (DS_TILE, DS_MIN_TILES, DS_MAX_TILES), "qwen": (32, 64, 2500)}
+
+
+def aligned_cell(grid, profile="deepseek"):
+    """Pixels per cell (tile * k, smallest k reaching the provider's minimum) for an unresized, token-aligned image."""
+    tile, lo, hi = ALIGN[profile]
+    cells = len(grid) * len(grid[0])
+    k = 1
+    while cells * k * k < lo:
+        k += 1
+    if cells * k * k > hi:
+        raise ValueError(f"grid of {cells} cells exceeds {hi} tiles even at one tile per cell")
+    return tile * k
+
+
+def deepseek_cell(grid):
+    """Pixels per cell for an unresized, token-aligned DeepSeek image of `grid`."""
+    return aligned_cell(grid, "deepseek")
+
+
+def deepseek_tokens(grid, cell=None):
+    """Prompt tokens DeepSeek charges for the image of `grid` drawn at `cell` px (default deepseek_cell)."""
+    cell = cell or deepseek_cell(grid)
+    tw, th = len(grid[0]) * cell // DS_TILE, len(grid) * cell // DS_TILE
+    return tw * th + th + 2
+
+
+def qwen_tokens(grid, cell=None):
+    """Prompt tokens Qwen3.8 Flash (Alibaba) charges for the image of `grid` at `cell` px (default aligned)."""
+    cell = cell or aligned_cell(grid, "qwen")
+    return (len(grid[0]) * cell // 32) * (len(grid) * cell // 32) + 2
+
+
 def data_uri(grid, cell=32):
     return "data:image/png;base64," + base64.b64encode(render(grid, cell)).decode()
 

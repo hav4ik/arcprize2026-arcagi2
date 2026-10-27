@@ -651,3 +651,24 @@ class DockerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TextImageContentTest(unittest.TestCase):
+    """E058 --grid-format text+image: JSON prompt first, then one labelled DeepSeek-aligned image per grid."""
+
+    def test_parts_and_alignment(self):
+        from arc_harness.grid_image import deepseek_cell, deepseek_tokens
+        train = [{"input": [[1, 2], [3, 4]], "output": [[4]]}, {"input": [[0] * 30] * 30, "output": [[5] * 13] * 13}]
+        from run_deepseek_tools import text_image_content
+        parts = text_image_content("PROMPT", train, [[[7, 7, 7]]], 0)
+        self.assertEqual(parts[0]["type"], "text")
+        self.assertTrue(parts[0]["text"].startswith("PROMPT") and "JSON grids specify the exact cells" in parts[0]["text"])
+        labels = [p["text"].strip() for p in parts[1:] if p["type"] == "text"]
+        self.assertEqual(labels, ["Example 0 input (2x2):", "Example 0 output (1x1):", "Example 1 input (30x30):",
+                                  "Example 1 output (13x13):", "Test input (1x3):"])
+        self.assertEqual(sum(p["type"] == "image_url" for p in parts), 5)
+        self.assertEqual(deepseek_cell([[0] * 30] * 30), 42)          # one tile per cell
+        self.assertEqual(deepseek_cell([[0] * 13] * 13), 42)          # exactly the 169-tile minimum
+        self.assertEqual(deepseek_cell([[0, 0, 0]]), 42 * 8)          # 3 cells -> k = 8 (3*64 = 192 tiles)
+        self.assertEqual(deepseek_tokens([[0] * 30] * 30), 932)       # measured on the API 2026-10-26
+        self.assertEqual(deepseek_tokens([[0] * 16] * 11), 189)       # measured

@@ -22,7 +22,7 @@ from openai import OpenAI
 from run_deepseek_arc2 import api_key
 from run_deepseek_arcprize import TASKS, build_prompt, parse
 from arc_harness.arcprize import TEMPLATE as ARC_TEMPLATE
-from arc_harness.grid_image import build_image_prompt
+from arc_harness.grid_image import aligned_cell, build_image_prompt, data_uri
 from sandbox_client import SandboxSession, check_health, tool_output
 from task_summary import task_summary
 from train_check import ranked_answers, train_check
@@ -93,7 +93,7 @@ V5_PROMPTS = {"lean2roles"}
 # v6 (E029) is recorded when an E029 option or prompt is active; it adds the keys below to the config.
 HARNESS_VERSION_V6 = "persistent-v6"
 V6_DEFAULTS = {"turns_note": 0, "fallback_solve": False, "cap_nudge": False, "effort_header": "", "grid_format": "json",
-               "image_cell": 32, "openrouter_provider": "", "or_reasoning": "", "multi_test": False,
+               "image_cell": 32, "image_align": "deepseek", "openrouter_provider": "", "or_reasoning": "", "multi_test": False,
                "multi_budget": 0.0, "multi_prompt": "note", "context_limit": 0,
                "prior_mode": "", "alt_answer": ""}
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
@@ -1335,6 +1335,27 @@ def _train_pass_shown(code, output, n_train):
     return bool(kinds) and (true_lines >= n_train or ("one" in kinds and true_lines >= 1))
 
 
+IMAGE_NOTE = ("\n\nThe images below show the SAME training examples and test input(s) as the JSON above, in the same "
+              "order; they are not additional examples. Each image is one grid, drawn as flat coloured squares "
+              "without lines (0 black, 1 blue, 2 red, 3 green, 4 yellow, 5 grey, 6 magenta, 7 orange, 8 light blue, "
+              "9 maroon). Use them to see shapes and layout; the JSON grids specify the exact cells.")
+
+
+def text_image_content(prompt, train, test_inputs, cell=0, align="deepseek"):
+    """E058 --grid-format text+image: chat content parts = the full text prompt, a note, then one labelled image per
+    grid (training inputs and outputs, then test inputs). cell 0 = grid_image.aligned_cell(align): each cell exactly
+    k x k model tiles (DeepSeek 42 px, Qwen 32 px), never rescaled by the API; otherwise a fixed cell size in pixels."""
+    def image(label, g):
+        return [{"type": "text", "text": f"\n{label} ({len(g)}x{len(g[0])}):"},
+                {"type": "image_url", "image_url": {"url": data_uri(g, cell or aligned_cell(g, align))}}]
+    parts = [{"type": "text", "text": prompt + IMAGE_NOTE}]
+    for i, pair in enumerate(train):  # numbered from 0, like the text prompt's --Example 0--
+        parts += image(f"Example {i} input", pair["input"]) + image(f"Example {i} output", pair["output"])
+    for j, g in enumerate(test_inputs, 1):
+        parts += image("Test input" if len(test_inputs) == 1 else f"Test input {j - 1}", g)
+    return parts
+
+
 def build_prompt_multi(train, test_inputs):
     """E046 --multi-test: the ARC Prize prompt with every test input of the task, numbered."""
     tests = "\n\n".join(f"--Test input {i}--\n\n{json.dumps(g)}" for i, g in enumerate(test_inputs))
@@ -1477,6 +1498,9 @@ def solve(client, args, task, test_input, session_factory=SandboxSession, test_i
         prompt += ALT_NOTES[args.alt_answer]
     if prior:  # E047 --prior-mode
         prompt += prior_note(args.prior_mode, prior["preds"], prior["train_pass"], prior.get("program"))
+    if getattr(args, "grid_format", "json") == "text+image":  # E058: JSON prompt unchanged, plus one image per grid
+        prompt = text_image_content(prompt, task["train"], test_inputs if multi else [test_input], args.image_cell,
+                                    getattr(args, "image_align", "deepseek"))
     messages = [{"role": "user", "content": prompt}]
     if getattr(args, "effort_header", ""):
         messages.insert(0, {"role": "system", "content": EFFORT_HEADERS[args.effort_header]})
@@ -1974,11 +1998,16 @@ def parser():
                          "attempt 0 nor 1 passes the train check (not part of the config, so files resume)")
     ap.add_argument("--turns-note", type=int, default=0,
                     help="E029: append a 'N turns left, submit now' note to tool output when N or fewer turns remain (0=off)")
-    ap.add_argument("--grid-format", default="json", choices=["json", "image"],
+    ap.add_argument("--grid-format", default="json", choices=["json", "image", "text+image"],
                     help="E033: image = every grid in the prompt is a PNG (ARC palette, --image-cell px per cell, no grid "
-                         "lines) instead of JSON; needs a vision model behind --base-url")
+                         "lines) instead of JSON; needs a vision model behind --base-url. E058: text+image = the JSON "
+                         "prompt unchanged plus one labelled image per grid (works with the DeepSeek API)")
     ap.add_argument("--image-cell", type=int, default=32,
-                    help="E033: pixels per grid cell (Qwen3.8: 32 = one LLM visual token per cell, 16 = one ViT patch)")
+                    help="E033: pixels per grid cell (Qwen3.8: 32 = one LLM visual token per cell, 16 = one ViT patch); "
+                         "E058 text+image: 0 = DeepSeek-aligned per grid (grid_image.deepseek_cell)")
+    ap.add_argument("--image-align", default="deepseek", choices=["deepseek", "qwen"],
+                    help="E058 text+image with --image-cell 0: tile geometry to align cells to (deepseek 42 px, "
+                         "169-1024 tiles; qwen = Qwen3.8 Flash on Alibaba, 32 px, 64-2500 tiles)")
     ap.add_argument("--openrouter-provider", default="",
                     help="E037: run through OpenRouter pinned to this provider (no fallbacks); --model is then an "
                          "OpenRouter id such as deepseek/deepseek-v4.1-flash-1017; cost comes from OpenRouter usage")

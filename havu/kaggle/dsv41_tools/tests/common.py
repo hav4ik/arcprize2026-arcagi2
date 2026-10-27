@@ -17,7 +17,9 @@ DSV41 = HERE.parent
 ROOT = DSV41.parents[1]
 KIT_TGZ = DSV41 / "kaggle_kit_v5/dsv41_kit.tgz"
 SOLVER = DSV41 / "solver_dsv41.py"
-HARNESS = ROOT / "evals/run_deepseek_tools.py"
+# the candidate's pinned harness (candidate B, 882c817f), not the live evals/ copy: other sessions keep extending the
+# live harness (E058 imports grid_image.deepseek_cell, which the Kaggle kit lacks); ARC_TEST_HARNESS overrides
+HARNESS = Path(os.environ.get("ARC_TEST_HARNESS") or DSV41 / "pinned_candb/run_deepseek_tools.py")
 SCRATCH = Path(tempfile.mkdtemp(prefix="dsv41_tests_"))
 
 

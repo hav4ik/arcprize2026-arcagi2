@@ -340,3 +340,18 @@ projections from now on.
   `evalx2t_s2026`, toolkit deadlines. Combined overlay packaging and parity under test on a 4090 (E056).
 - **Resources:** Vast 4090 boxes are easy to rent; 4xL4 is the scarce resource. Do development and A/B tests on 4090s;
   keep L4s for full replicas.
+- **Kaggle smoke of candidate B (10-27 06:20, PASS; E056 README):** offload starts on Kaggle; 16 GiB pinned pool +
+  Engram = 106.9 GiB shmem, anon 10.8 GiB at startup vs the 173 GiB cgroup (page cache fills the rest, reclaimable).
+  Kaggle's image leaves PYTORCH_CUDA_ALLOC_CONF unset. **Kaggle's L4s ran at a 72 W power limit (draw 72.1-72.6 W,
+  2,040 MHz), not 50 W** as assumed earlier; the pods match. Packaging bug caught before the push: the live harness
+  imported grid_image.deepseek_cell (E058), missing from the Kaggle kit; candidates now build from frozen copies
+  (`kaggle/dsv41_tools/pinned_candb/`) and `build_frozen_mt.check_imports` refuses unresolved imports.
+- **V6 leaderboard (10-27, user): 61.94** (dsv41-tools-submit-mtf Version 6: multi-test 0.5, KV gate 0.6, x36, V6 code,
+  no offload). Honest projection was 69.1 +- 4.7 (-1.5 sd); replica-informed guess 65-70. LB so far: v3 50.97, V5 58.19,
+  V6 61.94 (V6 - V5 = +3.75 vs +8 projected). The V5 replica reproduced V5's LB (57.6 vs 58.19), but V6 is the first
+  multi-test point and it fell short, so replica scores of multi-test configs (candidate B) are not yet calibrated: a V6
+  replica (exact V6 kit, toolkit workload, Kaggle clock) is the missing calibration point.
+
+- **Candidate B32 (10-27):** lineage, the replica protocol, V5/V6/B32 replica results (B32 77.4 Kaggle-clock, raw
+  79.1, 11.01 h), the realistic projection (~74, 80% range 67-80) and validation are in
+  `notes/2026-10-27_candidate_b32.md`; how to rebuild and re-run it: `kaggle/dsv41_tools/REPLICATE.md`.

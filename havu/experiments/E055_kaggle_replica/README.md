@@ -42,3 +42,8 @@ concurrency (no gate), random ids, no accuracy; complements, does not replace, t
 - New workload `toolkit/workloads/evalx2t_s2026_*`: copies under a seeded D8 + colour-permutation transform (no shared
   prefixes) for future replicas.
 - Solver bug found (fix-list S15): engine deaths used up job tries; fixed in solver a435ddf4.
+
+## Shared: B32 replica on Hugging Face (2026-10-27)
+Private dataset `livobereshka/arc-agi2-dsv41-e128-candb32-replica`: the complete `candBf_x2t` run (attempts, 346 traces,
+metrics, solver/server logs, submission), the `evalx2t_s2026` workload with solutions and idmap, the replica report, and
+the pinned code. Secret scan (incl. extracted traces) 0 hits before upload.

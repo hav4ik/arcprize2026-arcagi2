@@ -166,7 +166,21 @@ def check():
         sys.exit("kit check failed")
 
 
+def use_scheduler_v2():
+    """B+ variant: E051 overlay v2's offloading/scheduler.py (incremental update_offload_keys, 94b06f85; byte-level KV
+    parity passed on Vast 57929406) instead of v1's, written to kit_v2/ (kit/ stays candidate B's)."""
+    global OUT
+    FILES["vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py"] = (
+        ROOT / "experiments/E051_kv_offload/overlay_v2",
+        "94b06f850d3706d154d7d51b835e913af923cee1b5784bed0825c96ba489c8fa", None)
+    OUT = E056 / "kit_v2"
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true")
-    (check if ap.parse_args().check else build)()
+    ap.add_argument("--scheduler-v2", action="store_true", help="E051 overlay v2 scheduler, output kit_v2/")
+    args = ap.parse_args()
+    if args.scheduler_v2:
+        use_scheduler_v2()
+    (check if args.check else build)()

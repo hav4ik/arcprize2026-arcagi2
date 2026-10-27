@@ -1,0 +1,52 @@
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-10-26 07:04:42.178789936 -0700
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py	2026-10-26 23:52:02.605120655 -0700
+@@ -4,7 +4,7 @@
+ import time
+ from collections.abc import Iterable, Sequence
+ from dataclasses import dataclass, field
+-from itertools import chain, islice
++from itertools import chain
+ from typing import Any, NamedTuple
+ 
+ from vllm.config import VllmConfig
+@@ -507,22 +507,29 @@
+             )
+ 
+     def update_offload_keys(self) -> None:
++        # [dsv41-offload v2] Incremental: this runs for every scheduled request
++        # on every step. islice(block_hashes, start, ...) walks the list from
++        # index 0 to `start`, i.e. O(context) per call; on a 40k-token decode
++        # that was ~1.9 ms per step at 36 requests (bench_scheduler.py). Index
++        # the list directly instead: O(new hashes), and a bare length check on
++        # the steps that add no hash. block_hashes is an append-only list
++        # (Request.update_block_hashes extends it), so keys are identical.
++        block_hashes = self.req.block_hashes
++        num_hashes = len(block_hashes)
+         for group_config, group_state in zip(
+             self.config.kv_group_configs, self.group_states
+         ):
+             if group_config.skip:
+                 continue
+-            for req_block_hash in islice(
+-                self.req.block_hashes,
+-                group_config.hashes_per_chunk * len(group_state.offload_keys)
+-                + group_config.hashes_per_chunk
+-                - 1,
+-                None,
+-                group_config.hashes_per_chunk,
+-            ):
+-                group_state.offload_keys.append(
+-                    make_offload_key(req_block_hash, group_config.group_idx)
+-                )
++            step = group_config.hashes_per_chunk
++            start = step * len(group_state.offload_keys) + step - 1
++            if start >= num_hashes:
++                continue
++            group_idx = group_config.group_idx
++            group_state.offload_keys.extend(
++                make_offload_key(req_block_hash, group_idx)
++                for req_block_hash in block_hashes[start::step]
++            )
+ 
+     def update_block_id_groups(
+         self, new_block_id_groups: tuple[list[int], ...] | None

@@ -1,5 +1,7 @@
 # DeepSeek-V4.1 tool solver for Kaggle 4×L4 (E042 RW / E043 tool E128)
 
+Replicating candidate B32 end to end (artifacts, code, notebook build, local replica): see `REPLICATE.md`.
+
 Build with `.venv/bin/python kaggle/dsv41_tools/build.py` (add `--no-model` to leave model_sources empty). It writes:
 - `out/kit_ds/`: the dataset `chankhavu/dsv41-tools-kit`.
   - `dsv41_kit.tgz`: an exact snapshot of the harness files the solver imports (`evals/run_deepseek_tools.py` with E043's

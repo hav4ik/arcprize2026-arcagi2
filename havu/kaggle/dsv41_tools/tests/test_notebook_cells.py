@@ -3,6 +3,8 @@ live solver and harness, executed against a copy of the Kaggle kit of Version 5 
 1ad5ee24) in the commit / rerun x pass / fail cases (no Kaggle, no GPU). Ported from the 2026-10-26 deep audit
 (../tests_mtf_v6/test_notebook_cells.py, which read the built V6 notebook), plus the S10 regression tests."""
 import argparse
+import json
+import time
 import hashlib
 import importlib.util
 import io
@@ -269,4 +271,183 @@ class AllocConf(unittest.TestCase):
             self.assertEqual(os.environ["PYTORCH_CUDA_ALLOC_CONF"], "max_split_size_mb:512")
 
     def test_other_candidates_leave_it(self):
-        self.assertNotIn("PYTORCH_CUDA_ALLOC_CONF", B.settings_cell(A_NEXT))
+        self.assertNotIn("expandable_segments", B.settings_cell(A_NEXT))  # printed, never changed
+
+
+A_B = argparse.Namespace(**{**vars(A_NEXT), "workers": 56, "gate": 0.85, "effort": 0, "best_guess_at": 0.0,
+                            "best_guess_turns": 0, "post_pass_note": False}, admit_max_waiting=1, smoke_minutes=30,
+                         server_extra='["--kv-transfer-config", "{}"]')
+
+
+class CandidateBSmoke(unittest.TestCase):
+    """Candidate B: the S17 queue hold (ARC_ADMIT_MAX_WAITING) and the 30-min commit smoke (deadlines, environment
+    sampler, report cell); the competition rerun sees neither the smoke deadlines nor the sampler."""
+
+    def exec_settings(self, rerun, log):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("ARC_", "KAGGLE_"))}
+        env["ARC_SMOKE_ENV_LOG"] = str(log)
+        if rerun:
+            env["KAGGLE_IS_COMPETITION_RERUN"] = "1"
+        with patch.dict(os.environ, env, clear=True), redirect_stdout(io.StringIO()):
+            exec(compile(B.settings_cell(A_B), "cell00", "exec"), {})
+            return {k: v for k, v in os.environ.items() if k.startswith("ARC_")}
+
+    def test_queue_hold_setting_and_feature_check(self):
+        self.assertIn(("ARC_ADMIT_MAX_WAITING", "1"), B.opt_env(A_B))
+        self.assertIn("ARC_ADMIT_MAX_WAITING", B.opt_need(A_B)["solver_dsv41.py"])
+        self.assertIn("ADMIT_MAX_WAITING", C.SOLVER.read_text())
+
+    def test_commit_smoke_deadlines_and_sampler(self):
+        log = Path(tempfile.mkdtemp(prefix="smoke_", dir=C.SCRATCH)) / "smoke_env.jsonl"
+        env = self.exec_settings(False, log)
+        self.assertEqual([env[k] for k in ("ARC_STOP_NEW_S", "ARC_FORCE_AT_S", "ARC_HARD_STOP_S", "ARC_KILL_AT_S")],
+                         ["1500", "1620", "1680", "1770"])
+        self.assertEqual((env["ARC_COMMIT_MODE"], env["ARC_ADMIT_MAX_WAITING"]), ("smoke", "1"))
+        for _ in range(50):  # the sampler's first record is immediate
+            if log.exists() and log.read_text().strip():
+                break
+            time.sleep(0.1)
+        rec = json.loads(log.read_text().splitlines()[0])
+        self.assertTrue({"memory.current", "memory.max", "stat", "meminfo_kb", "gpu", "disk_free_gib"} <= set(rec))
+        out = io.StringIO()
+        with patch.dict(os.environ, {"ARC_SMOKE_ENV_LOG": str(log)}), redirect_stdout(out):
+            exec(compile(B.SMOKE_REPORT_CELL, "cell5", "exec"), {})
+        self.assertIn("smoke report: 1 samples", out.getvalue())
+        self.assertNotIn("smoke report failed", out.getvalue())
+
+    def test_report_cell_parses_samples(self):
+        log = Path(tempfile.mkdtemp(prefix="smoke_", dir=C.SCRATCH)) / "smoke_env.jsonl"
+        rec = lambda t, cur, draw: {"t": t, "memory.current": str(cur * 2**30), "memory.peak": str(150 * 2**30),
+                                    "memory.max": str(173 * 2**30), "memory.swap.current": "0",
+                                    "stat": {"anon": 40 * 2**30, "shmem": 107 * 2**30, "file": 20 * 2**30},
+                                    "meminfo_kb": {"MemTotal": 180 * 2**20, "MemAvailable": 30 * 2**20,
+                                                   "Shmem": 107 * 2**20, "Mlocked": 0},
+                                    "gpu": [f"0, {draw}, 50.00, 1500, 21000, 23034, 70"], "disk_free_gib": {"/tmp": 9.5}}
+        log.write_text(json.dumps(rec(0, 120, 48.1)) + "\n" + json.dumps(rec(60, 142, 50.2)) + "\n")
+        out = io.StringIO()
+        with patch.dict(os.environ, {"ARC_SMOKE_ENV_LOG": str(log)}), redirect_stdout(out):
+            exec(compile(B.SMOKE_REPORT_CELL, "cell5", "exec"), {})
+        o = out.getvalue()
+        self.assertIn("cgroup memory.max 173.0 GiB; peak memory.current 142.0 GiB; memory.peak 150.0 GiB", o)
+        self.assertIn("peak cgroup shmem 107.0 GiB", o)
+        self.assertIn("GPU 0: power limit 50.00 W, peak draw 50.2 W", o)
+        self.assertIn("lowest free disk (GiB): {'/tmp': 9.5}", o)
+
+    def test_rerun_has_no_smoke_deadlines(self):
+        log = Path(tempfile.mkdtemp(prefix="smoke_", dir=C.SCRATCH)) / "smoke_env.jsonl"
+        env = self.exec_settings(True, log)
+        for k in ("ARC_STOP_NEW_S", "ARC_FORCE_AT_S", "ARC_HARD_STOP_S", "ARC_KILL_AT_S", "ARC_COMMIT_MODE",
+                  "ARC_TASK_IDS"):
+            self.assertNotIn(k, env)
+        time.sleep(0.3)
+        self.assertFalse(log.exists())
+        out = io.StringIO()
+        with patch.dict(os.environ, {"KAGGLE_IS_COMPETITION_RERUN": "1", "ARC_SMOKE_ENV_LOG": str(log)}), \
+                redirect_stdout(out):
+            exec(compile(B.SMOKE_REPORT_CELL, "cell5", "exec"), {})
+        self.assertEqual(out.getvalue(), "")
+
+    def test_rerun_fallback_drops_queue_hold(self):
+        self.assertIn('"ARC_ADMIT_MAX_WAITING"):', B.code_cell(FILES, EXPECT)[0])
+
+
+class ImportGuard(unittest.TestCase):
+    """E055 incident: a pinned harness must not import names the Kaggle kit's helper modules lack."""
+
+    def test_pinned_candb_resolves(self):
+        files = {f"repo/evals/{n}": C.DSV41 / "pinned_candb" / n for n in ("run_deepseek_tools.py", "train_check.py",
+                                                                          "auto_repair.py")}
+        self.assertEqual(B.check_imports(files), [])
+
+    def test_unresolved_import_is_reported(self):
+        bad = Path(tempfile.mkdtemp(prefix="imp_", dir=C.SCRATCH)) / "run_deepseek_tools.py"
+        bad.write_text("from arc_harness.grid_image import build_image_prompt, no_such_helper\nimport json\n")
+        self.assertEqual(B.check_imports({"repo/evals/run_deepseek_tools.py": bad}),
+                         ["repo/evals/run_deepseek_tools.py: from arc_harness.grid_image import no_such_helper"])
+
+
+class PinsDataset(unittest.TestCase):
+    """--pins-dataset: the pinned files ride in a small private dataset and cell 0b is cells/cell0b_pins.py with only
+    its PINS data filled in (no base64, no generated code). Same checks and rerun fallback as the base64 cell."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="pins_", dir=C.SCRATCH))
+        self.files = dict(NEXT_FILES)
+        self.ds = self.root / "input" / "datasets" / "chankhavu" / "dsv41-pins-test"
+        self.archive_sha, self.sha = B.build_pins(self.files, self.ds, "dsv41-pins-test")
+        self.cell = B.pins_cell("dsv41-pins-test", self.archive_sha, self.sha, NEXT_EXPECT, NEXT_NEW, NEXT_NEED)
+
+    def run_pins(self, rerun, extra_env=None, cell=None):
+        kit = Path(tempfile.mkdtemp(prefix="kit_", dir=C.SCRATCH)) / "kit"
+        shutil.copytree(C.V3, kit)
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("ARC_", "KAGGLE_"))}
+        if rerun:
+            env["KAGGLE_IS_COMPETITION_RERUN"] = "1"
+        env.update(extra_env or {})
+        ns, out, err = {}, io.StringIO(), None
+        with patch.dict(os.environ, env, clear=True), redirect_stdout(out):
+            exec(compile(B.settings_cell(A_NEXT), "cell00", "exec"), ns)
+            import glob as _glob
+            ns.update(KIT=str(kit), MODE="submit", RERUN=rerun, INPUT=str(self.root / "input"),
+                      find_one=lambda p: (sorted(_glob.glob(p, recursive=True)) or [None])[0])
+            try:
+                exec(compile(cell or self.cell, "cell0b", "exec"), ns)
+            except RuntimeError as exc:
+                err = exc
+            final_env = {k: v for k, v in os.environ.items() if k.startswith("ARC_")}
+        return kit, out.getvalue(), err, final_env
+
+    def test_cell_is_the_template_plus_data(self):
+        self.assertNotIn("base64", self.cell)
+        template = B.PINS_CELL.read_text()
+        head, tail = template.split('"""__PINS__"""')
+        self.assertTrue(self.cell.startswith(head) and self.cell.endswith(tail))
+        self.assertEqual(sorted(p.name for p in self.ds.iterdir()), ["SHA256SUMS", "dataset-metadata.json",
+                                                                     "dsv41_pins.tgz"])
+        again, _ = B.build_pins(self.files, self.root / "rebuild", "dsv41-pins-test")
+        self.assertEqual(again, self.archive_sha)  # deterministic archive
+
+    def test_commit_ok_installs_pins(self):
+        kit, out, err, env = self.run_pins(rerun=False)
+        self.assertIsNone(err, out)
+        self.assertIn("E046 CHECK OK", out)
+        self.assertEqual({f: sha(kit / f) for f in self.sha}, {f: h[:8] for f, h in self.sha.items()})
+        self.assertEqual({f: sha(str(kit / f) + ".v3orig") for f in V3_SHA}, V3_SHA)
+        for f in NEXT_NEW:
+            self.assertFalse((kit / (f + ".v3orig")).exists())
+
+    def test_commit_wrong_archive_raises(self):
+        (self.ds / "dsv41_pins.tgz").write_bytes(b"not the build")
+        kit, out, err, env = self.run_pins(rerun=False)
+        self.assertIsInstance(err, RuntimeError)
+        self.assertIn("is not the build's archive", out)
+        self.assertEqual({f: sha(kit / f) for f in V3_SHA}, V3_SHA)  # nothing installed
+
+    def test_commit_wrong_setting_raises(self):
+        kit, out, err, env = self.run_pins(rerun=False, extra_env={"ARC_WORKERS": "7"})
+        self.assertIsInstance(err, RuntimeError)
+        self.assertIn("ARC_WORKERS='7'", out)
+
+    def test_rerun_missing_dataset_falls_back_cleanly(self):
+        shutil.rmtree(self.root / "input")
+        kit, out, err, env = self.run_pins(rerun=True)
+        self.assertIsNone(err)
+        self.assertIn("is not attached", out)
+        self.assertIn("E046 FALLBACK: the kit's v3 code, per pair, 36 workers", out)
+        self.assertNotIn("not restored", out)  # nothing was extracted, so nothing needed restoring
+        self.assertEqual({f: sha(kit / f) for f in V3_SHA}, V3_SHA)
+        self.assertEqual(env["ARC_WORKERS"], "36")
+        for k in ("ARC_MULTI_TEST", "ARC_AUTO_REPAIR", "ARC_POST_PASS_NOTE"):
+            self.assertNotIn(k, env)
+
+    def test_rerun_wrong_setting_restores_v3(self):
+        kit, out, err, env = self.run_pins(rerun=True, extra_env={"ARC_WORKERS": "7"})
+        self.assertIsNone(err)
+        self.assertIn("E046 FALLBACK", out)
+        self.assertEqual({f: sha(kit / f) for f in V3_SHA}, V3_SHA)
+        self.assertEqual(env["ARC_SERVER_EXTRA_ARGS"], B.V5_SERVER_EXTRA)
+
+    def test_fixed_checks_match_the_base64_cell(self):
+        cell, _ = B.code_cell(FILES, EXPECT)
+        for need in B.SOLVER_NEED + B.HARNESS_NEED + B.FALLBACK_DROP:
+            self.assertIn(f'"{need}"', cell)

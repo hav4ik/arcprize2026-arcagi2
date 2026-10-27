@@ -11,6 +11,7 @@ every task with the settings below.
 """
 import argparse
 import base64
+import gzip
 import hashlib
 import io
 import json
@@ -20,6 +21,44 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 V5 = HERE / "out/nb_submit_v4"  # submit Version 5's notebook (v3's cells + the v4 settings cell)
+KIT_TGZ = HERE / "kaggle_kit_v5/dsv41_kit.tgz"  # the kit dataset as Kaggle mounts it (Version 5's inputs)
+
+
+def check_imports(files, kit_tgz=KIT_TGZ):
+    """Build-time guard (E055, 2026-10-27: the live harness imported grid_image.deepseek_cell, which the Kaggle kit's
+    grid_image.py lacks, so every attempt would have failed on Kaggle; cell 0b checks features, not imports). Every
+    `from <local module> import <names>` in a pinned repo/evals file must resolve against what the notebook runs: the
+    pinned copy of that module if one is shipped, else the kit's. Returns the unresolved names."""
+    import ast
+    with tarfile.open(kit_tgz) as tf:
+        view = {m.name.removeprefix("./"): tf.extractfile(m).read().decode() for m in tf.getmembers()
+                if m.isfile() and m.name.endswith(".py")}
+    pinned = {arc: Path(src).read_text() for arc, src in files.items() if arc.endswith(".py")}
+    view.update(pinned)
+
+    def top_names(text):
+        names = set()
+        for n in ast.parse(text).body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(n.name)
+            elif isinstance(n, (ast.Assign, ast.AnnAssign)):
+                for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                    names |= {x.id for x in ast.walk(t) if isinstance(x, ast.Name)}
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                names |= {(a.asname or a.name).split(".")[0] for a in n.names}
+        return names
+    bad = []
+    for arc, text in pinned.items():
+        if not arc.startswith("repo/evals/"):
+            continue
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                mod = "repo/evals/" + node.module.replace(".", "/") + ".py"
+                if mod in view:  # a local module (not the standard library or site-packages)
+                    have = top_names(view[mod])
+                    bad += [f"{arc}: from {node.module} import {a.name}" for a in node.names
+                            if a.name != "*" and a.name not in have]
+    return bad
 
 
 
@@ -36,6 +75,8 @@ def opt_env(a):
         env.append(("ARC_BEST_GUESS_TURNS", str(g("best_guess_turns"))))
     if g("post_pass_note"):
         env.append(("ARC_POST_PASS_NOTE", "1"))
+    if g("admit_max_waiting"):
+        env.append(("ARC_ADMIT_MAX_WAITING", str(g("admit_max_waiting"))))
     return env
 
 
@@ -52,6 +93,8 @@ def opt_need(a):
         need.setdefault(solver, []).append("ARC_POST_PASS_NOTE")
     if g("effort"):
         need.setdefault(solver, []).append("ARC_REASONING_EFFORT")
+    if g("admit_max_waiting"):
+        need.setdefault(solver, []).append("ARC_ADMIT_MAX_WAITING")
     return need
 
 
@@ -67,6 +110,97 @@ V5_SERVER_EXTRA = json.dumps(["--linear-backend", "humming", "--compilation-conf
                               json.dumps({"cudagraph_mode": "FULL", "max_cudagraph_capture_size": 64})])
 
 
+def smoke_block(a):
+    """Commit runs only (`--smoke-minutes N`): deadlines that end the smoke within N minutes of the first cell (stop-new
+    N-5, force N-3, hard stop N-2, kill switch N-0.5 min), so model load, generation, the force cut and the final write
+    all run, and a background sampler of host memory (cgroup), GPU power / clocks / memory and free disk every 30 s
+    (ARC_SMOKE_ENV_LOG, read by the smoke report cell at the end)."""
+    n = getattr(a, "smoke_minutes", 0)
+    if not n:
+        return ""
+    dl = {"ARC_STOP_NEW_S": (n - 5) * 60, "ARC_FORCE_AT_S": (n - 3) * 60, "ARC_HARD_STOP_S": (n - 2) * 60,
+          "ARC_KILL_AT_S": int((n - 0.5) * 60)}
+    sets = "".join(f'    os.environ.setdefault("{k}", "{v}")\n' for k, v in dl.items())
+    return f'''    # smoke within {n} min of the first cell: model load, generation, force cut and final write all run
+{sets}    import shutil, subprocess, threading, time as _st
+    os.environ.setdefault("ARC_SMOKE_ENV_LOG", "/kaggle/working/smoke_env.jsonl")
+
+    def _smoke_env_sampler(path=os.environ["ARC_SMOKE_ENV_LOG"]):
+        def _rd(p):
+            try:
+                return open(p).read().strip()
+            except Exception:
+                return None
+        while True:
+            try:
+                rec = {{"t": round(_st.time(), 1)}}
+                for k in ("memory.current", "memory.peak", "memory.max", "memory.swap.current"):
+                    rec[k] = _rd(f"/sys/fs/cgroup/{{k}}")
+                rec["stat"] = {{l.split()[0]: int(l.split()[1]) for l in (_rd("/sys/fs/cgroup/memory.stat") or "").splitlines()
+                               if l.split()[:1] and l.split()[0] in ("anon", "file", "shmem", "unevictable", "file_mapped")}}
+                rec["meminfo_kb"] = {{l.split(":")[0]: int(l.split()[1]) for l in (_rd("/proc/meminfo") or "").splitlines()
+                                     if l.split(":")[0] in ("MemTotal", "MemAvailable", "Shmem", "Mlocked", "Cached")}}
+                try:
+                    rec["gpu"] = subprocess.run(["nvidia-smi", "--query-gpu=index,power.draw,power.limit,clocks.sm,"
+                                                 "memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"],
+                                                capture_output=True, text=True, timeout=20).stdout.strip().splitlines()
+                except Exception:
+                    rec["gpu"] = []
+                rec["disk_free_gib"] = {{d: round(shutil.disk_usage(d).free / 2**30, 1)
+                                        for d in ("/kaggle/working", "/kaggle/temp", "/kaggle/tmp", "/tmp", "/dev/shm")
+                                        if os.path.exists(d)}}
+                with open(path, "a") as f:
+                    f.write(json.dumps(rec) + "\\n")
+            except Exception:
+                pass
+            _st.sleep(30)
+    threading.Thread(target=_smoke_env_sampler, daemon=True).start()
+'''
+
+
+SMOKE_REPORT_CELL = '''# Cell 5 (smoke report, commit runs only): peaks of host memory (cgroup, the 173 GiB limit), GPU power / clocks /
+# memory / temperature and the lowest free disk, from the sampler started in the settings cell (every 30 s)
+import json, os
+if not os.environ.get("KAGGLE_IS_COMPETITION_RERUN") and os.environ.get("ARC_SMOKE_ENV_LOG"):
+    try:
+        _recs = [json.loads(l) for l in open(os.environ["ARC_SMOKE_ENV_LOG"]) if l.strip()]
+        _gib = lambda v: round(int(v) / 2**30, 1) if v not in (None, "", "max") and str(v).isdigit() else v
+        _mx = lambda xs: max([x for x in xs if isinstance(x, (int, float))], default=None)
+        print(f"smoke report: {len(_recs)} samples over {(_recs[-1]['t'] - _recs[0]['t']) / 60:.1f} min", flush=True)
+        print("  cgroup memory.max", _gib(_recs[-1].get("memory.max")), "GiB; peak memory.current",
+              _mx([_gib(r.get("memory.current")) for r in _recs]), "GiB; memory.peak", _gib(_recs[-1].get("memory.peak")),
+              "GiB; swap", _gib(_recs[-1].get("memory.swap.current")), flush=True)
+        for k in ("anon", "shmem", "file", "unevictable"):
+            print(f"  peak cgroup {k}", _mx([_gib(r.get("stat", {}).get(k)) for r in _recs]), "GiB", flush=True)
+        _mi = [r.get("meminfo_kb", {}) for r in _recs]
+        print("  host MemTotal", round(_mi[-1].get("MemTotal", 0) / 2**20, 1), "GiB; min MemAvailable",
+              round(min(m.get("MemAvailable", 0) for m in _mi) / 2**20, 1), "GiB; peak Shmem",
+              round(max(m.get("Shmem", 0) for m in _mi) / 2**20, 1), "GiB; peak Mlocked",
+              round(max(m.get("Mlocked", 0) for m in _mi) / 2**20, 1), "GiB", flush=True)
+        _g = {}
+        for r in _recs:
+            for line in r.get("gpu", []):
+                f = [x.strip() for x in line.split(",")]
+                if len(f) == 7:
+                    d = _g.setdefault(f[0], {"draw": [], "limit": f[2], "sm": [], "mem": [], "total": f[5], "temp": []})
+                    for k, i in (("draw", 1), ("sm", 3), ("mem", 4), ("temp", 6)):
+                        try:
+                            d[k].append(float(f[i]))
+                        except ValueError:
+                            pass
+        for i, d in sorted(_g.items()):
+            print(f"  GPU {i}: power limit {d['limit']} W, peak draw {_mx(d['draw'])} W, peak SM {_mx(d['sm'])} MHz, "
+                  f"peak memory {_mx(d['mem'])} / {d['total']} MiB, peak {_mx(d['temp'])} C", flush=True)
+        _df = {}
+        for r in _recs:
+            for k, v in r.get("disk_free_gib", {}).items():
+                _df[k] = min(_df.get(k, v), v)
+        print("  lowest free disk (GiB):", _df, flush=True)
+    except Exception as exc:
+        print("smoke report failed:", type(exc).__name__, exc, flush=True)
+'''
+
+
 def settings_cell(a):
     env = [("ARC_WORKERS", str(a.workers)), ("ARC_MULTI_TEST", "1"), ("ARC_MULTI_BUDGET", str(a.budget)),
            ("ARC_CONTEXT_LIMIT", "163840"), ("ARC_MAX_NUM_SEQS", "64"), ("ARC_GPU_UTIL", str(getattr(a, "util", 0.945)))]
@@ -75,7 +209,8 @@ def settings_cell(a):
     env += opt_env(a)
     pairs = ",\n               ".join(f'("{k}", "{v}")' for k, v in env)
     # E051: vLLM rejects a KV connector when PYTORCH_CUDA_ALLOC_CONF has expandable_segments (set by some images)
-    alloc_fix = ("_ac = [x for x in os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '').split(',') if x and 'expandable_segments' not in x]\n"
+    alloc_fix = ("print('PYTORCH_CUDA_ALLOC_CONF from the image:', repr(os.environ.get('PYTORCH_CUDA_ALLOC_CONF')), flush=True)\n"
+                 "_ac = [x for x in os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '').split(',') if x and 'expandable_segments' not in x]\n"
                  "os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ','.join(_ac)\n"
                  if "--kv-transfer-config" in getattr(a, "server_extra", "") else "")
     return f'''# Cell 00 (E046 frozen-input candidate): submit Version 5's settings (Humming dense, CUDA graphs <= 64, max-num-seqs
@@ -95,12 +230,62 @@ for _k, _v in ({pairs},
 if not os.environ.get("KAGGLE_IS_COMPETITION_RERUN"):
     os.environ.setdefault("ARC_COMMIT_MODE", "smoke")
     os.environ.setdefault("ARC_TASK_IDS", "25ff71a9,27a28665,00576224")
-print("E046 settings:", {{k: os.environ.get(k) for k in ("ARC_WORKERS", "ARC_MULTI_TEST", "ARC_MULTI_BUDGET",
+{smoke_block(a)}print("E046 settings:", {{k: os.environ.get(k) for k in ("ARC_WORKERS", "ARC_MULTI_TEST", "ARC_MULTI_BUDGET",
                                                      "ARC_CONTEXT_LIMIT", "ARC_KV_ADMIT_MAX", "ARC_MAX_NUM_SEQS", "ARC_GPU_UTIL",
                                                      "ARC_REASONING_EFFORT", "ARC_AUTO_REPAIR", "ARC_BEST_GUESS_AT",
-                                                     "ARC_BEST_GUESS_TURNS", "ARC_POST_PASS_NOTE",
-                                                     "ARC_SERVER_EXTRA_ARGS")}}, flush=True)
+                                                     "ARC_BEST_GUESS_TURNS", "ARC_POST_PASS_NOTE", "ARC_ADMIT_MAX_WAITING",
+                                                     "ARC_STOP_NEW_S", "ARC_FORCE_AT_S", "ARC_HARD_STOP_S", "ARC_KILL_AT_S",
+                                                     "ARC_SERVER_EXTRA_ARGS", "PYTORCH_CUDA_ALLOC_CONF")}}, flush=True)
 '''
+
+
+# Cell 0b's fixed feature checks (every candidate) and the settings its rerun fallback drops
+SOLVER_NEED = ["MULTI_TEST", "MULTI_BUDGET", "CONTEXT_LIMIT", "KV_ADMIT_MAX", "split_multi", "restart_allowed",
+               "shutdown_socket"]
+HARNESS_NEED = ["--multi-test", "--multi-budget", "--context-limit", "class ContextFull", "import builtins as _b",
+                "def answer_items", "def context_budget"]
+FALLBACK_DROP = ["ARC_MULTI_TEST", "ARC_MULTI_BUDGET", "ARC_KV_ADMIT_MAX", "ARC_CONTEXT_LIMIT", "ARC_AUTO_REPAIR",
+                 "ARC_BEST_GUESS_AT", "ARC_BEST_GUESS_TURNS", "ARC_POST_PASS_NOTE", "ARC_REASONING_EFFORT",
+                 "ARC_ADMIT_MAX_WAITING"]
+PINS_ARCHIVE = "dsv41_pins.tgz"
+PINS_CELL = HERE / "cells/cell0b_pins.py"
+PINS_MTIME = 1793059200  # 2026-10-27 00:00 UTC: fixed member mtime, so a rebuild gives the same archive
+
+
+def build_pins(files, out, slug, user="chankhavu"):
+    """The pins dataset folder for `kaggle datasets create -p out`: dsv41_pins.tgz (the pinned files at their kit
+    paths; deterministic: sorted members, fixed metadata, gzip mtime 0), SHA256SUMS and dataset-metadata.json.
+    Returns (archive sha256, {member: sha256})."""
+    out.mkdir(parents=True, exist_ok=True)
+    sha = {arc: hashlib.sha256(Path(src).read_bytes()).hexdigest() for arc, src in sorted(files.items())}
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+        for arc, src in sorted(files.items()):
+            data = Path(src).read_bytes()
+            info = tarfile.TarInfo(arc)
+            info.size, info.mtime, info.mode, info.uid, info.gid, info.uname, info.gname = (
+                len(data), PINS_MTIME, 0o644, 0, 0, "", "")
+            tf.addfile(info, io.BytesIO(data))
+    gz = io.BytesIO()
+    with gzip.GzipFile(fileobj=gz, mode="wb", mtime=0, filename="") as g:
+        g.write(raw.getvalue())
+    (out / PINS_ARCHIVE).write_bytes(gz.getvalue())
+    archive_sha = hashlib.sha256(gz.getvalue()).hexdigest()
+    (out / "SHA256SUMS").write_text(f"{archive_sha}  {PINS_ARCHIVE}\n"
+                                    + "".join(f"{h}  {arc}\n" for arc, h in sha.items()))
+    json.dump({"title": slug, "id": f"{user}/{slug}", "licenses": [{"name": "CC0-1.0"}]},
+              open(out / "dataset-metadata.json", "w"), indent=1)
+    return archive_sha, sha
+
+
+def pins_cell(slug, archive_sha, sha, expect, new=(), need=None):
+    """Cell 0b for a pins dataset: cells/cell0b_pins.py with its PINS data filled in (no code is generated)."""
+    pins = {"dataset": slug, "archive": PINS_ARCHIVE, "archive_sha": archive_sha, "sha": sha, "new": sorted(new),
+            "expect": expect, "solver_need": SOLVER_NEED, "harness_need": HARNESS_NEED, "opt_need": need or {},
+            "fallback_drop": FALLBACK_DROP, "fallback_server_extra": V5_SERVER_EXTRA}
+    text = PINS_CELL.read_text()
+    assert text.count('"""__PINS__"""') == 1
+    return text.replace('"""__PINS__"""', '"""' + json.dumps(pins, sort_keys=True) + '"""')
 
 
 def code_cell(files, expect, new=(), need=None):
@@ -173,7 +358,8 @@ if MODE != "fallback":
                     _kept.append(f"{{_f}} ({{type(exc).__name__}})")
             # (a kept pinned solver would pass the opt-in harness flags to the v3 harness, whose parser exits)
             for _k in ("ARC_MULTI_TEST", "ARC_MULTI_BUDGET", "ARC_KV_ADMIT_MAX", "ARC_CONTEXT_LIMIT", "ARC_AUTO_REPAIR",
-                       "ARC_BEST_GUESS_AT", "ARC_BEST_GUESS_TURNS", "ARC_POST_PASS_NOTE", "ARC_REASONING_EFFORT"):
+                       "ARC_BEST_GUESS_AT", "ARC_BEST_GUESS_TURNS", "ARC_POST_PASS_NOTE", "ARC_REASONING_EFFORT",
+                       "ARC_ADMIT_MAX_WAITING"):
                 os.environ.pop(_k, None)
             os.environ["ARC_WORKERS"] = "36"
             os.environ["ARC_SERVER_EXTRA_ARGS"] = {json.dumps(V5_SERVER_EXTRA)}  # no flag that needs the new overlay
@@ -192,6 +378,7 @@ def main():
     ap.add_argument("--gate", type=float, default=0.0)
     ap.add_argument("--solver", type=Path, default=HERE / "solver_dsv41.py")
     ap.add_argument("--harness", type=Path, default=ROOT / "evals/run_deepseek_tools.py")
+    ap.add_argument("--train-check", type=Path, help="pin repo/evals/train_check.py (default: the kit's)")
     ap.add_argument("--retention", type=int, default=0, help="--prefix-cache-retention-interval (0: the base 128)")
     ap.add_argument("--util", type=float, default=0.945, help="ARC_GPU_UTIL (V5/V6: 0.945)")
     ap.add_argument("--effort", type=int, default=0, help="ARC_REASONING_EFFORT (0: the solver's 50)")
@@ -201,6 +388,12 @@ def main():
     ap.add_argument("--post-pass-note", action="store_true", help="ARC_POST_PASS_NOTE=1 (I8)")
     ap.add_argument("--overlay", type=Path, help="dir with a replacement vllm_overlay_rw.tgz + .sha256 (cell 2 installs it)")
     ap.add_argument("--server-extra", default="", help="JSON list of extra vLLM server flags (appended)")
+    ap.add_argument("--admit-max-waiting", type=int, default=0, help="ARC_ADMIT_MAX_WAITING (S17: gate holds while "
+                    "the server has >= N waiting requests)")
+    ap.add_argument("--smoke-minutes", type=int, default=0, help="commit-run smoke ends within N min (deadlines + "
+                    "environment sampler + report cell); 0: Version 5's smoke deadlines")
+    ap.add_argument("--pins-dataset", default="", help="ship the pinned files as this private dataset (folder written to "
+                    "out/pins_<slug>/ for `kaggle datasets create`) instead of base64 inside cell 0b")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args()
     nb = json.load(open(V5 / "dsv41-tools-submit.ipynb"))
@@ -215,22 +408,37 @@ def main():
         expect["ARC_GPU_UTIL"] = str(a.util)
     files = {"solver_dsv41.py": a.solver, "repo/evals/run_deepseek_tools.py": a.harness}
     new, need = [], opt_need(a)
-    if a.auto_repair:
+    if a.train_check:  # pin train_check.py too (the kit's is 44c4d210; pods run 8fe36175); the fallback restores it
+        files["repo/evals/train_check.py"] = a.train_check
+    if a.auto_repair:  # taken from the pinned harness's folder when it has them, else the live evals/
         for name in ("auto_repair.py", "auto_repair_names.json"):
-            files[f"repo/evals/{name}"] = ROOT / "evals" / name
+            src = a.harness.parent / name
+            files[f"repo/evals/{name}"] = src if src.exists() else ROOT / "evals" / name
             new.append(f"repo/evals/{name}")
     if a.overlay:  # replaces the kit's overlay pair; cell 2 sha-checks every file it installs; the fallback restores the kit's
         for name in ("vllm_overlay_rw.tgz", "vllm_overlay_rw.sha256"):
             files[name] = a.overlay / name
     json.loads(a.server_extra or "[]")  # fail at build time on a malformed list
-    cell0b, sha = code_cell(files, expect, new, need)
+    bad = check_imports(files)
+    assert not bad, f"pinned files import names the notebook would not have: {bad}"
+    if a.pins_dataset:
+        archive_sha, sha = build_pins(files, HERE / f"out/pins_{a.pins_dataset}", a.pins_dataset)
+        cell0b = pins_cell(a.pins_dataset, archive_sha, sha, expect, new, need)
+    else:
+        cell0b, sha = code_cell(files, expect, new, need)
     nb["cells"][0]["source"] = settings_cell(a).splitlines(keepends=True)
     nb["cells"].insert(2, {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
                            "source": cell0b.splitlines(keepends=True)})
+    if a.smoke_minutes:
+        assert a.smoke_minutes >= 20, "the model alone takes ~15 min to load on Kaggle"
+        nb["cells"].append({"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
+                            "source": SMOKE_REPORT_CELL.splitlines(keepends=True)})
     out = a.out or HERE / f"out/nb_{a.slug}"
     out.mkdir(parents=True, exist_ok=True)
     json.dump(nb, open(out / f"{a.slug}.ipynb", "w"), indent=1, ensure_ascii=False)
     meta.update(id=f"chankhavu/{a.slug}", title=a.slug, code_file=f"{a.slug}.ipynb")
+    if a.pins_dataset:
+        meta["dataset_sources"] = list(meta["dataset_sources"]) + [f"chankhavu/{a.pins_dataset}"]
     meta.pop("id_no", None)
     json.dump(meta, open(out / "kernel-metadata.json", "w"), indent=1)
     print(out, {k: meta[k] for k in ("dataset_sources", "model_sources", "kernel_sources", "is_private")},
