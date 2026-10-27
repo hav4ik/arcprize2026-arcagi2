@@ -7,7 +7,7 @@ hold, 32 GiB KV CPU offload, fork PR #156 indexer skip, prefix-cache retention 5
 `notes/2026-10-27_candidate_b32.md`; rebuild and re-run: `kaggle/dsv41_tools/REPLICATE.md`.
 
 Status as of 2026-10-27 10:15 PDT: stages 0-5 passed (restart test on L4 PASS; 16 GiB twin on 4090 pending); stage 6
-(Kaggle smoke of Version 2) running; stage 7 calibration pending.
+(Kaggle smoke of Version 2) PASSED; stage 7 calibration pending.
 
 ## Stage 0. Frozen code
 | item | value |
@@ -76,13 +76,13 @@ full data: HF `livobereshka/arc-agi2-dsv41-e128-candb32-replica`.
 | run | what | result |
 |---|---|---|
 | Version 1 (B16, 2026-10-27 06:20 UTC, ~21 min, ~0.75 h quota) | 3 tasks; 30-min deadlines; memory/GPU/disk report | PASS: hashes, overlay, KV 1,554,183, offload line, 6/6 pairs, valid submission; host anon 10.8 + shmem 106.9 GiB at start vs 173 GiB; GPUs 72 W; allocator unset; /kaggle/working 19.5 GiB free (`kaggle_smoke_v1/`) |
-| **Version 2 (B32, the notebook to submit, 16:58 UTC, ≤ ~42 min, ≤ ~1.4 h quota)** | input integrity (136 model files sha256, wheels, kit, competition files); 56-session sandbox check; 24 tasks with the GPU KV pool cut to ~333k tokens (evictions, host restores, preemption, gate, queue hold); force cut and final write; memory/GPU/disk/sandbox report and coverage line | running (`kaggle_smoke_v2_b32/`) |
+| **Version 2 (B32, the notebook to submit, 2026-10-27 17:03-17:49 UTC, ~46 min, ~1.5 h quota)** | input integrity; 56-session sandbox check; 24 tasks with the GPU KV pool cut to 333,309 tokens; final write; report | **PASS**: E046 CHECK OK (7 frozen hashes, 16-file overlay); **INPUT INTEGRITY OK: all 136 model files (131.1 GB) match their sha256, all 198 wheels match SHA256SUMS, 6 competition files parse** (model hashed in 2.2 min after server up); SANDBOX CHECK OK (56 sessions in 2 s, 3.13 GiB; 6 GiB allocation blocked; runaway cell timed out and recovered; nothing left after close); server up after 585 s; 48/48 attempts submitted, all train-pass; 105,766 tokens restored from host (offload load path ran); KV max 0.41, so no preemption or gate hold (tasks too small; both covered by the L4 replica); all attempts finished before stop-new, so no force cut (covered by the replica); final write, submission valid. Host: anon 12.9 + shared 122.9 GiB peak vs 173 GiB (32 GiB pool), min MemAvailable 46.6 GiB; GPUs 72 W, 2,040 MHz; sandboxes peak 56 processes / 4.62 GiB RSS; /kaggle/working 19.5 GiB free (`kaggle_smoke_v2_b32/`) |
 
 ## Stage 7. Score estimate
 Kaggle-clock replica 77.4. Calibration: V5's replica 57.6 vs LB 58.19; V6's replica (running on wd44, Kaggle-clock point
 ~12:50 PDT) projects to ~52-56 vs LB 61.94. Realistic projection ~74 (80% range 67-80); see the notes file.
 
 ## Sign-off
-- [ ] Version 2 smoke passed (integrity OK, sandbox OK, coverage shows host restores and preemptions, valid submission)
+- [x] Version 2 smoke passed (integrity OK, sandbox OK, host restores ran, valid submission; preemption and force cut covered by the L4 replica)
 - [x] E059 restart test passed on L4 with 32 GiB (restart peak 1.05x steady); 16 GiB twin on 4090 pending
 - [ ] User approves the submission

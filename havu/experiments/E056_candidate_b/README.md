@@ -360,3 +360,6 @@ Output: `kaggle_smoke_v1/` (kernel log, `kernel_log.txt`, dsv41_logs, smoke_env.
   another cause).
 - **Disk:** /kaggle/working 19.5 GiB free, /tmp 1,041 GiB, /dev/shm 85.5 GiB.
 - Benign, also in earlier Kaggle runs: "Error in sitecustomize ... No module named 'wrapt'".
+
+## Kaggle smoke of B32 (Version 2, 2026-10-27 17:03-17:49 UTC): PASS
+Built with `--smoke-minutes 40 --smoke-stress --smoke-integrity`. Input integrity OK (136 model files sha256, 198 wheels, competition files), sandbox check OK, server up 585 s, 48/48 attempts submitted, host restores ran, final write valid. Host peak anon 12.9 + shared 122.9 GiB vs 173 GiB. Details: `TESTING_B32.md` stage 6; output in `kaggle_smoke_v2_b32/`.
