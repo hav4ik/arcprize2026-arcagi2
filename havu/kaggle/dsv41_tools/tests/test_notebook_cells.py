@@ -232,3 +232,41 @@ class NextCandidate(unittest.TestCase):
                   "ARC_POST_PASS_NOTE", "ARC_MULTI_TEST"):
             self.assertNotIn(k, env)
         self.assertEqual(env["ARC_WORKERS"], "36")
+
+
+class OverlayAndServerExtra(unittest.TestCase):
+    """--overlay ships a replacement kit overlay pair; --server-extra adds server flags; the rerun fallback restores the
+    kit's overlay and Version 5's server flags (so the stock connector never sees --kv-transfer-config)."""
+    E054 = C.ROOT / "experiments/E054_exact_cherrypicks/kit"
+
+    def test_server_extra_in_settings(self):
+        a = argparse.Namespace(**vars(A_NEXT), server_extra='["--kv-transfer-config", "{}"]')
+        self.assertIn('"--kv-transfer-config", "{}"', B.settings_cell(a))
+
+    def test_overlay_commit_and_rerun_fallback(self):
+        if not (self.E054 / "vllm_overlay_rw.tgz").exists():
+            self.skipTest("E054 overlay not built")
+        files = dict(FILES, **{n: self.E054 / n for n in ("vllm_overlay_rw.tgz", "vllm_overlay_rw.sha256")})
+        cell0b, _ = B.code_cell(files, EXPECT)
+        kit, out, err, env = run_cells(rerun=False, cell0b=cell0b)
+        self.assertIsNone(err, out)
+        self.assertEqual(sha(kit / "vllm_overlay_rw.tgz"), sha(self.E054 / "vllm_overlay_rw.tgz"))
+        orig = sha(C.V3 / "vllm_overlay_rw.tgz")
+        kit, out, err, env = run_cells(rerun=True, cell0b=cell0b, extra_env={"ARC_WORKERS": "7",
+                                       "ARC_SERVER_EXTRA_ARGS": '["--kv-transfer-config", "{}"]'})
+        self.assertIn("E046 FALLBACK", out)
+        self.assertEqual(sha(kit / "vllm_overlay_rw.tgz"), orig)
+        self.assertNotIn("kv-transfer-config", env["ARC_SERVER_EXTRA_ARGS"])
+        self.assertEqual(env["ARC_SERVER_EXTRA_ARGS"], B.V5_SERVER_EXTRA)
+
+
+class AllocConf(unittest.TestCase):
+    def test_offload_candidate_strips_expandable_segments(self):
+        a = argparse.Namespace(**vars(A_NEXT), server_extra='["--kv-transfer-config", "{}"]')
+        ns = {}
+        with patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:512"}, clear=True):
+            exec(compile(B.settings_cell(a), "cell00", "exec"), ns)
+            self.assertEqual(os.environ["PYTORCH_CUDA_ALLOC_CONF"], "max_split_size_mb:512")
+
+    def test_other_candidates_leave_it(self):
+        self.assertNotIn("PYTORCH_CUDA_ALLOC_CONF", B.settings_cell(A_NEXT))

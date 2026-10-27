@@ -1,0 +1,12 @@
+#!/bin/bash
+# E055 candidate B replica: the next candidate + E051 KV CPU offload (28 GiB private pinned, checkpoint SWA policy) at x56 +
+# KV gate 0.85, on eval x2 (240 tasks / 344 pairs) with Kaggle default deadlines; offload venv /root/dsv41/venv_offload
+N=candB_x2
+/root/podrun.sh $N ARC_VENV=/root/dsv41/venv_offload PATH=/root/dsv41/venv_offload/bin:/usr/local/cuda-13.0/bin:/usr/local/bin:/usr/bin:/bin \
+  ARC_CHALLENGES=/root/data/eval_x2_challenges.json ARC_SOLUTIONS=/root/data/eval_x2_solutions.json \
+  ARC_WORKERS=56 ARC_MULTI_TEST=1 ARC_MULTI_BUDGET=0.5 ARC_CONTEXT_LIMIT=163840 ARC_GPU_UTIL=0.938 \
+  ARC_MAX_NUM_SEQS=64 ARC_KV_ADMIT_MAX=0.85 ARC_KV_ADMIT_MIN_WORKERS=16 ARC_AUTO_REPAIR=1 ARC_CACHE_SALT=${N}_$(date -u +%H%M%S) \
+  'ARC_SERVER_EXTRA_ARGS=["--linear-backend", "humming", "--compilation-config", "{\"cudagraph_mode\": \"FULL\", \"max_cudagraph_capture_size\": 64}", "--prefix-cache-retention-interval", "512", "--kv-transfer-config", "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":30064771072,\"offload_prompt_only\":false,\"swa_store_policy\":\"checkpoint\",\"shared_region\":false,\"eviction_policy\":\"lru\"}}"]'
+sleep 2
+setsid nohup /root/memlog.sh /root/runs/$N/mem.log > /dev/null 2>&1 < /dev/null &
+echo "memlog started"

@@ -97,10 +97,16 @@ async def slot(session, a, i, shapes, t0, st):
 
     while not st["stop"]:
         if first:
-            att = rng.choices(shapes, weights=w_att)[0]
-            k = rng.choices(range(len(att["turns"])), weights=[c for c, _ in att["turns"]])[0]
-            u = rng.randrange(att["turns"][k][0])  # tokens of the current completion already generated
-            hist = rand_tokens(rng, att["p0"] + sum(c + r for c, r in att["turns"][:k]) + u)
+            for _try in range(1000):  # E055 (dsv4-infer): a start point whose history is >= --min-start-ctx tokens
+                att = rng.choices(shapes, weights=w_att)[0]
+                k = rng.choices(range(len(att["turns"])), weights=[c for c, _ in att["turns"]])[0]
+                u = rng.randrange(att["turns"][k][0])  # tokens of the current completion already generated
+                n0 = att["p0"] + sum(c + r for c, r in att["turns"][:k]) + u
+                if n0 >= a.min_start_ctx:
+                    break
+            else:
+                st["start_below_min"] += 1
+            hist = rand_tokens(rng, n0)
         else:
             att, k, u = rng.choice(shapes), 0, 0
             hist = rand_tokens(rng, att["p0"])
@@ -127,7 +133,13 @@ async def slot(session, a, i, shapes, t0, st):
 
 async def run(a):
     shapes = json.load(open(a.shapes))
-    st = {"stop": False, "ev": [], "turns": [], "first": {}, "attempts_done": 0, "pending": set()}
+    if a.scale != 1.0:  # heavier contexts (hidden-set calibration): every prompt, completion and tool-result length x scale
+        shapes = [{"p0": int(s["p0"] * a.scale), "turns": [[max(1, int(c * a.scale)), int(r * a.scale)]
+                                                            for c, r in s["turns"]]} for s in shapes]
+    if a.tail_frac < 1.0:  # E055 (dsv4-infer): late-run mix = the heaviest attempts only (by total context)
+        size = lambda s: s["p0"] + sum(c + r for c, r in s["turns"])
+        shapes = sorted(shapes, key=size, reverse=True)[:max(1, int(len(shapes) * a.tail_frac + 0.999))]
+    st = {"stop": False, "ev": [], "turns": [], "first": {}, "attempts_done": 0, "pending": set(), "start_below_min": 0}
     timeout = aiohttp.ClientTimeout(total=None, sock_read=a.sock_read)
     async with aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(limit=0)) as session:
         t0 = time.perf_counter()
@@ -193,7 +205,8 @@ async def run(a):
         if ndelay else None,
     }
     out = {
-        "mode": "tool_replay", "shapes": a.shapes, "conc": a.conc, "tool_delay_s": a.tool_delay,
+        "mode": "tool_replay", "shapes": a.shapes, "conc": a.conc, "tool_delay_s": a.tool_delay, "scale": a.scale,
+        "tail_frac": a.tail_frac, "min_start_ctx": a.min_start_ctx, "start_below_min": st["start_below_min"],
         "setup_s": round(t_setup, 1), "slots_started_at_setup": started, "drain_s": round(t_drain - t_setup, 1), "window_s": round(w1 - w0, 1),
         "gen_tok_s": round(gen / (w1 - w0), 1),
         "gen_tok_s_metrics": round(d.get("vllm:generation_tokens_total", 0) / (w1 - w0), 1),
@@ -228,6 +241,9 @@ def main():
     p.add_argument("--sock-read", type=float, default=14400)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-wall-s", type=float, default=0, help="cap on setup + warm-up + window (0: none)")
+    p.add_argument("--scale", type=float, default=1.0, help="scale all shape lengths (heavier contexts)")
+    p.add_argument("--tail-frac", type=float, default=1.0, help="E055: draw attempts from the heaviest fraction only")
+    p.add_argument("--min-start-ctx", type=int, default=0, help="E055: first turn of each slot starts at >= this history")
     p.add_argument("--json")
     asyncio.run(run(p.parse_args()))
 

@@ -1,7 +1,9 @@
 # E054: two exact vLLM cherry-picks for the DSv4.1 Kaggle stack (fork PR #156 part 1, upstream #58678)
 
-Status: **prepared, CPU checks pass (18/18); the GPU plan is ready and has not been run.** (2026-10-26, CPU only: no ssh,
-no Kaggle, no paid API.)
+Status: **GPU plan run on Vast 4x4090 box 2 (57817226), 2026-10-26 22:45 - 10-27 02:37 UTC. #156: GO (exact, decode
+step -5.7% / -6.5% at B = 36 / 48). #58678: NO-GO by the pre-registered gate (decode -2.4% at B = 48 against a -2%
+limit; not bit-identical under Humming), REVIEW at best; its memory gate passes (+9.9% Kaggle KV).** Results and caveats:
+§6. (CPU prep 2026-10-26: 18/18 checks.)
 
 These are the first two items of E053's cherry-pick list (`experiments/E053_vllm_upgrade/README.md` §4-5). Both ship as
 Python/Triton overlay files, each with its own environment kill switch:
@@ -400,6 +402,188 @@ If everything else passes but the layer test shows differences, the verdict is *
 - A GO on the box is necessary, not sufficient. The L4 pod soak and the 120-task accuracy A/B (E053 day plan,
   10-28..10-30; OLD run twice for the noise band) decide whether the change ships.
 
+## 6. GPU results (Vast 4x RTX 4090 box 2, 57817226; 2026-10-26 22:45 - 10-27 02:37 UTC)
+
+Everything is in `results/` (copied from `/root/e054/` on the box; scanned for `hf_` tokens, none found).
+`results/report.json` is `gpu/report_e054.py`'s output. Its `go` flags are **false for both items, and two of the
+reasons are test artifacts** (see "Gate artifacts" below). The verdicts here apply the pre-registered criteria to the
+corrected readings.
+
+### How it was run (deviations from §5)
+
+- **Venv.** The plan ran in a copy, `/root/dsv41/venv_e054` (`cp -a`, all 53 `bin/` shebangs rewritten to the copy,
+  `activate` fixed). `import vllm` and the `vllm` entry script both resolve to the copy. The E054 backups are in
+  `venv_e054/e054_backup/`. The original `/root/dsv41/venv` was checked before and after: its 12 overlay files match
+  the kit sha list (`377d83e0`), and `install_e054.sh --status` reports `kit` for both targets. The copy is left on the
+  box for later runs (7.9 GB).
+- **Step driver.** `/root/e054/step.sh NAME run_plan-args`, with `VENV=/root/dsv41/venv_e054` and the CUDA 13 env of
+  `serve_e054.sh`. Logs and exit codes are in `results/logs/`.
+- **Replay shapes.** The first `arm old` crashed in `tool_replay.py` within seconds. `SHAPES` points at E043's raw
+  `tool_shapes_*.json` (`{summary, attempts}`), which the replay cannot read; E051 hit the same bug. The rerun used the
+  converted file `E042 metadata/trace_shapes/tools_e043_e128t.json`, passed as `SHAPES=` with no script edits. That file
+  matches all 334 raw attempts (`p0` and per-turn completions). The failed attempt's startup, probe and decode data are
+  kept as `results/old_try1/`, a second OLD server sample.
+- **Replay windows are 600 s, not 1,500 s.** Setup takes 860-900 s on the 4090 (36-48 cold histories at about 1.2K
+  tok/s), so the 1,800-s wall cap leaves 300 s of warm-up and a 600-s window. At C = 48 the setup itself hit the
+  replay's 900-s cap with 42 of 48 slots started, so that window is still partly setup.
+- **Decode B = 36 was cold in every arm**, not a prefix hit (prefill 517-536 s). It is still the same work in each arm.
+
+### (a) #156 kernel A/B (`results/kernel/indexer_ab.{json,log}`, GPU 0, 179 s)
+
+- **Exact.** On all 74 cases (dense decode rows 36/40/48/64 x widths 81,920/163,840 x contexts 8K-full and mix;
+  candidates; 5 eager widths; 2 prefill chunks; the program-count sweep):
+  - OLD is self-deterministic.
+  - NEW == OLD **bitwise on the whole logits buffer**, eager and under CUDA-graph replay (graphs captured with
+    `row_ends = 1`, replayed with the real contexts).
+  - The `torch.topk` top-512 sets are identical, and the kill switch (`DSV41_INDEXER_SKIP=0`) == OLD.
+- **The script's `all_ok` is false** because of 3 cases (`dense_r36_w81920_full`, `dense_r48_w81920_65536`,
+  `dense_r48_w163840_32768`). In each, only `persistent_topk_identical` fails, and their logits are bit-identical.
+  `results/diag/topk_selfcheck.py` shows that the production `torch.ops._C.persistent_topk` is **not deterministic
+  against itself on one fixed OLD buffer**:
+  - over 8 reps, OLD-vs-OLD sets differ;
+  - every differing index is a tie at the 512th value (511 values above it, 2 candidates for the last slot);
+  - the value multisets are identical.
+
+  Identical inputs cannot make a deterministic op disagree, so these differences belong to the top-k op, not the
+  kernel. It is also one plausible source of the stack's server-level nondeterminism.
+- **Speed** (µs per call under graph replay, q predecode on):
+
+  | context | 8K | 32K | 64K | 128K | full | mix | candidates (16,384) |
+  |---|---|---|---|---|---|---|---|
+  | speedup, dense 81,920 / 163,840 | 11-15x / 13-16x | 4.5-4.8x / 4.3-4.6x | 2.5-2.7x / 2.4-2.7x | 1.4-1.6x | 1.24-1.36x | 1.8-2.6x | 1.07-1.16x |
+
+  - Indexer time per step for the mix (3 x 81,920 + 1 x 163,840 + 4 x candidates): 36 rows 4.96 -> 2.92 ms, 48 rows
+    7.24 -> 3.93 ms, 64 rows 9.66 -> 5.25 ms.
+  - Prefill: the 1 x 30K chunk is 1.12x faster; 2 x 60K is 2.16x.
+  - Tiny eager widths (1-4,097) are 0-4% slower: about 3 µs of launch overhead on calls of about 75 µs.
+  - Program-count sweep (4,096-32,768): bit-identical everywhere. 8,192 is at most 5% better than the default 16,384 on
+    the 4090; tune it on L4.
+
+### (c1) #58678 layer A/B (`results/kernel/engram_wkv_ab*.json`; `results/diag/wkv_ulp.*`)
+
+- **Not bit-identical under Humming**, the production `--linear-backend humming`:
+  - full (N = 25,600) vs 4 concatenated shards (N = 6,400) differ in about 41% of `wkv` outputs at T <= 512 and 3.8% at
+    T = 2,048;
+  - the Engram output differs in 40-50% (T <= 512) and 8.5% (T = 2,048).
+- **Size of the difference.** `wkv` |diff| is at most 4-8 on values up to about 1,264, i.e. one bf16 ulp at the top of
+  the range. Near-zero outputs that cross sign give large ulp distances but tiny absolute errors.
+- **Accuracy against an fp64 reference** (`x @ dequant(W)^T`) is the same class for both:
+  - mean error at T = 1-64: OLD 1.10-1.27 ulp, NEW 0.97-1.21;
+  - correctly rounded: OLD 61-62%, NEW 62-65%.
+  - At T = 512, OLD's full GEMM happens to use a more accurate config (97% correctly rounded vs NEW's 61%). At T = 2,048
+    both are about 97-98%.
+
+  This is accumulation-order rounding, not a wrong-column bug.
+- **Humming is not self-deterministic.** The full GEMM at T = 512 changes 2.3% of its outputs between two calls, and the
+  shards at T = 2,048 do too. So OLD `wkv` already carries run-to-run noise of this kind.
+- **The Ada kernel** (`--backend auto`, informational) is bit-identical for every T tested (1, 36, 48, 64, 2,048). It
+  is 1.2-4x slower than Humming.
+- **Measured saving: 243,302,400 B per GPU**, exactly as predicted.
+- **GEMM time:** full 176-193 µs vs shard 51-59 µs (T = 1-64); 4.14 ms vs 1.10 ms (T = 2,048).
+
+### (b, c2, c3) server arms (`results/{old,old_try1,idx,both}/`)
+
+All four arms ran with the pool pinned to 21,490 blocks (1,591,736 KV tokens), FULL graphs, util 0.92, and a separate
+`VLLM_CACHE_ROOT`. The arm lines in the logs confirm the switches (`old`/`old_try1`: skip off, `ReplicatedLinear`;
+`idx`: skip on, `ReplicatedLinear`; `both`: skip on, `ColumnParallelLinear 6400 of 25600`). No arm logged a traceback
+while serving. The one traceback in `both/server.log` is the `EngineDeadError` raised after `stop_server`'s SIGTERM,
+with 48 requests in flight.
+
+**Decode windows** (`decode_window.py`, contexts 8-40K, 60-s window):
+
+| arm | B=48 tok/s | B=48 step ms | B=48 cold prefill tok/s | B=36 tok/s | B=36 step ms | B=36 cold prefill tok/s |
+|---|---|---|---|---|---|---|
+| old_try1 | 904.8 | 53.0 | 1,754 | 752.4 | 47.8 | 1,781 |
+| old | 910.4 | 52.7 | 1,778 | 757.8 | 47.5 | 1,793 |
+| idx (#156) | 974.4 | 49.3 | 1,767 | 803.4 | 44.8 | 1,781 |
+| both (#156 + #58678) | 951.2 | 50.4 | 1,716 | 789.0 | 45.6 | 1,729 |
+
+- OLD's server-to-server spread is 0.6% on decode and 1.4% on prefill.
+- **#156 (idx vs old):** the step is 6.5% faster at B = 48 and 5.7% faster at B = 36 (7.0% / 6.3% against `old_try1`).
+  Decode is +7.0% / +6.0%, and cold prefill is unchanged (-0.6% / -0.7%, inside the spread). The step saves 3.4 / 2.7
+  ms, against 3.3 / 2.0 ms predicted from the kernel A/B.
+- **#58678 (both vs idx):** decode is -2.38% at B = 48 (the gate is >= -2%: **fail by 0.4 pp**) and -1.79% at B = 36
+  (pass). Cold prefill is -2.87% (the gate is >= -3%: pass, narrowly). The step costs +0.8-1.1 ms: the two extra
+  all-gathers cost more than the 4x smaller GEMMs save, even on the 4090's PCIe Gen4. On Kaggle's Gen3 shared-memory
+  all-reduce (about 4.9 GB/s) the cost is likely larger.
+- **Startup gate old -> both** (`startup_report.py --gate`):
+  - weights -0.23 GiB per GPU;
+  - KV budget +0.227 GiB = **+9.9% of Kaggle's KV** (projected 23,625 blocks, 1,708,621 tokens);
+  - peak activation +0.01 GiB;
+  - 113,157 B per extra profiled block (113,920 expected), so the page geometry is unchanged.
+
+  Every check passes except `no_tracebacks`, which counts the shutdown traceback above.
+- idx's memory and KV are identical to old's.
+
+**Logprob probe** (5 prompts x 3 cold repeats per arm; `results/diag/probe_noise.{py,json}`):
+- **The pre-registered `d_lp0 <= 0.5` check cannot pass on this stack.** It scores a token present in one run's top-5
+  but not the other's as -30, so any change in top-5 membership reads as about 27 nats. Even pairs from the same OLD
+  server have a median of 26.7, and old vs old_try1 fails it.
+- `probe_noise.py` compares token 0 on the top-5 intersection instead, with every arm judged against the OLD-vs-OLD
+  (two servers) floor:
+
+  | pair | first-divergence median | mean \|d lp\| median | token-0 \|d lp\| median / max | argmax0 same |
+  |---|---|---|---|---|
+  | floor: old vs old_try1 | 7 | 0.042 | 0.366 / 1.22 | 4/5 |
+  | old vs idx | 6 | 0.056 | 0.369 / 2.01 | 5/5 |
+  | old vs both | 6 | 0.072 | 0.370 / 1.46 | 5/5 |
+
+  - Both is inside the noise on every check.
+  - idx's medians match the floor. Its token-0 max (2.01) is the only check outside 1.5 x the floor + 0.05 (1.87). Both
+    runs the same indexer and passes, and single-server maxima already reach 1.03-1.41, so this is sampling noise in a
+    max over 45 pairs.
+
+**Tool replay, combined (both vs old)**, E128 shapes, seed 1, 600-s windows:
+
+| C | old gen tok/s | both gen tok/s | change | hit rate old / both | turns old / both | window KV mean (max) old / both | preemptions |
+|---|---|---|---|---|---|---|---|
+| 36 | 573.0 | 617.4 | **+7.7%** | 0.968 / 0.968 | 160 / 172 | 0.60 (0.66) / 0.60 (0.66) | 0 / 0 |
+| 48 | 273.3 | 157.6 | -42% (not attributable, below) | 0.747 / 0.525 | 69 / 38 | 0.81 (0.86) / 0.80 (0.88) | 0 / 0 |
+
+- **C = 36** is clean: same hits, no KV pressure, and #156's step gain shows through.
+- **C = 48 is not a valid comparison:**
+  - Both windows are still partly in setup: 42 of 48 slots started when the setup cap hit, 3-4 requests waiting.
+  - KV is 0.80-0.88 in both, the documented E128 thrash band.
+  - Most steps carry a 2,048-token prefill chunk and take over a second, so gen tok/s mostly measures how much uncached
+    prefill landed in the window (both: 852K uncached tokens vs old's 707K, hits 0.53 vs 0.75).
+  - There is one sample per arm.
+  - #58678 touches no attention or KV code, and with the pool pinned its extra KV is never used.
+
+  Treat it as open, not as a regression.
+
+### Verdicts
+
+- **#156 (indexer grid-stride skip): GO.**
+  - **Exactness:** bit-exact logits and top-k sets on every shape, eager and graph replay; the 3 flagged cases are the
+    downstream `persistent_topk`'s own tie nondeterminism, reproduced OLD vs OLD.
+  - **Speed:** the decode step is 5.7% / 6.5% faster (gate >= 4%), with 0 tracebacks.
+  - **Probe:** inside OLD's noise on medians.
+  - **Next:** the L4 soak and the 120-task A/B (a confirmation only, since the change is exact). The L4 has less
+    bandwidth, so the indexer is a larger share of its step; expect at least the 4090's gain.
+- **#58678 (Engram `wkv` column-parallel): NO-GO by the pre-registered gate (REVIEW at best).**
+  - **Memory:** passes (+9.9% KV, i.e. +3-4 streams at the same pressure).
+  - **Speed:** decode -2.4% at B = 48 against a -2% limit.
+  - **Exactness:** the layer is not bit-identical under Humming. The rounding is 1-ulp class, as accurate as OLD, and
+    of the same kind as Humming's own run-to-run noise.
+
+  To go further it needs:
+  1. a capacity test where the extra KV is used: pool 23,625 blocks, or unpinned at Kaggle util, at C = 44-48 on L4,
+     against old at 21,490;
+  2. the decode cost measured on L4 (Gen3 shared memory);
+  3. the 120-task accuracy A/B, because it is not exact.
+
+  It ships only if the extra streams buy more than the -2 to -3% per-step cost.
+
+### Gate artifacts to fix before the next run (not edited here)
+
+- `gpu/indexer_ab.py`: compare `persistent_topk` tie-aware (check OLD against itself first, or compare value
+  multisets).
+- `gpu/logprob_probe.py`: compute `d_lp0` on the top-5 intersection (as `results/diag/probe_noise.py` does), and gate
+  against a second OLD server.
+- `gpu/startup_report.py`: count tracebacks only before the shutdown line.
+- `gpu/run_plan.sh`: default `SHAPES` to the converted `E042 metadata/trace_shapes/tools_e043_e128t.json`, and raise
+  `REPLAY_WALL` (or cap setup) so C = 48 gets a steady-state window.
+
 ## Files
 
 - `overlay/vllm/...`: the two patched files.
@@ -424,6 +608,13 @@ If everything else passes but the layer test shows differences, the verdict is *
   - `logprob_probe.py`;
   - `run_plan.sh`;
   - `report_e054.py`.
+- `results/` (GPU run, §6):
+  - `kernel/` (indexer and Engram A/Bs);
+  - `old/`, `old_try1/`, `idx/`, `both/` (server logs, env, startup/probe/decode/replay JSON, `metrics.jsonl`);
+  - `ctx36.json` / `ctx48.json`, `report.json`, `cpu_checks.log`, `logs/` (step logs and exit codes);
+  - `diag/`: `topk_selfcheck.py` (persistent_topk self-determinism), `wkv_ulp.py` (ulp and fp64-reference analysis of
+    the `wkv` difference), `probe_noise.py` (the probe against OLD's own server-to-server spread), `replay_series.py` (KV, hit rate and queue
+    over the replay windows, from `metrics.jsonl`), and their outputs.
 - Not in the repo: the PR head files fetched read-only (scratchpad `e054/dl_pr156_tests/`). The PR's own test file was
   not used. It targets the combined commit (it monkeypatches `_use_fp4_dot`) and needs vLLM's `tests/conftest.py`
   `workspace_init` fixture. Its part-1 checks are covered by the CPU and GPU A/Bs above: grid shape, program-count

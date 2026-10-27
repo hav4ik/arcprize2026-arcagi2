@@ -303,6 +303,25 @@ class KVGate(unittest.TestCase):
             self.assertEqual(self.s.STATE["kv_missing"], 0)
 
 
+class WaitingGate(unittest.TestCase):
+    def test_s17_server_queue_holds_the_gate(self):
+        # S17 (fails before: after preemptions freed KV, a low reading admitted attempts while the server queued requests)
+        for limit, want in (("0", True), ("1", False)):
+            s = C.load_solver({**NB_ENV, "ARC_ADMIT_MAX_WAITING": limit})
+            now, m = [1000.0], {"kv_cache_usage_perc": 0.3, "num_requests_waiting": 12.0}
+            logs = []
+            with patch.object(s, "server_metrics", lambda: dict(m, t=now[0])), \
+                    patch.object(s.time, "time", lambda: now[0]), patch.object(s, "log", logs.append):
+                self.assertEqual(s.kv_admits(30), want)
+                if limit == "1":
+                    self.assertIn("KV gate: server has 12 waiting requests (limit 1), KV 0.300; holding new attempts "
+                                  "at 30 running", logs[0])
+                    self.assertTrue(s.kv_admits(15))  # below ARC_KV_ADMIT_MIN_WORKERS: never gated
+                    now[0] += 10
+                    m["num_requests_waiting"] = 0.0
+                    self.assertTrue(s.kv_admits(30))  # the queue drained: the KV gate decides again
+
+
 class MetricsParsing(unittest.TestCase):
     def test_s13_garbled_metrics_never_raise(self):
         # S13 (fails on V6: IndexError from server_metrics, raised through kv_admits into the main loop)
@@ -324,6 +343,26 @@ class MetricsParsing(unittest.TestCase):
                 self.assertIn(s.kv_admits(20), (True, False))
         finally:
             srv.close()
+
+
+class OffloadMetrics(unittest.TestCase):
+    def test_s16_host_restored_tokens_are_not_uncached(self):
+        # S16 (fails before: tokens restored from host by the KV offload connector counted as uncached)
+        s = C.load_solver(NB_ENV)
+        base = {"generation_tokens_total": 0.0, "prefix_cache_hits_total": 0.0, "prefix_cache_queries_total": 0.0,
+                "kv_cache_usage_perc": 0.5, "num_requests_running": 4.0, "num_requests_waiting": 0.0,
+                "num_preemptions_total": 0.0}
+        for ext, want_uncached, want_host in ((None, 300.0, None), (0.0, 300.0, 0.0), (200.0, 100.0, 200.0)):
+            prev, cur = dict(base, t=100.0), dict(base, t=110.0, generation_tokens_total=500.0,
+                                                  prefix_cache_hits_total=7000.0, prefix_cache_queries_total=10000.0)
+            if ext is not None:
+                prev["external_prefix_cache_hits_total"], cur["external_prefix_cache_hits_total"] = 0.0, ext * 10
+            s.STATE["metrics"] = prev
+            with patch.object(s, "server_metrics", lambda: dict(cur)):
+                tp = s.throughput()
+            self.assertEqual(tp["uncached_tok_s"], want_uncached)
+            self.assertEqual(tp.get("host_tok_s"), want_host)
+            self.assertEqual(tp["prefix_hit"], 0.7)
 
 
 class FakeProc:
@@ -562,6 +601,32 @@ class MainLoop(unittest.TestCase):
                       "answer is kept", log_text(work))
         self.assertTrue(all(len(json.loads(line)) for line in
                             (work / "out" / "dsv41_logs" / "attempts.jsonl").read_text().splitlines()))
+
+    def test_e055_engine_death_is_a_connection_error(self):
+        # E055 (fails before: an engine death's APIError/500 used up a job try, so with ARC_JOB_TRIES=1 the job was lost)
+        s = C.load_solver(NB_ENV)
+        for err in ("TurnError: APIError: EngineCore encountered an issue. See stack trace (above) for the root cause.",
+                    "TurnError: InternalServerError: Error code: 500 - {'error': {'message': 'EngineCore encountered an issue.",
+                    "EngineDeadError: EngineCore encountered an issue"):
+            self.assertTrue(any(c in err for c in s.CONN_ERRORS), err)
+        calls, holder = {}, {}
+
+        def dying(args, task, t, p, a):
+            calls[(t, a)] = calls.get((t, a), 0) + 1
+            if (t, a) == ("aaaa0001", 0) and calls[(t, a)] == 1:
+                holder["s"].STATE["server"].dead = True
+                time.sleep(0.2)
+                return {"pred": None, "error": "TurnError: APIError: EngineCore encountered an issue. See stack trace",
+                        "stop_reason": "error", "usage": {"completion": 10}, "task_id": t, "pair": p, "attempt": a,
+                        "cuts": {}, "train_pass": None}
+            return harness_like(args, task, t, p, a)
+
+        def setup(s):
+            holder["s"] = s
+        s, launches, sub, work, starts = run_main({**NB_ENV, "ARC_WORKERS": "1", "ARC_JOB_TRIES": "1"}, TASKS, dying,
+                                                  setup=setup)
+        self.assertEqual(launches.count(("aaaa0001", 0, 0)), 2)  # re-queued after the death, not dropped
+        self.assertIn("re-queue aaaa0001.0#0 after a server-side error", log_text(work))
 
     def test_s6_restart_time_rule(self):
         s = C.load_solver({"ARC_STOP_NEW_S": "3600", "ARC_HARD_STOP_S": "7200", "ARC_RESTART_MIN_LEFT_S": "1800"})

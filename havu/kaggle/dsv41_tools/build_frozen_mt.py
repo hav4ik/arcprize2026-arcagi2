@@ -56,8 +56,15 @@ def opt_need(a):
 
 
 def retention_args(a):
+    """Server flags appended to Version 5's: the retention interval and any --server-extra flags (e.g. E051's
+    --kv-transfer-config, which needs the --overlay that ships the patched offloading connector)."""
     r = getattr(a, "retention", 0)
-    return ["--prefix-cache-retention-interval", str(r)] if r else []
+    return (["--prefix-cache-retention-interval", str(r)] if r else []) + json.loads(getattr(a, "server_extra", "") or "[]")
+
+
+# Version 5's server flags: what the rerun fallback (the kit's v3 code and the kit's own vLLM overlay) runs with
+V5_SERVER_EXTRA = json.dumps(["--linear-backend", "humming", "--compilation-config",
+                              json.dumps({"cudagraph_mode": "FULL", "max_cudagraph_capture_size": 64})])
 
 
 def settings_cell(a):
@@ -67,6 +74,10 @@ def settings_cell(a):
         env += [("ARC_KV_ADMIT_MAX", str(a.gate)), ("ARC_KV_ADMIT_MIN_WORKERS", "16")]
     env += opt_env(a)
     pairs = ",\n               ".join(f'("{k}", "{v}")' for k, v in env)
+    # E051: vLLM rejects a KV connector when PYTORCH_CUDA_ALLOC_CONF has expandable_segments (set by some images)
+    alloc_fix = ("_ac = [x for x in os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '').split(',') if x and 'expandable_segments' not in x]\n"
+                 "os.environ['PYTORCH_CUDA_ALLOC_CONF'] = ','.join(_ac)\n"
+                 if "--kv-transfer-config" in getattr(a, "server_extra", "") else "")
     return f'''# Cell 00 (E046 frozen-input candidate): submit Version 5's settings (Humming dense, CUDA graphs <= 64, max-num-seqs
 # 64, util 0.945; Kaggle KV 1.55M) + one rollout per task for tasks with several test inputs (ARC_MULTI_TEST) with a
 # (1 + {a.budget} (n - 1)) x output budget / turn cap (ARC_MULTI_BUDGET); {a.workers} workers{f", KV gate {a.gate}" if a.gate else ""}.
@@ -79,7 +90,7 @@ for _k, _v in ({pairs},
                                                                  "max_cudagraph_capture_size": 64}})]
                                                     + {json.dumps(retention_args(a))}))):
     os.environ.setdefault(_k, _v)
-# The commit run ("Save & Run All") is a smoke test: server start + 3 tasks (2 multi-test). The competition rerun
+{alloc_fix}# The commit run ("Save & Run All") is a smoke test: server start + 3 tasks (2 multi-test). The competition rerun
 # ignores ARC_COMMIT_MODE (cell 0 always runs "submit") and never sees the task list.
 if not os.environ.get("KAGGLE_IS_COMPETITION_RERUN"):
     os.environ.setdefault("ARC_COMMIT_MODE", "smoke")
@@ -165,6 +176,7 @@ if MODE != "fallback":
                        "ARC_BEST_GUESS_AT", "ARC_BEST_GUESS_TURNS", "ARC_POST_PASS_NOTE", "ARC_REASONING_EFFORT"):
                 os.environ.pop(_k, None)
             os.environ["ARC_WORKERS"] = "36"
+            os.environ["ARC_SERVER_EXTRA_ARGS"] = {json.dumps(V5_SERVER_EXTRA)}  # no flag that needs the new overlay
         except Exception as exc:
             _kept.append(f"{{type(exc).__name__}}: {{exc}}")
         print("E046 FALLBACK: the kit's v3 code, per pair, 36 workers"
@@ -187,6 +199,8 @@ def main():
     ap.add_argument("--best-guess-at", type=float, default=0.0)
     ap.add_argument("--best-guess-turns", type=int, default=0)
     ap.add_argument("--post-pass-note", action="store_true", help="ARC_POST_PASS_NOTE=1 (I8)")
+    ap.add_argument("--overlay", type=Path, help="dir with a replacement vllm_overlay_rw.tgz + .sha256 (cell 2 installs it)")
+    ap.add_argument("--server-extra", default="", help="JSON list of extra vLLM server flags (appended)")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args()
     nb = json.load(open(V5 / "dsv41-tools-submit.ipynb"))
@@ -205,6 +219,10 @@ def main():
         for name in ("auto_repair.py", "auto_repair_names.json"):
             files[f"repo/evals/{name}"] = ROOT / "evals" / name
             new.append(f"repo/evals/{name}")
+    if a.overlay:  # replaces the kit's overlay pair; cell 2 sha-checks every file it installs; the fallback restores the kit's
+        for name in ("vllm_overlay_rw.tgz", "vllm_overlay_rw.sha256"):
+            files[name] = a.overlay / name
+    json.loads(a.server_extra or "[]")  # fail at build time on a malformed list
     cell0b, sha = code_cell(files, expect, new, need)
     nb["cells"][0]["source"] = settings_cell(a).splitlines(keepends=True)
     nb["cells"].insert(2, {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],

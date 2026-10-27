@@ -133,7 +133,10 @@ RESTART_UP_S = env_num("ARC_RESTART_UP_S", 600)  # S6: expected server start tim
 JOB_TRIES = env_num("ARC_JOB_TRIES", 2, int)
 CONN_TRIES = env_num("ARC_CONN_TRIES", 4, int)  # re-queues for attempts lost to a server outage (not in JOB_TRIES)
 CONN_ERRORS = ("Connection", "ConnectError", "RemoteProtocolError", "ReadError", "Server disconnected",
-               "Incomplete stream", "Connection refused", "ReadTimeout")
+               "Incomplete stream", "Connection refused", "ReadTimeout",
+               # E055: a dying engine answers in-flight requests with these before the port closes; without them every
+               # server death used up one ARC_JOB_TRIES of each in-flight job (43 jobs lost after two deaths)
+               "EngineCore encountered an issue", "EngineDeadError")
 TASK_LIMIT = env_num("ARC_TASK_LIMIT", 0, int)
 TASK_IDS = [t for t in E("ARC_TASK_IDS", "").split(",") if t]  # smoke tests: these tasks instead of the first N
 # E046 (opt-in): one attempt per task for tasks with several test inputs (all test inputs in one rollout, the answer
@@ -174,6 +177,10 @@ KV_ADMIT_MIN_WORKERS = env_num("ARC_KV_ADMIT_MIN_WORKERS", 16, int)
 # garbled, NaN), the gate fails safe: no new attempt above ARC_KV_MISSING_WORKERS running (V6 failed open)
 KV_MISSING_POLLS = env_num("ARC_KV_MISSING_POLLS", 2, int)
 KV_MISSING_WORKERS = env_num("ARC_KV_MISSING_WORKERS", 32, int)
+# S17 (E055 candB_x2): preempting requests frees KV, so the usage the gate reads dips (0.99 -> 0.6) while the server
+# still queues requests, and the gate admitted more attempts into an oversubscribed pool (832 preemptions, server
+# queue 11-22). With ARC_ADMIT_MAX_WAITING=N > 0 the gate also holds while the server has >= N waiting requests.
+ADMIT_MAX_WAITING = env_num("ARC_ADMIT_MAX_WAITING", 0, int)
 STAGE_DONE = E("ARC_STAGE_DONE", "")  # marker file written by the notebook's model-staging copy
 STAGE_WAIT_S = env_num("ARC_STAGE_WAIT_S", 2400)
 PREFLIGHT_RETRY_S = env_num("ARC_PREFLIGHT_RETRY_S", 300)  # S7: re-run a failed checkpoint pre-flight this long
@@ -333,7 +340,7 @@ def start_server():
         json.dump({"cmd": server_cmd(), "env": {k: "<redacted>" if any(s in k for s in ("TOKEN", "KEY", "SECRET", "PASS"))
                                                 else v for k, v in server_env().items()
                                                 if k.startswith(("VLLM", "DSV41", "E043", "FLASHINFER", "TORCH_CUDA",
-                                                                 "CUDA", "NCCL", "HF_"))}}, f, indent=1)
+                                                                 "CUDA", "NCCL", "HF_", "PYTORCH"))}}, f, indent=1)
     with open(path, "ab") as fh:  # the server keeps its own copy of the descriptor
         proc = subprocess.Popen(server_cmd(), stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                 env=server_env(), start_new_session=True, cwd=E("ARC_SCRATCH", "/tmp"))
@@ -744,7 +751,8 @@ def score(tasks):
 
 
 METRIC_KEYS = ("generation_tokens_total", "prefix_cache_hits_total", "prefix_cache_queries_total",
-               "kv_cache_usage_perc", "num_requests_running", "num_requests_waiting", "num_preemptions_total")
+               "kv_cache_usage_perc", "num_requests_running", "num_requests_waiting", "num_preemptions_total",
+               "external_prefix_cache_hits_total")
 METRICS_EVERY_S = float(E("ARC_METRICS_EVERY_S", "300"))
 
 
@@ -780,7 +788,7 @@ def kv_admits(n_running):
     if now - STATE.get("kv_t", 0) >= 10:
         m = server_metrics()
         STATE["kv_t"], STATE["kv"] = now, (m or {}).get("kv_cache_usage_perc")
-        STATE["kv_read"] = STATE["kv"]
+        STATE["kv_read"], STATE["srv_waiting"] = STATE["kv"], (m or {}).get("num_requests_waiting")
         STATE["kv_missing"] = 0 if STATE["kv"] is not None else STATE.get("kv_missing", 0) + 1
     kv = STATE.get("kv")
     if kv is None:
@@ -794,6 +802,13 @@ def kv_admits(n_running):
             log(f"WARNING KV gate: no KV usage from /metrics in {STATE['kv_missing']} readings; holding new attempts "
                 f"at {n_running} running (fail-safe cap {KV_MISSING_WORKERS})")
         return ok
+    waiting = STATE.get("srv_waiting")
+    if ADMIT_MAX_WAITING > 0 and waiting is not None and waiting >= ADMIT_MAX_WAITING:
+        if now - STATE.get("kv_gate_logged", 0) >= 300:
+            STATE["kv_gate_logged"] = now
+            log(f"KV gate: server has {waiting:.0f} waiting requests (limit {ADMIT_MAX_WAITING}), KV {kv:.3f}; holding "
+                f"new attempts at {n_running} running")
+        return False
     ok = kv < KV_ADMIT_MAX
     if ok and kv >= KV_ADMIT_MAX - 0.1:
         STATE["kv"] = KV_ADMIT_MAX  # one launch per reading in the last 10 points below the threshold
@@ -805,7 +820,9 @@ def kv_admits(n_running):
 
 
 def throughput():
-    """Generated tok/s and prefix-cache hit rate since the previous call (TPS log every METRICS_EVERY_S)."""
+    """Generated tok/s and prefix-cache hit rate since the previous call (TPS log every METRICS_EVERY_S). S16: with KV
+    offload, tokens the connector restores from host (`external_prefix_cache_hits_total`) are not GPU prefix hits but
+    are not recomputed either, so `uncached_tok_s` leaves them out and `host_tok_s` reports them."""
     cur = server_metrics()
     if cur is None:
         return None
@@ -814,12 +831,15 @@ def throughput():
         return None
     dt = cur["t"] - prev["t"]
     d = lambda k: cur.get(k, 0.0) - prev.get(k, 0.0)
-    q = d("prefix_cache_queries_total")
-    return {"window_s": round(dt), "gen_tok_s": round(d("generation_tokens_total") / dt, 1),
-            "prefix_hit": round(d("prefix_cache_hits_total") / q, 3) if q > 0 else None,
-            "uncached_tok_s": round((q - d("prefix_cache_hits_total")) / dt, 1),
-            "kv": round(cur.get("kv_cache_usage_perc", 0.0), 3), "srv_running": cur.get("num_requests_running"),
-            "srv_waiting": cur.get("num_requests_waiting"), "preemptions": cur.get("num_preemptions_total")}
+    q, host = d("prefix_cache_queries_total"), d("external_prefix_cache_hits_total")
+    tp = {"window_s": round(dt), "gen_tok_s": round(d("generation_tokens_total") / dt, 1),
+          "prefix_hit": round(d("prefix_cache_hits_total") / q, 3) if q > 0 else None,
+          "uncached_tok_s": round((q - d("prefix_cache_hits_total") - host) / dt, 1),
+          "kv": round(cur.get("kv_cache_usage_perc", 0.0), 3), "srv_running": cur.get("num_requests_running"),
+          "srv_waiting": cur.get("num_requests_waiting"), "preemptions": cur.get("num_preemptions_total")}
+    if "external_prefix_cache_hits_total" in cur:
+        tp["host_tok_s"] = round(host / dt, 1)
+    return tp
 
 
 def status(tasks, queue, running, done, errors):
@@ -838,7 +858,9 @@ def status(tasks, queue, running, done, errors):
                     f.write(json.dumps(tp) + "\n")
                 log(f"server: {tp['gen_tok_s']} gen tok/s, prefix hits {tp['prefix_hit']}, uncached "
                     f"{tp['uncached_tok_s']} tok/s, KV {tp['kv']}, running {tp['srv_running']}, waiting "
-                    f"{tp['srv_waiting']}, preemptions {tp['preemptions']} (last {tp['window_s']} s); {done} attempts done")
+                    f"{tp['srv_waiting']}, preemptions {tp['preemptions']}"
+                    + (f", host restored {tp['host_tok_s']} tok/s" if "host_tok_s" in tp else "")
+                    + f" (last {tp['window_s']} s); {done} attempts done")
         st["server"] = STATE.get("last_tp")
         atomic_json(LOG / "status.json", st)
     except Exception:

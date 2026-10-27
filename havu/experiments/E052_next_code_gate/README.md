@@ -10,7 +10,7 @@ Control: E050 `eff50` (V6 pinned code + effort env edit, box 1). Analysis: `expe
 | E050 eff50 (control) | V6 (harness a8a5b665, solver 4b344011) | 71.4% | 66.7 / 74.6 | 42.2k | 19.2 | 7 |
 | **A `new_ar`** | fixes (harness 13ebdb70, solver 24aaa376) + auto-repair | **76.5%** | **77.2** / 76.1 | 42.9k | 19.3 | 5 |
 | B `new_ar_bg` | A + best-guess nudge (0.8 / 3 turns), solver 82010f8a | 74.6% | 74.5 / 74.6 | 42.2k | 17.9 | 5 |
-| C `new_ar_pp` | A + post-pass note (I8), harness 882c817f, solver c760fae0 | running | | | | |
+| C `new_ar_pp` | A + post-pass note (I8), harness 882c817f, solver c760fae0 | 70.4% | 68.4 / 71.8 | 42.6k | 19.1 | 11 |
 
 - A vs control: +5.1 pp [-1.8, +12.2], task wins 17/9 (p=0.17), tokens x1.017 [0.94, 1.11]. B vs control: +3.2 pp
   [-4.0, +10.4]. B vs A: -1.9 pp [-8.2, +4.3], tokens x0.984, -1.4 turns. Same-config noise (run 7 a0 vs a1): 2.5 pp.
@@ -21,3 +21,8 @@ Control: E050 `eff50` (V6 pinned code + effort env edit, box 1). Analysis: `expe
   Not adopted.
 - Box-image credentials: arm A's server_cmd.json held the Vast image's HF_TOKEN (solver before the redaction fix);
   redacted on copy. The live solver redacts TOKEN/KEY/SECRET/PASS env values.
+- Post-pass note (I8, arm C): fired in 75/120 attempts, 74 submitted after, mean 4.7k tokens / 4 turns after the
+  note; tokens unchanged (42.6k), no-answer 11 vs 5 (more output-budget stops), pass@1 70.4 vs A 76.5 (-6.1, CI
+  -14.2..+2.1). Not adopted.
+- New-code estimate from all three arms on the same base (A 76.5 / B 74.6 / C 70.4): mean 73.8 vs V6 71.4, i.e.
+  ~+2.4 pp, in line with the conservative +2..+4 credit; A alone was the lucky end.
