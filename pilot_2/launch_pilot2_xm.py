@@ -37,10 +37,30 @@ flags.DEFINE_integer(
     6,
     "Number of parallel TPU shards per hypothesis across the 167 eval pairs (~28 pairs/shard).",
 )
+flags.DEFINE_list(
+    "shard_indices",
+    [],
+    "Optional comma-separated subset of shard indices to launch (empty = all 0..num_shards-1).",
+)
 flags.DEFINE_string(
     "cns_output_root",
     prompts_and_selector.FROZEN_BASELINE_CONFIG["cns_output_root"],
     "CNS root directory where each hypothesis writes its reasoning and code traces.",
+)
+flags.DEFINE_string(
+    "model_path",
+    prompts_and_selector.FROZEN_BASELINE_CONFIG["model_path"],
+    "CNS path to the Qwen3.8-27B-FP8 (base or SFT merged FP8) checkpoint.",
+)
+flags.DEFINE_string(
+    "lora_adapter_path",
+    "",
+    "Optional CNS path to a LoRA adapter checkpoint; if set, workers collaboratively export FP8 to --model_path inside Borg.",
+)
+flags.DEFINE_string(
+    "full_sft_ckpt_dir",
+    "",
+    "Optional CNS path to a Full-SFT distributed checkpoint directory; if set, workers collaboratively export FP8 to --model_path inside Borg.",
 )
 flags.DEFINE_integer("cpu", 32, "Host CPUs per work unit.")
 flags.DEFINE_integer("ram_gb", 128, "Host RAM (GiB) per work unit.")
@@ -84,7 +104,7 @@ def main(argv: list[str]) -> None:
         cpu=FLAGS.cpu,
         ram=FLAGS.ram_gb * xm.GiB,
         location=FLAGS.location,
-        tmp_ram_fs=16 * xm.GiB,
+        tmp_ram_fs=24 * xm.GiB,
     )
     executor = xm_abc.Borg(
         requirements=reqs,
@@ -120,13 +140,21 @@ def main(argv: list[str]) -> None:
         "SKIP_JAX_PRECOMPILE": "1",
     }
 
+    target_shards = (
+        [int(x) for x in FLAGS.shard_indices]
+        if FLAGS.shard_indices
+        else list(range(FLAGS.num_shards))
+    )
     total_wus = 0
     for exp_id in FLAGS.exp_ids:
       exp_out_dir = os.path.join(FLAGS.cns_output_root, exp_id)
-      for shard_idx in range(FLAGS.num_shards):
+      for shard_idx in target_shards:
         args = [
             f"--exp_id={exp_id}",
             f"--output_dir={exp_out_dir}",
+            f"--model_path={FLAGS.model_path}",
+            f"--lora_adapter_path={FLAGS.lora_adapter_path}",
+            f"--full_sft_ckpt_dir={FLAGS.full_sft_ckpt_dir}",
             f"--shard_index={shard_idx}",
             f"--num_shards={FLAGS.num_shards}",
             f"--max_tasks={FLAGS.max_tasks}",

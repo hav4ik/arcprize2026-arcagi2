@@ -211,13 +211,15 @@ class Pilot2AttemptSandbox:
       auto_check_on_solve: bool = False,
       run_equivariance_audit: bool = False,
       max_output_chars: int = 3500,
+      use_e031_ipython_mode: bool = False,
   ) -> None:
     self.train_pairs = train_pairs
     self.test_input = test_input
     self.use_arc_helpers = use_arc_helpers
     self.auto_check_on_solve = auto_check_on_solve
     self.run_equivariance_audit = run_equivariance_audit
-    self.max_output_chars = max_output_chars
+    self.use_e031_ipython_mode = use_e031_ipython_mode
+    self.max_output_chars = 16000 if use_e031_ipython_mode else max_output_chars
 
     self._train_np = [
         {
@@ -256,6 +258,7 @@ class Pilot2AttemptSandbox:
 
     self.env: dict[str, Any] = {
         "__builtins__": __builtins__,
+        "__name__": "__main__",
         "np": np,
         "numpy": np,
         "scipy": scipy,
@@ -283,11 +286,25 @@ class Pilot2AttemptSandbox:
       self._active_stdout_buf.write(text)
 
   def _refresh_task_globals(self) -> None:
-    self.env["train"] = [
-        {"input": p["input"].copy(), "output": p["output"].copy()}
-        for p in self._train_np
-    ]
-    self.env["test_input"] = self._test_np.copy()
+    if self.use_e031_ipython_mode:
+      train_lists = [
+          {"input": to_grid(p["input"]), "output": to_grid(p["output"])}
+          for p in self.train_pairs
+      ]
+      test_list = to_grid(self.test_input)
+      self.env["train"] = train_lists
+      self.env["test_input"] = test_list
+      self.env["test_in"] = test_list
+      self.env["task"] = {
+          "train": train_lists,
+          "test": [{"input": test_list}],
+      }
+    else:
+      self.env["train"] = [
+          {"input": p["input"].copy(), "output": p["output"].copy()}
+          for p in self._train_np
+      ]
+      self.env["test_input"] = self._test_np.copy()
     self.env["print"] = self._sandbox_print
     self.env["check"] = self._check_fn
 
@@ -303,7 +320,12 @@ class Pilot2AttemptSandbox:
       reports = []
       for idx, pair in enumerate(self._train_np):
         try:
-          pred = target_fn(pair["input"].copy())
+          arg = (
+              to_grid(pair["input"])
+              if self.use_e031_ipython_mode
+              else pair["input"].copy()
+          )
+          pred = target_fn(arg)
           if not is_valid_grid(pred):
             all_ok = False
             reports.append(
@@ -336,6 +358,8 @@ class Pilot2AttemptSandbox:
       timeout_s: float = 6.0,
   ) -> dict[str, Any]:
     """Execute `code` in-process inside a traced daemon thread with zero os.fork()."""
+    if self.use_e031_ipython_mode and timeout_s == 6.0:
+      timeout_s = 15.0
     stdout_buf = io.StringIO()
     self._active_stdout_buf = stdout_buf
     self._refresh_task_globals()
@@ -360,16 +384,37 @@ class Pilot2AttemptSandbox:
 
     deadline = time.monotonic() + timeout_s
 
+    class _SandboxTimeout(BaseException):
+      pass
+
     def _tracer(frame: Any, event: str, arg: Any) -> Any:
       del frame, event, arg
       if time.monotonic() > deadline:
-        raise TimeoutError("Execution timed out (limit: 6.0s).")
+        raise _SandboxTimeout(f"Execution timed out (limit: {timeout_s:g}s).")
       return _tracer
 
     def _worker() -> None:
       sys.settrace(_tracer)
       try:
-        exec(code, self.env)  # pylint: disable=exec-used
+        if self.use_e031_ipython_mode:
+          import pprint  # pylint: disable=g-import-not-at-top
+          tree = ast.parse(code, "<ipython-input>", "exec")
+          last_expr = None
+          if tree.body and isinstance(tree.body[-1], ast.Expr):
+            last_stmt = tree.body.pop()
+            if isinstance(last_stmt, ast.Expr):
+              last_expr = ast.Expression(last_stmt.value)
+          exec(compile(tree, "<ipython-input>", "exec"), self.env)  # pylint: disable=exec-used
+          if last_expr is not None:
+            val = eval(compile(last_expr, "<ipython-input>", "eval"), self.env)  # pylint: disable=eval-used
+            if val is not None:
+              if isinstance(val, (list, tuple, dict, set, frozenset)):
+                txt = pprint.pformat(val, width=79, sort_dicts=False)
+              else:
+                txt = repr(val)
+              self._sandbox_print("\n" + txt if "\n" in txt else txt)
+        else:
+          exec(code, self.env)  # pylint: disable=exec-used
         solve_fn = self.env.get("solve")
         should_eval_solve = callable(solve_fn) and (
             require_solve or (solve_fn is not prev_solve) or ("def solve" in code)
@@ -384,7 +429,15 @@ class Pilot2AttemptSandbox:
             pair_reports: list[str] = []
             for idx, pair in enumerate(self._train_np):
               try:
-                got_raw = solve_fn(pair["input"].copy())
+                inp_arg = (
+                    to_grid(pair["input"])
+                    if self.use_e031_ipython_mode
+                    else pair["input"].copy()
+                )
+                try:
+                  got_raw = solve_fn(inp_arg)
+                except Exception:
+                  got_raw = solve_fn(pair["input"].copy())
                 if not is_valid_grid(got_raw):
                   pair_reports.append(
                       f"Pair {idx}: FAIL (returned invalid grid: {type(got_raw).__name__})"
@@ -404,7 +457,7 @@ class Pilot2AttemptSandbox:
                   cell_accs.append(float(np.mean(got_arr == exp_arr)))
                 else:
                   cell_accs.append(0.0)
-              except TimeoutError:
+              except (TimeoutError, _SandboxTimeout):
                 raise
               except Exception as exc:
                 pair_reports.append(
@@ -422,7 +475,15 @@ class Pilot2AttemptSandbox:
             result["train_pass"] = passed_count == len(self._train_np)
 
             try:
-              test_raw = solve_fn(self._test_np.copy())
+              test_arg = (
+                  to_grid(self._test_np)
+                  if self.use_e031_ipython_mode
+                  else self._test_np.copy()
+              )
+              try:
+                test_raw = solve_fn(test_arg)
+              except Exception:
+                test_raw = solve_fn(self._test_np.copy())
               if is_valid_grid(test_raw):
                 pred_grid = to_grid(test_raw)
                 result["test_pred"] = pred_grid
@@ -435,7 +496,7 @@ class Pilot2AttemptSandbox:
                 result["test_error"] = (
                     f"solve(test_input) returned invalid grid of type {type(test_raw).__name__}"
                 )
-            except TimeoutError:
+            except (TimeoutError, _SandboxTimeout):
               raise
             except Exception as exc:
               result["test_error"] = f"{type(exc).__name__}: {exc}"
@@ -471,7 +532,7 @@ class Pilot2AttemptSandbox:
                     ):
                       all_op_ok = False
                       break
-                  except TimeoutError:
+                  except (TimeoutError, _SandboxTimeout):
                     raise
                   except Exception:
                     all_op_ok = False
@@ -518,7 +579,7 @@ class Pilot2AttemptSandbox:
                     ):
                       swap_ok = False
                       break
-                  except TimeoutError:
+                  except (TimeoutError, _SandboxTimeout):
                     raise
                   except Exception:
                     swap_ok = False
@@ -538,6 +599,8 @@ class Pilot2AttemptSandbox:
               self.env["train"] = saved_train
             if saved_test is not None:
               self.env["test_input"] = saved_test
+      except _SandboxTimeout as exc:
+        result["error"] = f"TimeoutError: {exc}"
       except Exception as exc:
         result["error"] = (
             f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=4)}"
@@ -551,7 +614,7 @@ class Pilot2AttemptSandbox:
     if worker_thread.is_alive():
       return {
           "stdout": stdout_buf.getvalue(),
-          "error": "TimeoutError: Python cell execution exceeded hard 6.0s limit.",
+          "error": f"TimeoutError: Execution timed out (limit: {timeout_s:g}s).",
           "defined_solve": False,
           "train_pass": False,
           "train_passed_count": 0,
@@ -662,6 +725,25 @@ class Pilot2AttemptSandbox:
             cum_gen_tokens=cum_gen_tokens,
         )
     )
+
+    if self.use_e031_ipython_mode:
+      stdout_raw = res.get("stdout") or ""
+      err_raw = res.get("error")
+      if err_raw:
+        status = "timeout" if "TimeoutError" in err_raw else "error"
+        parts = [f"[{status}]"]
+        if stdout_raw:
+          parts.append(stdout_raw.rstrip("\n"))
+        parts.append(err_raw.rstrip("\n"))
+      else:
+        parts = [
+            "[completed]",
+            stdout_raw.rstrip("\n") if stdout_raw else "[no output; use print()]",
+        ]
+      text = "\n".join(parts)
+      if len(text) > 16000:
+        text = text[:16000] + f"\n... [truncated, {len(text)} total chars]"
+      return text, bool(res.get("train_pass") and res.get("sanity_ok"))
 
     out_parts: list[str] = []
     stdout_str = (res.get("stdout") or "").strip()
@@ -833,3 +915,333 @@ class Pilot2AttemptSandbox:
         "calling `submit_program` so your rule is verified on all training pairs.",
         False,
     )
+
+  def _check_e031_train_reproduction(
+      self,
+      code: str,
+  ) -> tuple[bool, int, float]:
+    """Check whether `code` (or `solve` in session) reproduces all `train` pairs (E031 `check_answer_on_train`)."""
+    import copy  # pylint: disable=g-import-not-at-top
+    import types  # pylint: disable=g-import-not-at-top
+
+    total = max(1, len(self._train_np))
+    test_names = ("test_in", "test_input")
+    call_fn = None
+    try:
+      tree = ast.parse(code.strip(), mode="eval")
+      if (
+          isinstance(tree.body, ast.Call)
+          and len(tree.body.args) == 1
+          and not tree.body.keywords
+          and isinstance(tree.body.args[0], ast.Name)
+          and tree.body.args[0].id in test_names
+          and isinstance(tree.body.func, ast.Name)
+      ):
+        cand = self.env.get(tree.body.func.id)
+        if callable(cand):
+          call_fn = cand
+    except SyntaxError:
+      pass
+
+    if call_fn is None and callable(self.env.get("solve")):
+      call_fn = self.env.get("solve")
+
+    if call_fn is None:
+      user_fns = [
+          v
+          for k, v in self.env.items()
+          if isinstance(v, types.FunctionType)
+          and not k.startswith("_")
+          and getattr(v, "__code__", None) is not None
+          and v.__code__.co_argcount >= 1
+      ]
+      if user_fns:
+        call_fn = user_fns[-1]
+
+    if call_fn is None:
+      return False, 0, 0.0
+
+    passed = 0
+    cell_accs: list[float] = []
+    for pair in self._train_np:
+      try:
+        try:
+          got_raw = call_fn(copy.deepcopy(to_grid(pair["input"])))
+        except Exception:
+          got_raw = call_fn(pair["input"].copy())
+        if not is_valid_grid(got_raw):
+          cell_accs.append(0.0)
+          continue
+        got_arr = np.asarray(got_raw, dtype=int)
+        exp_arr = pair["output"]
+        if got_arr.shape == exp_arr.shape and np.array_equal(got_arr, exp_arr):
+          passed += 1
+          cell_accs.append(1.0)
+        elif got_arr.shape == exp_arr.shape:
+          cell_accs.append(float(np.mean(got_arr == exp_arr)))
+        else:
+          cell_accs.append(0.0)
+      except Exception:
+        cell_accs.append(0.0)
+    mean_acc = float(np.mean(cell_accs)) if cell_accs else 0.0
+    return (passed == len(self._train_np)), passed, mean_acc
+
+  def _run_with_hard_timeout(
+      self,
+      fn_body: Any,
+      timeout_s: float = 15.0,
+  ) -> tuple[Any, str | None]:
+    """Run `fn_body()` inside a traced daemon thread with a strict `BaseException` timeout."""
+    deadline = time.monotonic() + timeout_s
+
+    class _SandboxTimeout(BaseException):
+      pass
+
+    def _tracer(frame: Any, event: str, arg: Any) -> Any:
+      del frame, event, arg
+      if time.monotonic() > deadline:
+        raise _SandboxTimeout(f"Execution timed out (limit: {timeout_s:g}s).")
+      return _tracer
+
+    box: dict[str, Any] = {"val": None, "err": None}
+
+    def _worker() -> None:
+      sys.settrace(_tracer)
+      try:
+        box["val"] = fn_body()
+      except _SandboxTimeout as exc:
+        box["err"] = f"TimeoutError: {exc}"
+      except Exception as exc:
+        box["err"] = f"{type(exc).__name__}: {exc}"
+      finally:
+        sys.settrace(None)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout_s + 0.5)
+    if t.is_alive():
+      return None, f"TimeoutError: Execution timed out (limit: {timeout_s:g}s)."
+    return box["val"], box["err"]
+
+  def execute_submit_answer_code(
+      self,
+      code: str,
+      turn_idx: int,
+      cum_gen_tokens: int,
+  ) -> tuple[str, bool]:
+    """Execute E031 `submit_answer(code)` in the persistent IPython session and return `(tool_response_text, should_terminate)`."""
+    self._refresh_task_globals()
+
+    def _eval_and_check() -> tuple[Any, Grid | None, Grid | None, bool, int, float]:
+      try:
+        val = eval(compile(code, "<submit_answer>", "eval"), self.env)  # pylint: disable=eval-used
+      except SyntaxError:
+        exec(compile(code, "<submit_answer>", "exec"), self.env)  # pylint: disable=exec-used
+        val = self.env.get("answer")
+
+      p_grid: Grid | None = None
+      s_grid: Grid | None = None
+      if is_valid_grid(val):
+        p_grid = to_grid(val)
+      elif (
+          isinstance(val, (list, tuple))
+          and len(val) == 2
+          and is_valid_grid(val[0])
+          and is_valid_grid(val[1])
+      ):
+        p_grid = to_grid(val[0])
+        s_grid = to_grid(val[1])
+
+      if p_grid is None:
+        return val, None, None, False, 0, 0.0
+
+      tp, p_cnt, m_acc = self._check_e031_train_reproduction(code)
+      return val, p_grid, s_grid, tp, p_cnt, m_acc
+
+    out_tuple, eval_err = self._run_with_hard_timeout(_eval_and_check, timeout_s=15.0)
+    if eval_err is not None or out_tuple is None:
+      return (
+          f"[invalid answer: could not evaluate code ({eval_err}). "
+          "Fix and call submit_answer again.]",
+          False,
+      )
+
+    _, primary_grid, secondary_grid, train_pass, passed_cnt, mean_acc = out_tuple
+
+    if primary_grid is None:
+      return (
+          "[invalid answer: expected 2D list[list[int]] with values 0..9, shape 1..30x1..30 "
+          "(or [grid_1, grid_2] for 2 attempts). Fix and call submit_answer again.]",
+          False,
+      )
+    self.submitted_answer_grid = primary_grid
+    self.submitted_answer_turn = turn_idx
+    self.submitted_answer_gen_tokens = cum_gen_tokens
+
+    if train_pass:
+      self.latest_tp_pred = primary_grid
+      self.latest_tp_code = code
+      self.verified_variants.append(
+          VerifiedVariant(
+              grid=primary_grid,
+              code=code,
+              turn_idx=turn_idx,
+              cum_gen_tokens=cum_gen_tokens,
+              equivariance_bonus=0.0,
+          )
+      )
+      if self.first_tp_pred is None:
+        self.first_tp_pred = primary_grid
+        self.first_tp_code = code
+        self.first_tp_turn = turn_idx
+        self.first_tp_gen_tokens = cum_gen_tokens
+        self.first_tp_equivariance_bonus = 0.0
+      if secondary_grid is not None:
+        self.verified_variants.append(
+            VerifiedVariant(
+                grid=secondary_grid,
+                code=code + " # [grid_2]",
+                turn_idx=turn_idx,
+                cum_gen_tokens=cum_gen_tokens,
+                equivariance_bonus=0.0,
+            )
+        )
+    else:
+      t_frac = passed_cnt / max(1, len(self._train_np))
+      if (t_frac, mean_acc) >= (
+          self.best_partial_train_frac,
+          self.best_partial_cell_acc,
+      ):
+        self.best_partial_pred = primary_grid
+        self.best_partial_code = code
+        self.best_partial_train_frac = t_frac
+        self.best_partial_cell_acc = mean_acc
+        self.best_partial_gen_tokens = cum_gen_tokens
+        self.best_partial_turn = turn_idx
+
+    self.code_traces.append(
+        CodeTurnTrace(
+            turn_idx=turn_idx,
+            tool_name="submit_answer",
+            code_or_payload=code[:1000],
+            stdout="",
+            error=None,
+            defined_solve=callable(self.env.get("solve")),
+            train_pass=train_pass,
+            train_passed_count=passed_cnt,
+            train_total_count=len(self.train_pairs),
+            train_frac=passed_cnt / max(1, len(self.train_pairs)),
+            mean_cell_acc=mean_acc,
+            pair_reports=[],
+            test_pred_shape=(len(primary_grid), len(primary_grid[0])),
+            sanity_ok=True,
+            sanity_reason="ok",
+            equivariance_bonus=0.0,
+            cum_gen_tokens=cum_gen_tokens,
+        )
+    )
+    if secondary_grid is not None:
+      return (
+          f"[2 answers accepted: {len(primary_grid)}x{len(primary_grid[0])} and "
+          f"{len(secondary_grid)}x{len(secondary_grid[0])} grids]",
+          True,
+      )
+    return (
+        f"[answer accepted: {len(primary_grid)}x{len(primary_grid[0])} grid]",
+        True,
+    )
+
+  def finalize_e031_session_fallback(
+      self,
+      turn_idx: int,
+      cum_gen_tokens: int,
+  ) -> None:
+    """Run E031's 3-tier session fallback (`answer` -> `solve(test_input)` -> `salvage_answer`) if no `submit_answer` succeeded."""
+    if self.submitted_answer_grid is not None or self.first_tp_pred is not None:
+      return
+    import copy  # pylint: disable=g-import-not-at-top
+    import types  # pylint: disable=g-import-not-at-top
+
+    self._refresh_task_globals()
+    # Tier 1: `answer` in session
+    ans_val = self.env.get("answer")
+    if is_valid_grid(ans_val):
+      self.execute_submit_answer_code("answer", turn_idx, cum_gen_tokens)
+      return
+    if (
+        isinstance(ans_val, (list, tuple))
+        and len(ans_val) == 2
+        and is_valid_grid(ans_val[0])
+        and is_valid_grid(ans_val[1])
+    ):
+      self.execute_submit_answer_code("answer", turn_idx, cum_gen_tokens)
+      return
+
+    # Tier 2: `solve(test_input)` in session
+    if callable(self.env.get("solve")):
+      _, ok = self.execute_submit_answer_code(
+          "solve(test_input)", turn_idx, cum_gen_tokens
+      )
+      if ok:
+        return
+
+    # Tier 3: `salvage_answer` across user functions in session (bounded by 15s timeout)
+    def _salvage() -> str:
+      skip_names = {"exit", "quit", "get_ipython", "open"}
+      best_score = (0, 0.0, -1)
+      best_grid: Grid | None = None
+      best_fn_name = ""
+      idx = 0
+      for name, fn in list(self.env.items()):
+        if name.startswith("_") or name in skip_names:
+          continue
+        if not isinstance(fn, types.FunctionType):
+          continue
+        code_obj = getattr(fn, "__code__", None)
+        if code_obj is None:
+          continue
+        n_defaults = len(fn.__defaults__) if fn.__defaults__ else 0
+        n_req = code_obj.co_argcount - n_defaults
+        if not (n_req <= 1 <= code_obj.co_argcount):
+          continue
+        idx += 1
+        n_exact = 0
+        sim_sum = 0.0
+        ok_fn = True
+        for pair in self._train_np:
+          try:
+            got_raw = fn(copy.deepcopy(to_grid(pair["input"])))
+          except Exception:
+            ok_fn = False
+            break
+          if not is_valid_grid(got_raw):
+            ok_fn = False
+            break
+          got_arr = np.asarray(got_raw, dtype=int)
+          exp_arr = pair["output"]
+          if got_arr.shape == exp_arr.shape:
+            if np.array_equal(got_arr, exp_arr):
+              n_exact += 1
+              sim_sum += 1.0
+            else:
+              sim_sum += float(np.mean(got_arr == exp_arr))
+        if not ok_fn:
+          continue
+        score = (n_exact, sim_sum / max(1, len(self._train_np)), idx)
+        if score > best_score:
+          try:
+            test_raw = fn(copy.deepcopy(to_grid(self._test_np)))
+            if is_valid_grid(test_raw):
+              best_score = score
+              best_grid = to_grid(test_raw)
+              best_fn_name = name
+          except Exception:
+            pass
+      return best_fn_name if best_grid is not None else ""
+
+    best_fn_name, _ = self._run_with_hard_timeout(_salvage, timeout_s=15.0)
+    if best_fn_name:
+      self.execute_submit_answer_code(
+          f"{best_fn_name}(test_input)", turn_idx, cum_gen_tokens
+      )
+

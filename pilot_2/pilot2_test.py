@@ -30,7 +30,7 @@ class Pilot2Test(googletest.TestCase):
     self.test_input = [[0, 0, 1, 0], [0, 1, 1, 1]]
 
   def test_all_hypotheses_preserve_frozen_baseline_invariants(self) -> None:
-    self.assertLen(prompts_and_selector.PILOT2_HYPOTHESES, 8)
+    self.assertLen(prompts_and_selector.PILOT2_HYPOTHESES, 11)
     for exp_id, cfg in prompts_and_selector.PILOT2_HYPOTHESES.items():
       cfg.validate()
       self.assertEqual(cfg.temperature, 1.0, f"{exp_id} violated temperature=1.0")
@@ -44,6 +44,72 @@ class Pilot2Test(googletest.TestCase):
     self.assertTrue(
         prompts_and_selector.PILOT2_HYPOTHESES["h8_evolutionary_two_wave_repair"].use_evolutionary_two_wave
     )
+    self.assertEqual(
+        prompts_and_selector.PILOT2_HYPOTHESES["e031_deepseek_teaching"].attempt_prompt_styles,
+        ("lean2sub", "lean2sub"),
+    )
+
+  def test_e031_deepseek_teaching_harness(self) -> None:
+    cfg = prompts_and_selector.PILOT2_HYPOTHESES["e031_deepseek_teaching"]
+    sys_p = prompts_and_selector.build_system_prompt(cfg, 0)
+    usr_p = prompts_and_selector.build_user_prompt(self.train_pairs, self.test_input, cfg, 0)
+    self.assertIn("Reasoning Effort: Minimal", sys_p)
+    self.assertIn('"name": "submit_answer"', sys_p)
+    self.assertIn("--Training Examples--", usr_p)
+    self.assertIn("You have a Python tool. The variables `train`", usr_p)
+
+    sb = sandbox_verifier.Pilot2AttemptSandbox(
+        train_pairs=self.train_pairs,
+        test_input=self.test_input,
+        use_arc_helpers=cfg.use_arc_helpers,
+        auto_check_on_solve=cfg.auto_check_on_solve,
+        run_equivariance_audit=cfg.use_equivariance_audit,
+        use_e031_ipython_mode=True,
+    )
+    pair_spec = pilot2_eval.EvalPairSpec(
+        global_pair_idx=1,
+        task_id="e031_task",
+        test_idx=0,
+        train_pairs=self.train_pairs,
+        test_input=self.test_input,
+        ground_truth_output=[[0, 0, 2, 0], [0, 2, 2, 2]],
+    )
+    st = pilot2_eval.AttemptStreamState(
+        pair_spec=pair_spec,
+        attempt_idx=0,
+        cfg=cfg,
+        sandbox=sb,
+        system_prompt=sys_p,
+        user_prompt=usr_p,
+        transcript=prompts_and_selector.format_initial_chatml_transcript(
+            sys_p, usr_p, use_native_xml_tools=True
+        ),
+        seed=10001,
+    )
+    msg1 = (
+        "Let me define solve and test on train.\n</think>\n\n"
+        "<tool_call>\n<function=run_python>\n<parameter=code>\n"
+        "def solve(g):\n    return [[2 if x == 1 else x for x in r] for r in g]\n"
+        "all(solve(p['input']) == p['output'] for p in train)\n"
+        "</parameter>\n</function>\n</tool_call>"
+    )
+    resp1, done1, _ = pilot2_eval.execute_tool_for_attempt(st, msg1, 250)
+    self.assertFalse(done1)
+    self.assertTrue(resp1.startswith("[completed]\nTrue"))
+
+    msg2 = (
+        "All train pass.\n</think>\n\n"
+        "<tool_call>\n<function=submit_answer>\n<parameter=code>\n"
+        "solve(test_input)\n"
+        "</parameter>\n</function>\n</tool_call>"
+    )
+    resp2, done2, reason2 = pilot2_eval.execute_tool_for_attempt(st, msg2, 120)
+    self.assertTrue(done2)
+    self.assertEqual(reason2, "e031_submit_answer")
+    self.assertEqual(resp2, "[answer accepted: 2x4 grid]")
+    att_sum = pilot2_eval.build_attempt_candidate_summary(st)
+    self.assertTrue(att_sum.train_pass)
+    self.assertEqual(att_sum.verified_grid, [[0, 0, 2, 0], [0, 2, 2, 2]])
 
   def test_xml_tool_parsing_and_wave2_evolutionary_seed(self) -> None:
     xml_out = (

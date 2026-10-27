@@ -98,7 +98,11 @@ class Pilot2HypothesisConfig:
     assert len(self.attempt_prompt_styles) == self.num_attempts
     assert len(self.attempt_include_task_summary) == self.num_attempts
     for style in self.attempt_prompt_styles:
-      assert style in ("lean2prog", "lean2progroles"), f"Unknown prompt style: {style}"
+      assert style in (
+          "lean2prog",
+          "lean2progroles",
+          "lean2sub",
+      ), f"Unknown prompt style: {style}"
 
 
 # ==============================================================================
@@ -299,16 +303,233 @@ PILOT2_HYPOTHESES: dict[str, Pilot2HypothesisConfig] = {
         use_evolutionary_two_wave=True,
         use_transcript_compaction=True,
     ),
+    "e031_deepseek_teaching": Pilot2HypothesisConfig(
+        exp_id="e031_deepseek_teaching",
+        title="E031 DeepSeek Teaching Interface (lean2sub + Minimal Effort + IPython run_python & submit_answer, N=2)",
+        hypothesis_summary=(
+            "Exact E031 / E032 DeepSeek teaching harness: ARC Prize user prompt + lean2sub suffix, "
+            "native Qwen3.8 XML tool calls (`run_python` / `submit_answer` evaluating expressions or `answer` in "
+            "persistent IPython session), `minimal` effort header, s20x60 strong budget notes, turns_note=5 at "
+            "40 turns, and 3-tier session fallback (`answer` -> `solve(test_input)` -> `salvage_answer`)."
+        ),
+        num_attempts=2,
+        max_turns=40,
+        total_token_budget=60000,
+        soft_token_target=20000,
+        turn_think_cap=16384,
+        attempt_prompt_styles=("lean2sub", "lean2sub"),
+        attempt_include_task_summary=(False, False),
+        use_arc_helpers=False,
+        auto_check_on_solve=False,
+        use_falsification_protocol=False,
+        use_equivariance_audit=False,
+        use_native_xml_tools=True,
+        use_two_stage_think_nudge=False,
+        use_evolutionary_two_wave=False,
+        use_transcript_compaction=True,
+    ),
+    "e031_deepseek_teaching_bo4": Pilot2HypothesisConfig(
+        exp_id="e031_deepseek_teaching_bo4",
+        title="E031 DeepSeek Teaching Interface (lean2sub + Minimal Effort + IPython run_python & submit_answer, N=4)",
+        hypothesis_summary=(
+            "Exact E031 / E032 DeepSeek teaching harness with N=4 attempts per test pair and train-verified "
+            "selection + 3-tier session fallback (`answer` -> `solve(test_input)` -> `salvage_answer`)."
+        ),
+        num_attempts=4,
+        max_turns=40,
+        total_token_budget=60000,
+        soft_token_target=20000,
+        turn_think_cap=16384,
+        attempt_prompt_styles=("lean2sub", "lean2sub", "lean2sub", "lean2sub"),
+        attempt_include_task_summary=(False, False, False, False),
+        use_arc_helpers=False,
+        auto_check_on_solve=False,
+        use_falsification_protocol=False,
+        use_equivariance_audit=False,
+        use_native_xml_tools=True,
+        use_two_stage_think_nudge=False,
+        use_evolutionary_two_wave=False,
+        use_transcript_compaction=True,
+    ),
+    "e031_deepseek_teaching_fast": Pilot2HypothesisConfig(
+        exp_id="e031_deepseek_teaching_fast",
+        title="Fast E031 DeepSeek Teaching Interface (lean2sub + Minimal Effort + 40k/32t Single-Wave + Final Submit Rescue, N=2)",
+        hypothesis_summary=(
+            "Fast, single-wave E031 DeepSeek teaching harness (`lean2sub`, `minimal` effort, persistent IPython "
+            "`run_python` & `submit_answer`) with 40k token budget (covers >96% of solved attempts empirically, "
+            "where median=15.5k and p90=34.3k tokens), 32 max turns, 10k per-turn think cap, and final-turn "
+            "forced `submit_answer` rescue (`use_two_stage_think_nudge=True`)."
+        ),
+        num_attempts=2,
+        max_turns=32,
+        total_token_budget=40000,
+        soft_token_target=18000,
+        turn_think_cap=10240,
+        attempt_prompt_styles=("lean2sub", "lean2sub"),
+        attempt_include_task_summary=(False, False),
+        use_arc_helpers=False,
+        auto_check_on_solve=False,
+        use_falsification_protocol=False,
+        use_equivariance_audit=False,
+        use_native_xml_tools=True,
+        use_two_stage_think_nudge=True,
+        use_evolutionary_two_wave=False,
+        use_transcript_compaction=True,
+    ),
 }
 
 for _cfg in PILOT2_HYPOTHESES.values():
   _cfg.validate()
 
 
-
 # ==============================================================================
 # 3. SYSTEM & USER PROMPT BUILDERS (RAW CHATML FOR 100% PREFIX CACHE HIT)
 # ==============================================================================
+
+E031_ARC_PRIZE_TEMPLATE = (
+    "You are participating in a puzzle solving competition. You are an expert at"
+    " solving puzzles.\n\nBelow is a list of input and output pairs with a"
+    " pattern. Your goal is to identify the pattern or transformation in the"
+    " training examples that maps the input to the output, then apply that"
+    " pattern to the test input to give a final output.\n\nRespond in the"
+    " format of the training output examples\n\n--Training"
+    " Examples--\n{training_examples}\n--End of Training Examples--\n\n--Test"
+    " Input--\n{test_input}\n--End of Test Input--\n\nYour response:"
+)
+
+E031_LEAN2SUB_SUFFIX = (
+    "\n\nYou have a Python tool. The variables `train` (list of {'input',"
+    " 'output'} grids) and `test_input` are already loaded in it: use them"
+    " directly and never retype or reassign them. Work efficiently: inspect the"
+    " grids with code instead of reading them by hand, form a hypothesis, and"
+    " write code that computes the output. Never construct, copy or count grids"
+    " by hand. Check your rule on every training pair with code before"
+    " answering, and if a pair fails, fix the rule rather than explaining the"
+    " mismatch away. Before answering, check that the rule's assumptions also"
+    " hold on test_input. Keep your reasoning brief."
+    "\n\nWhen your code reproduces every training output and its assumptions"
+    " hold on test_input, call submit_answer with an expression such as"
+    " `solve(test_input)`: the harness evaluates it in your session and that"
+    " grid is your answer, so never retype the grid. Keep your current best"
+    " guess for the test output in a variable `answer`; if you run out of"
+    " budget it is submitted automatically."
+)
+
+E031_TOOLS_SPEC_JSON = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": (
+                "Execute a Python cell in your persistent IPython session. Variables/functions persist. "
+                "Preloaded: train (list of {'input': grid, 'output': grid}), test_input (grid), numpy as np. "
+                "scipy is available. No internet or host files. Timeout 30s. "
+                "Use print() to inspect results. Check transformations on all training pairs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"code": {"type": "string"}},
+                "required": ["code"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_answer",
+            "description": (
+                "End this attempt with your test output. `code` is a Python expression evaluated in your session, "
+                "e.g. solve(test_input) or answer, giving a rectangular grid of ints 0-9 (list or numpy array); "
+                "statements that set a variable `answer` also work. The harness reads the grid directly: do not "
+                "retype it. Invalid grids return an error and the attempt continues."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"code": {"type": "string"}},
+                "required": ["code"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+E031_TOOLS_FOOTER = (
+    "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+    "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+    "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
+    "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified "
+    "format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+    "- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in "
+    "natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer "
+    "the question like normal with your current knowledge and do not tell the user about function calls\n"
+    "</IMPORTANT>"
+)
+
+E031_TIER_MINIMAL = (
+    "Reasoning effort is set to minimal. Keep your thinking short and terse: brief notes, not full sentences. "
+    "Test ideas with small code experiments instead of long deliberation, and submit as soon as the rule "
+    "reproduces every training pair."
+)
+
+E031_EFFORT_HEADER_MINIMAL = (
+    "Reasoning Effort: Minimal. Keep your thinking short and terse: write brief notes, not full sentences. "
+    "Do not restate the task, do not re-read or re-derive what code has already printed, and do not re-verify "
+    "what has already been checked. Test ideas with small code experiments instead of long deliberation, and "
+    "submit as soon as the rule reproduces every training pair."
+)
+
+E031_FORCE_SUBMIT_FINAL = (
+    "\n\nI am out of budget, so I must submit my best answer now as one short expression: `answer` if I "
+    "set it, otherwise solve(test_input) or the name of my best function applied to test_input.\n</think>\n\n"
+    "<tool_call>\n<function=submit_answer>\n<parameter=code>\n"
+)
+
+
+def format_e031_budget_and_turns_note(
+    used_tokens: int | None = None,
+    turn_idx_1based: int | None = None,
+    max_turns: int = 40,
+    soft_target: int = 20000,
+    hard_cap: int = 60000,
+    turns_note_threshold: int = 5,
+    *,
+    cum_gen_tokens: int | None = None,
+    turn_idx_after_tool: int | None = None,
+    hard_budget: int | None = None,
+) -> str:
+  """Format exact E031 / E032 budget and turns-left notes appended inside `<tool_response>`."""
+  toks = int(cum_gen_tokens if cum_gen_tokens is not None else (used_tokens or 0))
+  t_idx = int(
+      turn_idx_after_tool
+      if turn_idx_after_tool is not None
+      else (turn_idx_1based or 0)
+  )
+  h_cap = int(hard_budget if hard_budget is not None else hard_cap)
+  note = ""
+  if toks >= int(0.01 * h_cap):
+    note = (
+        f"\n[budget: {toks / 1000:.0f}k output tokens used; aim to finish within "
+        f"{soft_target / 1000:.0f}k (hard limit {h_cap / 1000:.0f}k)]"
+    )
+    if soft_target <= toks < int(0.75 * h_cap):
+      note += (
+          " Past the target: submit your best answer now with submit_answer, unless one more experiment "
+          "will very likely make every training pair pass."
+      )
+    elif toks >= int(0.75 * h_cap):
+      note += (
+          " Budget nearly spent: submit your best answer now with submit_answer "
+          "(or at least set `answer`)."
+      )
+  left = max_turns - t_idx
+  if turns_note_threshold and 0 < left <= turns_note_threshold:
+    note += (
+        f"\n[{left} turn{'s' if left != 1 else ''} left: call submit_answer with your best answer now, "
+        "or at least set `answer`.]"
+    )
+  return note
+
 
 TOOLS_SPEC_JSON = [
     {
@@ -424,6 +645,17 @@ XML_FORCE_SUBMIT_FINAL = (
 def build_system_prompt(cfg: Pilot2HypothesisConfig, attempt_idx: int) -> str:
   """Build the system prompt with tool definitions for a specific attempt."""
   style = cfg.attempt_prompt_styles[attempt_idx]
+  if style == "lean2sub":
+    e031_tools_lines = "".join(
+        "\n" + json.dumps(t, ensure_ascii=False) for t in E031_TOOLS_SPEC_JSON
+    )
+    return (
+        f"{E031_TIER_MINIMAL}\n\n"
+        "# Tools\n\nYou have access to the following functions:\n\n<tools>"
+        f"{e031_tools_lines}{E031_TOOLS_FOOTER}\n\n"
+        f"{E031_EFFORT_HEADER_MINIMAL}"
+    )
+
   tools_lines = "\n".join(json.dumps(t) for t in TOOLS_SPEC_JSON)
 
   if cfg.use_arc_helpers:
@@ -508,6 +740,27 @@ def build_user_prompt(
     extra_seed_note: str = "",
 ) -> str:
   """Build the initial user message containing the ARC-AGI-2 grids and optional perception/evolutionary summary."""
+  style = cfg.attempt_prompt_styles[attempt_idx]
+  if style == "lean2sub":
+    ex = ""
+    for i, pair in enumerate(train_pairs):
+      ex += (
+          f"--Example {i}-- \n\n INPUT: \n\n"
+          + json.dumps(pair["input"])
+          + "\n\nOUTPUT: \n\n"
+          + json.dumps(pair["output"])
+          + "\n\n"
+      )
+    base_prompt = (
+        E031_ARC_PRIZE_TEMPLATE.format(
+            training_examples=ex, test_input=json.dumps(test_input)
+        )
+        + E031_LEAN2SUB_SUFFIX
+    )
+    if extra_seed_note:
+      base_prompt += "\n\n" + extra_seed_note.strip()
+    return base_prompt.strip()
+
   blocks: list[str] = [
       "Find the common rule that maps an input grid to an output grid, given the examples below."
   ]
@@ -571,7 +824,8 @@ def append_turn_to_chatml_transcript(
   clean_assistant = assistant_output
   if clean_assistant.endswith("<|im_end|>"):
     clean_assistant = clean_assistant[: -len("<|im_end|>")]
-  note_suffix = f"\n{budget_note}" if budget_note else ""
+  clean_note = budget_note.lstrip("\n") if budget_note else ""
+  note_suffix = f"\n{clean_note}" if clean_note else ""
   assistant_prefix = (
       "<|im_start|>assistant\n<think>\n"
       if use_native_xml_tools
