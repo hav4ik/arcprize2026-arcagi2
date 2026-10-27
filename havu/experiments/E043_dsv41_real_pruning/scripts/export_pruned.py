@@ -156,7 +156,10 @@ def main():
         for k, fn in src_idx.items():
             if fn.startswith("model-engram-"):
                 if not (out / fn).exists():
-                    (out / fn).hardlink_to(Path(a.engram_from) / fn)
+                    try:
+                        (out / fn).hardlink_to(Path(a.engram_from) / fn)
+                    except OSError:  # another filesystem: copy
+                        shutil.copy2(Path(a.engram_from) / fn, out / fn)
                 we.weight_map[k] = fn
         src_cfg = json.load(open(Path(a.engram_from) / "config.json"))["text_config"]
         compact_kept = src_cfg["engram_compact_kept"]

@@ -7,6 +7,9 @@ Quality: the 120 ARC-AGI-2 eval tasks with the same harness, full vs pruned on t
 The plan pack (the user's upload, unzipped) is in `plan/` (START_HERE.md, REAP_IMPLEMENTATION_CONTRACT.md,
 TASKS_ENGRAM_FIRST.md, ...). Deployment counterpart: E042 (session dsv4-infer).
 
+**Pre-quantization (native MXFP4) tool E128, with all weight and artifact links:** `PREQUANT_E128.md`. It is a CPU
+rebuild from the public base plus the 2-bit repo's manifest, checked by `scripts/verify_prequant.py`.
+
 ## Offline follow-ups after the box (2026-10-25/26; no box, no API spend)
 
 Detailed reports: `analysis/typos/REPORT.md`, `analysis/doubt/REPORT.md`, `analysis/layer_alloc/NOTES.md`.
