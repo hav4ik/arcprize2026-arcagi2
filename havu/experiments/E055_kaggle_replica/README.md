@@ -86,3 +86,11 @@ Where judgment still enters (disclosed, not hidden):
   The two calibration gaps differ by 3.6 points, about one replica sd, so the mean gap itself is uncertain by ~±2.
 - For comparison, the judgment-based "realistic ~74 (67-80)" given before this point stays inside the range; the
   pre-registered number is the one to quote.
+
+**Final runs (2026-10-28 00:45 UTC; Runpod stopped by the user for budget):**
+- V6 replica `v6rep_x2t` finished at 11.01 h: raw 69.24, central Kaggle-clock score **64.93** (unchanged from the
+  calibration point; optimistic 68.68, pessimistic 63.26), `toolkit/reports/v6rep_x2t_final.md`.
+- B32 draw 2 `candBf2_t2` (workload `evalt2_s2027`) was stopped by SIGTERM at pod 4.94 h of ~11 h (final write done,
+  submission valid): 141 of 240 tasks with a first attempt, score so far 39.17, per-attempt accuracy of finished
+  attempts 65.2%, 5.63M output tokens in finished attempts (draw 1 at the same pod time: 158 tasks, 5.72M).
+  Too early for a second full-run estimate; B32's estimate stays 76.2 from draw 1. `toolkit/reports/candBf2_t2_partial.md`.

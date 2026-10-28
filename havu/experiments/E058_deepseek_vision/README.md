@@ -41,3 +41,22 @@ Test: `tests/test_deepseek_tools.py` `TextImageContentTest`. Smoke (1ae2feb7, 3 
 ## Pilot (pending): 30 random tasks (seed 58, `pilot_tasks.txt`) x 2 attempts, E046 best harness + images
 (`run_pilot.sh`, launched off-peak by `launch_pilot_offpeak.sh`), compared with E046 `e046p_note_all` on the same
 tasks (`compare.py`).
+
+## Results (scored 2026-10-27 from the result files; runs finished overnight, retries done 15:23 UTC)
+Both arms are the full 120 eval tasks x 2 attempts (the files keep the `pilot30` tag), text+image vs the same harness
+text-only, same tasks, paired bootstrap over tasks (`compare.py`).
+
+| model (API) | arm | pass@1 | pass@2 | out tokens/attempt | turns |
+|---|---|---|---|---|---|
+| DeepSeek V4.1-Flash-1017 (E046 best harness) | text (`e046p_note_all`) | 77.6 | 88.6 | 29.6k | |
+| | text+image (`e058_pilot30`) | 81.1 | 90.7 | 27.0k | |
+| Qwen3.8-Flash-Next (E048 harness, Alibaba) | text (E048 `sub80s40` + retry) | 59.8 | 72.9 | 35.0k | 9.5 |
+| | text+image (`e058q_pilot30`) | **67.6** | **77.4** | 29.0k | 8.6 |
+
+- Flash-Next: pass@1 +7.8 pp [95% CI +2.2, +13.8], pass@2 +4.4 pp [-1.7, +11.2], 17% fewer output tokens.
+- DeepSeek: pass@2 +2.1 pp [-2.9, +7.5] (8 tasks better, 6 worse), pass@1 +3.5, 9% fewer output tokens.
+- Images help although neither model can transcribe a grid from an image (perception probes: DeepSeek 0/20 exact,
+  ~35% of cells; Flash-Next with thinking 1/20 exact, 49% of cells, `perception_probe_qwenflash.jsonl`): they work as
+  a supplement to the exact JSON values, not as a replacement (E033: images instead of JSON, 1/55 vs 27/55).
+- Kaggle cost not measured: each 30x30 grid adds ~900 prompt tokens (Qwen, 32 px cells) or ~930 (DeepSeek, 42 px), up
+  to ~16 images per task, which adds prefill and KV on 4xL4. E128 as shipped has no vision tower (dropped in pruning).

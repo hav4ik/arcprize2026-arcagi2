@@ -55,7 +55,7 @@ Exact build command: `REPLICATE.md` section 3.
    - S19 metrics reset after restart (logging), S18 host-capacity guard;
    - E057 8-bit two-shot all-reduce (decode +3-7%, prefill ~1.3x, planned);
    - analysis of B32's traces: 21 pairs without a first-attempt answer, value of second attempts (attempt_2 policy);
-   - a second B32 replica draw (`launch_candBf2_t2.sh`, workload `evalt2_s2027`) is running for a tighter estimate.
+   - a second B32 replica draw (`launch_candBf2_t2.sh`, workload `evalt2_s2027`): stopped at 4.94 h for budget (2026-10-28); rerun it in full for a tighter estimate.
 
 ## B32.1: B32 + failure handling (handoff notebook, not run on Kaggle)
 | | |
