@@ -2,7 +2,7 @@
 
 B32-M V3 (LB 46.5) with the causes found today removed. The model is the E128 text model already on Kaggle
 (`chankhavu/dsv41-flash-1017-arc-tool-e128-2bit`). The harness is B32's (`882c817f`). The server is Manh's **v8** cell (scriptVersionId 363632080) with HIS restart supervisor (`dsv41_vllm.py --supervise 3`).
-Notebook sha256 `d8e1dbeafff6`. Builder: `kaggle/dsv41_tools/build_img_manh.py --text --no-supervisor` (command below). The
+Notebook sha256 `f1c22c4923f7`. Builder: `kaggle/dsv41_tools/build_img_manh.py --text --no-supervisor` (command below). The
 diff against his v8 is in `review/`.
 
 | B32-M V3 | This build | Why |
@@ -33,3 +33,9 @@ with the same KV pool, all 64 workers resumed, and host RAM never held two engin
 engine answers in-flight requests with a plain 500 ("The server had an error while processing your request"), which
 the solver counted as a job try: every in-flight attempt spent 1 of its 2 tries and one was lost. Fixed in solver
 `1ea2b25d`: that 500 is a connection error (free re-queue), and `ARC_CONN_TRIES=12` (was 4) covers several restarts.
+
+Inputs pinned at push (2026-10-29 ~22:40 UTC): `nguyennguyen599/vllm-wheels/11` (vLLM g8cf0c0664b = v10's gf506afa210 + Manh's
+mHC kernel speed-up 71dca8bc24 + the per-layer expert patch (inert for E128); the pods ran v10). Other datasets: latest.
+Docker: latest (user). Model: chankhavu/dsv41-flash-1017-arc-tool-e128-2bit/PyTorch/default/1.
+Build: `... --text --no-supervisor --manh-nb <v8> --slug dsv41-tools-submit-b32m-fix --max-num-seqs 64 --gpu-util 0.90
+--exec-timeout-s 900 --pin-dataset nguyennguyen599/vllm-wheels/11`.

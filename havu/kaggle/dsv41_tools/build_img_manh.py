@@ -201,6 +201,9 @@ def main():
     ap.add_argument("--server-env", action="append", default=[], metavar="KEY=VALUE",
                     help="replace the value of a key already in his MANH_SERVER_ENV (cell 2m), e.g. "
                          "VLLM_DSA_DECODE_INDEXER_ROW_SHARD=0; repeatable")
+    ap.add_argument("--pin-dataset", action="append", default=[], metavar="OWNER/SLUG/VERSION",
+                    help="attach this exact version of one of his dataset_sources (Kaggle otherwise attaches the latest "
+                         "at push time), e.g. nguyennguyen599/vllm-wheels/10")
     ap.add_argument("--keep-docker-pin", action="store_true",
                     help="keep his kernel-metadata docker_image pin (the image he tested his server under) instead of latest")
     ap.add_argument("--no-supervisor", action="store_true",
@@ -423,6 +426,12 @@ def main():
     meta.update(id=f"chankhavu/{a.slug}", title=a.slug, code_file=f"{a.slug}.ipynb", is_private=True,
                 model_sources=[a.model_source] if a.model_source else meta["model_sources"])
     meta.pop("id_no", None)
+    for pin in a.pin_dataset:
+        base = pin.rsplit("/", 1)[0]
+        assert pin.count("/") == 2 and pin.rsplit("/", 1)[1].isdigit(), pin
+        hits_ = [i for i, d in enumerate(meta["dataset_sources"]) if d.split("/")[:2] == base.split("/")]
+        assert len(hits_) == 1, f"{base} not among his dataset_sources {meta['dataset_sources']}"
+        meta["dataset_sources"][hits_[0]] = pin
     if not a.keep_docker_pin:
         # docker: Kaggle's latest image (the user, 2026-10-29), as B32-M V2/V3 ran; his pinned digest is unverified here
         meta.pop("docker_image", None)

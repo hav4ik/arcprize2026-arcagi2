@@ -250,3 +250,37 @@ Per worker, RssAnon minus Engram is ~15.2 GiB on every rank. That is the 12 GiB/
 | Worker TP1 | 29.3 | 26.1 | 2.1 | 62 MiB | 10.8 |
 | Worker TP2 | 39.2 | 36.0 | 2.1 | 82 MiB | 20.7 |
 | Worker TP3 | 48.2 | 45.0 | 2.1 | 100 MiB | 29.7 |
+
+### Phase 2 stopped at 21:53:30 UTC (coordinator: the decode-numerics A/B replaced it)
+- **Run time:** 1.21 h of the notebook, 1.12 h of the solver. Stopped by process group: kernel, solver, server and runner.
+- **First attempts:** 82 done, 65 correct (79.3%), all submitted. Errors: 0 attempt errors; 0 HTTP 4xx/5xx; 0 ERROR or Traceback lines; 0 preemptions; no context or image-count errors.
+- **KV gate:** 7 gate-hold lines. KV stayed at 0.86-0.90 from minute ~40. Running fell to 56-63 with 3-5 waiting (gate plus ARC_ADMIT_MAX_WAITING). GPU prefix hits 97-98%; still no CPU restores.
+- **Trends:**
+  - GPU memory per rank: 0.88 GiB free at the end (1.11 at 25 min); peak allocated 20.03 GiB; 0 OOMs.
+  - Host: used 170 GiB, flat after load; peak 188 at load. Process RSS 150 GiB.
+  - Server tree RSS 144.2 → 145.6 GiB in the first hour.
+- **Archive:** `runs/nb_p2_rerun_1707e4da/` (executed-notebook state, timeline, solver/server logs, attempts, traces, mem probe).
+
+## Decode-vs-prefill logprob A/B (coordinator, 21:52 UTC; E72-152, because E128 was not on the pod)
+- **Why:** Manh's decode-only paths engage only at >= 8 concurrent decodes and had never been checked numerically. They are VLLM_DSA_DECODE_INDEXER_ROW_SHARD, VLLM_TRITON_SPARSE_INDEXER_LOGITS and VLLM_TP_HOST_GATHER.
+- **Server:** the b32m-fix notebook's (sha 3cf579f62484) cell 2m, run as-is by `scripts/run_srv.py`, with Manh's dsv41_vllm.py from arc2-2026-src v22 and his MANH_SERVER_ENV, including VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=900.
+  - Settings: util 0.90, --kv-offload-gib-per-rank 10, --concurrency 64, --context 163840, --max-num-batched-tokens 2048, MANH_VISION=0 (--language-model-only), TP4, GPU order 0,2,1,3.
+  - vLLM: gf506afa210 + 2r, as needed for E72-152's per-layer expert counts.
+  - KV 1,909,056 tokens; GPU 2.47-2.54 GiB free per rank.
+- **Prompts:** 32 b32m_x2t (E128 text harness) transcripts, each cut after a tool turn and rendered with /tokenize (messages + tools, add_generation_prompt). 32.3k-44.9k tokens, 1.35M total (`ab_decode/prompts_index.json`).
+- **Passes** (`scripts/ab_logprob.py`):
+  - Decode: all 32 at once, temperature 0, max_tokens 256, logprobs 1, token ids. The server ran 13-14 requests (about 13 decoding plus 1 prefill chunk) for most of the pass, so >= 8 concurrent decodes was in effect.
+  - Prefill: prompt + generated[:k], max_tokens 1, logprobs 20, every 4th position, concurrency 4 (< 8 decodes possible). The decode token was always in the prefill top-20.
+
+| comparison | n | mean \|d\| | p99 | max | \|d\| > 0.5 | mean d | prefill argmax != decode token |
+|---|---|---|---|---|---|---|---|
+| A: flags ON (Manh's production env), decode (conc 32) vs prefill | 2,040 | 0.0362 | 0.277 | 1.68 | 4 | +0.009 | 56 |
+| B: ROW_SHARD=0, SPARSE_INDEXER_LOGITS=0, TP_HOST_GATHER=0, decode vs prefill | 2,038 | 0.0347 | 0.278 | 1.86 | 5 | +0.007 | 62 |
+| decode A vs decode B, common greedy prefixes | 1,554 | 0.0216 | 0.158 | 0.30 | 0 | +0.002 | n/a |
+| control on A: decode conc 1 vs prefill (8 prompts, common prefixes) | 97 | 0.0156 | 0.170 | 0.17 | 0 | -0.001 | n/a |
+| control on A: decode conc 32 vs decode conc 1 | 374 | 0.0230 | 0.273 | 0.46 | 0 | -0.002 | n/a |
+
+- **Verdict:** the decode paths are numerically clean. Flags on and off are indistinguishable, at fp-noise level, with no systematic offset; per prompt, mean |d| is 0.02-0.06 on both servers.
+- **B's flags were really off:** the workers' /proc/<pid>/environ shows ROW_SHARD=0, SPARSE_INDEXER_LOGITS=0, TP_HOST_GATHER=0 and AR_OVERLAP_CHUNKS=2.
+- **(f) AR_OVERLAP_CHUNKS=0 was skipped:** it is a prefill-only path, so a wrong overlap would have shown as a decode-vs-prefill gap on both servers.
+- **Files:** `ab_decode/` (dec*/pre* JSON, server logs and launch.json). Scripts: `scripts/ab_logprob.py`, `ab_control.py`, `run_srv.py`.
