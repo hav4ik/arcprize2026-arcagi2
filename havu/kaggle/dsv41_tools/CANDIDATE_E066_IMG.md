@@ -6,7 +6,7 @@ side is ours. The only serving-side addition is our patch that lets his vLLM loa
 ## What it is
 
 - **Notebook:** `build_img_manh.py` takes Manh's notebook as input (`nguyennguyen599/dsv41-tools-submit-b32m-external-server`,
-  pulled with `kaggle kernels pull -m`; built on his **v6**, scriptVersionId 363607395: v5 + the server's output root in `dsv41_logs`; notebook sha256 67ad5bc705b6, ~20:30 UTC. Review package for Manh: `out/nb_dsv41-tools-submit-img-manh/README.md`). His install cells,
+  pulled with `kaggle kernels pull -m`; built on his **v6**, scriptVersionId 363607395: v5 + the server's output root in `dsv41_logs`; notebook sha256 `55992cf482fd`, ~20:30 UTC. Review package for Manh: `out/nb_dsv41-tools-submit-img-manh/README.md`). His install cells,
   production server cell 2m (his `dsv41_vllm.py` launcher, his flags and env: TP4, no DCP, util 0.94, --concurrency 64 (his request ~21:00 UTC; his v6 line says 80, our build edits only that line, `--max-num-seqs`),
   --context 163840, 12 GiB/rank CPU KV offload, lossless host all-reduce MODE 556, row shard, AR overlap), solver cell 3
   (ARC_EXTERNAL_SERVER) and stop cell 4 stay byte-identical. His v5 dropped the GPU gate (0a, commented out) and his
@@ -46,6 +46,47 @@ side is ours. The only serving-side addition is our patch that lets his vLLM loa
   Head to head on 79 image tasks, E72-152 trails C1: pass@1 -4.0 [-9.3, +0.8], pass@2 -4.4 [-10.1, 0.0].
   Earlier option: E72-152 (`DeepSeek-V4.1-Flash-1017-arc-tool-img-E72-152-avg120-2bit`, floor 72 / cap 152 / step 16, 4,800
   experts, vision kept) or C1 (uniform E128 + vision) as the fallback. Kaggle's quota fits one; the user picks.
+
+## Final configuration (2026-10-29 ~21:50 UTC): restart supervisor + safety margins
+
+**Build command** (notebook sha256 `55992cf482fd`):
+```
+python3 kaggle/dsv41_tools/build_img_manh.py --manh-nb <Manh v6 pull> \
+  --model-source arazzd/deepseek-v41-flash-1017-arc-tool-img-e128-2bit/PyTorch/default/1 \
+  --model-manifest experiments/E066_dsv41_image_pruning/results/c1_gptq_sha256_manifest.json \
+  --max-num-seqs 64 --gpu-util 0.90 --kv-offload-gib 10 --context 131072 --mm-cache-gb 2 --exec-timeout-s 900
+```
+
+**Server settings (his cell 2m; each is a one-token edit; review diff in `review/cells_vs_manh.md`):**
+
+| Setting | v6 | Final | Why |
+|---|---|---|---|
+| `--gpu-memory-utilization` | 0.94 | **0.90** | ~1.95 GiB free per GPU instead of ~1.0 (B32 had 2.7, B32-M 1.1). Room for long-context prefill spikes: Manh traced the OOMs to re-prefill of large requests |
+| `--kv-offload-gib-per-rank` | 12 | **10** | Host RAM: projected ~150 of Kaggle's 173 GiB (~23 GiB headroom). The CPU tier still holds ~4M tokens, more than the in-flight set, so few re-prefills |
+| `MANH_SEQS` / `ARC_WORKERS` | 80 | **64** | Manh ran 64 on Kaggle; fewer sandboxes and less KV pressure |
+| `MANH_CONTEXT` / `ARC_CONTEXT_LIMIT` | 163840 | **131072** | C1's image eval: max attempt context 130,371 of 280 attempts; caps the longest re-prefill |
+| `--mm-processor-cache-gb` | 4 (vLLM default, held twice) | **2** | ~4 GiB host RAM |
+| `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` | 300 | **900** | A slow step no longer kills the engine; deadlocks still trap at 600 s |
+
+C1's KV pool at util 0.90 is ~1.5M tokens (pod), the same as B32's pool on Kaggle.
+
+**Restart supervisor (cell 2s, ours; `cells/e066_supervisor.py`):**
+- A daemon thread watches `MANH_SERVER_PID`. It acts when the server exits, or after 25 min with no generated tokens while requests run.
+- Recovery steps:
+  1. Write the status "restarting" (`dsv41_logs/e066_supervisor.json`, Manh's `--supervise` format).
+  2. Stop the server's process group, and wait until the group and every GPU compute process are gone. Two engines' RAM never overlap.
+  3. Rerun cell 2m's exact launcher command with `--output-root dsv41_logs/r<N>`.
+  4. Wait for `/v1/models`, then write "up" with the new pid and log.
+- Limits: at most 2 restarts, and only with >= 60 min left before stop-new. Otherwise it writes "failed".
+- Cell 3 passes the status file to the solver (`ARC_EXTERNAL_SERVER_STATUS`, `ARC_MAX_SERVER_RESTARTS=3`). Cell 3s stops the supervisor before cell 4.
+- Solver `324ea6ee`: S26 from Manh's PR #2, plus a wait while the status is not "up".
+  - On "restarting" it stops launching and re-queues in-flight attempts without using a try.
+  - It resumes on the new start, and on "failed" it finishes with what it has.
+- A restart costs the server load time: ~5 min on a healthy host, up to ~25 min under a slow THP Engram load. Re-queued attempts restart from scratch.
+- Tests:
+  - `test_img.Supervisor`: a fake launcher/server is killed, relaunched, then killed again, ending in "failed".
+  - Manh's 8 ExternalServer/SupervisedServer tests pass on the pinned solver.
+  - Pod 3 runs a real kill test (SIGKILL of one TP worker).
 
 ## Build
 

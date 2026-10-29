@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -270,14 +271,16 @@ class ManhBase(unittest.TestCase):
         his = set(self.his)
         ours = [c.splitlines()[0][:14] for c in self.cells if c not in his]
         self.assertEqual(ours, ["# E066 image c", "# Cell 0b (E04", "# Cell 1b (smo", "# Cell 2r (E06", "# Cell 2m (B32",
-                                "# Cell 2c (B32", "# Cell 3w (E06", "# Cell 4b (B32"])
+                                "# Cell 2s (E06", "# Cell 2c (B32", "# Cell 3: the ", "# Cell 3s (E06", "# Cell 3w (E06",
+                                "# Cell 4b (B32"])
         w = next(i for i, c in enumerate(self.cells) if c.startswith("# Cell 3w (E066"))
-        self.assertTrue(self.cells[w - 1].startswith("# Cell 3: the solver"))
+        self.assertTrue(self.cells[w - 1].startswith("# Cell 3s (E066)"))
         self.assertTrue(self.cells[w + 1].startswith("# Cell 4: final check"))
         # every other cell is his, in his order
         self.assertEqual([c for c in self.cells if c in his], [c for c in self.his if c.splitlines()[0][:14] not in
                                                                ("# B32-M + MANH", "# Cell 0b (E04", "# Cell 1b (smo",
-                                                                "# Cell 2m (B32", "# Cell 2c (B32", "# Cell 4b (B32")])
+                                                                "# Cell 2m (B32", "# Cell 2c (B32", "# Cell 3: the ",
+                                                                "# Cell 4b (B32")])
         i = next(i for i, c in enumerate(self.cells) if c.startswith("# Cell 2r (E066"))
         self.assertTrue(self.cells[i - 1].startswith("# Manh's cell 5"))
         self.assertTrue(self.cells[i + 1].startswith("# Cell 2 (B32-M)"))
@@ -286,7 +289,7 @@ class ManhBase(unittest.TestCase):
         diff = [(a, b) for a, b in zip(his_server.splitlines(), server.splitlines()) if a != b]
         self.assertEqual(len(server.splitlines()), len(his_server.splitlines()))
         self.assertEqual(diff, [("MANH_CONTEXT, MANH_SEQS = 163840, 80", "MANH_CONTEXT, MANH_SEQS = 163840, 64  # E066 build: "
-                                 "Manh's 163840, 80 -> 163840, 64 (his request)")])  # his server cell, 1 line
+                                 "Manh's 163840, 80 -> 163840, 64 (Manh 64 + 128k; E066 margins)")])  # his server cell, 1 line
         self.assertEqual(self.meta["model_sources"], [MODEL])
         self.assertEqual(self.meta["docker_image_pinning_type"], "latest")
         self.assertNotIn("docker_image", self.meta)
@@ -400,6 +403,116 @@ class ContextOption(unittest.TestCase):
         self.assertIn("MANH_CONTEXT, MANH_SEQS = 131072, 64", c2m)
         b = next(c for c in cells if c.startswith("# Cell 0b"))
         self.assertIn('"ARC_CONTEXT_LIMIT": "131072"', b)
+
+
+FAKE_SERVER = r"""
+import http.server, json, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/v1/models"):
+            body = json.dumps({"data": [{"id": "dsv41", "max_model_len": 131072}]}).encode()
+        else:
+            body = b'vllm:generation_tokens_total{engine="0"} 5.0\nvllm:num_requests_running{engine="0"} 0.0\n'
+        self.send_response(200); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+"""
+FAKE_LAUNCHER = r"""
+import json, os, subprocess, sys
+a = sys.argv
+root, port = a[a.index("--output-root") + 1], a[a.index("--port") + 1]
+os.makedirs(f"{root}/server")
+p = subprocess.Popen([sys.executable, a[a.index("--server") + 1], port], start_new_session=True,
+                     stdout=open(f"{root}/server/server.log", "w"), stderr=subprocess.STDOUT)
+json.dump({"pid": p.pid}, open(f"{root}/server/launch.json", "w"))
+"""
+
+
+class Supervisor(unittest.TestCase):
+    """Cell 2s: a dead server is relaunched with cell 2m's command and a fresh --output-root; the status file follows
+    S26's format; after E066_MAX_RESTARTS it says failed."""
+    def test_relaunch_then_give_up(self):
+        import signal, socket, threading
+        d = Path(tempfile.mkdtemp(dir=SCRATCH))
+        (d / "srv.py").write_text(FAKE_SERVER)
+        (d / "launch.py").write_text(FAKE_LAUNCHER)
+        with socket.socket() as so:
+            so.bind(("127.0.0.1", 0))
+            port = so.getsockname()[1]
+        cmd = [sys.executable, str(d / "launch.py"), "--output-root", str(d / "dsv41_logs"), "--port", str(port),
+               "--server", str(d / "srv.py")]
+        subprocess.run(cmd, check=True)
+        pid0 = json.load(open(d / "dsv41_logs/server/launch.json"))["pid"]
+
+        def alive(pid):
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    return f.read().rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+            except OSError:
+                return False
+        for _ in range(100):
+            try:
+                urllib_get(f"http://127.0.0.1:{port}/v1/models")
+                break
+            except Exception:
+                time.sleep(0.1)
+        env_keys = ("E066_MAX_RESTARTS", "E066_RESTART_MIN_LEFT_S", "E066_STALL_S", "ARC_STOP_NEW_S")
+        old = {k: os.environ.get(k) for k in env_keys}
+        os.environ.update(E066_MAX_RESTARTS="1", E066_RESTART_MIN_LEFT_S="0", E066_STALL_S="0", ARC_STOP_NEW_S="99999")
+        ns = {"T0": time.time(), "WORK": str(d), "MODE": "submit", "_cmd": cmd, "_env": dict(os.environ),
+              "MANH_BASE_URL": f"http://127.0.0.1:{port}/v1", "MANH_SERVER_PID": pid0,
+              "MANH_SERVER_LOG": str(d / "dsv41_logs/server/server.log"), "_manh_alive": alive, "_t": time.time()}
+        try:
+            code_ = (D / "cells/e066_supervisor.py").read_text()
+            exec(compile(code_, "cell2s", "exec"), ns)
+            ns["_sup_gpu_apps"] = lambda: []  # this box's own GPU processes are not the fake server's
+            status = lambda: json.load(open(ns["SUPERVISOR_STATUS"]))
+            self.assertEqual((status()["start"], status()["state"], status()["pid"]), (0, "up", pid0))
+            os.killpg(pid0, signal.SIGKILL)
+            t = time.time()
+            while time.time() - t < 60 and not (status()["start"] == 1 and status()["state"] == "up"):
+                time.sleep(0.5)
+            st = status()
+            self.assertEqual((st["start"], st["state"]), (1, "up"), st)
+            self.assertNotEqual(st["pid"], pid0)
+            self.assertEqual(ns["MANH_SERVER_PID"], st["pid"])
+            self.assertTrue(ns["MANH_SERVER_LOG"].endswith("dsv41_logs/r1/server/server.log"))
+            self.assertIn("dsv41", urllib_get(f"http://127.0.0.1:{port}/v1/models"))
+            os.killpg(st["pid"], signal.SIGKILL)  # second death: no restart left
+            t = time.time()
+            while time.time() - t < 30 and status()["state"] != "failed":
+                time.sleep(0.5)
+            self.assertEqual(status()["state"], "failed", status())
+            self.assertTrue(any("no restart" in e for e in ns["SUPERVISOR"]["events"]), ns["SUPERVISOR"]["events"])
+        finally:
+            ns.get("SUPERVISOR", {})["stop"] = True
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            for pid in {pid0, ns.get("MANH_SERVER_PID")}:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+
+    def test_cells_wired(self):
+        cells = build_manh()
+        heads = [c.splitlines()[0] for c in cells]
+        at = lambda p: next(i for i, h in enumerate(heads) if h.startswith(p))
+        self.assertEqual(at("# Cell 2s (E066"), at("# Cell 2m (B32-M") + 1)
+        self.assertEqual(at("# Cell 3s (E066)"), at("# Cell 3: the solver") + 1)
+        c3 = next(c for c in cells if c.startswith("# Cell 3: the solver"))
+        self.assertIn('ARC_EXTERNAL_SERVER_STATUS=globals().get("SUPERVISOR_STATUS") or ""', c3)
+        self.assertIn('ARC_MAX_SERVER_RESTARTS="3" if globals().get("SUPERVISOR_STATUS") else "0"', c3)
+        compile(c3, "cell3", "exec")
+
+
+def urllib_get(url):
+    import urllib.request
+    with urllib.request.urlopen(url, timeout=5) as r:
+        return r.read().decode()
 
 
 class LightSmokeChecks(unittest.TestCase):

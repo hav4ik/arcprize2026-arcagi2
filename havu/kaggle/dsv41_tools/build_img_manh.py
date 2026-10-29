@@ -85,6 +85,11 @@ def contract_image_block():
 
 # cell 4b additions (inside his `if not RERUN` block, 4-space indent; _w = WORK, _sl = solver.log text, json/os imported)
 E066_REPORT_CHECKS = """\
+    try:  # E066: the restart supervisor's history (cell 2s); informational
+        print("E066 supervisor status:", open(f"{_w}/dsv41_logs/e066_supervisor.json").read().strip(),
+              "| events:", (globals().get("SUPERVISOR") or {}).get("events"), flush=True)
+    except Exception as exc:
+        print("E066 supervisor status: none", type(exc).__name__, flush=True)
     try:  # E066: cell 2r's patch outcome (fatal unless patched / already_fixed)
         _pr = json.load(open(f"{_w}/e066_vllm_patch.json"))
         print("E066 vLLM patch:", [(os.path.basename(x.get("file", "?")), x.get("action")) for x in _pr], flush=True)
@@ -136,6 +141,15 @@ E066_LIGHT_CHECKS = """\
         except Exception as exc:
             _b32m_bad.append(f"host RAM check: {type(exc).__name__}: {exc}")
 """
+STOP_SUPERVISOR_CELL = """\
+# Cell 3s (E066): the solver is done; stop cell 2s's restart supervisor before cell 4 stops the server (both modes).
+if "SUPERVISOR" in globals():
+    SUPERVISOR["stop"] = True
+    if SUPERVISOR.get("thread"):
+        SUPERVISOR["thread"].join(timeout=30)
+    print("E066 supervisor stopped:", {"restarts": SUPERVISOR["restarts"], "events": SUPERVISOR["events"][-8:]},
+          flush=True)
+"""
 WAIT_CELL = """\
 # Cell 3w (E066, commit runs only): cell 2c's API contract runs in a background thread and needs the server. The light
 # smoke's 2 tasks can finish before it does, and cell 4 then stops the server, so wait for it here (at most 15 min).
@@ -174,6 +188,9 @@ def main():
     ap.add_argument("--exec-timeout-s", default=None,
                     help="VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS in his server env (vLLM default 300: a slower step kills "
                          "the engine); only with Manh's OK")
+    ap.add_argument("--no-supervisor", action="store_true",
+                    help="leave out cell 2s (our restart supervisor for his server) and cell 3s; the solver then keeps "
+                         "S25 (no restarts)")
     ap.add_argument("--model-manifest", type=Path, required=True,
                     help="the E066 export's path/size/sha256 manifest: commit-run input integrity (cell 1b)")
     ap.add_argument("--out", type=Path)
@@ -220,7 +237,7 @@ def main():
     new_ctx = a.context if a.context is not None else ctx
     if (seqs, ctx) != (a.max_num_seqs, new_ctx):
         c2m = replace_once(c2m, line, f"MANH_CONTEXT, MANH_SEQS = {new_ctx}, {a.max_num_seqs}  # E066 build: Manh's "
-                                      f"{ctx}, {seqs} -> {new_ctx}, {a.max_num_seqs} (his request)")
+                                      f"{ctx}, {seqs} -> {new_ctx}, {a.max_num_seqs} (Manh 64 + 128k; E066 margins)")
     for flag, val in (("--kv-offload-gib-per-rank", a.kv_offload_gib), ("--gpu-memory-utilization", a.gpu_util)):
         if val is not None:
             m_ = re.search(rf'"{flag}", "([0-9.]+)"', c2m)
@@ -234,7 +251,7 @@ def main():
     if a.exec_timeout_s is not None:
         anchor = '    "VLLM_TP_HOST_GATHER": "1",'
         assert c2m.count(anchor) == 1 and "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS" not in c2m
-        c2m = c2m.replace(anchor, f'    "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "{a.exec_timeout_s}",  # E066 build (Manh\'s OK)\n' + anchor)
+        c2m = c2m.replace(anchor, f'    "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "{a.exec_timeout_s}",  # E066 build: safety margin (2026-10-29)\n' + anchor)
     cells[k2] = code(c2m)
 
     # cell 0b: our pins, his checks + ours
@@ -333,6 +350,19 @@ def main():
     # cell 3w (new): wait for the contract thread before his cell 4 stops the server
     w = find(cells, "# Cell 3: the solver")
     cells.insert(w + 1, code(WAIT_CELL))
+
+    if not a.no_supervisor:
+        # cell 2s (new, after his server cell): our restart supervisor; cell 3 follows it (S26); cell 3s stops it
+        k2 = find(cells, "# Cell 2m (B32-M + Manh's server)")
+        cells.insert(k2 + 1, code((HERE / "cells/e066_supervisor.py").read_text()))
+        k3 = find(cells, "# Cell 3: the solver")
+        c3 = src(cells[k3])
+        c3 = replace_once(c3, 'ARC_EXTERNAL_SERVER_LOG=MANH_SERVER_LOG, ARC_MAX_SERVER_RESTARTS="0",',
+                          'ARC_EXTERNAL_SERVER_LOG=MANH_SERVER_LOG,  # E066: + S26, follow cell 2s through restarts\n'
+                          '               ARC_MAX_SERVER_RESTARTS="3" if globals().get("SUPERVISOR_STATUS") else "0",\n'
+                          '               ARC_EXTERNAL_SERVER_STATUS=globals().get("SUPERVISOR_STATUS") or "",')
+        cells[k3] = code(c3)
+        cells.insert(k3 + 1, code(STOP_SUPERVISOR_CELL))
 
     nb["cells"] = cells
     out = a.out or HERE / f"out/nb_{a.slug}"

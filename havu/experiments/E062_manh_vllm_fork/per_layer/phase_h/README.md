@@ -213,3 +213,40 @@ Per worker, RssAnon minus Engram is ~15.2 GiB on every rank. That is the 12 GiB/
 
   Per worker, VmRSS / AnonHugePages: TP0 21.3 / 2.8, TP1 29.3 / 10.8, TP2 39.2 / 20.7, TP3 48.2 / 29.7 GiB. EngineCore 3.8, API server 2.4 GiB.
 - **Probe caveat:** the probe started before the launcher re-pointed /kaggle/working. Its "after_load" record and log lines came from phase 1's server.log; the values above were re-read from phase 2's own server.log (`mem_probe_after.jsonl`). The probe now ignores a server.log older than its own start.
+
+### Checkpoint ~1 h (21:41 UTC; the solver has run 55 min)
+
+| min | gen/s | prompt/s | GPU-hit/s | CPU-restored/s | recompute/s | GPU % | KV | run / wait | done |
+|---|---|---|---|---|---|---|---|---|---|
+| 17-22 | 775 | 7,299 | 6,642 | 0 | 657 | 91.0 | 0.62 | 79 / 0 | 22 |
+| 22-27 | 802 | 7,636 | 7,086 | 0 | 550 | 92.8 | 0.70 | 80 / 0 | 28 |
+| 27-33 | 731 | 10,002 | 9,172 | 0 | 830 | 91.7 | 0.75 | 80 / 0 | 38 |
+| 33-38 | 776 | 8,547 | 7,889 | 0 | 658 | 92.3 | 0.81 | 80 / 0 | 47 |
+| 38-43 | 768 | 10,592 | 9,935 | 0 | 657 | 93.8 | 0.86 | 80 / 0 | 55 |
+| 44-49 | 787 | 10,689 | 10,112 | 0 | 577 | 94.6 | 0.90 | 76 / 0 | 62 |
+| 49-54 | 800 | 10,626 | 10,265 | 0 | 361 | 96.6 | 0.88 | 68 / 0 | 71 |
+
+- **Attempts:** 71 first attempts, 57 correct (80.3%), all submitted, 0 errors.
+- **KV gate:** KV above 0.85 in 3 of 11 windows (from ~40 min, peak 0.90). 4 gate-hold lines, the last "KV gate: usage 0.881 (limit 0.85); holding new attempts at 72 running".
+- **No CPU restores yet:** GPU prefix hits are 92-97%, recompute 3-9%.
+- **Server health:** 0 preemptions, HTTP 4xx/5xx, ERROR or Traceback.
+- **GPU memory per rank:** 19.54 GiB allocated (peak 19.96), 20.41 reserved, 0.92-0.97 GiB free, 0 OOMs.
+- **Host:** used 170 GiB now (peak 188 at load). Disk 16 GB free.
+- **use_thp memory, first hour:** compaction Δ 0 and no MADV_COLLAPSE throughout.
+
+| UTC | MemAvailable | AnonPages | AnonHugePages | Cached | Shmem | PageTables | server tree RSS |
+|---|---|---|---|---|---|---|---|
+| 20:50 | 317.8 | 161.0 | 64.3 | 261.3 | 7.2 | 423 MiB | 144.2 |
+| 21:00 | 317.5 | 161.3 | 64.3 | 261.2 | 7.2 | 426 MiB | 144.1 |
+| 21:10 | 317.1 | 161.8 | 64.3 | 186.1 | 7.2 | 426 MiB | 144.6 |
+| 21:20 | 316.6 | 162.3 | 64.3 | 186.1 | 7.2 | 428 MiB | 145.0 |
+| 21:30 | 316.0 | 163.0 | 64.3 | 186.1 | 7.2 | 430 MiB | 145.6 |
+
+| process (21:30) | VmRSS | RssAnon | RssShmem | VmPTE | AnonHugePages |
+|---|---|---|---|---|---|
+| API server | 2.4 | 2.0 | 0.0 | 8 MiB | 0.0 |
+| EngineCore | 5.2 | 4.7 | 0.1 | 13 MiB | 0.0 |
+| Worker TP0 | 21.3 | 18.1 | 2.1 | 46 MiB | 2.8 |
+| Worker TP1 | 29.3 | 26.1 | 2.1 | 62 MiB | 10.8 |
+| Worker TP2 | 39.2 | 36.0 | 2.1 | 82 MiB | 20.7 |
+| Worker TP3 | 48.2 | 45.0 | 2.1 | 100 MiB | 29.7 |

@@ -453,6 +453,9 @@ def start_external():
             log(f"external server {URL}: its supervisor is {status['state']} ({status.get('error')}); no wait left")
             STATE["restarts"] = max(STATE["restarts"], MAX_RESTARTS)
             return False
+        if status and status.get("state") != "up":  # E066: the supervisor's next start is not up yet (it may
+            time.sleep(5)                          # still answer /v1/models on the same port before "up")
+            continue
         try:
             with urllib.request.urlopen(URL + "/v1/models", timeout=5) as r:
                 ids = [m.get("id") for m in json.loads(r.read())["data"]]

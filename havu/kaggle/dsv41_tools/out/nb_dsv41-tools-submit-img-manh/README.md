@@ -13,7 +13,7 @@ small patch to your vLLM so per-layer expert counts load. Everything we changed 
 | [`review/solver_vs_manh.diff`](review/solver_vs_manh.diff) | our pinned solver vs the one in your v6 cell 0b |
 | [`review/harness_vs_manh.diff`](review/harness_vs_manh.diff) | our pinned harness vs the one in your v6 cell 0b (B32's) |
 
-The current build is notebook sha256 `67ad5bc705b6`, built on your v6 (scriptVersionId 363607395, the server's
+The current build is notebook sha256 `55992cf482fd`, built on your v6 (scriptVersionId 363607395, the server's
 output root moved into `dsv41_logs`) after the fourth audit's fixes (~20:30 UTC).
 
 Longer record: [`kaggle/dsv41_tools/CANDIDATE_E066_IMG.md`](../../CANDIDATE_E066_IMG.md).
@@ -80,6 +80,47 @@ your main 71dca8bc24. It is not pushed; the diffs are in `kaggle/dsv41_tools/b32
 
 `ARC_WORKERS=64` (= your `--concurrency 64`), `ARC_MULTI_TEST=1`, `ARC_MULTI_BUDGET=0.5`, `ARC_CONTEXT_LIMIT=163840`
 (= your `--context`), KV admission gate `ARC_KV_ADMIT_MAX=0.85`, auto-repair on, image harness as above.
+
+## Final configuration (2026-10-29 ~21:50 UTC): restart supervisor + safety margins
+
+**Build command** (notebook sha256 `55992cf482fd`):
+```
+python3 kaggle/dsv41_tools/build_img_manh.py --manh-nb <Manh v6 pull> \
+  --model-source arazzd/deepseek-v41-flash-1017-arc-tool-img-e128-2bit/PyTorch/default/1 \
+  --model-manifest experiments/E066_dsv41_image_pruning/results/c1_gptq_sha256_manifest.json \
+  --max-num-seqs 64 --gpu-util 0.90 --kv-offload-gib 10 --context 131072 --mm-cache-gb 2 --exec-timeout-s 900
+```
+
+**Server settings (his cell 2m; each is a one-token edit; review diff in `review/cells_vs_manh.md`):**
+
+| Setting | v6 | Final | Why |
+|---|---|---|---|
+| `--gpu-memory-utilization` | 0.94 | **0.90** | ~1.95 GiB free per GPU instead of ~1.0 (B32 had 2.7, B32-M 1.1). Room for long-context prefill spikes: Manh traced the OOMs to re-prefill of large requests |
+| `--kv-offload-gib-per-rank` | 12 | **10** | Host RAM: projected ~150 of Kaggle's 173 GiB (~23 GiB headroom). The CPU tier still holds ~4M tokens, more than the in-flight set, so few re-prefills |
+| `MANH_SEQS` / `ARC_WORKERS` | 80 | **64** | Manh ran 64 on Kaggle; fewer sandboxes and less KV pressure |
+| `MANH_CONTEXT` / `ARC_CONTEXT_LIMIT` | 163840 | **131072** | C1's image eval: max attempt context 130,371 of 280 attempts; caps the longest re-prefill |
+| `--mm-processor-cache-gb` | 4 (vLLM default, held twice) | **2** | ~4 GiB host RAM |
+| `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` | 300 | **900** | A slow step no longer kills the engine; deadlocks still trap at 600 s |
+
+C1's KV pool at util 0.90 is ~1.5M tokens (pod), the same as B32's pool on Kaggle.
+
+**Restart supervisor (cell 2s, ours; `cells/e066_supervisor.py`):**
+- A daemon thread watches `MANH_SERVER_PID`. It acts when the server exits, or after 25 min with no generated tokens while requests run.
+- Recovery steps:
+  1. Write the status "restarting" (`dsv41_logs/e066_supervisor.json`, Manh's `--supervise` format).
+  2. Stop the server's process group, and wait until the group and every GPU compute process are gone. Two engines' RAM never overlap.
+  3. Rerun cell 2m's exact launcher command with `--output-root dsv41_logs/r<N>`.
+  4. Wait for `/v1/models`, then write "up" with the new pid and log.
+- Limits: at most 2 restarts, and only with >= 60 min left before stop-new. Otherwise it writes "failed".
+- Cell 3 passes the status file to the solver (`ARC_EXTERNAL_SERVER_STATUS`, `ARC_MAX_SERVER_RESTARTS=3`). Cell 3s stops the supervisor before cell 4.
+- Solver `324ea6ee`: S26 from Manh's PR #2, plus a wait while the status is not "up".
+  - On "restarting" it stops launching and re-queues in-flight attempts without using a try.
+  - It resumes on the new start, and on "failed" it finishes with what it has.
+- A restart costs the server load time: ~5 min on a healthy host, up to ~25 min under a slow THP Engram load. Re-queued attempts restart from scratch.
+- Tests:
+  - `test_img.Supervisor`: a fake launcher/server is killed, relaunched, then killed again, ending in "failed".
+  - Manh's 8 ExternalServer/SupervisedServer tests pass on the pinned solver.
+  - Pod 3 runs a real kill test (SIGKILL of one TP worker).
 
 ## Please vibe-check
 
