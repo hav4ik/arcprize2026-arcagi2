@@ -86,8 +86,15 @@ def hash_ids(geo, ids, pos):
     return out
 
 
-def iter_consumed(tokdir, chunk=2_000_000):
-    """Yield (ids, pos, role) chunks of consumed inputs (each sequence minus its last token)."""
+IMAGE_TOKEN_ID = 129264
+
+
+def iter_consumed(tokdir, chunk=2_000_000, image_dead=False):
+    """Yield (ids, pos, role) chunks of consumed inputs (each sequence minus its last token).
+
+    image_dead (E066): image-span positions (id 129264) are dead for Engram in the vLLM fork: they break n-grams
+    (every shift reaching one reads pad, as before a sequence start) and their gate is zeroed. So they are dropped
+    here, and pos counts from the last image position instead of the sequence start."""
     tokdir = Path(tokdir)
     toks = np.fromfile(tokdir / "tokens.u32", dtype=np.uint32)
     roles = np.fromfile(tokdir / "roles.u8", dtype=np.uint8)
@@ -95,9 +102,14 @@ def iter_consumed(tokdir, chunk=2_000_000):
     for line in open(tokdir / "index.jsonl"):
         r = json.loads(line)
         o, L = r["offset"], r["length"]
-        buf_ids.append(toks[o:o + L - 1].astype(np.int64))
-        buf_pos.append(np.arange(L - 1, dtype=np.int64))
-        buf_role.append(roles[o:o + L - 1])
+        ids, pos, role = toks[o:o + L - 1].astype(np.int64), np.arange(L - 1, dtype=np.int64), roles[o:o + L - 1]
+        if image_dead:
+            dead = ids == IMAGE_TOKEN_ID
+            pos = pos - np.maximum.accumulate(np.where(dead, pos, -1)) - 1
+            ids, pos, role = ids[~dead], pos[~dead], role[~dead]
+        buf_ids.append(ids)
+        buf_pos.append(pos)
+        buf_role.append(role)
         n += L - 1
         if n >= chunk:
             yield np.concatenate(buf_ids), np.concatenate(buf_pos), np.concatenate(buf_role)
@@ -107,13 +119,13 @@ def iter_consumed(tokdir, chunk=2_000_000):
 
 
 def _count_worker(job):
-    geo_path, tokdirs, out = job
+    geo_path, tokdirs, out, image_dead = job
     geo = dict(np.load(geo_path))
     ne = geo["num_embeddings"]
     counts = {(l, r): np.zeros(int(ne[l]), dtype=np.uint32) for l in range(2) for r in range(2)}
     ntok = np.zeros(2, dtype=np.int64)
     for d in tokdirs:
-        for ids, pos, role in iter_consumed(d):
+        for ids, pos, role in iter_consumed(d, image_dead=image_dead):
             h = hash_ids(geo, ids, pos)
             for r in range(2):
                 sel = role == r
@@ -131,7 +143,7 @@ def cmd_count(a):
     groups = [dirs[i::a.workers] for i in range(a.workers)]
     tmp = Path(a.out).with_suffix(".parts")
     tmp.mkdir(exist_ok=True)
-    jobs = [(str(geo_path), g, str(tmp / f"part{i}.npz")) for i, g in enumerate(groups) if g]
+    jobs = [(str(geo_path), g, str(tmp / f"part{i}.npz"), a.image_dead) for i, g in enumerate(groups) if g]
     with ProcessPoolExecutor(len(jobs)) as ex:
         parts = list(ex.map(_count_worker, jobs))
     total, ntok = None, np.zeros(2, dtype=np.int64)
@@ -196,7 +208,7 @@ def cmd_coverage(a):
                             for l in range(2)] for p in a.masks}
     stats = {k: {"lookups": 0, "hits": 0, "tokens": 0, "all48": 0, "gen_lookups": 0, "gen_hits": 0} for k in masks}
     for d in a.tok:
-        for ids, pos, role in iter_consumed(d):
+        for ids, pos, role in iter_consumed(d, image_dead=a.image_dead):
             h = hash_ids(geo, ids, pos)
             for k, m in masks.items():
                 hit = np.stack([m[l][h[:, l]] for l in range(2)], axis=1)  # [T, 2, 24]
@@ -216,7 +228,7 @@ def cmd_coverage(a):
 
 def cmd_hashes(a):
     geo = load_geometry(a.model_dir, a.geo)
-    ids, pos, _ = next(iter_consumed(a.tok[0], chunk=1))
+    ids, pos, _ = next(iter_consumed(a.tok[0], chunk=1, image_dead=a.image_dead))
     n = min(a.n, len(ids))
     h = hash_ids(geo, ids[:n], pos[:n])
     np.savez(a.out, ids=ids[:n], hashes=h)
@@ -237,6 +249,8 @@ def main():
     ap.add_argument("--out-dir", default="")
     ap.add_argument("--masks", nargs="*", default=[])
     ap.add_argument("--n", type=int, default=4096)
+    ap.add_argument("--image-dead", action="store_true",
+                    help="E066: image positions break n-grams and are not counted (the fork's rule)")
     a = ap.parse_args()
     {"count": cmd_count, "select": cmd_select, "coverage": cmd_coverage, "hashes": cmd_hashes}[a.cmd](a)
 

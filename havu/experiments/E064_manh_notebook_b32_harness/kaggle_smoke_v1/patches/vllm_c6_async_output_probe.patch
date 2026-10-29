@@ -1,0 +1,46 @@
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index f7646682e7..5c235d754b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4,6 +4,7 @@ import contextlib
+ import functools
+ import gc
+ import itertools
++import os
+ import threading
+ import time
+ from collections import defaultdict
+@@ -282,10 +283,33 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+         self._routed_experts = routed_experts
+         self._has_fault: torch.Tensor | None = None
+ 
++        # ARC forensic controls. These are opt-in, diagnostic-only controls:
++        # snapshot on the producing stream to distinguish producer corruption
++        # from reuse while the async device-to-host copy is in flight.
++        snapshot_async_output = os.environ.get(
++            "ARC_VLLM_ASYNC_OUTPUT_SNAPSHOT", "0"
++        ).strip().lower() in {"1", "true", "yes", "on"}
++        if snapshot_async_output:
++            self._sampled_token_ids = self._sampled_token_ids.clone()
++            if self._logprobs_tensors is not None:
++                self._logprobs_tensors = LogprobsTensors(
++                    self._logprobs_tensors.logprob_token_ids.clone(),
++                    self._logprobs_tensors.logprobs.clone(),
++                    self._logprobs_tensors.selected_token_ranks.clone(),
++                    self._logprobs_tensors.cu_num_generated_tokens,
++                )
++
+         # Initiate the copy on a separate stream, but do not synchronize it.
+         default_stream = torch.cuda.current_stream()
+         with torch.cuda.stream(async_output_copy_stream):
+             async_output_copy_stream.wait_stream(default_stream)
++            delay_cycles = int(
++                os.environ.get("ARC_VLLM_ASYNC_COPY_DELAY_CYCLES", "0") or 0
++            )
++            if delay_cycles > 0:
++                # Test-only race amplifier. A private snapshot must survive
++                # this delay even if a graph/static output is reused.
++                torch.cuda._sleep(delay_cycles)
+             self.sampled_token_ids_cpu = self._sampled_token_ids.to(
+                 "cpu", non_blocking=True
+             )

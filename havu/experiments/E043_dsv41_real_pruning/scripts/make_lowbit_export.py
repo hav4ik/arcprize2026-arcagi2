@@ -72,11 +72,12 @@ def main():
     json.dump(idx, open(out / "model.safetensors.index.json", "w"), indent=1)
     pd = out / "gptq"
     pd.mkdir()
-    n_exp = None
+    counts = []
     for L in range(40):
         src = Path(a.precomputed) / f"layer_{L:02d}.safetensors"
         kept = np.nonzero(keep[L])[0]
         n_exp = len(kept)
+        counts.append(n_exp)
         comp = {int(o): i for i, o in enumerate(kept)}
         with safe_open(str(src), framework="pt") as sf:
             t = {}
@@ -90,6 +91,9 @@ def main():
                 t[f"e{e}.{m.group(2)}.{m.group(3)}"] = sf.get_tensor(k)
         assert len(t) == 9 * n_exp, (L, len(t), n_exp)
         save_file(t, str(pd / f"layer_{L:02d}.safetensors"), metadata={"format": "pt", "experts": str(n_exp)})
+    n_exp = counts[0] if len(set(counts)) == 1 else counts  # E066 per-layer counts: the list
+    n_desc = f"{n_exp} per backbone layer" if isinstance(n_exp, int) else \
+        f"{min(counts)}-{max(counts)} per backbone layer ({sum(counts)} in all, text_config.n_routed_experts_per_layer)"
     if (Path(a.precomputed) / "manifest.json").exists():
         shutil.copy(Path(a.precomputed) / "manifest.json", pd / "source_manifest.json")
     lowbit = {"name": a.name, "quantizer": a.quantizer, "experts_per_layer": n_exp, "humming_schema": json.loads(a.schema),
@@ -101,13 +105,13 @@ def main():
     json.dump(cfg, open(out / "config.json", "w"), indent=2)
     readme = f"""# DeepSeek-V4.1-Flash-1017, {a.name} (E043 low-bit, GPTQ-only layout)
 
-Routed experts: {n_exp} per backbone layer ({a.keep_desc}, original ids in e043_manifest.json), stored only as
+Routed experts: {n_desc} ({a.keep_desc}, original ids in e043_manifest.json), stored only as
 low-bit Humming tensors in `gptq/` (no MXFP4 copies): {a.quantizer}. Schema (gate/up): `{a.schema}`;
 down: `{a.schema_w2 or a.schema}`. Attention, router (sliced to the kept experts), shared expert, norms and mHC as
 released; Engram compact as in the base export (`text_config.engram_compact_kept`).
 
 Serve with the vLLM DeepSeek-V4.1 SM89/SM120 fork plus E043's patches (apply_e043_patches.py, apply_compact_engram.py,
-apply_e043_humming.py, which add the router shape ({n_exp}, 6)) and:
+apply_e043_humming.py, which add the router shape (experts, 6)) and:
 
     export DSV41_EXPERT_HUMMING='{a.schema}'
 """ + (f"    export DSV41_EXPERT_HUMMING_W2='{a.schema_w2}'\n" if a.schema_w2 else "") + """    export E043_GPTQ_DIR=<model_dir>/gptq

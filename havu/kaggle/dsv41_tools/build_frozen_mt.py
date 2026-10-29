@@ -471,6 +471,13 @@ def main():
     ap.add_argument("--gate", type=float, default=0.0)
     ap.add_argument("--solver", type=Path, default=HERE / "solver_dsv41.py")
     ap.add_argument("--harness", type=Path, default=ROOT / "evals/run_deepseek_tools.py")
+    ap.add_argument("--extra-pin", action="append", default=[], metavar="ARC=PATH",
+                    help="E066: also pin PATH at kit path ARC (e.g. repo/evals/arc_harness/grid_image.py=...); "
+                         "it replaces the kit's copy (a new file is created)")
+    ap.add_argument("--expect-env", action="append", default=[], metavar="K=V",
+                    help="E066: cell 0b also checks os.environ[K] == V (the settings cell must set it)")
+    ap.add_argument("--need", action="append", default=[], metavar="ARC=TEXT",
+                    help="E066: cell 0b also checks that the installed file ARC contains TEXT")
     ap.add_argument("--train-check", type=Path, help="pin repo/evals/train_check.py (default: the kit's)")
     ap.add_argument("--retention", type=int, default=0, help="--prefix-cache-retention-interval (0: the base 128)")
     ap.add_argument("--util", type=float, default=0.945, help="ARC_GPU_UTIL (V5/V6: 0.945)")
@@ -506,10 +513,20 @@ def main():
     if a.gate:
         expect["ARC_KV_ADMIT_MAX"] = str(a.gate)
     expect.update(opt_env(a))
+    expect.update(dict(kv.split("=", 1) for kv in a.expect_env))
     if a.util != 0.945:
         expect["ARC_GPU_UTIL"] = str(a.util)
     files = {"solver_dsv41.py": a.solver, "repo/evals/run_deepseek_tools.py": a.harness}
     new, need = [], opt_need(a)
+    for arc_text in a.need:
+        arc, text = arc_text.split("=", 1)
+        need.setdefault(arc, []).append(text)
+    for pin in a.extra_pin:
+        arc, path = pin.split("=", 1)
+        files[arc] = Path(path)
+        with tarfile.open(KIT_TGZ) as tf:
+            if arc not in {m.name.removeprefix("./") for m in tf.getmembers()}:
+                new.append(arc)
     if a.train_check:  # pin train_check.py too (the kit's is 44c4d210; pods run 8fe36175); the fallback restores it
         files["repo/evals/train_check.py"] = a.train_check
     if a.auto_repair:  # taken from the pinned harness's folder when it has them, else the live evals/

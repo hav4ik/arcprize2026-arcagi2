@@ -4,7 +4,8 @@
 Each step file holds x [Tsub, 40, 5120] (BF16 bits as int16) for the sampled rows x_rows, plus the routing of every
 row: ids [T, 40, 6] (int16) and w [T, 40, 6] (fp16, the top-k weights handed to the experts). Writes, per layer L,
 x_LL.npy int16 [N, 5120], ids_LL.npy int16 [N, 6], w_LL.npy float16 [N, 6] (memory-mappable) and manifest.json.
-The warmup step (manifest line {"warmup": ...}) is skipped.
+The warmup step (manifest line {"warmup": ...}) is skipped. E066: --obs takes several dump dirs (e.g. image and text
+replays), concatenated in order, each without its warmup step.
 
   calx_transpose.py --obs /dev/shm/e043/obs/calx --out /dev/shm/e043/calx_by_layer
 """
@@ -19,11 +20,11 @@ L = 40
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--obs", required=True)
+    ap.add_argument("--obs", required=True, nargs="+")
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-steps", type=int, default=0, help="smoke tests: only the first N step files")
     a = ap.parse_args()
-    steps = sorted(Path(a.obs).glob("step_*.npz"))[1:]  # step 0 = warmup prompt
+    steps = [p for d in a.obs for p in sorted(Path(d).glob("step_*.npz"))[1:]]  # each dir's step 0 = warmup prompt
     if a.max_steps:
         steps = steps[: a.max_steps]
     sizes = []

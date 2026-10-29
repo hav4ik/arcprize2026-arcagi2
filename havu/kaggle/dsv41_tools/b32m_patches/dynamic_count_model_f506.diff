@@ -1,0 +1,87 @@
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+index e53abeb785..762ce7638e 100644
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -154,6 +154,38 @@ if typing.TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++def routed_experts_per_layer(config) -> list[int] | None:
++    """Per-layer routed-expert counts of a pruned export, or None when every
++    decoder layer has ``n_routed_experts``.
++
++    Exports that keep a different number of experts in each MoE layer list
++    them in ``n_routed_experts_per_layer`` (one entry per decoder layer, in
++    layer order); each layer's gate, correction bias, vision bias and expert
++    tensors are stored at that layer's count.
++    """
++    counts = getattr(config, "n_routed_experts_per_layer", None)
++    if counts is None:
++        return None
++    counts = [int(c) for c in counts]
++    if len(counts) != config.num_hidden_layers:
++        raise ValueError(
++            f"n_routed_experts_per_layer has {len(counts)} entries, expected "
++            f"num_hidden_layers={config.num_hidden_layers}"
++        )
++    if min(counts) < config.num_experts_per_tok:
++        raise ValueError(
++            f"n_routed_experts_per_layer has a layer with {min(counts)} experts, "
++            f"fewer than num_experts_per_tok={config.num_experts_per_tok}"
++        )
++    return counts
++
++
++def max_routed_experts(config) -> int:
++    """The largest decoder-layer routed-expert count (expert-name mapping)."""
++    counts = routed_experts_per_layer(config)
++    return config.n_routed_experts if counts is None else max(counts)
++
++
+ class DeepseekV4MoE(DeepseekV4MoEBase):
+     def __init__(
+         self,
+@@ -163,9 +195,22 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
+         reduce_results: bool = True,
+     ):
+         config = vllm_config.model_config.hf_config
++        layer_idx = extract_layer_index(prefix)
++        per_layer = routed_experts_per_layer(config)
+         n_routed_experts = config.n_routed_experts
++        if per_layer is not None and layer_idx < config.num_hidden_layers:
++            n_routed_experts = per_layer[layer_idx]
++        if (
++            per_layer is not None
++            and len(set(per_layer)) > 1
++            and vllm_config.parallel_config.enable_eplb
++        ):
++            raise NotImplementedError(
++                "EPLB needs the same routed-expert count in every MoE layer; "
++                "this export sets n_routed_experts_per_layer."
++            )
+         n_activated_experts = config.num_experts_per_tok
+-        if extract_layer_index(prefix) >= config.num_hidden_layers:
++        if layer_idx >= config.num_hidden_layers:
+             n_routed_experts = (
+                 getattr(config, "dspark_n_routed_experts", 0) or n_routed_experts
+             )
+@@ -1817,7 +1862,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+         first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
+         if first_layer.ffn.use_native_mega_moe:
+-            return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
++            return make_deepseek_v4_expert_params_mapping(
++                max_routed_experts(self.config)
++            )
+         # Params for weights, fp8 weight scales, fp8 activation scales
+         # (param_name, weight_name, expert_id, shard_id)
+         return fused_moe_make_expert_params_mapping(
+@@ -1825,7 +1872,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             ckpt_gate_proj_name="w1",
+             ckpt_down_proj_name="w2",
+             ckpt_up_proj_name="w3",
+-            num_experts=self.config.n_routed_experts,
++            num_experts=max_routed_experts(self.config),
+             num_redundant_experts=first_layer.ffn.n_redundant_experts,
+         )
+ 

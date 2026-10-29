@@ -332,6 +332,98 @@ class ContextLimit(unittest.TestCase):
         self.assertIn("[budget: 5k output tokens used; aim to finish within 80k (hard limit 160k)]", tool[0])
 
 
+def chat_args(extra=()):
+    """The solver's harness argv on the image (chat) path: --grid-format text+image instead of --token-exact."""
+    a = C.harness_args(list(extra) + ["--grid-format", "text+image", "--image-cell", "0"])
+    a.token_exact = False
+    return a
+
+
+def run_chat(turns, args, task, limit, pad=0, image_tokens=900):
+    srv = C.FakeChatServer(turns, limit, pad=pad, image_tokens=image_tokens)
+    trace, result = H.solve(srv, args, task, task["test"][0]["input"], session_factory=C.local_factory)
+    return srv, trace, result
+
+
+class ChatContextLimit(unittest.TestCase):
+    """--context-limit on the chat path (images): before 2026-10-29 it was applied only on the token-exact path, so an
+    image attempt whose prompt grew past max-model-len - max_tokens failed with the server's 400 (E066 full_ref: 68 of
+    334 records, 19 of 120 tasks, at max-model-len 131,072)."""
+    LONG = FLIP + "answer = solve(test_input)\n" + "#" * 6000  # a turn-1 call whose tool round trip adds ~6k tokens
+
+    def first_prompt(self, pad):
+        srv, _, _ = run_chat([("submit_answer", "solve(test_input)")], chat_args(), TASK1, 10 ** 9, pad=pad)
+        return srv.requests[0][0]
+
+    def test_message_bound_is_an_upper_bound(self):
+        srv = C.FakeChatServer([], 0)
+        for m in ({"role": "tool", "content": "x" * 5000}, {"role": "tool", "content": "é€😀" * 100},
+                  {"role": "assistant", "content": "", "reasoning_content": "r" * 300,
+                   "tool_calls": [{"id": "c", "type": "function", "function": {"name": "run_python",
+                                                                               "arguments": json.dumps({"code": "1"})}}]},
+                  {"role": "user", "content": [{"type": "text", "text": "a"},
+                                               {"type": "image_url", "image_url": {"url": "data:"}}]}):
+            self.assertGreaterEqual(H.message_token_bound(m), srv.prompt_tokens([m], []) - len("<assistant><think>"))
+
+    def test_image_turn_past_the_limit_errors_without_the_flag(self):
+        n1 = self.first_prompt(500)
+        limit = n1 + 64000 + 3000  # turn 1 fits; turn 2 (+~6k tokens of round trip) at max_tokens 64000 does not
+        srv, trace, result = run_chat([("run_python", self.LONG), ("submit_answer", "solve(test_input)")],
+                                      chat_args(), TASK1, limit, pad=500)
+        self.assertEqual(result["stop_reason"], "error")
+        self.assertIn("maximum context length", result["error"])
+
+    def test_image_turn_capped_to_the_room_left(self):
+        n1 = self.first_prompt(500)
+        limit = n1 + 64000 + 3000
+        srv, trace, result = run_chat([("run_python", self.LONG), ("submit_answer", "solve(test_input)")],
+                                      chat_args(["--context-limit", str(limit)]), TASK1, limit, pad=500)
+        self.assertEqual((result["stop_reason"], result["pred"]), ("submitted", F0), result)
+        self.assertNotIn("error", result)
+        self.assertLess(srv.requests[1][1], 64000)
+        self.assertTrue(all(n + m <= limit for n, m in srv.requests), srv.requests)
+        slack = limit - sum(srv.requests[1]) - 16 - H.CHAT_CONTEXT_MARGIN
+        self.assertLess(slack, 2 * H.CHAT_MESSAGE_TOKENS + 200, srv.requests)  # the bound is tight for ASCII text
+
+    def test_context_full_takes_session_answer(self):
+        # measure turn 1 (prompt + output tokens, its tool message), then set the limit so that the chat bound leaves
+        # one token less than CONTEXT_MIN_ROOM for turn 2
+        # (a short call with a long tool output, images at the bound's own size: turn 1's cap fits its output)
+        code = FLIP + "answer = solve(test_input)\nprint('#' * 6000)"
+        srv, trace, _ = run_chat([("run_python", code), ("submit_answer", "solve(test_input)")], chat_args(),
+                                 TASK1, 10 ** 9, pad=500, image_tokens=H.CHAT_IMAGE_TOKENS)
+        used = srv.requests[0][0] + len("thinking" + "run_python" + json.dumps({"code": code}))
+        tool = [m for m in trace["messages"] if m["role"] == "tool"][0]
+        self.assertGreater(H.message_token_bound(tool), 6000)
+        limit = used + H.message_token_bound(tool) + H.CHAT_CONTEXT_MARGIN + 16 + H.CONTEXT_MIN_ROOM - 1
+        srv, trace, result = run_chat([("run_python", code)], chat_args(["--context-limit", str(limit)]),
+                                      TASK1, limit, pad=500, image_tokens=H.CHAT_IMAGE_TOKENS)
+        self.assertEqual(len(srv.requests), 1)
+        self.assertEqual((result["stop_reason"], result["pred"], result["answer_source"]), ("context", F0, "session"))
+        self.assertNotIn("error", result)
+        self.assertTrue(any("chat bound" in e.get("context_full", "") for e in trace["events"]))
+
+    def test_first_turn_bounded(self):
+        # pad = template text the bound cannot see (here < CHAT_TEMPLATE_TOKENS)
+        n1 = self.first_prompt(1500)
+        srv, trace, result = run_chat([], chat_args(["--context-limit", str(n1 + 500)]), TASK1, n1 + 500, pad=1500)
+        self.assertEqual((result["stop_reason"], result["turns"], srv.requests), ("context", 0, []))
+        self.assertNotIn("error", result)
+        limit = n1 + 30000  # turn 1 capped below 64000 by the bound, and the request fits
+        srv, trace, result = run_chat([("submit_answer", "solve(test_input)")],
+                                      chat_args(["--context-limit", str(limit)]), TASK1, limit, pad=1500)
+        self.assertLess(srv.requests[0][1], 64000)
+        self.assertLessEqual(sum(srv.requests[0]), limit)
+
+    def test_token_exact_with_images_is_rejected(self):
+        import io
+        from contextlib import redirect_stdout
+        with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
+            with patch("sys.argv", ["x", "--token-exact", "--grid-format", "text+image", "--base-url", "http://s/v1",
+                                    "--sandbox-url", "http://s"]):
+                H.main()
+
+
 class MultiBudget(unittest.TestCase):
     def test_scaling_n1_to_n6(self):
         base = C.harness_args(MULTI)

@@ -3,7 +3,8 @@
 # on the 8x RTX PRO 6000 (SM120) box with the E043 hooks (runtime expert/Engram masks, REAP observer).
 # Usage: serve.sh <run_name> [extra vllm args...]
 #   env: PORT (18000), TP (8), EP (1 = --enable-expert-parallel), SEQS (64), MBT (8192), UTIL (0.90),
-#        MAXLEN (131072), EAGER (0), PREFIX (1), MODEL, CTRL (/dev/shm/e043/ctrl.json), GPUS (0-7)
+#        MAXLEN (131072), EAGER (0), PREFIX (1), MODEL, CTRL (/dev/shm/e043/ctrl.json), GPUS (0-7),
+#        VISION (0; 1 = keep the vision tower: no --language-model-only, for E066 image traffic)
 set -u
 NAME=$1; shift
 R=/workspace/dsv4/runs/$NAME; mkdir -p $R /dev/shm/e043; rm -f $R/server.pid
@@ -19,13 +20,14 @@ GRAPH=(--compilation-config '{"cudagraph_mode":"FULL"}')
 [ "${EAGER:-0}" = 1 ] && GRAPH=(--enforce-eager)
 EPF=(); [ "${EP:-1}" = 1 ] && EPF=(--enable-expert-parallel)
 PC=(--enable-prefix-caching); [ "${PREFIX:-1}" = 0 ] && PC=(--no-enable-prefix-caching)
+LMO=(--language-model-only); [ "${VISION:-0}" = 1 ] && LMO=()
 cmd=(vllm serve ${MODEL:-/dev/shm/dsv4/DeepSeek-V4.1-Flash-1017} --served-model-name dsv41
   --host 127.0.0.1 --port ${PORT:-18000} --trust-remote-code
   --tensor-parallel-size ${TP:-8} "${EPF[@]}" --distributed-executor-backend mp
   --kv-cache-dtype fp8 --block-size 128 --max-model-len ${MAXLEN:-131072}
   --max-num-seqs ${SEQS:-64} --max-num-batched-tokens ${MBT:-8192} --gpu-memory-utilization ${UTIL:-0.90}
   "${PC[@]}" --engram-config '{"cpu_offload":true}'
-  --tokenizer-mode deepseek_v41 --language-model-only
+  --tokenizer-mode deepseek_v41 "${LMO[@]}"
   --reasoning-parser deepseek_v41 --tool-call-parser deepseek_v41 --enable-auto-tool-choice
   "${GRAPH[@]}" "$@")
 printf '%q ' "${cmd[@]}" > $R/cmd.txt; echo >> $R/cmd.txt

@@ -68,3 +68,6 @@ Exact build command: `REPLICATE.md` section 3.
 | Commit run | a 32-min smoke that freezes the engine on purpose (cell 2c) and fails loudly if the watchdog does not restart it; the competition rerun skips it |
 | Tests | 83 unit tests (`kaggle/dsv41_tools/tests/`); **4090 hang rehearsal PASS** with the exact solver and smoke settings: frozen engine flagged in 65 s, server up again 3 min 25 s after the freeze, 48/48 in-flight attempts re-queued, ramp 16 → 32, 31/31 pairs, memory 0.99x steady (`experiments/E059_restart_under_load/hang_4090/README.md`) |
 | Not yet done | a Kaggle smoke and a 6-12 h L4 replica (`kaggle/SUBMISSION_TESTING_PROTOCOL.md`); vLLM #58947 cherry-pick |
+
+## Leaderboard result
+**68.89** (2026-10-28), against the pre-registered 76.2. See experiments/E055_kaggle_replica/README.md (end) for the calibration and the candidate causes.

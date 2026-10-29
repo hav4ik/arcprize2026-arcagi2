@@ -1,0 +1,90 @@
+--- qwen3.py
++++ qwen3.py
+@@ -14,6 +14,7 @@
+ 
+ from .llama import *
+ import os
++from flash_attn import flash_attn_func
+ from ._utils import __version__
+ from unsloth_zoo.utils import Version, _get_dtype
+ from ..utils.packing import get_packed_info_from_kwargs
+@@ -303,74 +304,12 @@
+     Kn = self.paged_attention_K[:kv_seq_len].permute(1, 2, 0, 3)
+     Vn = self.paged_attention_V[:kv_seq_len].permute(1, 2, 0, 3)
+ 
+-    # Handle sliding windows
+-    sliding_window = getattr(self.config, "sliding_window", None)
+-    if sliding_window is not None and kv_seq_len > sliding_window:
+-        start = kv_seq_len - sliding_window
+-        Knn = Kn[:, :, start:, :]  # .contiguous()
+-        Vnn = Vn[:, :, start:, :]  # .contiguous()
+-        if attention_mask is not None:
+-            attention_mask = attention_mask[..., start:]
+-    else:
+-        Knn, Vnn = Kn, Vn
++    Qnn = Qn.transpose(1, 2)
++    Knn = Kn.transpose(1, 2)
++    Vnn = Vn.transpose(1, 2)
++
++    A = flash_attn_func(Qnn, Knn, Vnn)
+ 
+-    # when qlen==vlen and attn_mask is None, we should use causal attention
+-    Q_len = Qn.shape[-2]
+-    K_len = Knn.shape[-2]
+-    if attention_mask is not None and attention_mask.dim() == 2:
+-        attention_mask = attention_mask[:, None, None, :].to(torch.bool)
+-    elif (
+-        attention_mask is not None
+-        and attention_mask.dim() == 4
+-        and attention_mask.dtype != torch.bool
+-    ):
+-        attention_mask = attention_mask.eq(0)
+-    if attention_mask is None and Q_len == K_len:
+-        is_causal = True
+-    else:
+-        is_causal = False
+-    use_sdpa_gqa = SDPA_HAS_GQA
+-    if (
+-        use_sdpa_gqa
+-        and isinstance(attention_mask, torch.Tensor)
+-        and attention_mask.dim() >= 3
+-        and attention_mask.shape[0] > 1
+-    ):
+-        # Avoid SDPA GQA drift for batched masked decode.
+-        use_sdpa_gqa = False
+-
+-    # Grouped query attention
+-    _, _, cached_len, _ = Knn.shape
+-    if bsz == 1 or ((not use_sdpa_gqa) and n_groups != 1):
+-        Knn = Knn[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, cached_len, head_dim)
+-        Vnn = Vnn[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, cached_len, head_dim)
+-        Knn = Knn.reshape(bsz, n_heads, cached_len, head_dim)
+-        Vnn = Vnn.reshape(bsz, n_heads, cached_len, head_dim)
+-
+-    # Attention
+-    if bsz == 1:
+-        Qn *= (
+-            self.scalar
+-        )  # See https://github.com/ggerganov/llama.cpp/issues/7805#issuecomment-2153349963
+-        # It seems like doing (Q * scalar) @ K is better than (Q @ K) * scalar to stop overflows
+-        A = torch_matmul(Qn, Knn.transpose(2, 3), out = self.attention[:, :, :, :cached_len])
+-        A[:] = torch_nn_functional_softmax(A, dim = -1, dtype = torch.float32)  # .to(A.dtype)
+-        A = torch_matmul(A, Vnn, out = Qn)
+-    else:
+-        if use_sdpa_gqa:
+-            A = scaled_dot_product_attention(
+-                Qn,
+-                Knn,
+-                Vnn,
+-                attn_mask = attention_mask,
+-                is_causal = is_causal,
+-                enable_gqa = True,
+-            )
+-        else:
+-            A = scaled_dot_product_attention(
+-                Qn, Knn, Vnn, attn_mask = attention_mask, is_causal = is_causal
+-            )
+-    A = A.transpose(1, 2)
+     A = A.reshape(bsz, 1, attention_size)
+     A = fast_linear_forward(self.o_proj, A, out = self.temp_O)
+     return A, (Kn, Vn)

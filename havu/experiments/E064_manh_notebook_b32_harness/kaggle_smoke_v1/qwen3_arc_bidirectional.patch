@@ -1,0 +1,47 @@
+--- qwen3.py
++++ qwen3.py
+@@ -23,10 +23,11 @@
+     run_attention,
+     SDPA,
+     select_attention_backend,
+     resolve_prefix_seg_info,
+ )
++from ..utils.arc_prompt_attention import resolve_arc_prompt_attention_info
+ from .llama import (
+     LlamaRotaryEmbedding,
+     LlamaLinearScalingRotaryEmbedding,
+     _LlamaModel_fast_forward_inference,
+ )
+@@ -148,10 +149,20 @@
+         },
+     )
+     # PrefixGrouper seg table rides in **kwargs from the GRPO logprob forward; misuse
+     # (KV cache / padding mask) raises. None => byte-identical default.
+     _pg_seg = resolve_prefix_seg_info(kwargs, past_key_value, attention_mask)
++    _arc_prompt_info = resolve_arc_prompt_attention_info(
++        kwargs,
++        past_key_value,
++        attention_mask,
++    )
++    if _pg_seg is not None and _arc_prompt_info is not None:
++        raise RuntimeError(
++            "PrefixGrouper and ARC bidirectional prompt attention cannot be "
++            "enabled in the same Qwen3 forward"
++        )
+     context = AttentionContext(
+         bsz = bsz,
+         q_len = q_len,
+         kv_seq_len = kv_seq_len,
+         n_heads = n_heads,
+@@ -159,10 +170,11 @@
+         requires_grad = hidden_states.requires_grad,
+         seq_info = seq_info,
+         attention_mask = attention_mask,
+         causal_mask = causal_mask,
+         prefix_seg_info = _pg_seg,
++        arc_prompt_attention_info = _arc_prompt_info,
+     )
+ 
+     A = run_attention(config = attention_config, context = context, Q = Q, K = K, V = V)
+ 
+     attn_output = A.reshape(bsz, q_len, n_heads * head_dim)

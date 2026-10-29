@@ -1,0 +1,58 @@
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -351,24 +351,6 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+                 "vocab_size": int(self.vocab_size),
+             }
+ 
+-        # ARC forensic controls. These are deliberately opt-in and are not a
+-        # production policy: they let us distinguish a producer-side corrupt
+-        # sampler tensor from a lifetime race while the async D2H copy is in
+-        # flight. Snapshotting happens on the producing (default) stream,
+-        # before the copy stream is allowed to overlap the next engine step.
+-        snapshot_async_output = os.environ.get(
+-            "ARC_VLLM_ASYNC_OUTPUT_SNAPSHOT", "0"
+-        ).strip().lower() in {"1", "true", "yes", "on"}
+-        if snapshot_async_output:
+-            self._sampled_token_ids = self._sampled_token_ids.clone()
+-            if self._logprobs_tensors is not None:
+-                self._logprobs_tensors = LogprobsTensors(
+-                    self._logprobs_tensors.logprob_token_ids.clone(),
+-                    self._logprobs_tensors.logprobs.clone(),
+-                    self._logprobs_tensors.selected_token_ranks.clone(),
+-                    self._logprobs_tensors.cu_num_generated_tokens,
+-                )
+-
+         # Initiate the copy on a separate stream, but do not synchronize it.
+         default_stream = torch.cuda.current_stream()
+         with torch.cuda.stream(async_output_copy_stream):
+@@ -4614,6 +4597,29 @@ class GPUModelRunner(
+         with record_function_or_nullcontext("gpu_model_runner: sample"):
+             sampler_output = self._sample(logits, spec_decode_metadata)
+ 
++        # A compiled sampler may return tensors backed by reusable graph or
++        # Inductor storage. Prompt-logprob bookkeeping below launches more
++        # compiled projection work before AsyncGPUModelRunnerOutput initiates
++        # its device-to-host copy, so merely holding a Python reference is not
++        # sufficient to preserve those values. Snapshot immediately at the
++        # sampler boundary, on the producing stream, before any bookkeeping
++        # kernel can reuse that storage.
++        snapshot_async_output = os.environ.get(
++            "ARC_VLLM_ASYNC_OUTPUT_SNAPSHOT", "0"
++        ).strip().lower() in {"1", "true", "yes", "on"}
++        if self.use_async_scheduling and snapshot_async_output:
++            sampler_output.sampled_token_ids = (
++                sampler_output.sampled_token_ids.clone()
++            )
++            if sampler_output.logprobs_tensors is not None:
++                tensors = sampler_output.logprobs_tensors
++                sampler_output.logprobs_tensors = LogprobsTensors(
++                    tensors.logprob_token_ids.clone(),
++                    tensors.logprobs.clone(),
++                    tensors.selected_token_ranks.clone(),
++                    tensors.cu_num_generated_tokens,
++                )
++
+         self._update_states_after_model_execute(
+             sampler_output.sampled_token_ids, scheduler_output
+         )

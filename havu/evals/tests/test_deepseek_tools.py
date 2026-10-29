@@ -672,3 +672,104 @@ class TextImageContentTest(unittest.TestCase):
         self.assertEqual(deepseek_cell([[0, 0, 0]]), 42 * 8)          # 3 cells -> k = 8 (3*64 = 192 tiles)
         self.assertEqual(deepseek_tokens([[0] * 30] * 30), 932)       # measured on the API 2026-10-26
         self.assertEqual(deepseek_tokens([[0] * 16] * 11), 189)       # measured
+
+
+class E064VisionTests(unittest.TestCase):
+    """E064 --show-tool / --check-image / --image-note: grids drawn as images inside tool results."""
+
+    def args(self, *extra):
+        return parser().parse_args(["--sandbox-url", "http://sandbox", "--attempts", "1", "--answer-tool",
+                                    "--final-mode", "session", "--prompt", "lean2sub", "--image-cell", "0", *extra])
+
+    def test_tool_listed_only_when_on(self):
+        from run_deepseek_tools import tools_for
+        self.assertNotIn("show_grid", [t["function"]["name"] for t in tools_for(self.args())])
+        self.assertIn("show_grid", [t["function"]["name"] for t in tools_for(self.args("--show-tool"))])
+
+    def test_show_grid_values(self):
+        from run_deepseek_tools import show_grid
+        args, s = self.args("--show-tool"), FakeSession("u", TASK["train"], [[3, 4]], 30, 16000)
+        cases = [([[1, 2], [3, 4]], 1), ([[[1]], [[2, 2]]], 2), ([[True, False]], 1), ([[1, 12]], None), (5, None),
+                 ([[[1]]] * 5, None)]
+        for value, n in cases:
+            with patch("run_deepseek_tools._answer_value", return_value=({"process_status": "completed"}, value, True)):
+                content, ok = show_grid(s, "x", args)
+            if n is None:
+                self.assertFalse(ok)
+                self.assertIsInstance(content, str)
+            else:
+                self.assertTrue(ok)
+                self.assertEqual(sum(p["type"] == "image_url" for p in content), n)
+                self.assertTrue(content[0]["text"].startswith("[show_grid:"))
+
+    def test_show_grid_call_returns_images_and_notes_append(self):
+        args = self.args("--show-tool", "--budget-notes", "0.01")
+        client = FakeClient([[chunk(calls=[call("solve(test_input)", "show_grid")], finish="tool_calls", tokens=20000)],
+                             [chunk(calls=[call("solve(test_input)", "submit_answer")], finish="tool_calls", tokens=5)]])
+        with patch("run_deepseek_tools._answer_value", return_value=({"process_status": "completed"}, [[4, 3]], True)):
+            trace, result = solve(client, args, TASK, TASK["test"][0]["input"], FakeSession)
+        tool = [m for m in client.requests[1]["messages"] if m["role"] == "tool"][0]
+        self.assertIsInstance(tool["content"], list)
+        self.assertEqual(sum(p["type"] == "image_url" for p in tool["content"]), 1)
+        self.assertIn("budget", tool["content"][-1]["text"])  # the budget note became a text part
+        self.assertEqual((result["shows"], result["pred"], result["tool_errors"]), (1, [[4, 3]], 0))
+
+    def test_check_image_then_resubmit(self):
+        client = FakeClient([[chunk(calls=[call("solve(test_input)", "submit_answer")], finish="tool_calls", tokens=5)],
+                             [chunk(calls=[call("solve(test_input)", "submit_answer")], finish="tool_calls", tokens=5)]])
+        with patch("run_deepseek_tools.submit_answer", return_value=("[answer accepted: 1x2 grid]", [[4, 3]])):
+            trace, result = solve(client, self.args("--check-image"), TASK, TASK["test"][0]["input"], FakeSession)
+        tool = [m for m in client.requests[1]["messages"] if m["role"] == "tool"][0]
+        self.assertTrue(tool["content"][0]["text"].startswith("[answer not submitted yet]"))
+        labels = [p["text"].strip() for p in tool["content"][1:] if p["type"] == "text"]
+        self.assertEqual(labels, ["Test input (1x2):", "Your output (1x2):"])
+        self.assertEqual((result["pred"], result["answer_source"], result["tool_errors"]), ([[4, 3]], "submit", 0))
+        self.assertEqual(result["image_check"], {"turn": 1, "changed": False, "source": "submit"})
+
+    def test_check_image_keeps_answer_without_resubmit(self):
+        client = FakeClient([[chunk(calls=[call("solve(test_input)", "submit_answer")], finish="tool_calls", tokens=5)],
+                             [chunk(content="done", finish="stop", tokens=5)]])
+        answers = iter([("[answer accepted: 1x2 grid]", [[4, 3]])])
+        with patch("run_deepseek_tools.submit_answer", side_effect=lambda *a, **k: next(answers, ("[no]", None))):
+            trace, result = solve(client, self.args("--check-image"), TASK, TASK["test"][0]["input"], FakeSession)
+        self.assertEqual((result["pred"], result["answer_source"]), ([[4, 3]], "image_check"))
+
+    def test_strict_note_and_flag_checks(self):
+        from run_deepseek_tools import IMAGE_NOTES, text_image_content
+        parts = text_image_content("P", TASK["train"], [[[3, 4]]], 0, note=IMAGE_NOTES["strict"])
+        self.assertIn("confirm it in code", parts[0]["text"])
+        with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
+            import run_deepseek_tools as rdt
+            with patch("sys.argv", ["x", "--image-note", "strict", "--sandbox-url", "http://s"]):
+                rdt.main()
+
+    def test_image_in_user_message(self):
+        client = FakeClient([[chunk(calls=[call("solve(test_input)", "submit_answer")], finish="tool_calls", tokens=5)],
+                             [chunk(calls=[call("solve(test_input)", "submit_answer")], finish="tool_calls", tokens=5)]])
+        with patch("run_deepseek_tools.submit_answer", return_value=("[answer accepted: 1x2 grid]", [[4, 3]])):
+            trace, result = solve(client, self.args("--check-image", "--image-in", "user"), TASK,
+                                  TASK["test"][0]["input"], FakeSession)
+        msgs = client.requests[1]["messages"]
+        self.assertEqual([m["role"] for m in msgs[-2:]], ["tool", "user"])
+        self.assertIsInstance(msgs[-2]["content"], str)
+        self.assertTrue(msgs[-2]["content"].endswith("(images in the next message)"))
+        self.assertEqual(sum(p["type"] == "image_url" for p in msgs[-1]["content"]), 2)
+        self.assertEqual(result["pred"], [[4, 3]])
+
+
+class OffpeakWaitTest(unittest.TestCase):
+    """E065 --offpeak-only: hold new attempts through weekday peak windows (UTC 01-04, 06-10) plus a margin."""
+
+    def test_windows(self):
+        import datetime
+        from run_deepseek_tools import offpeak_wait
+        utc = datetime.timezone.utc
+        wed = lambda h, m=0: datetime.datetime(2026, 10, 28, h, m, tzinfo=utc)  # a Wednesday
+        self.assertEqual(offpeak_wait(20, wed(12)), 0)                 # off-peak, far from a window
+        self.assertEqual(offpeak_wait(20, wed(0, 45)), 3.25 * 3600)    # 15 min before 01:00 -> wait to 04:00
+        self.assertEqual(offpeak_wait(20, wed(0, 39)), 0)              # 21 min before
+        self.assertEqual(offpeak_wait(20, wed(7)), 3 * 3600)           # inside 06-10
+        self.assertEqual(offpeak_wait(20, wed(4, 30)), 0)              # the 04-06 gap: 04:50 is off-peak
+        self.assertEqual(offpeak_wait(20, wed(5, 45)), 4.25 * 3600)    # 05:45 + 20 min hits 06:00 -> wait to 10:00
+        sat = datetime.datetime(2026, 10, 31, 7, tzinfo=utc)
+        self.assertEqual(offpeak_wait(20, sat), 0)                     # weekends are off-peak
