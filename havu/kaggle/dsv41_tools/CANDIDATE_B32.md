@@ -68,3 +68,13 @@ Exact build command: `REPLICATE.md` section 3.
 | Commit run | a 32-min smoke that freezes the engine on purpose (cell 2c) and fails loudly if the watchdog does not restart it; the competition rerun skips it |
 | Tests | 83 unit tests (`kaggle/dsv41_tools/tests/`); **4090 hang rehearsal PASS** with the exact solver and smoke settings: frozen engine flagged in 65 s, server up again 3 min 25 s after the freeze, 48/48 in-flight attempts re-queued, ramp 16 → 32, 31/31 pairs, memory 0.99x steady (`experiments/E059_restart_under_load/hang_4090/README.md`) |
 | Not yet done | a Kaggle smoke and a 6-12 h L4 replica (`kaggle/SUBMISSION_TESTING_PROTOCOL.md`); vLLM #58947 cherry-pick |
+
+## B32 + S23: Manh's server cell (example notebook, not run on Kaggle)
+| | |
+|---|---|
+| What changes | only the solver (`pinned_candb_ext/solver_dsv41.py`, 0be2b9d3 = `pinned_candb/` + S23); the other four pinned files are `pinned_candb/`'s |
+| Why | the notebook starts Manh's vLLM (prod flags, own cell) and hands the solver `ARC_EXTERNAL_SERVER=http://127.0.0.1:<port>/v1`; the solver then never starts, stops or restarts a server |
+| Settings | `ARC_EXTERNAL_SERVER`, `ARC_EXTERNAL_SERVER_LOG` (that server's log), `ARC_MODEL_DIR` (the model it serves; tokenizer); every B32 attempt setting unchanged |
+| Behaviour | waits for `/v1/models` to list `dsv41`; a server death ends new launches (no restart: the notebook owns it) and the run finishes with what it has |
+| Tests | `ExternalServer` in `tests/test_solver.py` (both solvers); `check_imports` clean |
+| Diff vs B32 | `git diff --no-index kaggle/dsv41_tools/pinned_candb kaggle/dsv41_tools/pinned_candb_ext` (the S23 hunk only; in git: a verbatim-copy commit, then S23) |
