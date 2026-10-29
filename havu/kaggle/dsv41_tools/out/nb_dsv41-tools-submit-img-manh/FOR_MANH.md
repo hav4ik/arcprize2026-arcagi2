@@ -34,6 +34,16 @@ Full record: `kaggle/dsv41_tools/CANDIDATE_E066_IMG.md`.
 - The candidates are E72-152 (per-layer 72-152 experts, average 120, vision kept) and C1 (uniform E128 + vision). Only
   one will be a Kaggle Model, and the choice is pending.
 - `kernel-metadata.json` points at the E72-152 handle, which is not uploaded yet.
+- HF (private, your read key works):
+  - E72-152: `chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-img-E72-152-avg120-2bit`
+  - C1: `chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-img-E128-2bit`
+  - sha256 manifests: `experiments/E066_dsv41_image_pruning/results/{e72c152,c1}_gptq_sha256_manifest.json`
+- **If you serve E72-152 outside this notebook, apply our patch to your installed vLLM first**, or the per-layer
+  counts fail to load:
+  - `kaggle/dsv41_tools/b32m_patches/dynamic_count_model_f506.diff` (on `vllm/models/deepseek_v41/nvidia/model.py`);
+  - `kaggle/dsv41_tools/b32m_patches/dynamic_count_dsv4_topk.diff` (on
+    `vllm/model_executor/layers/fused_moe/router/dsv4_topk.py`).
+  - Cell 2r does exactly this, guarded by sha256: `kaggle/dsv41_tools/cells/img_patches.py`. C1 doesn't need it.
 
 ## What we see on Runpod 4xL4 with your production cell (TP4, no DCP), E72-152 + images
 
