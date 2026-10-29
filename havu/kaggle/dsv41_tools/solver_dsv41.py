@@ -152,12 +152,15 @@ MAX_RESTARTS = env_num("ARC_MAX_SERVER_RESTARTS", 0 if EXTERNAL and not EXTERNAL
 RESTART_MIN_LEFT_S = env_num("ARC_RESTART_MIN_LEFT_S", 2700)
 RESTART_UP_S = env_num("ARC_RESTART_UP_S", 600)  # S6: expected server start time, at least (the first start's if longer)
 JOB_TRIES = env_num("ARC_JOB_TRIES", 2, int)
-CONN_TRIES = env_num("ARC_CONN_TRIES", 4, int)  # re-queues for attempts lost to a server outage (not in JOB_TRIES)
+CONN_TRIES = env_num("ARC_CONN_TRIES", 12 if EXTERNAL_STATUS else 4, int)  # S27: several supervised restarts  # re-queues for attempts lost to a server outage (not in JOB_TRIES)
 CONN_ERRORS = ("Connection", "ConnectError", "RemoteProtocolError", "ReadError", "Server disconnected",
                "Incomplete stream", "Connection refused", "ReadTimeout",
                # E055: a dying engine answers in-flight requests with these before the port closes; without them every
                # server death used up one ARC_JOB_TRIES of each in-flight job (43 jobs lost after two deaths)
-               "EngineCore encountered an issue", "EngineDeadError")
+               "EngineCore encountered an issue", "EngineDeadError",
+               # S27 (pod kill test 2026-10-29): Manh's vLLM answers a dying engine's in-flight requests with a plain
+               # OpenAI-style 500 before its API server exits; counted as a try it cost every in-flight attempt 1 of 2
+               "The server had an error while processing your request")
 TASK_LIMIT = env_num("ARC_TASK_LIMIT", 0, int)
 TASK_IDS = [t for t in E("ARC_TASK_IDS", "").split(",") if t]  # smoke tests: these tasks instead of the first N
 # E046 (opt-in): one attempt per task for tasks with several test inputs (all test inputs in one rollout, the answer
@@ -456,6 +459,9 @@ def start_external():
             log(f"external server {URL}: its supervisor is {status['state']} ({status.get('error')}); no wait left")
             STATE["restarts"] = max(STATE["restarts"], MAX_RESTARTS)
             return False
+        if status and status.get("state") != "up":  # S27: the next start is not up yet (the port may still answer)
+            time.sleep(5)
+            continue
         try:
             with urllib.request.urlopen(URL + "/v1/models", timeout=5) as r:
                 ids = [m.get("id") for m in json.loads(r.read())["data"]]
