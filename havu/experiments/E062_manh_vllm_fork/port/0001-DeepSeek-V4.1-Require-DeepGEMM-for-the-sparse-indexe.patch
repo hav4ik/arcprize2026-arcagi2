@@ -1,0 +1,50 @@
+From 469f71877f1fddaa19f8edd66669f1d695407350 Mon Sep 17 00:00:00 2001
+From: hav4ik <hav4ik@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 03:17:39 -0700
+Subject: [PATCH] [DeepSeek V4.1] Require DeepGEMM for the sparse indexer only
+ on SM90+
+
+An SM89-only build (TORCH_CUDA_ARCH_LIST=8.9, L4 / RTX 4090) vendors no
+DeepGEMM, so SparseAttnIndexer.__init__ raised "Sparse Attention Indexer
+CUDA op requires DeepGEMM support" on every rank and E128 could not start.
+Below SM90 the logits dispatch already takes the Triton kernels whenever
+DeepGEMM's MQA logits are unsupported, so require DeepGEMM only where it
+can run.
+
+Checked on 4x RTX 4090 (SM89) with E128 (Kaggle copy, TP4 + DCP4): the
+server starts and serves; kernel tests pass (test_triton_sparse_mla_dsv4,
+test_triton_mqa_logits, test_dcp_indexer_topk,
+test_deepseek_v41_expert_gptq, test_humming_mxfp8_bmm: 59 passed;
+test_engram, test_topk_softplus_sqrt, test_mla_short_prefill_indexer:
+1818 passed, 33 skipped).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019SwAYQEQ4vGnApMgqrNK7N
+---
+ vllm/model_executor/layers/sparse_attn_indexer.py | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index 614523b..8fb4971 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -1198,7 +1198,15 @@ class SparseAttnIndexer(CustomOp):
+         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
+-        if current_platform.is_cuda() and not has_deep_gemm():
++        # E062: DeepGEMM only runs on SM90+. Below that (SM89: L4 / 4090) the
++        # logits dispatch already takes the Triton kernels whenever DeepGEMM's
++        # MQA logits are unsupported, and an SM89-only build ships no vendored
++        # DeepGEMM, so require it only where it can run.
++        if (
++            current_platform.is_cuda()
++            and current_platform.has_device_capability(90)
++            and not has_deep_gemm()
++        ):
+             raise RuntimeError(
+                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
+                 "the current vLLM environment."
+-- 
+2.34.1
+

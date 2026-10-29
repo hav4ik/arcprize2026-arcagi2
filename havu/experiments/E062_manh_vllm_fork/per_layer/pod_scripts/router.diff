@@ -1,0 +1,38 @@
+diff --git a/vllm/model_executor/layers/fused_moe/router/dsv4_topk.py b/vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
+index 9c1eba96e2..bef4339f79 100644
+--- a/vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
++++ b/vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
+@@ -12,6 +12,15 @@ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ 
+ _TOPK = 6
++# The kernel holds a gating row in one warp's registers (BLOCK_N = next power of
++# two, lanes >= num_experts masked), so any count from top-k to 512 works.
++# Pruned exports with per-layer expert counts (e.g. 72-224 routed experts) take
++# this path too; the CUDA topk_softplus_sqrt fallback only accepts a fixed list.
++_MAX_EXPERTS = 512
++
++
++def _supports_num_experts(num_experts: int) -> bool:
++    return _TOPK <= num_experts <= _MAX_EXPERTS
+ 
+ # Adapted from:
+ # https://github.com/sgl-project/sglang/blob/main/python/sglang/jit_kernel/moe_fused_gate.py
+@@ -28,7 +37,7 @@ def can_use_dsv4_topk(
+         current_platform.is_cuda()
+         and gating_output.dtype == torch.float32
+         and gating_output.ndim == 2
+-        and gating_output.shape[1] in (128, 256, 384)
++        and _supports_num_experts(gating_output.shape[1])
+         and gating_output.is_contiguous()
+         and correction_bias is not None
+         and correction_bias.dtype == torch.float32
+@@ -186,7 +195,7 @@ def register_dsv4_topk_warmup(
+     """
+     if (
+         current_platform.is_cuda()
+-        and num_experts in (128, 256, 384)
++        and _supports_num_experts(num_experts)
+         and topk == _TOPK
+         and renormalize
+     ):

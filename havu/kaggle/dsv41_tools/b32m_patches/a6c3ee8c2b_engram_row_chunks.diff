@@ -1,0 +1,89 @@
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+index 81e8433..e1a3f16 100644
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -1610,6 +1610,67 @@ def _linear_scale_param_name(vllm_config: VllmConfig, expert_dtype: str) -> str:
+     return "weight_scale" if use_mxfp8 else "weight_scale_inv"
+ 
+ 
++_ENGRAM_ROW_CHUNK = re.compile(r"^(.*\.engram)\.embed\.(weight|scale)\.rows_(\d+)$")
++
++
++def _engram_row_chunks(
++    weights: Iterable[tuple[str, torch.Tensor]],
++    mapper: WeightsMapper,
++    params: dict[str, nn.Parameter],
++    loaded: set[str],
++) -> Iterable[tuple[str, torch.Tensor]]:
++    """Load Engram tables stored as row chunks.
++
++    Exports with a file size limit store each table as
++    ``<layer>.engram.embed.{weight,scale}.rows_<start>``. Each chunk's overlap
++    with this rank's rows is copied into the table; other weights pass
++    through. A table that receives any chunk must have this rank's rows
++    covered exactly once.
++    """
++    spans: dict[str, list[tuple[int, int]]] = {}
++    for name, tensor in weights:
++        match = _ENGRAM_ROW_CHUNK.match(name)
++        if match is None:
++            yield name, tensor
++            continue
++        # Map only the module prefix: the VL wrapper hands its child names that
++        # are already mapped, and the suffix rules do not see ``.rows_<start>``.
++        module = mapper.map_name(match.group(1))
++        if module is None:
++            continue
++        leaf = "weight" if match.group(2) == "weight" else "weight_scale_inv"
++        pname = f"{module}.embed_tokens.{leaf}"
++        param = params.get(pname)
++        if param is None:
++            if any(key.startswith(f"{module}.") for key in params):
++                raise ValueError(f"Engram row chunk {name} matches no parameter")
++            continue  # A layer of another pipeline-parallel rank.
++        if tensor.dtype == torch.float8_e8m0fnu:
++            tensor = tensor.view(torch.uint8)
++        start, lo = int(match.group(3)), param.engram_vocab_start
++        a = max(start, lo)
++        b = min(start + tensor.shape[0], lo + param.shape[0])
++        rows = spans.setdefault(pname, [])
++        if a < b:
++            param.data[a - lo : b - lo].copy_(tensor[a - start : b - start])
++            rows.append((a - lo, b - lo))
++        loaded.add(pname)
++    for pname, rows in spans.items():
++        end = 0
++        for a, b in sorted(rows):
++            if a != end:
++                raise ValueError(
++                    f"Engram row chunks of {pname}: rank rows "
++                    f"{min(a, end)}..{max(a, end)} missing or duplicated"
++                )
++            end = b
++        if end != params[pname].shape[0]:
++            raise ValueError(
++                f"Engram row chunks cover {end} of "
++                f"{params[pname].shape[0]} rank rows of {pname}"
++            )
++
++
+ def _make_deepseek_v4_weights_mapper(
+     expert_dtype: str, linear_scale_name: str = "weight_scale_inv"
+ ) -> WeightsMapper:
+@@ -1858,8 +1919,16 @@ class DeepseekV41LLMForCausalLM(
+         if gptq_files:
+             # Already in vLLM naming, which both the text and VL mappers keep.
+             weights = chain(weights, iter_expert_gptq_weights(gptq_files, "model."))
++        engram_chunks: set[str] = set()
++        weights = _engram_row_chunks(
++            weights,
++            self.hf_to_vllm_mapper,
++            dict(self.named_parameters()),
++            engram_chunks,
++        )
+         loader = AutoWeightsLoader(self)
+         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++        loaded_params |= engram_chunks
+         self.process_weights_after_loading()
+         if config.engram_config and config.engram_config.use_thp:
+             # Loading weights refills the file cache; release it before MADV_COLLAPSE.

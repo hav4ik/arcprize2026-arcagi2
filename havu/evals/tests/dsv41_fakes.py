@@ -142,6 +142,50 @@ class FakeTokenServer:
         return _C()
 
 
+class FakeChatServer:
+    """Chat-path fake (images: --grid-format text+image, no --token-exact): a vLLM-like OpenAI client whose prompt is one
+    token per character of the messages and tools (FakeTokenServer's rendering) plus `image_tokens` per image part, and
+    which rejects prompt + max_tokens > `limit` (the server's max-model-len) like vLLM. A turn is (name, code): one tool
+    call, or (None, text): a plain answer."""
+
+    def __init__(self, turns, limit, pad=0, image_tokens=900):
+        self.turns, self.limit, self.pad, self.image_tokens = list(turns), limit, pad, image_tokens
+        self.requests = []  # (prompt tokens, max_tokens)
+        self.base_url = "http://fake:1/v1"
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+    def prompt_tokens(self, messages, tools):
+        n = self.pad + len(json.dumps(tools))
+        for m in messages:
+            parts = m["content"] if isinstance(m.get("content"), list) else [{"type": "text", "text": m.get("content")}]
+            n += len(f"<{m['role']}>") + len(m.get("reasoning_content") or "")
+            n += sum(self.image_tokens if p["type"] == "image_url" else len(p.get("text") or "") for p in parts)
+            n += sum(len(c["function"]["name"] + c["function"]["arguments"]) for c in m.get("tool_calls") or [])
+        return n + len("<assistant><think>")
+
+    def create(self, model, messages, tools, tool_choice, max_tokens, stream, stream_options, extra_body):
+        n = self.prompt_tokens(messages, tools)
+        self.requests.append((n, max_tokens))
+        if n + max_tokens > self.limit:
+            raise RuntimeError(f"Error code: 400 - This model's maximum context length is {self.limit} tokens")
+        name, text = self.turns.pop(0)
+        reasoning = "thinking"
+        if name:
+            args = json.dumps({"code": text})
+            calls = [SimpleNamespace(index=0, id=f"call_{len(self.requests)}",
+                                     function=SimpleNamespace(name=name, arguments=args))]
+            delta, finish, out = (SimpleNamespace(content="", reasoning_content=reasoning, tool_calls=calls,
+                                                  model_extra={}), "tool_calls", len(reasoning + name + args))
+        else:
+            delta, finish, out = (SimpleNamespace(content=text, reasoning_content=reasoning, tool_calls=None,
+                                                  model_extra={}), "stop", len(reasoning + text))
+        assert out <= max_tokens, (out, max_tokens)  # scripted turns must fit the cap (no length cut here)
+        last = SimpleNamespace(choices=[], usage=SimpleNamespace(model_dump=lambda: {
+            "prompt_tokens": n, "completion_tokens": out, "total_tokens": n + out}))
+        return _Stream([SimpleNamespace(choices=[SimpleNamespace(delta=delta, finish_reason=finish)], usage=None),
+                        last])
+
+
 class _Stream:
     def __init__(self, chunks):
         self.chunks = chunks

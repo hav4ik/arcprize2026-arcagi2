@@ -94,3 +94,7 @@ Where judgment still enters (disclosed, not hidden):
   submission valid): 141 of 240 tasks with a first attempt, score so far 39.17, per-attempt accuracy of finished
   attempts 65.2%, 5.63M output tokens in finished attempts (draw 1 at the same pod time: 158 tasks, 5.72M).
   Too early for a second full-run estimate; B32's estimate stays 76.2 from draw 1. `toolkit/reports/candBf2_t2_partial.md`.
+
+**B32 leaderboard (2026-10-28, user): 68.89**, against the pre-registered 76.2 (80% range ~69-83). Kaggle-clock replica 77.43, so LB - replica = -8.5 (V5 +0.6, V6 -3.0): the replicas get more optimistic as the config gets heavier.
+- In the replica, 68.89 matches a ~1.55x Kaggle slowdown (x1.5 -> ~71, x1.6 -> ~67).
+- Candidate causes: a server hang (#58947 deadlock, no watchdog in B32); Kaggle slowing the offload/host-restore traffic more than pods do; a harder hidden set. Scoring logs are not visible.

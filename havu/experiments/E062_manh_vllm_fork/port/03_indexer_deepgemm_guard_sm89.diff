@@ -1,0 +1,19 @@
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py	2026-10-28 02:34:49.510668641 -0700
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py	2026-10-28 02:34:49.526668737 -0700
+@@ -1198,7 +1198,15 @@
+         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+         self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
+-        if current_platform.is_cuda() and not has_deep_gemm():
++        # E062: DeepGEMM only runs on SM90+. Below that (SM89: L4 / 4090) the
++        # logits dispatch already takes the Triton kernels whenever DeepGEMM's
++        # MQA logits are unsupported, and an SM89-only build ships no vendored
++        # DeepGEMM, so require it only where it can run.
++        if (
++            current_platform.is_cuda()
++            and current_platform.has_device_capability(90)
++            and not has_deep_gemm()
++        ):
+             raise RuntimeError(
+                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
+                 "the current vLLM environment."

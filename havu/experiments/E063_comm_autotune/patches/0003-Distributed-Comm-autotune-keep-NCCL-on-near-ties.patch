@@ -1,0 +1,70 @@
+From 786468e2dc2cfdd82acb4d1fc3e791389e88f1bd Mon Sep 17 00:00:00 2001
+From: hav4ik <hav4ik@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 08:34:23 -0700
+Subject: [PATCH 3/3] [Distributed] Comm autotune: keep NCCL on near-ties
+
+A candidate replaces NCCL for a size only when it is more than 5% faster,
+so run-to-run timing noise does not flip the table between near-equal
+backends.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019SwAYQEQ4vGnApMgqrNK7N
+---
+ tests/distributed/test_comm_autotune.py              | 12 ++++++++----
+ .../device_communicators/comm_autotune.py            |  8 ++++++--
+ 2 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/tests/distributed/test_comm_autotune.py b/tests/distributed/test_comm_autotune.py
+index e72dbd5..1090dda 100644
+--- a/tests/distributed/test_comm_autotune.py
++++ b/tests/distributed/test_comm_autotune.py
+@@ -41,11 +41,15 @@ def test_message_sizes():
+ 
+ def test_choose_fastest_and_skips_inf():
+     table = choose(
+-        [16, 32, 48],
+-        {"nccl": [0.5, 0.5, 0.5], "host": [0.2, 0.5, INF], "custom": [0.3, 0.4, 0.6]},
++        [16, 32, 48, 64],
++        {
++            "nccl": [0.5, 0.5, 0.5, 0.5],
++            "host": [0.2, 0.5, INF, 0.49],
++            "custom": [0.3, 0.4, 0.6, 0.6],
++        },
+     )
+-    # Ties go to the earlier candidate; inf never wins.
+-    assert table.choices == ["host", "custom", "nccl"]
++    # inf never wins; within the 5% margin the first candidate (NCCL) stays.
++    assert table.choices == ["host", "custom", "nccl", "nccl"]
+     with pytest.raises(ValueError):
+         choose([16], {"nccl": [INF], "host": [INF]})
+ 
+diff --git a/vllm/distributed/device_communicators/comm_autotune.py b/vllm/distributed/device_communicators/comm_autotune.py
+index 6f3e6e0..65bb9ff 100644
+--- a/vllm/distributed/device_communicators/comm_autotune.py
++++ b/vllm/distributed/device_communicators/comm_autotune.py
+@@ -75,16 +75,20 @@ def message_sizes(
+ 
+ 
+ def choose(
+-    sizes: Sequence[int], times_ms: dict[str, Sequence[float]]
++    sizes: Sequence[int], times_ms: dict[str, Sequence[float]], margin: float = 0.05
+ ) -> AutotuneTable:
+     """The fastest candidate per size; inf marks a candidate that can't take
+-    the size. Ties go to the earlier candidate (list NCCL first)."""
++    the size. The first candidate (list the default, NCCL, first) keeps a size
++    unless another is more than `margin` faster, so timing noise does not
++    flip near-ties."""
+     names = list(times_ms)
+     choices = []
+     for j in range(len(sizes)):
+         best = min(names, key=lambda name: (times_ms[name][j], names.index(name)))
+         if times_ms[best][j] == float("inf"):
+             raise ValueError(f"no candidate can take {sizes[j]} bytes")
++        if times_ms[names[0]][j] <= times_ms[best][j] * (1 + margin):
++            best = names[0]
+         choices.append(best)
+     return AutotuneTable(sizes, choices)
+ 
+-- 
+2.34.1
+

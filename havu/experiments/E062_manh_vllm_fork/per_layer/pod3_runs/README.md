@@ -1,0 +1,151 @@
+# Pod 3: C1 (E128 + vision) on Manh's production server + DCP4, image-harness load run (2026-10-29)
+
+Part of the E066 model choice for tonight's Kaggle candidate.
+- **DCP4 model A/B:** C1 here vs E72-152 on a 4th pod.
+- **No-DCP vs DCP4:** E72-152 on pod 2.
+
+Scripts: `../pod3_scripts/`. Raw tables and metrics: this folder.
+
+## Pod and hardware
+- **Pod:** Runpod 4xL4, pod 3 = o5r3oa6tgfpc8i, location IS, deployed by the user 18:40 UTC; SSH up 19:04.
+- **GPUs:** L4 23,034 MiB, power limit 72 W.
+- **Topology differs from pod 2:** only GPU1-GPU2 are a PHB pair; GPU0 and GPU3 are NODE to every other GPU. Pod 2 has
+  pairs 0-1 and 2-3. Manh's `--gpu-ids 0,2,1,3` therefore maps logical ranks to different physical pairs on the two
+  pods, so throughput is not strictly comparable across pods.
+- **Host:** 128 CPUs (pod 2: 48), 503 GB RAM, /dev/shm 104 GB, 200 GB disk, CUDA 13.0.
+- **Incident 19:05-19:10:** my bundle tar reset /root to uid 1000 / mode 775, which broke sshd StrictModes. The user
+  fixed it from the web terminal (`chown root:root /root && chmod 700 /root`). Staging now uses
+  `tar --no-same-owner --no-overwrite-dir` from inside root/.
+
+## Stack (identical to the other pods)
+- **Environment:** Manh's offline install (`install_b32m.sh`, all steps offline OK), Python 3.13.18.
+  - vllm-wheels **v10**: 293 wheels identical to v8 plus vllm-0.32.1rc1.dev0+**gf506afa210** (sha256 f3c297dc...).
+  - torch 2.14.0+cu130, numpy 2.4.6, scipy 1.18.1.
+- **Our runtime patch** (`apply_patch_f506.sh`), base hashes checked first:
+  - `model.py` 029aa62e -> **ad4ac0fd** (`b32m_patches/dynamic_count_model_f506.diff`; per-layer counts, row chunks
+    native in his wheel);
+  - `dsv4_topk.py` 7e1e101a -> **ab32ea7e** (router whitelist).
+- **Manh's source:** arc2-2026-src **v22** (kagglehub path .../versions/22), copied to the work dir as his cell 2 does.
+- **Model:** C1 = chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-img-E128-2bit, read-only HF key. **Full sha256 of all 137
+  files OK** against `E066/results/c1_gptq_sha256_manifest.json`.
+- **Server:** Manh's **v5 production cell 2m**. Run 1: verbatim through `run_prod_cell.py`. Run 2: as cell 14
+  of the notebook itself, TP4, no DCP.
+  - Cell settings: util 0.94, VLLM_GPU_DRIVER_RESERVE_MB 256, --context 163840, --concurrency 80 (max-num-seqs and
+    graphs), MODE 556 lossless, retention 128, tool parser.
+  - Env: MANH_VISION=1, MANH_VISION_MAX_IMAGES=32.
+  - **Run 1 only, plus DCP4:** `--vllm-arg=--decode-context-parallel-size=4 --vllm-arg=--cp-kv-cache-interleave-size=64
+    --vllm-arg=--prefix-cache-retention-interval=512`, inserted after his last flag, so 512 overrides his 128.
+- **Solver:** kit = kaggle_kit_v5 + `pinned_img/`.
+  - Files: solver **e96f7cb7** (external-server probe tolerates timeouts), harness 1d1a281e, grid_image 18ed78fb,
+    train_check 8fe36175, auto-repair 2292369c / 571f47eb.
+  - Launcher: pod 2's `launch_ext_e72c152.sh` with C1's dir and **80 workers**.
+  - Settings: ARC_GRID_FORMAT=text+image, multi-test 0.5, context limit 163840, gate 0.85 + queue hold, auto-repair,
+    workload evalx2t_s2026, replica deadlines.
+
+## Run 1: C1 + DCP4, stopped before serving (19:35-19:57): slow Engram THP load on this host
+- **Timeline:** the v5 cell 2m + DCP4 flags started at 19:35:56.
+  - TP0 loaded in 357 s and TP1 in 860 s ("Model loading took 14.56 GiB").
+  - TP2/TP3 (physical GPUs 1 and 3) were still loading after 21 min: 6 GB on the GPU, ~136% CPU each, no log after
+    19:36:52 "Engram table offloaded to pinned host memory" (10.36 / 16.31 GiB per rank).
+  - TP1 finished right after "Engram MADV_COLLAPSE failed; keeping existing pages".
+- **Evidence** (`dcp4_slow_load/`, read-only, 19:56):
+  - `/proc/vmstat` over 10 s: compact_migrate_scanned **+143.6M**, compact_stall +260, compact_fail +253,
+    compact_success +7, thp_fault_fallback +63.
+  - The workers were R (running), VmRSS 30.0 / 23.9 GB, wchan 0.
+  - py-spy was refused (the container lacks SYS_PTRACE).
+  - So the Engram THP collapse (`--engram-config.use_thp=true`) drives synchronous memory compaction that mostly
+    fails.
+  - THP settings are identical to pod 2 (enabled madvise, defrag madvise, khugepaged defrag 1).
+  - Suspected cause: this host's memory state (fragmentation; 128 CPUs), possibly made worse by the C1 sha256 verify
+    that ran during the first 3 min. **A Kaggle startup risk to watch:** Kaggle runs the same use_thp=true.
+- **Stopped** per the coordinator at 19:57: TERM to run_variant and the cell runner, TERM then KILL to the server's
+  process group 3475. No DCP4 throughput data.
+
+## Run 2 (main job): the exact submission notebook, C1 copy, RERUN mode, 240-task x2t workload
+- **Notebook:** `kaggle/dsv41_tools/out/nb_dsv41-tools-submit-img-manh/dsv41-tools-submit-img-manh.ipynb` (sha
+  8d1fac9e).
+  **Build actually run: 8d1fac9e** (the C1 copy c31c5d5d).
+  - The later rebuild c23eb5fb (fourth audit, GitHub main dd38b0555) changes only commit mode: new cell 3w, the 4b
+    light-smoke checks, the 1b size pass. Its 2r also writes {WORK}/e066_vllm_patch.json.
+  - So rerun behaviour is the same, and this run was not restarted. In the copy, ONLY cell 1b's model manifest is swapped to C1's 137 entries (sha c31c5d5d; diffed: only
+  cell 6 differs). Cell 1b runs only in commit runs, so the rerun never uses it.
+- **Runner** (`../pod3_scripts/nb_setup.sh`, `nb_restore_vllm.sh`, `nb_run.sh`):
+  - papermill with --log-output, a Python 3.13.18 kernel (the solver venv + ipykernel), cwd /kaggle/working,
+    KAGGLE_IS_COMPETITION_RERUN=1, VIRTUAL_ENV = the venv (so his `uv pip install` cells target it).
+- **/kaggle/input mapped to local copies:**
+  - datasets/nguyennguyen599/arc2-2026-src = v22;
+  - datasets/nguyennguyen599/vllm-wheels = the downloaded v10 set (wheels/wheels/, 294 files);
+  - datasets/chankhavu/dsv41-tools-kit/dsv41_kit.tgz = kaggle_kit_v5's;
+  - models/chankhavu/dsv41-flash-1017-arc-tool-img-e128-2bit/pytorch/default/1 = the C1 copy;
+  - competitions/arc-prize-2026-arc-agi-2/arc-agi_test_challenges.json = evalx2t_s2026 (240 tasks).
+  - **Not mapped:** cu13-install, so his CUDA cell fails harmlessly in the rerun ("CUDA installation failed (rerun:
+    continuing; the fallback stands)") and the pod keeps its CUDA 13.0; and unsloth-main (training only).
+- **vLLM files restored** to the wheel's originals before the run (029aa62e / 7e1e101a), so cell 2r patches them as on
+  Kaggle. The 21 GB uv cache was removed from /dev/shm so it doesn't inflate host-RAM numbers.
+- **Cell results (rerun mode):**
+  - cell 0: fallback written for 240 tasks, kit sha256 OK;
+  - 0b: E046 CHECK OK, pins solver e96f7cb7 / harness 1d1a281e / grid_image 18ed78fb / train_check 8fe36175;
+  - Manh's cells 1-5 ran (wheels copied to /dev/shm; uv audited the venv; the unsloth installs fail, harmless);
+  - **2r: E066 VLLM PATCH PATCHED both files** (029aa62e -> ad4ac0fd, 7e1e101a -> ab32ea7e);
+  - cell 2: import check OK on vllm 0.32.1rc1.dev0+gf506afa210;
+  - **2m: model staging "ok after 0s wait"** (the files were page-cached), Manh's server launched (PID 7403).
+- **Fidelity gaps vs Kaggle:**
+  - 72 W pod GPUs (the user says Kaggle is 50 W);
+  - 128 CPUs, and no 173 GiB cgroup (host RAM peak is logged by mem.log);
+  - this pod's topology (only 1-2 PHB);
+  - Kaggle-clock deadlines unshifted (the notebook's own: stop-new 10.83 h, force 11.17 h, kill 11.75 h).
+
+## Run 2 startup timeline (per rank)
+| UTC | Event |
+|---|---|
+| 19:58:0x | notebook start (papermill); cells 0-2 done within ~20 s |
+| ~19:59:00 | cell 2m launches Manh's server (PID 7403) |
+| 19:59:31-33 | first Engram table offloaded to pinned host memory: TP0 1.41 GiB, TP1 5.39, TP2 10.36, TP3 16.31 GiB per rank (TP0 also its second table, 1.41 GiB) |
+| 20:00:01 | TP0 model loaded: 14.56 GiB, **36.6 s** |
+| 20:04:00 | TP1 "Engram MADV_COLLAPSE failed; keeping existing pages" |
+| 20:04:04 | TP1 model loaded, **279.9 s** |
+| 20:07:51 | **FLAG: TP2 and TP3 still loading after 8.3 min.** All workers at 125-173% CPU. Host compaction counters since boot: compact_stall 13.1M, compact_fail 12.3M, compact_success 0.74M |
+| 20:03:37 | TP1 second Engram table (5.39 GiB) |
+| 20:13:10 | TP2 second Engram table (10.35 GiB) |
+| 20:13:35 / 20:13:39 | TP2 MADV_COLLAPSE failed / TP2 model loaded, **854.6 s** |
+| 20:19:31 | TP3 second Engram table (13.38 GiB) |
+| 20:19:56 / 20:19:59 | TP3 MADV_COLLAPSE failed / TP3 model loaded, **1235.4 s** (20.6 min) |
+| 20:20:23 | host all-reduce enabled; TileLang kernel compile, then shm_broadcast "no block in 60 s" while the engine profiles (normal during warm-up) |
+| pending | KV profile, graph capture, server up (cell 2m deadline: 7200 s) |
+
+Each rank holds **two** Engram tables, so the pinned Engram totals per rank are TP0 2.82, TP1 10.78, TP2 20.71 and TP3 29.69 GiB.
+Load time scales with that size, and the second table is the slow step: it is logged 4-20 min after the first, and on TP1-TP3 the collapse then fails.
+This matches run 1; pod 2 had the server up in 125 s.
+
+## Run 2 host RAM with `--engram-config.use_thp=true` (read-only)
+Probe: `pod3_scripts/memprobe.py`, samples `/proc/meminfo`, `/proc/<pid>/status` and `/proc/<pid>/smaps_rollup`; raw output in `/root/e066/nbrun/memprobe.jsonl` on the pod.
+Samples: one after all ranks loaded, one at server up, then every 10 min for an hour.
+
+Per rank after load (20:22:52, before the KV pool and CPU offload buffers are allocated). Units are GiB.
+
+| rank (pid) | Engram total | AnonHugePages | huge share of Engram | RssAnon | RssShmem | VmRSS | VmPTE MiB |
+|---|---|---|---|---|---|---|---|
+| TP0 (8550) | 2.82 | 2.82 | 100% | 5.24 | 1.97 | 8.14 | 20 |
+| TP1 (8553) | 10.78 | 8.81 | 82% | 13.20 | 1.97 | 16.10 | 36 |
+| TP2 (8552) | 20.71 | 13.73 | 66% | 23.13 | 1.97 | 26.03 | 56 |
+| TP3 (8551) | 29.69 | 18.73 | 63% | 32.11 | 1.97 | 35.01 | 74 |
+| API server (7403) | | 0 | | 0.88 | 0 | 1.34 | 6 |
+| EngineCore (8246) | | 0 | | 0.68 | 0 | 1.13 | 6 |
+
+Host at 20:22:52 (`/proc/meminfo`): AnonPages 88.5 GiB, AnonHugePages 44.2 GiB, Cached 129.2 GiB (mostly model files), Shmem 6.9 GiB, PageTables 0.27 GiB, Mlocked 0.03 GiB, MemAvailable 387.5 of 503.5 GiB.
+The server tree (7 processes) has 87.8 GiB RSS.
+
+RssAnon minus Engram is about 2.4 GiB on every rank, so the gap between ranks is the Engram tables.
+TP0's tables are fully huge-page backed. On TP1-TP3, where MADV_COLLAPSE failed, the 4 KiB remainder is 2.0, 7.0 and 11.0 GiB.
+The bytes are the same either way. Failed collapses cost load time and page-table size (TP3 VmPTE 74 MiB), not host RAM.
+
+| UTC | tag | AnonPages | AnonHugePages | MemAvailable | tree RSS | TP0 / TP1 / TP2 / TP3 RssAnon | TP0 / TP1 / TP2 / TP3 AnonHuge |
+|---|---|---|---|---|---|---|---|
+| 20:22:52 | loaded, pre-up | 88.5 | 44.2 | 387.5 | 87.8 | 5.24 / 13.20 / 23.13 / 32.11 | 2.82 / 8.81 / 13.73 / 18.73 |
+| pending | server up, +10 ... +60 min | | | | | | |
+
+## Run 2 KV pool and contract
+pending
+
+## Run 2 load windows (5 min, then hourly)
+pending

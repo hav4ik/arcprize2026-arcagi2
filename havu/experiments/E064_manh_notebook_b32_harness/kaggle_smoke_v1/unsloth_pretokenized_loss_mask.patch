@@ -1,0 +1,21 @@
+@@ -1008,7 +1008,19 @@
+     elif "input_ids" in column_names:
+         if is_vlm and not hasattr(tokenizer, "pad"):
+             raise RuntimeError(f"Unsloth: {processing_class.__class__} does not have .pad!")
+-        self.data_collator = DataCollatorForLanguageModeling(tokenizer, mlm = False)
++        # TRL creates a completion/assistant-aware collator before calling
++        # this helper. Preserve that collator and its masks for pre-tokenized
++        # datasets; replacing it with the plain LM collator silently trains on
++        # prompt tokens. The selected mask columns must also survive packing.
++        loss_mask_columns = [
++            name
++            for name in ("completion_mask", "assistant_masks")
++            if name in column_names
++        ]
++        if loss_mask_columns:
++            used_column_names.extend(loss_mask_columns)
++        else:
++            self.data_collator = DataCollatorForLanguageModeling(tokenizer, mlm = False)
+         do_tokenize = False
+     elif "prompt" in column_names and "completion" in column_names:
+         # Prompt/completion dataset (used with completion_only_loss).

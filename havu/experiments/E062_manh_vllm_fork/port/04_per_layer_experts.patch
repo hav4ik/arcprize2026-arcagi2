@@ -1,0 +1,295 @@
+From b3a3f642a96c4c7d4dce0fbb98586891c1453f6a Mon Sep 17 00:00:00 2001
+From: hav4ik <hav4ik@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 07:28:52 -0700
+Subject: [PATCH] [DSV4.1] Per-layer routed-expert counts for pruned exports
+
+Pruned exports can keep a different number of routed experts in each MoE
+layer (E066: 72-224 per layer, multiples of 8). The config lists them in
+`n_routed_experts_per_layer`, one entry per decoder layer.
+
+- DeepseekV4MoE builds each layer's gate, correction bias, vision bias and
+  FusedMoE at that layer's count. The expert-name mapping covers the largest
+  layer. EPLB is rejected when the counts differ.
+- The Triton dsv4_topk router takes any count from top-k to 512. Its kernel
+  already masks lanes past the row (BLOCK_N = next power of two); only the
+  (128, 256, 384) whitelists in can_use_dsv4_topk and the warmup registration
+  kept other counts on the CUDA topk_softplus_sqrt fallback, which rejects
+  them ("Unsupported expert number").
+
+Router cost at these counts (standalone copy of the kernel, RTX 3090, 40 calls
+in a CUDA graph = one step): 94-123 us per decode step of 80 rows, 190-277 us
+per 2,048-row prefill chunk, i.e. <0.1% of an L4 step.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019SwAYQEQ4vGnApMgqrNK7N
+---
+ tests/kernels/moe/test_topk_softplus_sqrt.py  | 75 +++++++++++++++++++
+ .../deepseek_v41/test_per_layer_experts.py    | 39 ++++++++++
+ .../layers/fused_moe/router/dsv4_topk.py      | 13 +++-
+ vllm/models/deepseek_v41/nvidia/model.py      | 53 ++++++++++++-
+ 4 files changed, 175 insertions(+), 5 deletions(-)
+ create mode 100644 tests/models/deepseek_v41/test_per_layer_experts.py
+
+diff --git a/tests/kernels/moe/test_topk_softplus_sqrt.py b/tests/kernels/moe/test_topk_softplus_sqrt.py
+index 2e85176375..85f831b26d 100644
+--- a/tests/kernels/moe/test_topk_softplus_sqrt.py
++++ b/tests/kernels/moe/test_topk_softplus_sqrt.py
+@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.config import (
+ from vllm.model_executor.layers.fused_moe.router.dsv4_topk import (
+     _dsv4_topk,
+     _dsv4_topk_kernel,
++    can_use_dsv4_topk,
+     dsv4_topk,
+ )
+ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+@@ -815,3 +816,77 @@ def test_dsv4_fast_topk_bias_vl():
+     assert topk_ids.dtype == torch.int64
+     torch.testing.assert_close(topk_ids_ref.to(torch.int64), topk_ids, atol=0, rtol=0)
+     torch.testing.assert_close(topk_weights_ref, topk_weights, atol=2e-5, rtol=2e-5)
++
++
++@pytest.mark.skipif(
++    not current_platform.is_cuda(),
++    reason="The DeepSeek V4 fast path is CUDA-only.",
++)
++@pytest.mark.parametrize("num_experts", [72, 96, 120, 136, 152, 160, 224])
++@pytest.mark.parametrize("num_tokens", [1, 80, 2048])
++@pytest.mark.parametrize("use_vision_bias", [False, True])
++def test_dsv4_topk_per_layer_expert_counts(
++    num_experts: int, num_tokens: int, use_vision_bias: bool
++):
++    """Pruned exports keep a different number of routed experts per layer
++    (multiples of 8 up to 224). The CUDA topk_softplus_sqrt fallback rejects
++    these counts, so the Triton fast path must take them, image rows included.
++    """
++    torch.manual_seed(0)
++    gating_output = torch.randn(
++        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
++    )
++    correction_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
++    assert can_use_dsv4_topk(
++        gating_output, correction_bias, 6, True, torch.int32
++    )
++    bias_vl, input_ids, image_sentinel_lo = None, None, 0
++    if use_vision_bias:
++        image_sentinel_lo = 1000
++        bias_vl = torch.randn(num_experts, dtype=torch.float32, device="cuda")
++        input_ids = _make_mixed_input_ids(num_tokens, image_sentinel_lo, torch.int32)
++
++    topk_weights_ref, topk_ids_ref = _torch_topk_softplus_sqrt(
++        gating_output=gating_output,
++        topk=6,
++        renormalize=True,
++        routed_scaling_factor=1.5,
++        e_score_correction_bias=correction_bias,
++        input_ids=input_ids,
++        bias_vl=bias_vl,
++        image_sentinel_lo=image_sentinel_lo,
++    )
++    topk_weights, topk_ids = fused_topk_bias(
++        gating_output,
++        gating_output,
++        "sqrtsoftplus",
++        correction_bias,
++        6,
++        True,
++        indices_type=torch.int32,
++        input_tokens=input_ids,
++        routed_scaling_factor=1.5,
++        bias_vl=bias_vl,
++        image_sentinel_lo=image_sentinel_lo,
++    )
++    torch.testing.assert_close(
++        topk_ids_ref.to(torch.int32), topk_ids, atol=0, rtol=0
++    )
++    torch.testing.assert_close(topk_weights_ref, topk_weights, atol=2e-5, rtol=2e-5)
++    assert int(topk_ids.max()) < num_experts
++
++
++def test_dsv4_topk_expert_count_limits():
++    gating_output = torch.zeros(4, 600)
++    for num_experts, ok in ((5, False), (6, True), (72, True), (512, True), (520, False)):
++        bias = torch.zeros(num_experts)
++        assert (
++            can_use_dsv4_topk(
++                gating_output[:, :num_experts].contiguous(),
++                bias,
++                6,
++                True,
++                torch.int32,
++            )
++            == (ok and current_platform.is_cuda())
++        ), num_experts
+diff --git a/tests/models/deepseek_v41/test_per_layer_experts.py b/tests/models/deepseek_v41/test_per_layer_experts.py
+new file mode 100644
+index 0000000000..fb354d96a3
+--- /dev/null
++++ b/tests/models/deepseek_v41/test_per_layer_experts.py
+@@ -0,0 +1,39 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Per-layer routed-expert counts of pruned DeepSeek-V4.1 exports."""
++
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.models.deepseek_v41.nvidia.model import (
++    max_routed_experts,
++    routed_experts_per_layer,
++)
++
++
++def _config(**kw):
++    return SimpleNamespace(
++        n_routed_experts=128, num_experts_per_tok=6, num_hidden_layers=4, **kw
++    )
++
++
++def test_uniform_export_has_no_per_layer_counts():
++    config = _config()
++    assert routed_experts_per_layer(config) is None
++    assert max_routed_experts(config) == 128
++
++
++def test_per_layer_counts():
++    config = _config(n_routed_experts_per_layer=[72, 160, 224, 96])
++    assert routed_experts_per_layer(config) == [72, 160, 224, 96]
++    # The expert-name mapping covers the largest layer, even above n_routed_experts.
++    assert max_routed_experts(config) == 224
++
++
++@pytest.mark.parametrize(
++    "counts", [[72, 160, 224], [72, 160, 224, 96, 96], [72, 5, 224, 96]]
++)
++def test_bad_per_layer_counts(counts):
++    with pytest.raises(ValueError):
++        routed_experts_per_layer(_config(n_routed_experts_per_layer=counts))
+diff --git a/vllm/model_executor/layers/fused_moe/router/dsv4_topk.py b/vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
+index 9c1eba96e2..bef4339f79 100644
+--- a/vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
++++ b/vllm/model_executor/layers/fused_moe/router/dsv4_topk.py
+@@ -12,6 +12,15 @@ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ 
+ _TOPK = 6
++# The kernel holds a gating row in one warp's registers (BLOCK_N = next power of
++# two, lanes >= num_experts masked), so any count from top-k to 512 works.
++# Pruned exports with per-layer expert counts (e.g. 72-224 routed experts) take
++# this path too; the CUDA topk_softplus_sqrt fallback only accepts a fixed list.
++_MAX_EXPERTS = 512
++
++
++def _supports_num_experts(num_experts: int) -> bool:
++    return _TOPK <= num_experts <= _MAX_EXPERTS
+ 
+ # Adapted from:
+ # https://github.com/sgl-project/sglang/blob/main/python/sglang/jit_kernel/moe_fused_gate.py
+@@ -28,7 +37,7 @@ def can_use_dsv4_topk(
+         current_platform.is_cuda()
+         and gating_output.dtype == torch.float32
+         and gating_output.ndim == 2
+-        and gating_output.shape[1] in (128, 256, 384)
++        and _supports_num_experts(gating_output.shape[1])
+         and gating_output.is_contiguous()
+         and correction_bias is not None
+         and correction_bias.dtype == torch.float32
+@@ -186,7 +195,7 @@ def register_dsv4_topk_warmup(
+     """
+     if (
+         current_platform.is_cuda()
+-        and num_experts in (128, 256, 384)
++        and _supports_num_experts(num_experts)
+         and topk == _TOPK
+         and renormalize
+     ):
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+index 7069cafeb0..49ebcdf9d9 100644
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -153,6 +153,38 @@ if typing.TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++def routed_experts_per_layer(config) -> list[int] | None:
++    """Per-layer routed-expert counts of a pruned export, or None when every
++    decoder layer has ``n_routed_experts``.
++
++    Exports that keep a different number of experts in each MoE layer list
++    them in ``n_routed_experts_per_layer`` (one entry per decoder layer, in
++    layer order); each layer's gate, correction bias, vision bias and expert
++    tensors are stored at that layer's count.
++    """
++    counts = getattr(config, "n_routed_experts_per_layer", None)
++    if counts is None:
++        return None
++    counts = [int(c) for c in counts]
++    if len(counts) != config.num_hidden_layers:
++        raise ValueError(
++            f"n_routed_experts_per_layer has {len(counts)} entries, expected "
++            f"num_hidden_layers={config.num_hidden_layers}"
++        )
++    if min(counts) < config.num_experts_per_tok:
++        raise ValueError(
++            f"n_routed_experts_per_layer has a layer with {min(counts)} experts, "
++            f"fewer than num_experts_per_tok={config.num_experts_per_tok}"
++        )
++    return counts
++
++
++def max_routed_experts(config) -> int:
++    """The largest decoder-layer routed-expert count (expert-name mapping)."""
++    counts = routed_experts_per_layer(config)
++    return config.n_routed_experts if counts is None else max(counts)
++
++
+ class DeepseekV4MoE(DeepseekV4MoEBase):
+     def __init__(
+         self,
+@@ -162,9 +194,22 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
+         reduce_results: bool = True,
+     ):
+         config = vllm_config.model_config.hf_config
++        layer_idx = extract_layer_index(prefix)
++        per_layer = routed_experts_per_layer(config)
+         n_routed_experts = config.n_routed_experts
++        if per_layer is not None and layer_idx < config.num_hidden_layers:
++            n_routed_experts = per_layer[layer_idx]
++        if (
++            per_layer is not None
++            and len(set(per_layer)) > 1
++            and vllm_config.parallel_config.enable_eplb
++        ):
++            raise NotImplementedError(
++                "EPLB needs the same routed-expert count in every MoE layer; "
++                "this export sets n_routed_experts_per_layer."
++            )
+         n_activated_experts = config.num_experts_per_tok
+-        if extract_layer_index(prefix) >= config.num_hidden_layers:
++        if layer_idx >= config.num_hidden_layers:
+             n_routed_experts = (
+                 getattr(config, "dspark_n_routed_experts", 0) or n_routed_experts
+             )
+@@ -1811,7 +1856,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+         first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
+         if first_layer.ffn.use_native_mega_moe:
+-            return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
++            return make_deepseek_v4_expert_params_mapping(
++                max_routed_experts(self.config)
++            )
+         # Params for weights, fp8 weight scales, fp8 activation scales
+         # (param_name, weight_name, expert_id, shard_id)
+         return fused_moe_make_expert_params_mapping(
+@@ -1819,7 +1866,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             ckpt_gate_proj_name="w1",
+             ckpt_down_proj_name="w2",
+             ckpt_up_proj_name="w3",
+-            num_experts=self.config.n_routed_experts,
++            num_experts=max_routed_experts(self.config),
+             num_redundant_experts=first_layer.ffn.n_redundant_experts,
+         )
+ 
+-- 
+2.34.1
+

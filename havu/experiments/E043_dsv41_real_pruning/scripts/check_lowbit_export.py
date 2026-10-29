@@ -5,7 +5,8 @@
 
 - gptq/layer_LL.safetensors: e{i}.{w1,w3,w2}.{q,s,z} equal the source GPTQ tensors of original expert kept[i];
 - router (ffn.gate.weight / bias / bias_vl) rows equal the checkpoint rows at the kept ids, on every layer;
-- config n_routed_experts and the manifest's kept ids match the keep set;
+- config n_routed_experts and the manifest's kept ids match the keep set (per-layer exports, E066: the counts in
+  n_routed_experts_per_layer, n_routed_experts = their maximum);
 - every indexed tensor exists in its file, and no safetensors file is larger than 5 GB.
 """
 import argparse
@@ -44,11 +45,14 @@ def main():
     keep = np.load(a.keep).astype(bool)
     cfg = json.load(open(X / "config.json"))
     tc = cfg.get("text_config", cfg)
-    E = int(keep[0].sum())
+    counts = keep.sum(1).astype(int).tolist()
+    E = max(counts)
     assert tc["n_routed_experts"] == E, tc["n_routed_experts"]
+    per_layer = len(set(counts)) > 1
+    assert tc.get("n_routed_experts_per_layer") == (counts if per_layer else None), tc.get("n_routed_experts_per_layer")
     man = json.load(open(X / "e043_manifest.json"))
     ids = man["keep_original_ids"]
-    assert man["experts_per_layer"] == E
+    assert man["experts_per_layer"] == (counts if per_layer else E)
     assert all(list(np.nonzero(keep[L])[0]) == list(ids[str(L)]) for L in range(40)), "manifest ids != keep set"
     # gptq tensors
     pk = re.compile(r"^e(\d+)\.(w[123])\.([qsz])$")
@@ -57,12 +61,13 @@ def main():
         with safe_open(str(X / f"gptq/layer_{L:02d}.safetensors"), framework="pt") as fx, \
                 safe_open(str(Path(a.gptq) / f"layer_{L:02d}.safetensors"), framework="pt") as fs:
             keys = list(fx.keys())
-            assert len(keys) == 9 * E, (L, len(keys))
+            assert len(keys) == 9 * counts[L], (L, len(keys))
             for k in keys:
                 i, w, p = pk.match(k).groups()
                 if not torch.equal(fx.get_tensor(k), fs.get_tensor(f"e{kept[int(i)]}.{w}.{p}")):
                     raise SystemExit(f"layer {L} {k} differs from source e{kept[int(i)]}")
-    print(f"gptq: 40 layers x {E} experts x 9 tensors equal the source GPTQ at the kept ids")
+    print(f"gptq: 40 layers x {'per-layer ' + str(min(counts)) + '-' + str(E) if per_layer else E} experts x 9 tensors "
+          "equal the source GPTQ at the kept ids")
     # router rows
     names = [f"layers.{L}.ffn.gate.{p}" for L in range(40) for p in ("weight", "bias", "bias_vl")]
     ours, orig = tensors_of(X, names), tensors_of(a.src, names)
