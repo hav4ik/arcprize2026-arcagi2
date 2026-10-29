@@ -1,9 +1,9 @@
 # B32-M fix (2026-10-29 pivot): tonight's candidate
 
 B32-M V3 (LB 46.5) with the causes found today removed. The model is the E128 text model already on Kaggle
-(`chankhavu/dsv41-flash-1017-arc-tool-e128-2bit`). The harness is B32's (`882c817f`). The server is Manh's **v7** cell (scriptVersionId 363628071) with HIS restart supervisor (`dsv41_vllm.py --supervise 3`).
-Notebook sha256 `e55caf7a534f`. Builder: `kaggle/dsv41_tools/build_img_manh.py --text --no-supervisor` (command below). The
-diff against his v7 is in `review/`.
+(`chankhavu/dsv41-flash-1017-arc-tool-e128-2bit`). The harness is B32's (`882c817f`). The server is Manh's **v8** cell (scriptVersionId 363632080) with HIS restart supervisor (`dsv41_vllm.py --supervise 3`).
+Notebook sha256 `d8e1dbeafff6`. Builder: `kaggle/dsv41_tools/build_img_manh.py --text --no-supervisor` (command below). The
+diff against his v8 is in `review/`.
 
 | B32-M V3 | This build | Why |
 |---|---|---|
@@ -18,7 +18,7 @@ diff against his v7 is in `review/`.
 Context stays at 163,840. In B32-M's replica, 1 of 480 attempts hit it, but outputs reach 95k (p90) to 128k (max).
 
 ```
-python3 kaggle/dsv41_tools/build_img_manh.py --text --no-supervisor --manh-nb <Manh v7 pull> \
+python3 kaggle/dsv41_tools/build_img_manh.py --text --no-supervisor --manh-nb <Manh v8 pull> \
   --slug dsv41-tools-submit-b32m-fix --max-num-seqs 64 --gpu-util 0.90 --exec-timeout-s 900
 ```
 Optional, if the decode-numerics test incriminates his decode-only paths:

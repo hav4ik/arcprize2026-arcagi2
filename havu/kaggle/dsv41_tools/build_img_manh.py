@@ -201,6 +201,8 @@ def main():
     ap.add_argument("--server-env", action="append", default=[], metavar="KEY=VALUE",
                     help="replace the value of a key already in his MANH_SERVER_ENV (cell 2m), e.g. "
                          "VLLM_DSA_DECODE_INDEXER_ROW_SHARD=0; repeatable")
+    ap.add_argument("--keep-docker-pin", action="store_true",
+                    help="keep his kernel-metadata docker_image pin (the image he tested his server under) instead of latest")
     ap.add_argument("--no-supervisor", action="store_true",
                     help="leave out cell 2s (our restart supervisor for his server) and cell 3s; the solver then keeps "
                          "S25 (no restarts)")
@@ -421,9 +423,10 @@ def main():
     meta.update(id=f"chankhavu/{a.slug}", title=a.slug, code_file=f"{a.slug}.ipynb", is_private=True,
                 model_sources=[a.model_source] if a.model_source else meta["model_sources"])
     meta.pop("id_no", None)
-    # docker: Kaggle's latest image (the user, 2026-10-29), as B32-M V2/V3 ran; his pinned digest is unverified here
-    meta.pop("docker_image", None)
-    meta["docker_image_pinning_type"] = "latest"
+    if not a.keep_docker_pin:
+        # docker: Kaggle's latest image (the user, 2026-10-29), as B32-M V2/V3 ran; his pinned digest is unverified here
+        meta.pop("docker_image", None)
+        meta["docker_image_pinning_type"] = "latest"
     assert "arc-prize-2026-arc-agi-2" in meta["competition_sources"], "4xL4 needs the competition attached"
     json.dump(meta, open(out / "kernel-metadata.json", "w"), indent=1)
     print(out, len(cells), "cells;", {f: h[:8] for f, h in sha.items()},
