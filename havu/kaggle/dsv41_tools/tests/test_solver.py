@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -382,16 +383,17 @@ class Exit(BaseException):
     pass
 
 
-def run_main(env, tasks, attempt_fn, metrics=None, patch_metrics=True, fake_server=True, kit=None, setup=None):
-    """Run the live solver's main() with fake attempts (and by default a fake server); -> (solver, launches, sub,
-    work dir, starts). `setup(solver)` runs before main (extra patches)."""
+def run_main(env, tasks, attempt_fn, metrics=None, patch_metrics=True, fake_server=True, kit=None, setup=None,
+             path=C.SOLVER):
+    """Run the live solver's main() (or the solver at `path`) with fake attempts (and by default a fake server); ->
+    (solver, launches, sub, work dir, starts). `setup(solver)` runs before main (extra patches)."""
     work = Path(tempfile.mkdtemp(prefix="solver_main_", dir=C.SCRATCH))
     (work / "model").mkdir()
     (work / "model" / "config.json").write_text("{}")
     (work / "challenges.json").write_text(json.dumps(tasks))
     full_env = {**env, "ARC_CHALLENGES": str(work / "challenges.json"), "ARC_MODEL_DIR": str(work / "model"),
                 "ARC_OUT": str(work / "out"), **({"ARC_KIT": str(kit)} if kit else {})}
-    s = C.load_solver(full_env)
+    s = C.load_solver(full_env, path=path)
     launches, lock, starts = [], threading.Lock(), []
 
     def start_server():
@@ -835,6 +837,154 @@ class ServerStart(unittest.TestCase):
         self.assertFalse(Path(f"/proc/{child}").exists() and
                          Path(f"/proc/{child}/stat").read_text().split()[2] != "Z")
         self.assertEqual(len(list(state.glob("start_*"))), 2)
+
+
+PINNED_EXT = C.DSV41 / "pinned_candb_ext" / "solver_dsv41.py"  # B32 + S23, the solver the manh-server notebook runs
+
+
+class ModelsServer:
+    """S23: a stand-in for the notebook's vLLM server: /v1/models lists `ids`; close() stops it (its port then refuses
+    connections) and reopen() serves again on the same port."""
+
+    def __init__(self, ids=("dsv41",)):
+        self.ids, self.port = list(ids), 0
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                b = json.dumps({"object": "list", "data": [{"id": i, "object": "model"} for i in outer.ids]}).encode()
+                self.send_response(200 if self.path == "/v1/models" else 404)
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+        self.handler = Handler
+        self.reopen()
+
+    def reopen(self):
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), self.handler)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+def short_sleeps(s):
+    """run_main setup: the solver's 5 s polls take 0.05 s (undone by patch.stopall())."""
+    real_sleep = s.time.sleep
+    patch.object(s.time, "sleep", lambda x: real_sleep(min(x, 0.05))).start()
+
+
+class ExternalServer(unittest.TestCase):
+    """S23: ARC_EXTERNAL_SERVER, on the live solver and on pinned_candb_ext (B32 + S23)."""
+    SOLVERS = (C.SOLVER, PINNED_EXT)
+
+    def env(self, port, **kw):
+        return {**NB_ENV, "ARC_WORKERS": "1", "ARC_EXTERNAL_SERVER": f"http://127.0.0.1:{port}/v1",
+                "ARC_VLLM": str(C.SCRATCH / "no_vllm_here"), **kw}
+
+    def test_s23_env_and_url(self):
+        for path in self.SOLVERS:
+            with self.subTest(path.parent.name):
+                s = C.load_solver({**NB_ENV, "ARC_EXTERNAL_SERVER": " http://127.0.0.1:1234/v1/ "}, path=path)
+                self.assertEqual((s.URL, s.MAX_RESTARTS), ("http://127.0.0.1:1234", 0))
+                self.assertEqual(s.make_args().base_url, "http://127.0.0.1:1234/v1")
+                s = C.load_solver({**NB_ENV, "ARC_EXTERNAL_SERVER": "http://10.0.0.2:30000",
+                                   "ARC_MAX_SERVER_RESTARTS": "2"}, path=path)
+                self.assertEqual((s.URL, s.MAX_RESTARTS), ("http://10.0.0.2:30000", 2))
+                s = C.load_solver({**NB_ENV, "ARC_PORT": "8123"}, path=path)
+                self.assertEqual((s.EXTERNAL, s.URL, s.MAX_RESTARTS), ("", "http://127.0.0.1:8123", 3))
+
+    def test_s23_uses_the_running_server(self):
+        # S23 (fails before: the solver always launched its own vLLM on ARC_PORT; here ARC_VLLM does not exist)
+        for path in self.SOLVERS:
+            with self.subTest(path.parent.name):
+                srv = ModelsServer()
+                slog = Path(tempfile.mkdtemp(prefix="extlog_", dir=C.SCRATCH)) / "dsv41_server.log"
+                slog.write_text("INFO GPU KV cache size: 1,234,567 tokens\n")
+                try:
+                    s, launches, sub, work, _ = run_main(self.env(srv.port, ARC_EXTERNAL_SERVER_LOG=str(slog)), TASKS,
+                                                         harness_like, fake_server=False, path=path)
+                    with urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/v1/models", timeout=5) as r:
+                        self.assertEqual(r.status, 200)  # still up: the solver never stops it
+                finally:
+                    srv.close()
+                text = log_text(work)
+                self.assertIn("(external); GPU KV cache size: 1,234,567 tokens", text)
+                self.assertNotIn("server start (", text)
+                self.assertFalse((work / "out" / "dsv41_logs" / "server_cmd.json").exists())
+                self.assertEqual(len(launches), 6)
+                for t, task in TASKS.items():
+                    for q in range(len(task["test"])):
+                        self.assertEqual(sub[t][q], {"attempt_1": grid(q % 10), "attempt_2": grid((q + 1) % 10)})
+
+    def test_s23_wrong_model_or_no_server_keeps_the_fallback(self):
+        for path in self.SOLVERS:
+            with self.subTest(path.parent.name):
+                srv = ModelsServer(ids=["qwen38"])
+                try:
+                    s, launches, sub, work, _ = run_main(self.env(srv.port), TASKS, harness_like, fake_server=False,
+                                                         path=path)
+                finally:
+                    srv.close()
+                text = log_text(work)
+                self.assertIn("serves ['qwen38'], not dsv41", text)
+                self.assertIn("server failed to start (0 retries); keeping the fallback submission", text)
+                self.assertEqual((launches, sub["aaaa0001"][0]), ([], {"attempt_1": grid(1), "attempt_2": grid(1)}))
+                try:
+                    s, launches, sub, work, _ = run_main(self.env(free_port(), ARC_SERVER_UP_TIMEOUT_S="0.3"), TASKS,
+                                                         harness_like, fake_server=False, path=path,
+                                                         setup=short_sleeps)
+                finally:
+                    patch.stopall()
+                self.assertIn("not up after", log_text(work))
+                self.assertEqual(launches, [])
+
+    def test_s23_server_death(self):
+        # S23: a refused connection counts as a dead server at once (as an exited process): no restart by default;
+        # with ARC_MAX_SERVER_RESTARTS=1 the solver waits for the server to answer again and re-runs the job
+        for path in self.SOLVERS:
+            for restarts in ("", "1"):
+                with self.subTest(path.parent.name, restarts=restarts):
+                    srv, died = ModelsServer(), []
+
+                    def attempt(args, task, t, p, a):
+                        if (t, a) == ("aaaa0001", 0) and not died:
+                            died.append(1)
+                            srv.close()
+                            if restarts:
+                                threading.Timer(0.5, srv.reopen).start()
+                            return {"pred": grid(7), "error": "TurnError: Connection refused", "stop_reason": "error",
+                                    "usage": {"completion": 10}, "task_id": t, "pair": p, "attempt": a, "cuts": {},
+                                    "train_pass": None}
+                        return harness_like(args, task, t, p, a)
+
+                    def setup(s):
+                        short_sleeps(s)
+                        patch.object(s, "EXTERNAL_PROBE_S", 0.0).start()
+                    env = self.env(srv.port, ARC_SERVER_UP_TIMEOUT_S="20",
+                                   **({"ARC_MAX_SERVER_RESTARTS": restarts} if restarts else {}))
+                    try:
+                        s, launches, sub, work, _ = run_main(env, TASKS, attempt, fake_server=False, setup=setup,
+                                                             path=path)
+                    finally:
+                        patch.stopall()
+                        srv.close()
+                    text = log_text(work)
+                    self.assertIn("server died (code 1)", text)
+                    if restarts:
+                        self.assertIn("(wait 1): started by the notebook", text)
+                        self.assertEqual(text.count("server up after"), 2)
+                        self.assertEqual((len(launches), launches.count(("aaaa0001", 0, 0))), (7, 2))
+                    else:
+                        self.assertIn("server down and no restart left; finishing with what we have", text)
+                        self.assertEqual(launches, [("aaaa0001", 0, 0)])
+                        self.assertEqual(sub["aaaa0001"][0]["attempt_1"], grid(7))  # the harvested answer is kept
+                        self.assertEqual(sub["cccc0003"][2], {"attempt_1": grid(7), "attempt_2": grid(7)})
 
 
 SSE_DONE = b"data: [DONE]\n\n"
