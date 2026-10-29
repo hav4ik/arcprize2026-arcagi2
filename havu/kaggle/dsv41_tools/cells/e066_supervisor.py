@@ -96,10 +96,13 @@ def _sup_metrics():
         return None
     gen = busy = 0.0
     for line in text.splitlines():
-        if line.startswith("vllm:generation_tokens_total"):
-            gen += float(line.rsplit(" ", 1)[1])
-        elif line.startswith(("vllm:num_requests_running", "vllm:num_requests_waiting")):
-            busy += float(line.rsplit(" ", 1)[1])
+        try:
+            if line.startswith("vllm:generation_tokens_total"):
+                gen += float(line.rsplit(" ", 1)[1])
+            elif line.startswith(("vllm:num_requests_running", "vllm:num_requests_waiting")):
+                busy += float(line.rsplit(" ", 1)[1])
+        except (ValueError, IndexError):
+            pass
     return gen, busy
 
 
@@ -114,27 +117,36 @@ def _sup_relaunch(n):
         raise RuntimeError(f"launcher exited {r.returncode}: {(r.stdout + r.stderr)[-1500:]}")
     pid = int(json.load(open(f"{root}/server/launch.json"))["pid"])
     log = f"{root}/server/server.log"
-    while time.time() - t < E066_UP_TIMEOUT_S:
+    while time.time() - t < E066_UP_TIMEOUT_S and not SUPERVISOR["stop"]:
         if _sup_models_ok():
             return pid, log, time.time() - t
         if not _manh_alive(pid):
+            _sup_stop(pid)  # its children (EngineCore, TP workers) can outlive the leader
             raise RuntimeError(f"server exited during startup; {log}")
         time.sleep(5)
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except Exception:
-        pass
-    raise RuntimeError(f"server not up after {time.time() - t:.0f}s; {log}")
+    _sup_stop(pid)
+    raise RuntimeError(f"server not up after {time.time() - t:.0f}s (or supervisor stopped); {log}")
 
 
 def _sup_loop():
+    try:
+        _sup_loop_body()
+    except Exception as exc:  # never die silently: a "restarting" status would leave the solver waiting
+        _sup_log(f"supervisor crashed: {type(exc).__name__}: {exc}; status failed")
+        try:
+            _sup_write(start=-1, state="failed", error=f"supervisor crashed: {type(exc).__name__}")
+        except Exception:
+            pass
+
+
+def _sup_loop_body():
     global MANH_SERVER_PID, MANH_SERVER_LOG
     start, prog_t, prog_gen = 0, time.time(), -1.0
     while not SUPERVISOR["stop"]:
         time.sleep(5)
         pid = MANH_SERVER_PID
         why = None
-        if not pid or not _manh_alive(pid):
+        if not pid or not (_manh_alive(pid) or (time.sleep(1) is None and _manh_alive(pid))):
             why = f"server pid {pid} exited"
         elif E066_STALL_S > 0:
             m = _sup_metrics()
@@ -155,9 +167,11 @@ def _sup_loop():
         SUPERVISOR["restarts"] += 1
         _sup_write(start=start, state="restarting", error=why)
         _sup_log(f"{why}; restart {start}/{E066_MAX_RESTARTS} ({left / 60:.0f} min to stop-new)")
-        if not _sup_stop(pid):
+        if pid and not _sup_stop(pid):
             _sup_log(f"old server group {pid} or GPU processes still there: {_sup_gpu_apps()}; giving up")
             _sup_write(start=start, state="failed", error="old server would not stop")
+            return
+        if SUPERVISOR["stop"]:
             return
         try:
             new_pid, log, up_s = _sup_relaunch(start)

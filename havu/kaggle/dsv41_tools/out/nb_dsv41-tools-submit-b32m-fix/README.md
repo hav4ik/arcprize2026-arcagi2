@@ -1,41 +1,51 @@
-# B32-M fix (2026-10-29 pivot): tonight's candidate
+# B32-M fix: tonight's candidate (2026-10-29)
 
-B32-M V3 (LB 46.5) with the causes found today removed. The model is the E128 text model already on Kaggle
-(`chankhavu/dsv41-flash-1017-arc-tool-e128-2bit`). The harness is B32's (`882c817f`). The server is Manh's **v8** cell (scriptVersionId 363632080) with HIS restart supervisor (`dsv41_vllm.py --supervise 3`).
-Notebook sha256 `f1c22c4923f7`. Builder: `kaggle/dsv41_tools/build_img_manh.py --text --no-supervisor` (command below). The
-diff against his v8 is in `review/`.
+Notebook sha256 `bec71fb1e3f1`, kernel `chankhavu/dsv41-tools-submit-b32m-fix`. This is B32-M V3 (LB 46.5) with the
+causes found today removed, plus **graceful recovery from server failures**.
+- Model: the E128 text model already on Kaggle (`chankhavu/dsv41-flash-1017-arc-tool-e128-2bit/PyTorch/default/1`).
+- Harness: B32's, byte-identical (`882c817f`).
+- Server: Manh's v6 server cell (no `--supervise`), with the margins below.
+- Diff against his v6: `review/`.
+
+```
+python3 kaggle/dsv41_tools/build_img_manh.py --text --manh-nb <Manh v6 pull> --slug dsv41-tools-submit-b32m-fix \
+  --max-num-seqs 64 --gpu-util 0.90 --kv-offload-gib 10 --exec-timeout-s 900 --pin-dataset nguyennguyen599/vllm-wheels/11
+```
 
 | B32-M V3 | This build | Why |
 |---|---|---|
-| DCP4 (lossy fp8 combine, 0.72x speed on Kaggle) | TP4, no DCP, his production flags | his tuned Kaggle config |
-| wheel g5e1bccd07c (no prefill-memory fix) | v10 gf506afa210 (has 7ab756940a "budget prefill memory the startup profile misses") | likely OOM trigger: re-prefill of long requests |
-| util 0.938, ~1.1 GiB VRAM free | util **0.90** (his v7: 0.94) + his driver reserve 512 MiB, ~2 GiB free (pod 3 measured 2.04-2.09 at 0.90) | room for long-prefill spikes |
-| offload 32 GiB, 80 workers | offload **10 GiB/rank** (his v7), **64** workers/seqs (his v7: 80) | host RAM ~150 of 173 GiB |
-| B32's solver: launches into a dead port, burns retries (S24), 19 min restarts, no hang detection | solver `1ea2b25d` (S25 probe, S26 follows his supervisor's status file, waits while it is not up) + **his supervisor** (`--supervise 3`: restarts after an exit, not past stop-new). Our cell-2s supervisor is built and pod-tested as a fallback (`out/nb_dsv41-tools-submit-img-manh`), not used here: one supervisor only | B32-M's 46.5 fits a run that stopped producing answers at hour 4-6 |
+| DCP4, Manh's comm flags off | TP4, no DCP, his production flags (decode flags checked: numerically identical on vs off) | his tuned Kaggle config; DCP4's fp8 combine was lossy and 0.72x speed on Kaggle |
+| wheel g5e1bccd07c (no prefill-memory fix) | vllm-wheels **v11** pinned (g8cf0c0664b = v10 gf506afa210, which has the fix, + his mHC kernel speed-up) | the likely OOM trigger was re-prefill of long requests |
+| util 0.938, ~1.1 GiB VRAM free | util **0.90**, ~2.0-2.5 GiB free (measured on pods) | room for long-prefill spikes |
+| 80 workers, offload 32 GiB | **64** workers/seqs, offload **10 GiB/GPU** | host RAM ~150 of 173 GiB |
+| B32 solver: launches into a dead port, burns retries, 19 min restarts, no hang detection | **our recovery:** see below | B32-M's 46.5 fits a run that stopped answering at Kaggle hour 4-6 |
 | exec timeout 300 s | **900 s** | a slow step no longer kills the engine |
-| 80-task load-test commit | light smoke (2 tasks) + checks: answers, crash lines, RAM headroom, file sizes, supervisor log | quota; fail closed on a bad config |
+| 80-task load-test commit, no answer checks | light smoke (2 tasks), fails on no answers, crash lines, RAM headroom < 5 GiB, missing or short model files | quota; fail closed |
 
-Context stays at 163,840. In B32-M's replica, 1 of 480 attempts hit it, but outputs reach 95k (p90) to 128k (max).
+## Graceful recovery (cell 2s supervisor + solver 1ea2b25d)
 
-```
-python3 kaggle/dsv41_tools/build_img_manh.py --text --no-supervisor --manh-nb <Manh v8 pull> \
-  --slug dsv41-tools-submit-b32m-fix --max-num-seqs 64 --gpu-util 0.90 --exec-timeout-s 900
-```
-Optional, if the decode-numerics test incriminates his decode-only paths:
-`--server-env VLLM_DSA_DECODE_INDEXER_ROW_SHARD=0 --server-env VLLM_TRITON_SPARSE_INDEXER_LOGITS=0 --server-env VLLM_TP_HOST_GATHER=0`.
+- **Detect:** a daemon thread watches the server pid and confirms a death twice. It also catches a hang: 25 min
+  with no generated tokens while requests run.
+- **Signal:** it writes the status "restarting". The solver (S26) stops launching at once. In-flight attempts are
+  **re-queued for free**, including the dying server's plain HTTP 500s ("The server had an error while processing your
+  request"), which the kill test showed would otherwise cost each attempt a try. `ARC_CONN_TRIES=12` covers several
+  outages.
+- **Clean stop:** it kills the server's process group and waits until the group and every GPU compute process are
+  gone, so two engines' RAM never overlap. A relaunch that dies in startup is cleaned up the same way.
+- **Relaunch:** it reruns his exact launcher command with a fresh `--output-root dsv41_logs/r<N>`. It waits for
+  `/v1/models`, then writes "up". The solver waits for "up", then resumes.
+- **Limits:** at most 2 restarts, and only with >= 60 min before stop-new; otherwise "failed", and the solver finishes
+  with what it has. An exception in the supervisor also writes "failed", so the solver never waits forever.
+- **Kill test** (pod 3, 22:06 UTC; one TP worker SIGKILLed with 63 requests running):
+  - the API server exits on its own 13 s after the kill;
+  - old processes were gone in 20 s;
+  - the new server was up in 150 s with the same KV pool;
+  - all 64 workers resumed;
+  - host RAM went 137 -> 14 -> 136 GiB;
+  - the 500-handling bug it found is fixed in `1ea2b25d`.
+- **Compared with Manh's v8:** his `--supervise` also restarts, but his pinned solver spends a try per in-flight attempt
+  on each death and loses some outright, and a second death loses all in flight. We have not kill-tested his
+  supervisor. See `kaggle/dsv41_tools/MANH_SAFETY_EDITS.md` for edits that make his notebook safer.
 
-His v7 cell 1b has a typo, `len(json.load(f))f`. It is a SyntaxError that would fail the cell and the run; this build
-fixes it. The same build on his v6 with our own supervisor: `--text` without `--no-supervisor`.
-
-Kill test (pod 3, 2026-10-29 22:06 UTC, SIGKILL of one TP worker under 63 running requests, our cell-2s supervisor):
-the API server exits on its own 13 s after the kill. Old processes were gone in 20 s, the new server was up in 150 s
-with the same KV pool, all 64 workers resumed, and host RAM never held two engines. It also showed that the dying
-engine answers in-flight requests with a plain 500 ("The server had an error while processing your request"), which
-the solver counted as a job try: every in-flight attempt spent 1 of its 2 tries and one was lost. Fixed in solver
-`1ea2b25d`: that 500 is a connection error (free re-queue), and `ARC_CONN_TRIES=12` (was 4) covers several restarts.
-
-Inputs pinned at push (2026-10-29 ~22:40 UTC): `nguyennguyen599/vllm-wheels/11` (vLLM g8cf0c0664b = v10's gf506afa210 + Manh's
-mHC kernel speed-up 71dca8bc24 + the per-layer expert patch (inert for E128); the pods ran v10). Other datasets: latest.
-Docker: latest (user). Model: chankhavu/dsv41-flash-1017-arc-tool-e128-2bit/PyTorch/default/1.
-Build: `... --text --no-supervisor --manh-nb <v8> --slug dsv41-tools-submit-b32m-fix --max-num-seqs 64 --gpu-util 0.90
---exec-timeout-s 900 --pin-dataset nguyennguyen599/vllm-wheels/11`.
+Context stays at 163,840. In B32-M's replica, 1 of 480 attempts hit it, but outputs reach 95k tokens at p90 and 128k
+at the max.
