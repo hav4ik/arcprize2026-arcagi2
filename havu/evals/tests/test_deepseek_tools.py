@@ -507,6 +507,155 @@ class TokenExactParseTests(unittest.TestCase):
                          ("still thinking, cut by max_tokens", "", [], False))
 
 
+class FakeVisionServer:
+    """vLLM stand-in for --token-exact: /tokenize renders an image as a run of `span` IMG ids, /inference/v1/generate
+    expands each IMG of its token_ids to `expand` ids and echoes that prompt."""
+    IMG = 7
+
+    def __init__(self, replies, span=3, expand=3, render_status=200):
+        self.replies, self.span, self.expand, self.render_status, self.requests = iter(replies), span, expand, \
+            render_status, []
+
+    def render(self, messages, gen):
+        ids = []
+        for m in messages:
+            ids.append({"system": 1, "user": 2, "assistant": 3, "tool": 4}[m["role"]])
+            parts = m["content"] if isinstance(m["content"], list) else [{"type": "text", "text": m["content"] or ""}]
+            for p in parts:
+                ids += [self.IMG] * self.span if p["type"] == "image_url" else [100 + len(p["text"])]
+        return ids + [5] * gen
+
+    def handler(self, request):
+        path, body = request.url.path, json.loads(request.content)
+        self.requests.append((path, body))
+        if path == "/tokenize" and "prompt" in body:
+            placeholder = body["prompt"] == "<｜deepseek_image｜>"
+            return httpx.Response(200, json={"tokens": [self.IMG] if placeholder else [9, 9]})
+        if path == "/tokenize":
+            return httpx.Response(200, json={"tokens": self.render(body["messages"], body["add_generation_prompt"])})
+        if path == "/v1/completions/render":
+            if self.render_status != 200:
+                return httpx.Response(self.render_status, json={"error": "Scale-out endpoints are disabled"})
+            sp = {k: body[k] for k in ("temperature", "max_tokens", "skip_special_tokens",
+                                       "spaces_between_special_tokens") if k in body}
+            return httpx.Response(200, json=[{"token_ids": body["prompt"], "sampling_params": sp}])
+        assert path == "/inference/v1/generate", path
+        ran = [x for t in body["token_ids"] for x in ([t] * self.expand if t == self.IMG else [t])]
+        text, ids = next(self.replies)
+        events = [{"choices": [{"index": 0, "text": text[:3], "token_ids": ids[:1], "finish_reason": None}],
+                   "prompt_token_ids": ran},
+                  {"choices": [{"index": 0, "text": text[3:], "token_ids": ids[1:], "finish_reason": "stop"}]},
+                  {"choices": [], "usage": {"prompt_tokens": len(ran), "completion_tokens": len(ids),
+                                            "total_tokens": len(ran) + len(ids)}}]
+        sse = "".join(f"data: {json.dumps(e)}\n\n" for e in events) + "data: [DONE]\n\n"
+        return httpx.Response(200, content=sse.encode(), headers={"content-type": "text/event-stream"})
+
+    def posted(self, path):
+        return [b for p, b in self.requests if p == path]
+
+
+class TokenExactImageTests(unittest.TestCase):
+    """--token-exact with --grid-format text+image: /v1/completions token ids carry no pixels, so turns with images go
+    to /inference/v1/generate with one placeholder per image plus the images, and the echoed prompt must match."""
+    IMG = FakeVisionServer.IMG
+
+    def setUp(self):
+        import run_deepseek_tools
+        run_deepseek_tools._IMAGE_IDS.clear()
+        self.args = parser().parse_args(["--sandbox-url", "http://sandbox", "--base-url", "http://fake/v1",
+                                         "--token-exact", "--extra-body", json.dumps(
+                                             {"chat_template_kwargs": {"thinking": True}, "temperature": 1.0,
+                                              "cache_salt": "s1"})])
+        self.tok = {"ids": None, "n": 0, "prev_len": 0, "prev_sampled": [], "resync": False, "turns": 0, "breaks": 0,
+                    "rerenders": 0, "resyncs": 0, "parse_fallbacks": 0}
+        self.completions = []
+        self.client = SimpleNamespace(base_url="http://fake/v1", timeout=30, completions=SimpleNamespace(
+            create=lambda **kw: self.completions.append(kw) or Stream(self.text_reply)))
+        self.text_reply = []
+
+    @staticmethod
+    def user(*images, label=True):
+        parts = [{"type": "text", "text": "PROMPT"}]
+        for url in images:
+            parts += ([{"type": "text", "text": "\nGrid:"}] if label else []) + [
+                {"type": "image_url", "image_url": {"url": url}}]
+        return {"role": "user", "content": parts}
+
+    def run_turns(self, server, turns):
+        from run_deepseek_tools import turn_token_exact
+        mock = httpx.Client(transport=httpx.MockTransport(server.handler))
+        out = []
+        with mock, patch("httpx.post", mock.post), patch("httpx.stream", mock.stream):
+            for messages in turns:
+                out.append(turn_token_exact(self.client, self.args, messages, 64, self.tok))
+                messages.append(out[-1][0])
+        return out
+
+    def test_images_go_to_generate(self):
+        from run_deepseek_tools import DS_EOS
+        server = FakeVisionServer([("r1</think>[[1]]" + DS_EOS, [40, 41, 42]), ("r2</think>[[2]]" + DS_EOS, [50, 51])])
+        messages = [self.user("data:a", "data:b")]
+        (a1, u1, f1), = self.run_turns(server, [messages])
+        prompt1 = server.render(messages[:1], True)
+        self.assertEqual(prompt1.count(self.IMG), 6)
+        g1 = server.posted("/inference/v1/generate")[0]
+        self.assertEqual(g1["token_ids"], [2, 106, 106, self.IMG, 106, self.IMG, 5])
+        self.assertEqual([p["url"] for p in g1["content_parts"]], ["data:a", "data:b"])
+        self.assertEqual(g1["sampling_params"], {"temperature": 1.0, "max_tokens": 64, "skip_special_tokens": False,
+                                                 "spaces_between_special_tokens": False})
+        self.assertEqual((g1["cache_salt"], g1["output_mode"], g1["return_token_ids"], g1["stream"]),
+                         ("s1", "text", True, True))
+        r1 = server.posted("/v1/completions/render")[0]
+        self.assertEqual(r1["prompt"], [2])
+        self.assertNotIn("cache_salt", r1)
+        self.assertNotIn("chat_template_kwargs", r1)
+        self.assertEqual((a1["content"], a1["reasoning_content"], f1), ("[[1]]", "r1", "stop"))
+        self.assertEqual(u1["prompt_tokens"], len(prompt1))
+        self.assertEqual(self.tok["ids"], prompt1 + [40, 41, 42])
+        # turn 2 continues the exact history: still one placeholder per image, prompt echo checked again
+        messages.append({"role": "user", "content": "again"})
+        (a2, u2, _), = self.run_turns(server, [messages])
+        g2 = server.posted("/inference/v1/generate")[1]
+        self.assertEqual(g2["token_ids"], g1["token_ids"] + [40, 41, 42, 2, 105, 5])
+        self.assertEqual(u2["prompt_tokens"], len(prompt1) + 3 + 3)
+        self.assertEqual(a2["content"], "[[2]]")
+        self.assertEqual(self.tok["turns"], 2)
+        self.assertEqual(len([b for b in server.posted("/tokenize") if "prompt" in b]), 1)  # placeholder id cached
+        self.assertEqual(self.completions, [])
+
+    def test_prompt_echo_mismatch_fails(self):
+        from run_deepseek_tools import DS_EOS
+        server = FakeVisionServer([("r</think>[[1]]" + DS_EOS, [40, 41])], expand=4)
+        with self.assertRaisesRegex(TurnError, "expanded the images to another prompt"):
+            self.run_turns(server, [[self.user("data:a")]])
+        self.assertIsNone(self.tok["ids"])
+
+    def test_adjacent_images_fail_closed(self):
+        server = FakeVisionServer([])
+        with self.assertRaisesRegex(TurnError, "1 image spans in the prompt for 2 images"):
+            self.run_turns(server, [[self.user("data:a", "data:b", label=False)]])
+        self.assertEqual(server.posted("/inference/v1/generate"), [])
+
+    def test_scale_out_disabled(self):
+        server = FakeVisionServer([], render_status=403)
+        with self.assertRaisesRegex(TurnError, "--enable-scale-out"):
+            self.run_turns(server, [[self.user("data:a")]])
+
+    def test_text_only_keeps_completions(self):
+        from run_deepseek_tools import DS_EOS
+        self.text_reply = [SimpleNamespace(usage=None, choices=[SimpleNamespace(
+                               text="r</think>[[1]]" + DS_EOS, model_extra={"token_ids": [40]}, finish_reason="stop")]),
+                           SimpleNamespace(usage=SimpleNamespace(model_dump=lambda: {"prompt_tokens": 3}), choices=[])]
+        server = FakeVisionServer([])
+        (a, _, finish), = self.run_turns(server, [[{"role": "user", "content": "PROMPT"}]])
+        self.assertEqual((a["content"], finish), ("[[1]]", "stop"))
+        (req,) = self.completions
+        self.assertEqual(req["prompt"], [2, 106, 5])
+        self.assertEqual(req["extra_body"], {"temperature": 1.0, "cache_salt": "s1", "return_token_ids": True,
+                                             "skip_special_tokens": False, "spaces_between_special_tokens": False})
+        self.assertEqual([p for p, _ in server.requests], ["/tokenize"])
+
+
 class SandboxClientTests(unittest.TestCase):
     def test_reset_restores_only_prelude_and_cleanup(self):
         requests = []

@@ -105,6 +105,7 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
   - Canonical output is parsed like `encoding.py`; anything else is parsed leniently like the server's `deepseek_v41` tool parser.
   - After a non-canonical turn, a max_tokens cut, or a turn the harness rewrote (rescue, tool-name fix), the next prompt is rendered from the messages, as on the chat path.
   - Records get `token_exact: {turns, breaks, rerenders, resyncs, parse_fallbacks}`.
+  - With images (E058 `--grid-format text+image`) on a self-hosted vision server, turns go to vLLM's `/inference/v1/generate` instead. `/v1/completions` token ids carry no pixels, so every image token would run, silently, on the placeholder's text embedding. The prompt keeps one placeholder per image and the images go as content parts. The server must echo back exactly the rendered ids, or the turn fails. Server: vision weights, `--enable-scale-out`, `--limit-mm-per-prompt '{"image": N}'` instead of `--language-model-only`. Live check: `evals/check_token_exact_images.py`.
   - Use it for every self-hosted DeepSeek-V4.1 tool run.
 - **E046 options (opt-in; defaults unchanged):**
   - `--multi-test`: one attempt per task for tasks with several test inputs (all test inputs in the prompt, `test_inputs` in the session, `submit_answer` takes a list of grids; one record per pair, usage on pair 0). DeepSeek API and `--base-url` paths.
