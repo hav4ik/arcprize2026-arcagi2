@@ -3,9 +3,9 @@
 # KAGGLE_IS_COMPETITION_RERUN; phase rerun: KAGGLE_IS_COMPETITION_RERUN=1 on the 240-task x2t workload).
 # Fresh /tmp/dsv41, /tmp/arc_vision, /dev/shm/wheels, /root/kenv and /kaggle/working; a clean environment (env -i) with the
 # Kaggle-like kernel venv /root/kenv first on PATH, so Manh's `uv pip install` cells install into it.
-# Usage: launch_nb.sh <commit|rerun> <name>
+# Usage: launch_nb.sh <commit|rerun> <name> [notebook]
 set -euo pipefail
-PH=$1; N=$2; R=/root/nbruns/$N; NB=/root/e062pl/dsv41-tools-submit-img-manh.ipynb
+PH=$1; N=$2; R=/root/nbruns/$N; NB=${3:-/root/e062pl/dsv41-tools-submit-img-manh.ipynb}
 mkdir -p $R; [ -e $R/nb.timeline ] && { echo "$R/nb.timeline exists"; exit 1; }
 rm -rf /tmp/dsv41 /tmp/arc_vision /dev/shm/wheels
 # the kernel venv starts as a fresh copy (the install cells add ~20 GB to it): /root/kenv_fresh = kenv_fresh_freeze.txt

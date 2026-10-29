@@ -96,3 +96,11 @@ Stopped at ~25 min (19:35-20:02 UTC) when the priority moved to the exact-notebo
   - Fix: removed the run's /tmp/dsv41 and the regenerable uv cache (/root/b32m/uvcache, 21 GB). Also removed /root/b32m/venv (20 GB): the earlier non-notebook server env, rebuildable from /root/b32m/dl with `freeze.txt` and `install_b32m.sh`; the notebook installs the same stack into /root/kenv.
   - Recreated /root/kenv fresh (`kenv_fresh_freeze.txt`, 48 packages). That left 59 GB free.
   - Relaunched as p1b_commit at 20:13 UTC. Kaggle has its own large /tmp, and Manh's notebook installs fine there.
+- **Second attempt (p1b_commit, 20:13 UTC): the pod image lacks system packages that Kaggle's image has.**
+  - The install cells took only 42 s, because the wheels were already in page cache.
+  - Then `dpkg -i ./*.deb` exited non-zero, and cell 4 raised "CUDA installation failed" again. The cause was dependency problems: openjdk-21 needs ca-certificates-java, java-common, libnss3, libgif7 and libpcsclite1; nsight-systems needs libegl1 and libopengl0; x11-utils needs libxaw7, libxft2, libxkbfile1, libxmu6, libxmuu1 and libxt6t64.
+  - Kaggle's image must have these: Manh's own cell raises on that error, and his notebook passes on Kaggle.
+  - Fix: `apt-get install -f --no-install-recommends` from the Ubuntu 24.04 sources only. That installed 16 packages, including libnspr4, libegl-mesa0 and libxpm4, and removed nothing. `dpkg --audit` is clean; nvcc reports 13.0. Log: `/root/e062pl/apt_deps.log`.
+  - A private sources dir was needed: Manh's cuda-keyring deb adds `cuda-ubuntu2404-x86_64.list` (signed-by), which conflicts with the pod image's own `cuda.list`, so plain `apt-get` now fails with "Conflicting values set for option Signed-By".
+- **The launcher now resets /root/kenv** from a pristine copy (`/root/kenv_fresh`, built at /root/kenv so its shebangs are right; freeze identical to `kenv_fresh_freeze.txt`).
+- **Third attempt (p1c_commit, 20:16:35 UTC)** on c23eb5fb. Per the coordinator, phase 1 is then repeated on the v6-based rebuild, sha256 1e773bbc42e85f27, before phase 2. v6 changes one line of cell 2m: the server output root is `{WORK}/dsv41_logs`, so the server log is `dsv41_logs/server/server.log`.

@@ -13,7 +13,7 @@ small patch to your vLLM so per-layer expert counts load. Everything we changed 
 | [`review/solver_vs_manh.diff`](review/solver_vs_manh.diff) | our pinned solver vs the one in your v6 cell 0b |
 | [`review/harness_vs_manh.diff`](review/harness_vs_manh.diff) | our pinned harness vs the one in your v6 cell 0b (B32's) |
 
-The current build is notebook sha256 `1e773bbc42e8`, built on your v6 (scriptVersionId 363607395, the server's
+The current build is notebook sha256 `1707e4da22f2`, built on your v6 (scriptVersionId 363607395, the server's
 output root moved into `dsv41_logs`) after the fourth audit's fixes (~20:30 UTC).
 
 Longer record: [`kaggle/dsv41_tools/CANDIDATE_E066_IMG.md`](../../CANDIDATE_E066_IMG.md).
@@ -27,7 +27,7 @@ MODE 556 + row shard + AR overlap.
 
 | Cell | Change | Why |
 |---|---|---|
-| settings | adds `ARC_GRID_FORMAT=text+image`, `MANH_VISION=1`, `MANH_VISION_MAX_IMAGES=32`; commit run = light smoke (2 tasks, ends when both are done, capped at ~50 min) | image harness; 32 is your launcher's maximum (ARC prompts: max ~22-24 images, mean ~7); the light smoke saves Kaggle quota, since load testing runs on our pods |
+| settings | adds `ARC_GRID_FORMAT=text+image`, `MANH_VISION=1`, `MANH_VISION_MAX_IMAGES=32`; commit run = light smoke (2 tasks, ends when both are done, capped at ~75 min: your cell 2m waits for the server until `ARC_STOP_NEW_S`, and one pod needed 20.6 min for a rank's Engram load under `use_thp`) | image harness; 32 is your launcher's maximum (ARC prompts: max ~22-24 images, mean ~7); the light smoke saves Kaggle quota, since load testing runs on our pods |
 | 0b | our pinned files (below) | harness side = ours |
 | 1b | integrity check against the E066 model's sha256 manifest, plus names and sizes of all 137 files at once | it pointed at E128's manifest; the sha256 pass starts at server up and rarely finishes inside a light smoke |
 | 2r (inserted after your install cells) | patches your installed vLLM: `model.py` 029aa62e -> ad4ac0fd, `dsv4_topk.py` 7e1e101a -> ab32ea7e | E72-152 has per-layer expert counts (72-152, average 120); see below |

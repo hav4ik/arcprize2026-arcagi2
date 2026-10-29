@@ -324,8 +324,8 @@ print("LIGHTENV", json.dumps({{k: os.environ.get(k) for k in ("ARC_TASK_IDS", "E
             if rerun:  # the scored rerun: none of the light smoke's settings
                 self.assertEqual(light, dict.fromkeys(light))
             else:
-                self.assertEqual(light, {"ARC_TASK_IDS": "00576224,25ff71a9", "E066_LIGHT_SMOKE": "1", "ARC_STOP_NEW_S": "2700",
-                                         "ARC_FORCE_AT_S": "2820", "ARC_HARD_STOP_S": "2880", "ARC_KILL_AT_S": "2970",
+                self.assertEqual(light, {"ARC_TASK_IDS": "00576224,25ff71a9", "E066_LIGHT_SMOKE": "1", "ARC_STOP_NEW_S": "4200",
+                                         "ARC_FORCE_AT_S": "4320", "ARC_HARD_STOP_S": "4380", "ARC_KILL_AT_S": "4470",
                                          "B32M_LOAD_TEST": None})
             self.assertEqual(sha(kit / "solver_dsv41.py"), sha(P / "solver_dsv41.py"))
             self.assertEqual(sha(kit / "repo/evals/arc_harness/grid_image.py"), sha(P / "arc_harness/grid_image.py"))

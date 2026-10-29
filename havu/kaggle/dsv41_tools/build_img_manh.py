@@ -138,7 +138,7 @@ def main():
     ap.add_argument("--vision-max-images", type=int, default=32)
     ap.add_argument("--commit", choices=["light", "load"], default="light",
                     help="commit run: light = 2 smallest tasks (00576224, 25ff71a9 with 2 test inputs), ends when they are done, "
-                         "deadline cap ~45 min (saves quota; load testing is done on pods); load = his 80-task load test")
+                         "deadline cap ~75 min (saves quota; load testing is done on pods); load = his 80-task load test")
     ap.add_argument("--model-manifest", type=Path, required=True,
                     help="the E066 export's path/size/sha256 manifest: commit-run input integrity (cell 1b)")
     ap.add_argument("--out", type=Path)
@@ -163,12 +163,15 @@ def main():
         s0 = (s0[:start] + '    os.environ.setdefault("ARC_TASK_IDS", "00576224,25ff71a9")  # E066 light smoke: the 2 smallest tasks\n'
               '    os.environ.setdefault("E066_LIGHT_SMOKE", "1")  # cells 3w and 4b: the light smoke\'s checks\n'
               '    print("E066 LIGHT SMOKE: tasks", os.environ["ARC_TASK_IDS"], flush=True)\n' + s0[end:])
-        for k, old_v, new_v in (("ARC_STOP_NEW_S", "2280", "2700"), ("ARC_FORCE_AT_S", "2400", "2820"),
-                                ("ARC_HARD_STOP_S", "2460", "2880"), ("ARC_KILL_AT_S", "2550", "2970")):
+        # 70 min: his cell 2m waits for the server only until ARC_STOP_NEW_S. Pod 3 (2026-10-29) needed 20.6 min for one
+        # rank's Engram load under use_thp on a fragmented host, so 45 min could fail a good commit run. A healthy run
+        # still ends as soon as both tasks are done.
+        for k, old_v, new_v in (("ARC_STOP_NEW_S", "2280", "4200"), ("ARC_FORCE_AT_S", "2400", "4320"),
+                                ("ARC_HARD_STOP_S", "2460", "4380"), ("ARC_KILL_AT_S", "2550", "4470")):
             s0 = replace_once(s0, f'os.environ.setdefault("{k}", "{old_v}")', f'os.environ.setdefault("{k}", "{new_v}")')
         line = next(l for l in s0.splitlines() if l.startswith("    # smoke within 43 min of the first cell"))
         s0 = replace_once(s0, line, "    # E066 light smoke: the solver ends once the 2 tasks are done (model load, contract, generation, final "
-                                    "write); the deadlines below only cap it at ~50 min of the first cell")
+                                    "write); the deadlines below only cap it at ~75 min of the first cell")
     cells[i] = code(s0)
 
     # cell 0b: our pins, his checks + ours

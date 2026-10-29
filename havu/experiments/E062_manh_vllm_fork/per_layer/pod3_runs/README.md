@@ -100,14 +100,49 @@ Scripts: `../pod3_scripts/`. Raw tables and metrics: this folder.
 |---|---|
 | 19:58:0x | notebook start (papermill); cells 0-2 done within ~20 s |
 | ~19:59:00 | cell 2m launches Manh's server (PID 7403) |
-| 19:59:31-33 | Engram offloaded to pinned host memory: TP0 1.41 GiB, TP1 5.39, TP2 10.36, TP3 16.31 GiB per rank |
+| 19:59:31-33 | first Engram table offloaded to pinned host memory: TP0 1.41 GiB, TP1 5.39, TP2 10.36, TP3 16.31 GiB per rank (TP0 also its second table, 1.41 GiB) |
 | 20:00:01 | TP0 model loaded: 14.56 GiB, **36.6 s** |
 | 20:04:00 | TP1 "Engram MADV_COLLAPSE failed; keeping existing pages" |
 | 20:04:04 | TP1 model loaded, **279.9 s** |
 | 20:07:51 | **FLAG: TP2 and TP3 still loading after 8.3 min.** All workers at 125-173% CPU. Host compaction counters since boot: compact_stall 13.1M, compact_fail 12.3M, compact_success 0.74M |
-| pending | TP2 / TP3 loaded, graph capture, server up |
+| 20:03:37 | TP1 second Engram table (5.39 GiB) |
+| 20:13:10 | TP2 second Engram table (10.35 GiB) |
+| 20:13:35 / 20:13:39 | TP2 MADV_COLLAPSE failed / TP2 model loaded, **854.6 s** |
+| 20:19:31 | TP3 second Engram table (13.38 GiB) |
+| 20:19:56 / 20:19:59 | TP3 MADV_COLLAPSE failed / TP3 model loaded, **1235.4 s** (20.6 min) |
+| 20:20:23 | host all-reduce enabled; TileLang kernel compile, then shm_broadcast "no block in 60 s" while the engine profiles (normal during warm-up) |
+| pending | KV profile, graph capture, server up (cell 2m deadline: 7200 s) |
 
-Load time scales with the rank's pinned Engram size. This matches run 1; pod 2 had the server up in 125 s.
+Each rank holds **two** Engram tables, so the pinned Engram totals per rank are TP0 2.82, TP1 10.78, TP2 20.71 and TP3 29.69 GiB.
+Load time scales with that size, and the second table is the slow step: it is logged 4-20 min after the first, and on TP1-TP3 the collapse then fails.
+This matches run 1; pod 2 had the server up in 125 s.
+
+## Run 2 host RAM with `--engram-config.use_thp=true` (read-only)
+Probe: `pod3_scripts/memprobe.py`, samples `/proc/meminfo`, `/proc/<pid>/status` and `/proc/<pid>/smaps_rollup`; raw output in `/root/e066/nbrun/memprobe.jsonl` on the pod.
+Samples: one after all ranks loaded, one at server up, then every 10 min for an hour.
+
+Per rank after load (20:22:52, before the KV pool and CPU offload buffers are allocated). Units are GiB.
+
+| rank (pid) | Engram total | AnonHugePages | huge share of Engram | RssAnon | RssShmem | VmRSS | VmPTE MiB |
+|---|---|---|---|---|---|---|---|
+| TP0 (8550) | 2.82 | 2.82 | 100% | 5.24 | 1.97 | 8.14 | 20 |
+| TP1 (8553) | 10.78 | 8.81 | 82% | 13.20 | 1.97 | 16.10 | 36 |
+| TP2 (8552) | 20.71 | 13.73 | 66% | 23.13 | 1.97 | 26.03 | 56 |
+| TP3 (8551) | 29.69 | 18.73 | 63% | 32.11 | 1.97 | 35.01 | 74 |
+| API server (7403) | | 0 | | 0.88 | 0 | 1.34 | 6 |
+| EngineCore (8246) | | 0 | | 0.68 | 0 | 1.13 | 6 |
+
+Host at 20:22:52 (`/proc/meminfo`): AnonPages 88.5 GiB, AnonHugePages 44.2 GiB, Cached 129.2 GiB (mostly model files), Shmem 6.9 GiB, PageTables 0.27 GiB, Mlocked 0.03 GiB, MemAvailable 387.5 of 503.5 GiB.
+The server tree (7 processes) has 87.8 GiB RSS.
+
+RssAnon minus Engram is about 2.4 GiB on every rank, so the gap between ranks is the Engram tables.
+TP0's tables are fully huge-page backed. On TP1-TP3, where MADV_COLLAPSE failed, the 4 KiB remainder is 2.0, 7.0 and 11.0 GiB.
+The bytes are the same either way. Failed collapses cost load time and page-table size (TP3 VmPTE 74 MiB), not host RAM.
+
+| UTC | tag | AnonPages | AnonHugePages | MemAvailable | tree RSS | TP0 / TP1 / TP2 / TP3 RssAnon | TP0 / TP1 / TP2 / TP3 AnonHuge |
+|---|---|---|---|---|---|---|---|
+| 20:22:52 | loaded, pre-up | 88.5 | 44.2 | 387.5 | 87.8 | 5.24 / 13.20 / 23.13 / 32.11 | 2.82 / 8.81 / 13.73 / 18.73 |
+| pending | server up, +10 ... +60 min | | | | | | |
 
 ## Run 2 KV pool and contract
 pending

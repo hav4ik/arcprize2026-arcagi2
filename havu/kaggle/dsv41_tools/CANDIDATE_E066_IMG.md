@@ -6,7 +6,7 @@ side is ours. The only serving-side addition is our patch that lets his vLLM loa
 ## What it is
 
 - **Notebook:** `build_img_manh.py` takes Manh's notebook as input (`nguyennguyen599/dsv41-tools-submit-b32m-external-server`,
-  pulled with `kaggle kernels pull -m`; built on his **v6**, scriptVersionId 363607395: v5 + the server's output root in `dsv41_logs`; notebook sha256 1e773bbc42e8, ~20:30 UTC. Review package for Manh: `out/nb_dsv41-tools-submit-img-manh/README.md`). His install cells,
+  pulled with `kaggle kernels pull -m`; built on his **v6**, scriptVersionId 363607395: v5 + the server's output root in `dsv41_logs`; notebook sha256 1707e4da22f2, ~20:30 UTC. Review package for Manh: `out/nb_dsv41-tools-submit-img-manh/README.md`). His install cells,
   production server cell 2m (his `dsv41_vllm.py` launcher, his flags and env: TP4, no DCP, util 0.94, --concurrency 80,
   --context 163840, 12 GiB/rank CPU KV offload, lossless host all-reduce MODE 556, row shard, AR overlap), solver cell 3
   (ARC_EXTERNAL_SERVER) and stop cell 4 stay byte-identical. His v5 dropped the GPU gate (0a, commented out) and his
@@ -14,7 +14,7 @@ side is ours. The only serving-side addition is our patch that lets his vLLM loa
   - **settings (00):** `ARC_GRID_FORMAT=text+image`, `MANH_VISION=1`, `MANH_VISION_MAX_IMAGES=32`. His launcher accepts
     2-32 images; ARC's worst case is ~22-24.
     - The commit run is a **light smoke** (`--commit light`, the default): the 2 smallest tasks (00576224, 25ff71a9 with 2
-      test inputs), deadlines capped at ~50 min, ending when both are done. This saves quota versus his 80-task load
+      test inputs), deadlines capped at ~75 min (his cell 2m waits for the server until ARC_STOP_NEW_S; pod 3 needed 20.6 min for one rank's Engram load), ending when both are done. This saves quota versus his 80-task load
       test (`--commit load`). The competition rerun ignores all of it.
   - **0b:** our pinned files from `pinned_img/`:
     - solver `e96f7cb7` = B32's 77fe80a3 + the image switch + S25 (= his S23 ARC_EXTERNAL_SERVER; the probe tolerates
