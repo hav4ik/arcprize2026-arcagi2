@@ -515,6 +515,52 @@ def urllib_get(url):
         return r.read().decode()
 
 
+class TextBuild(unittest.TestCase):
+    """--text (B32-M fix): his E128 model and cell 1b, B32's harness, MANH_VISION=0, no cell 2r; supervisor kept."""
+    @classmethod
+    def setUpClass(cls):
+        cls.out = Path(tempfile.mkdtemp(dir=SCRATCH)) / "nb"
+        r = subprocess.run([sys.executable, str(D / "build_img_manh.py"), "--text", "--manh-nb", str(MANH_V4), "--out",
+                            str(cls.out), "--slug", "t", "--gpu-util", "0.90", "--kv-offload-gib", "10",
+                            "--server-env", "VLLM_DSA_DECODE_INDEXER_ROW_SHARD=0"], capture_output=True, text=True,
+                           cwd=str(D))
+        assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+        cls.cells = ["".join(c["source"]) for c in json.load(open(cls.out / "t.ipynb"))["cells"]]
+        cls.meta = json.load(open(cls.out / "kernel-metadata.json"))
+        his_meta = json.load(open(MANH_V4 / "kernel-metadata.json"))
+        cls.his = ["".join(c["source"]) for c in json.load(open(MANH_V4 / his_meta["code_file"]))["cells"]]
+        cls.his_meta = his_meta
+
+    def test_cells(self):
+        heads = [c.splitlines()[0] for c in self.cells]
+        self.assertFalse(any(h.startswith("# Cell 2r") for h in heads))
+        self.assertTrue(any(h.startswith("# Cell 2s (E066") for h in heads))
+        s0 = self.cells[1]
+        self.assertIn('("MANH_VISION", "0")', s0)
+        self.assertNotIn("ARC_GRID_FORMAT", s0)
+        b = next(c for c in self.cells if c.startswith("# Cell 0b"))
+        self.assertIn('"MANH_VISION": "0"', b)
+        self.assertNotIn('"ARC_GRID_FORMAT"', b)
+        c1b = next(c for c in self.cells if c.startswith("# Cell 1b"))
+        his1b = next(c for c in self.his if c.startswith("# Cell 1b"))
+        self.assertIn('state["model_stat"] = stat', c1b)
+        self.assertEqual(c1b.split("INTEGRITY = ", 1)[1][:200], his1b.split("INTEGRITY = ", 1)[1][:200])  # his manifest
+        rep = next(c for c in self.cells if c.startswith("# Cell 4b"))
+        self.assertNotIn("cell 2r's patch outcome", rep)
+        self.assertIn("cell 1b's names-and-sizes pass", rep)
+        c2m = next(c for c in self.cells if c.startswith("# Cell 2m"))
+        self.assertIn('"VLLM_DSA_DECODE_INDEXER_ROW_SHARD": "0",  # E066 build (was "1")', c2m)
+        self.assertIn('"--gpu-memory-utilization", "0.90", "--kv-offload-gib-per-rank", "10"', c2m)
+        self.assertEqual(self.meta["model_sources"], self.his_meta["model_sources"])
+
+    def test_pins_are_b32s_harness_and_our_solver(self):
+        b = next(c for c in self.cells if c.startswith("# Cell 0b"))
+        for f, h in (("solver_dsv41.py", sha(P / "solver_dsv41.py")),
+                     ("repo/evals/run_deepseek_tools.py", sha(D / "pinned_candb/run_deepseek_tools.py"))):
+            self.assertIn(h, b, f)
+        self.assertNotIn("grid_image.py", b)
+
+
 class LightSmokeChecks(unittest.TestCase):
     """Audit 2026-10-29: the light smoke's verdict needs real answers and no crash, records cell 2r's outcome and the
     model files' names and sizes, and cell 3w keeps the server up until the contract is done."""

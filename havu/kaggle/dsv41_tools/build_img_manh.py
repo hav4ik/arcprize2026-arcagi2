@@ -36,6 +36,12 @@ FILES = {"solver_dsv41.py": P / "solver_dsv41.py", "repo/evals/run_deepseek_tool
          "repo/evals/arc_harness/grid_image.py": P / "arc_harness/grid_image.py",
          "repo/evals/train_check.py": P / "train_check.py", "repo/evals/auto_repair.py": P / "auto_repair.py",
          "repo/evals/auto_repair_names.json": P / "auto_repair_names.json"}
+# --text (B32-M fix): our solver (S25 + S26 + supervisor wait) with B32's own harness, train_check and auto-repair
+B32 = HERE / "pinned_candb"
+FILES_TEXT = {"solver_dsv41.py": P / "solver_dsv41.py", "repo/evals/run_deepseek_tools.py": B32 / "run_deepseek_tools.py",
+              "repo/evals/train_check.py": B32 / "train_check.py", "repo/evals/auto_repair.py": B32 / "auto_repair.py",
+              "repo/evals/auto_repair_names.json": B32 / "auto_repair_names.json"}
+NEED_TEXT = {"solver_dsv41.py": ['EXTERNAL = E("ARC_EXTERNAL_SERVER"', 'EXTERNAL_STATUS = E("ARC_EXTERNAL_SERVER_STATUS"']}
 NEED_EXTRA = {"solver_dsv41.py": ['GRID_FORMAT = E("ARC_GRID_FORMAT"', 'EXTERNAL = E("ARC_EXTERNAL_SERVER"',
                                   'EXTERNAL_STATUS = E("ARC_EXTERNAL_SERVER_STATUS"'],  # S26 (Manh's PR #2)
               "repo/evals/run_deepseek_tools.py": ["def chat_context_cap", "def text_image_content"],
@@ -165,7 +171,11 @@ if not RERUN and "_ct_thread" in globals():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manh-nb", type=Path, required=True, help="`kaggle kernels pull -m` folder of his notebook")
-    ap.add_argument("--model-source", required=True)
+    ap.add_argument("--model-source", default=None, help="Kaggle Model handle (default: his notebook's)")
+    ap.add_argument("--text", action="store_true",
+                    help="B32-M fix (2026-10-29 pivot): B32's text harness + E128 text model (his model source and his "
+                         "cell 1b manifest), MANH_VISION=0 (--language-model-only), no cell 2r; keeps the supervisor, "
+                         "S25/S26 solver, margins, light smoke and the 4b checks")
     ap.add_argument("--slug", default="dsv41-tools-submit-img-manh")
     ap.add_argument("--vision-max-images", type=int, default=32)
     ap.add_argument("--commit", choices=["light", "load"], default="light",
@@ -188,26 +198,37 @@ def main():
     ap.add_argument("--exec-timeout-s", default=None,
                     help="VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS in his server env (vLLM default 300: a slower step kills "
                          "the engine); only with Manh's OK")
+    ap.add_argument("--server-env", action="append", default=[], metavar="KEY=VALUE",
+                    help="replace the value of a key already in his MANH_SERVER_ENV (cell 2m), e.g. "
+                         "VLLM_DSA_DECODE_INDEXER_ROW_SHARD=0; repeatable")
     ap.add_argument("--no-supervisor", action="store_true",
                     help="leave out cell 2s (our restart supervisor for his server) and cell 3s; the solver then keeps "
                          "S25 (no restarts)")
-    ap.add_argument("--model-manifest", type=Path, required=True,
+    ap.add_argument("--model-manifest", type=Path, default=None,
                     help="the E066 export's path/size/sha256 manifest: commit-run input integrity (cell 1b)")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args()
+    assert a.text or (a.model_source and a.model_manifest), "image builds need --model-source and --model-manifest"
     meta = json.load(open(a.manh_nb / "kernel-metadata.json"))
     nb = json.load(open(a.manh_nb / meta["code_file"]))
     cells = nb["cells"]
 
     # cell 00: settings (os.environ.setdefault tuples)
     i = find(cells, "# B32-M + MANH'S SERVER")
-    s0 = replace_once(src(cells[i]), '               ("ARC_PORT", "18084"),\n',
-                      '               ("ARC_PORT", "18084"),\n'
-                      '               ("ARC_GRID_FORMAT", "text+image"),  # E066: the E058 image harness\n'
-                      f'               ("MANH_VISION_MAX_IMAGES", "{a.vision_max_images}"),  # E066: one image per grid\n'
-                      '               ("MANH_VISION", "1"),  # E066: his vision recipe (images), not --language-model-only\n')
-    s0 = (f"# E066 image candidate (build_img_manh.py, 2026-10-29): Manh's notebook + our image harness and the E066\n"
-          f"# checkpoint {a.model_source} (per-layer expert counts: cell 2r).\n" + s0)
+    if a.text:
+        s0 = replace_once(src(cells[i]), '               ("ARC_PORT", "18084"),\n',
+                          '               ("ARC_PORT", "18084"),\n'
+                          '               ("MANH_VISION", "0"),  # B32-M fix: text prompts, his --language-model-only path\n')
+        s0 = ("# B32-M fix (build_img_manh.py --text, 2026-10-29): Manh's notebook + B32's text harness on the E128 text\n"
+              "# model, with a restart supervisor (cell 2s), memory margins and the commit-report checks.\n" + s0)
+    else:
+        s0 = replace_once(src(cells[i]), '               ("ARC_PORT", "18084"),\n',
+                          '               ("ARC_PORT", "18084"),\n'
+                          '               ("ARC_GRID_FORMAT", "text+image"),  # E066: the E058 image harness\n'
+                          f'               ("MANH_VISION_MAX_IMAGES", "{a.vision_max_images}"),  # E066: one image per grid\n'
+                          '               ("MANH_VISION", "1"),  # E066: his vision recipe (images), not --language-model-only\n')
+        s0 = (f"# E066 image candidate (build_img_manh.py, 2026-10-29): Manh's notebook + our image harness and the E066\n"
+              f"# checkpoint {a.model_source} (per-layer expert counts: cell 2r).\n" + s0)
     if a.commit == "light":  # commit runs only (the competition rerun never reads these)
         start = s0.index('    os.environ["B32M_LOAD_TEST"] = "1"\n')
         end = s0.index('    print("B32-M LOAD TEST: eval file", _lf[:1], flush=True)\n')
@@ -252,35 +273,46 @@ def main():
         anchor = '    "VLLM_TP_HOST_GATHER": "1",'
         assert c2m.count(anchor) == 1 and "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS" not in c2m
         c2m = c2m.replace(anchor, f'    "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "{a.exec_timeout_s}",  # E066 build: safety margin (2026-10-29)\n' + anchor)
+    for kv in a.server_env:
+        key, val = kv.split("=", 1)
+        m_ = re.search(rf'^    "{re.escape(key)}": "[^"]*",', c2m, flags=re.M)
+        assert m_ and len(re.findall(rf'^    "{re.escape(key)}": ', c2m, flags=re.M)) == 1, f"{key} not in his server env"
+        c2m = c2m.replace(m_.group(0), f'    "{key}": "{val}",  # E066 build (was {m_.group(0).split(": ", 1)[1].rstrip(",")})', 1)
     cells[k2] = code(c2m)
 
     # cell 0b: our pins, his checks + ours
     j = find(cells, "# Cell 0b (E046, frozen inputs)")
     his = src(cells[j])
     expect = json_line(his, "_MT_EXPECT")
-    expect["ARC_GRID_FORMAT"] = "text+image"
-    expect["MANH_VISION"] = "1"
+    if a.text:
+        expect["MANH_VISION"] = "0"
+    else:
+        expect["ARC_GRID_FORMAT"] = "text+image"
+        expect["MANH_VISION"] = "1"
     assert expect.get("ARC_WORKERS") == "80", expect.get("ARC_WORKERS")  # his check pins the settings' worker count
     expect["ARC_WORKERS"] = str(a.max_num_seqs)  # else the rerun's 0b check falls back to v3 settings (36 workers)
     if a.context is not None:
         assert expect.get("ARC_CONTEXT_LIMIT") == "163840", expect.get("ARC_CONTEXT_LIMIT")
         expect["ARC_CONTEXT_LIMIT"] = str(a.context)
     need = json_line(his, "_MT_NEED")
-    for f, needs in NEED_EXTRA.items():
+    files = FILES_TEXT if a.text else FILES
+    for f, needs in (NEED_TEXT if a.text else NEED_EXTRA).items():
         need.setdefault(f, [])
         need[f] += [n for n in needs if n not in need[f]]
     new = json_line(his, "_MT_NEW")
-    bad = B.check_imports(FILES)
+    bad = B.check_imports(files)
     assert not bad, f"pinned files import names the notebook would not have: {bad}"
-    cell0b, sha = B.code_cell(FILES, expect, new, need)
+    cell0b, sha = B.code_cell(files, expect, new, need)
     cells[j] = code(cell0b)
 
     # cell 2r: our multi-variant vLLM patch. His v4 had a row-chunk-only 2r (replaced); from his v5 on, his wheels load
     # row chunks themselves and 2r is gone, so ours goes right after his install cells (before cell 2's env record)
     hits = [i for i, c in enumerate(cells) if src(c).startswith("# Cell 2r ")]
-    if hits:
+    if a.text:
+        assert not hits, "his notebook has a cell 2r; the text build expects none (his wheel loads row chunks)"
+    elif hits:
         cells[hits[0]] = code(patch_cell())
-    else:
+    if not a.text and not hits:
         k = find(cells, "# Cell 2 (B32-M): Manh's environment")
         assert src(cells[k - 1]).startswith("# Manh's cell 5"), "expected his install cells right before cell 2"
         cells.insert(k, code(patch_cell()))
@@ -303,10 +335,13 @@ def main():
 
     # cell 1b: commit-run input integrity against the E066 export's manifest (his cell checks E128's)
     q = find(cells, "# Cell 1b ")
-    ic = B.integrity_cell(a.model_manifest)
-    man = json.load(open(a.model_manifest))
-    ic = re.sub(r"every file of the model \(\d+ files, \d+ GB\)",
-                f"every file of the model ({man['files']} files, {man['total_bytes'] / 1e9:.0f} GB)", ic)
+    if a.text:  # his cell 1b already checks the E128 model's manifest; only the names-and-sizes pass is added
+        ic = src(cells[q])
+    else:
+        ic = B.integrity_cell(a.model_manifest)
+        man = json.load(open(a.model_manifest))
+        ic = re.sub(r"every file of the model \(\d+ files, \d+ GB\)",
+                    f"every file of the model ({man['files']} files, {man['total_bytes'] / 1e9:.0f} GB)", ic)
     ic = replace_once(ic, '        integrity_save(state)\n        log = f"{WORK}/dsv41_logs/solver.log"\n',
                       '        integrity_save(state)\n'
                       '        # E066: names and sizes of every model file at once (seconds): the sha256 pass starts at server up and\n'
@@ -341,7 +376,12 @@ def main():
         raise AssertionError("his cell 4b: the _fatal line was not found")
     load_if = '    if os.environ.get("B32M_LOAD_TEST") == "1":  # load test'
     assert rep.count(load_if) == 1
-    rep = rep.replace(load_if, E066_REPORT_CHECKS + load_if)
+    checks = E066_REPORT_CHECKS
+    if a.text:  # no cell 2r, so no patch record
+        p0 = checks.index("    try:  # E066: cell 2r's patch outcome")
+        p1 = checks.index("    try:  # E066: cell 1b's names-and-sizes pass")
+        checks = checks[:p0] + checks[p1:]
+    rep = rep.replace(load_if, checks + load_if)
     tail = "    B32M_BAD = _b32m_bad  # the verdict cell at the end raises on it"
     assert rep.count(tail) == 1
     rep = rep.replace(tail, E066_LIGHT_CHECKS + tail)
@@ -369,7 +409,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     json.dump(nb, open(out / f"{a.slug}.ipynb", "w"), indent=1, ensure_ascii=False)
     meta.update(id=f"chankhavu/{a.slug}", title=a.slug, code_file=f"{a.slug}.ipynb", is_private=True,
-                model_sources=[a.model_source])
+                model_sources=[a.model_source] if a.model_source else meta["model_sources"])
     meta.pop("id_no", None)
     # docker: Kaggle's latest image (the user, 2026-10-29), as B32-M V2/V3 ran; his pinned digest is unverified here
     meta.pop("docker_image", None)

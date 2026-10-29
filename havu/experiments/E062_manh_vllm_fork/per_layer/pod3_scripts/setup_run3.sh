@@ -9,7 +9,7 @@ echo "setup_run3 $(date -u +%T)"
 mkdir -p /kaggle/working
 [ -n "$KIT" ] && cp "$KIT" /kaggle/input/datasets/chankhavu/dsv41-tools-kit/dsv41_kit.tgz
 echo "kit $(sha256sum /kaggle/input/datasets/chankhavu/dsv41-tools-kit/dsv41_kit.tgz | cut -c1-16)"
-MS=$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1]))["model_sources"]; assert len(m)==1, m; o,n,f,v=m[0].split("/"); print(f"{o}/{n}/{f.lower()}/{v}")' $KM)
+MS=$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1]))["model_sources"]; assert len(m)==1, m; o,n,f,var,v=m[0].split("/"); print(f"{o}/{n}/{f.lower()}/{var}/{v}")' $KM)
 rm -f /kaggle/input/datasets/nguyennguyen599/arc2-2026-src; ln -s $SRC /kaggle/input/datasets/nguyennguyen599/arc2-2026-src
 mkdir -p /kaggle/input/models/$(dirname $MS); [ -e /kaggle/input/models/$MS ] || ln -s /root/models/c1 /kaggle/input/models/$MS
 echo "model source /kaggle/input/models/$MS -> $(readlink -f /kaggle/input/models/$MS); src -> $(readlink -f /kaggle/input/datasets/nguyennguyen599/arc2-2026-src)"

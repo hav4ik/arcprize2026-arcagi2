@@ -222,7 +222,33 @@ Decode health of run 2:
 
 Verdict at 21:26: no significant difference, and the gap is within the eval's own run-to-run noise. The common set is the easy early finishers, and n = 72 detects only large drops.
 
-## Run 3 (prepared, not started): new build with Manh's restart supervisor, TP-worker kill test
+Final snapshot at 21:45, when run 2 was stopped for run 3: 71 first attempts, 98 pairs scored, 97 in common with the eval.
+
+| snapshot | pairs | n (tasks) | run 2 | eval a0 | run-only | eval-only | McNemar exact p |
+|---|---|---|---|---|---|---|---|
+| 21:45 | originals | 48 (35) | 77.1% | 87.5% | 2 | 7 | 0.18 |
+| 21:45 | copies -> original | 49 (35) | 73.5% | 79.6% | 2 | 5 | 0.45 |
+| 21:45 | all | 97 (70) | 75.3% | 83.5% | 4 | 12 | 0.077 |
+| 21:45 | tasks, all pairs right | 70 | 51 | 56 | 3 | 8 | 0.23 |
+
+- Distinct eval tasks behind the discordant pairs: 7 lost (6e453dd6, 1ae2feb7, 4c3d4a41, 8f3a5a89, 16de56c4, d35bdbdc, 71e489b6) vs 3 won (b0039139, 3dc255db, 291dc1e1). Sign test p = 0.34.
+  - 4c3d4a41 alone is 4 discordant pairs (orig + copy, 2 tests each), so the pair-level p overstates the evidence.
+- Eval-defined subsets, which avoid run 2's early-finisher selection: tasks whose eval a0 and a1 both used < 20k / < 30k output tokens.
+  - Run 2 finished 54% / 51% of them (the queue had not reached the rest).
+  - Run-only 0 / 1 vs eval-only 6 / 9, p = 0.031 / 0.021, with the same correlation caveat.
+- Noise: the eval's own a1 beats its a0 on these 97 pairs (89 vs 81; a0-only 2, a1-only 10).
+- Lengths of run 2's wrong answers against the eval's right ones: some are much shorter (4cccce55 4k vs 22k / 14k, 6e453dd6 10k vs 22k / 14k), one is longer (4c3d4a41 40k vs 13k / 16k), the rest similar.
+
+Verdict at stop: a consistent ~8 pp negative trend at the pair level. It is borderline and not significant at the task level, and a real accuracy cost of the new decode paths (or of the 163,840 context, or concurrency) is not ruled out.
+Run 3 adds more pairs at the submitted configuration.
+
+### Run 2 stop (21:46)
+- `stop_run2.sh`: notebook and kernel killed 21:46:30, solver + 38 sandboxes 21:46:31, server group 7403 (SIGTERM) gone 21:46:33.
+- At 21:46:51 nvidia-smi still listed pid 8551 (TP3, "[No data]", 21.6 GiB); the GPUs were empty at 21:47:00.
+- So the rank with the largest pinned Engram tables takes ~20-25 s after its process exits to release the GPU.
+- Run 2 data: `/root/e066/run2_working` and `/root/e066/nbrun/run2_attempts_final.jsonl` on the pod; local copy of the logs taken at 21:45.
+
+## Run 3: new build with the notebook-side restart supervisor (cell 2s), TP-worker kill test, then the C1 replica
 Plan from the coordinator, ~22:30 UTC on the go:
 1. Stop run 2.
 2. Run the new build (Manh's `--supervise 3`; status file passed to the solver as `ARC_EXTERNAL_SERVER_STATUS`; pinned solver S26, sha 832d3367). Rerun mode, C1, x2t workload, fresh `/kaggle/working`.
@@ -246,3 +272,21 @@ Differences between the current build (out/nb_dsv41-tools-submit-img-manh, sha a
 - `model_sources` is `arazzd/deepseek-v41-flash-1017-arc-tool-img-e128-2bit`, and cell 1b's manifest already equals C1's 137 entries, so no manifest swap is needed.
 - ARC_WORKERS and Manh's `--max-num-seqs` are 64 (Manh's Kaggle value); run 2 used 80. Run 3 is therefore the replica of the submitted concurrency.
 - The server root is `{WORK}/dsv41_logs` (server.log under `dsv41_logs/server/`).
+
+GO from the coordinator (21:45): our notebook-side supervisor, not Manh's `--supervise`.
+- Build `kaggle/dsv41_tools/out/nb_dsv41-tools-submit-img-manh/` sha 55992cf482fd. The kit is unchanged (f24e624b, the same as kaggle_kit_v5's) and src is v22.
+- Cell 2s: a daemon thread watches MANH_SERVER_PID, triggering on exit or on 25 min of no generated tokens while requests are running. It then:
+  1. writes `{WORK}/dsv41_logs/e066_supervisor.json` with state "restarting";
+  2. kills the server group and waits until the group and all GPU compute apps are gone;
+  3. reruns the launcher with `--output-root {WORK}/dsv41_logs/r<N>`, waits for /v1/models, and writes "up".
+  It restarts at most twice, and only with >= 60 min left before stop-new.
+- Cell 3 passes ARC_EXTERNAL_SERVER_STATUS and ARC_MAX_SERVER_RESTARTS=3. The pinned solver is 324ea6ee (S26 + waits while the status is not "up"). Cell 3s stops the supervisor before cell 4.
+- Server: util 0.90, `--kv-offload-gib-per-rank 10`, MANH_SEQS 64, MANH_CONTEXT 131072, `--mm-processor-cache-gb=2`, VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=900. ARC_WORKERS 64, ARC_CONTEXT_LIMIT 131072.
+
+Run 3 timeline:
+
+| UTC | Event |
+|---|---|
+| 21:47:24-37 | `setup_run3.sh`: run 2's working dirs archived. Model source `arazzd/deepseek-v41-flash-1017-arc-tool-img-e128-2bit/pytorch/default/1` -> C1 copy; cell 1b manifest == C1's (137). vLLM files restored to 029aa62e / 7e1e101a. Run 2's `chankhavu/...` model mapping removed, so the model glob finds one dir as on Kaggle. |
+| 21:47:58 | papermill start (RERUN). Samplers: `restart_sampler.py` every 5 s, `mem.log` every 60 s, `scrape_loop.sh` (re-attaches after restarts) |
+| ~21:48:30 | cell 0b E046 CHECK OK (solver 324ea6ee); dpkg fails as in run 2 ("CUDA installation failed (rerun: continuing...)"); cell 2r PATCHED both files; cell 2m launches the server |
