@@ -49,5 +49,5 @@ Observation = what is in the traces. Inference = my reading. I re-ran the submit
 
 ## Quotes
 - `missA/e72/1ae2feb7_a0.txt`: "Check test1/test2 right width only 2, so output mostly input with period fills."
-- `missA/e72/31f7f899_a1.txt`: "I think answer = solve(test_input)... Wait test bars: ... Submit." (the tool call `submit_answer` follows `solve(test_input)` directly after printing an 11-cell orange column that it described as "height10").
+- `missA/e72/31f7f899_a1.txt`: "I think answer = solve(test_input). However let me double-check whether widths handled correctly: alternative component sorting same as above. So answer stands." (followed by "Submit."; it never counted the rows of the 10-high bar, which its program draws 11 cells tall).
 - `missA/e72/b0039139_a1.txt`: "Test0 ori0 vertical, Y 3x5, k=Y height=3; horizontal rule width=3*5+2=17, transpose -> 17x3. Seems output given."
