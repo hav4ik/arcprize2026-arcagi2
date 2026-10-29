@@ -839,11 +839,11 @@ class ServerStart(unittest.TestCase):
         self.assertEqual(len(list(state.glob("start_*"))), 2)
 
 
-PINNED_EXT = C.DSV41 / "pinned_candb_ext" / "solver_dsv41.py"  # B32 + S23 + S24: the manh-server notebook's
+PINNED_EXT = C.DSV41 / "pinned_candb_ext" / "solver_dsv41.py"  # B32 + S25 + S26: the manh-server notebook's
 
 
 class ModelsServer:
-    """S23: a stand-in for the notebook's vLLM server: /v1/models lists `ids`; close() stops it (its port then refuses
+    """S25: a stand-in for the notebook's vLLM server: /v1/models lists `ids`; close() stops it (its port then refuses
     connections) and reopen() serves again on the same port."""
 
     def __init__(self, ids=("dsv41",)):
@@ -880,7 +880,7 @@ def short_sleeps(s):
 
 
 class ExternalServer(unittest.TestCase):
-    """S23: ARC_EXTERNAL_SERVER, on the live solver and on pinned_candb_ext (B32 + S23)."""
+    """S25: ARC_EXTERNAL_SERVER, on the live solver and on pinned_candb_ext (B32 + S25)."""
     SOLVERS = (C.SOLVER, PINNED_EXT)
 
     def env(self, port, **kw):
@@ -900,7 +900,7 @@ class ExternalServer(unittest.TestCase):
                 self.assertEqual((s.EXTERNAL, s.URL, s.MAX_RESTARTS), ("", "http://127.0.0.1:8123", 3))
 
     def test_s23_uses_the_running_server(self):
-        # S23 (fails before: the solver always launched its own vLLM on ARC_PORT; here ARC_VLLM does not exist)
+        # S25 (fails before: the solver always launched its own vLLM on ARC_PORT; here ARC_VLLM does not exist)
         for path in self.SOLVERS:
             with self.subTest(path.parent.name):
                 srv = ModelsServer()
@@ -945,7 +945,7 @@ class ExternalServer(unittest.TestCase):
                 self.assertEqual(launches, [])
 
     def test_s23_server_death(self):
-        # S23: a refused connection counts as a dead server at once (as an exited process): no restart by default;
+        # S25: a refused connection counts as a dead server at once (as an exited process): no restart by default;
         # with ARC_MAX_SERVER_RESTARTS=1 the solver waits for the server to answer again and re-runs the job
         for path in self.SOLVERS:
             for restarts in ("", "1"):
@@ -987,13 +987,32 @@ class ExternalServer(unittest.TestCase):
                         self.assertEqual(sub["cccc0003"][2], {"attempt_1": grid(7), "attempt_2": grid(7)})
 
 
+    def test_s25_probe_timeouts_need_three_in_a_row(self):
+        # S25 (pinned_img's probe rule; fails before: one timed-out connect called a live server dead)
+        def fake(addr, timeout=5):
+            e = seq.pop(0)
+            if e is not None:
+                raise e
+            return socket.socket()  # an unconnected socket: close() is all poll() calls
+        for path in self.SOLVERS:
+            with self.subTest(path.parent.name):
+                s = C.load_solver(self.env(1), path=path)
+                s.EXTERNAL_PROBE_S = 0
+                with patch.object(s.socket, "create_connection", fake):
+                    srv, seq = s.ExternalServer(), [TimeoutError(), TimeoutError(), None, TimeoutError(), OSError()]
+                    self.assertEqual([srv.poll() for _ in range(5)], [None] * 5)
+                    seq = [TimeoutError()]
+                    self.assertEqual(srv.poll(), 1)
+                    srv, seq = s.ExternalServer(), [ConnectionRefusedError()]
+                    self.assertEqual(srv.poll(), 1)
+
 def conn_error(t, p, a):
     return {"pred": grid(7), "error": "TurnError: Connection refused", "stop_reason": "error",
             "usage": {"completion": 10}, "task_id": t, "pair": p, "attempt": a, "cuts": {}, "train_pass": None}
 
 
 class SupervisedServer(unittest.TestCase):
-    """S24: ARC_EXTERNAL_SERVER_STATUS (the status file of Manh's --supervise), on the live solver and on
+    """S26: ARC_EXTERNAL_SERVER_STATUS (the status file of Manh's --supervise), on the live solver and on
     pinned_candb_ext."""
     SOLVERS = ExternalServer.SOLVERS
 
@@ -1034,7 +1053,7 @@ class SupervisedServer(unittest.TestCase):
                 self.assertEqual(s.external_status(), {})
 
     def test_s24_restart_on_the_same_port(self):
-        # S24 (fails before: the port never refused, so the solver never saw the restart: no "server died", and the
+        # S26 (fails before: the port never refused, so the solver never saw the restart: no "server died", and the
         # second start's log was not the one in the status)
         for path in self.SOLVERS:
             with self.subTest(path.parent.name):
@@ -1062,7 +1081,7 @@ class SupervisedServer(unittest.TestCase):
                 self.assertEqual((len(launches), launches.count(("aaaa0001", 0, 0))), (7, 2))
 
     def test_s24_supervisor_gave_up(self):
-        # S24 (fails before: with ARC_MAX_SERVER_RESTARTS=3 the solver waited ARC_SERVER_UP_TIMEOUT_S three times for a
+        # S26 (fails before: with ARC_MAX_SERVER_RESTARTS=3 the solver waited ARC_SERVER_UP_TIMEOUT_S three times for a
         # server its supervisor no longer restarts)
         for path in self.SOLVERS:
             with self.subTest(path.parent.name):
