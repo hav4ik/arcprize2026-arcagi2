@@ -653,7 +653,17 @@ class LightSmokeChecks(unittest.TestCase):
     def test_missing_records_are_failures(self):
         w = Path(tempfile.mkdtemp(dir=SCRATCH))
         bad = self.run_checks(w, "")
-        self.assertEqual(len(bad), 5, bad)  # patch record, integrity file, attempts.jsonl, submission.json, RAM samples
+        self.assertEqual(len(bad), 5, bad)  # patch record, integrity file, attempts.jsonl, submission.json, no RAM file
+
+    def test_ram_check_without_cgroup_v2_warns(self):
+        w = Path(tempfile.mkdtemp(dir=SCRATCH))
+        (w / "dsv41_logs").mkdir()
+        (w / "e066_vllm_patch.json").write_text(json.dumps([{"file": "/v/model.py", "action": "patched"}]))
+        (w / "smoke_integrity.json").write_text(json.dumps({"model_stat": {"files": 1, "missing": [], "size_mismatch": []}}))
+        (w / "dsv41_logs/attempts.jsonl").write_text(json.dumps({"task_id": "a", "pred": [[1]]}) + "\n")
+        (w / "submission.json").write_text(json.dumps({"a": [{"attempt_1": [[1]]}]}))
+        (w / "smoke_env.jsonl").write_text(json.dumps({"memory.max": None, "stat": {}}) + "\n")  # cgroup v1 pod
+        self.assertEqual(self.run_checks(w, "submission written (final)"), [])
 
     def ram_bad(self, anon_gib, shmem_gib, workers="64"):
         w = Path(tempfile.mkdtemp(dir=SCRATCH))

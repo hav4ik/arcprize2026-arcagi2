@@ -69,3 +69,15 @@ at the max.
   - No effect on the verdict or the scored rerun: 4b and the sampler run in commit runs only.
   - Fixed in the builder (`_cgs`) for future builds; Version 1 is unchanged.
 - Log: `scratchpad/kaggle_b32mfix_v1/dsv41-tools-submit-b32m-fix.log` (local).
+
+## Pod 2 commit smoke of the same notebook (E128, 23:30 UTC)
+
+- **Every functional check passes:**
+  - E046 CHECK OK; sha256 of all 136 model files OK; wheel g8cf0c0664b;
+  - server up in 240 s, KV 1,617,253 (Kaggle V1: 1,614,903); VRAM free 2.0-2.5 GiB per GPU; 0 OOMs;
+  - the supervisor watches and stops; the contract passes;
+  - 4/4 attempts answered and correct on the public solutions.
+- **The verdict raised** on the RAM guard alone: the pod is cgroup v1, so there were no memory.stat samples.
+  - Hand projection from /proc/meminfo: ~154 GiB, ~19 GiB headroom.
+  - Builder fix for future builds: without cgroup v2 stats the guard warns and skips. Kaggle (v2) is unchanged.
+- **The CV replica** of this notebook (rerun mode, x2t) started at 23:44 UTC on pod 2, with a TP-worker kill ~30 min in.

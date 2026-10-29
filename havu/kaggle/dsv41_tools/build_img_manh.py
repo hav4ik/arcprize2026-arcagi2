@@ -133,6 +133,8 @@ E066_LIGHT_CHECKS = """\
             # 2026-10-29: the engine grows ~4 GiB from server up to load; solver + sandboxes + kernel ~0.2 GiB/worker
             _env = [json.loads(x) for x in open(os.environ.get("ARC_SMOKE_ENV_LOG", f"{_w}/smoke_env.jsonl")) if x.strip()]
             _cgs = [x["stat"] for x in _env if isinstance(x.get("stat"), dict) and "anon" in x["stat"]]  # not _st: the
+            if not _cgs:  # no cgroup v2 memory.stat (e.g. a cgroup-v1 pod): nothing to project; Kaggle has v2
+                raise LookupError("no cgroup v2 memory.stat samples")
             _peak = max((s_["anon"] + s_.get("shmem", 0)) / 2**30 for s_ in _cgs)  # settings cell's sampler is time as _st
             _lim = min(float(x["memory.max"]) for x in _env if str(x.get("memory.max", "")).replace(".", "").isdigit()) / 2**30
             _nw = int(os.environ.get("ARC_WORKERS", "64"))
@@ -144,6 +146,8 @@ E066_LIGHT_CHECKS = """\
                                  f"under the {_lim:.1f} GiB cgroup (need >= 5)")
             elif _lim - _proj < 15:
                 print("E066 host RAM WARNING: headroom under 15 GiB", flush=True)
+        except LookupError as exc:
+            print(f"E066 host RAM WARNING: check skipped ({exc})", flush=True)
         except Exception as exc:
             _b32m_bad.append(f"host RAM check: {type(exc).__name__}: {exc}")
 """
