@@ -246,6 +246,11 @@ def main():
         s0 = replace_once(s0, line, "    # E066 light smoke: the solver ends once the 2 tasks are done (model load, contract, generation, final "
                                     "write); the deadlines below only cap it at ~75 min of the first cell")
     s0 = replace_once(s0, '(("ARC_WORKERS", "80"),', f'(("ARC_WORKERS", "{a.max_num_seqs}"),')
+    # E066 kill test: each server restart costs every in-flight job >= 1 connection retry (more while the port is still
+    # open); 12 instead of 4 keeps them through several restarts
+    s0 = replace_once(s0, '               ("ARC_PORT", "18084"),\n',
+                      '               ("ARC_PORT", "18084"),\n'
+                      '               ("ARC_CONN_TRIES", "12"),  # E066: free re-queues across server restarts (solver default 4)\n')
     if a.context is not None:
         s0 = replace_once(s0, '("ARC_CONTEXT_LIMIT", "163840"),', f'("ARC_CONTEXT_LIMIT", "{a.context}"),')
     cells[i] = code(s0)
@@ -365,7 +370,7 @@ def main():
     r = find(cells, "# Cell 4b ")
     rep = src(cells[r])
     if 'r"server up after (\\d+)s; (.*)"' in rep:  # his v6 regex misses "(external)"; his v7 handles it
-        rep = replace_once(rep, 'r"server up after (\\d+)s; (.*)"', 'r"server up after (\\d+)s(?: \\(external\\))?; (.*)"')
+        rep = replace_once(rep, 'r"server up after (\\d+)s; (.*)"', 'r"server up after (\\d+)s(?: \\([^)]*\\))?; (.*)"')
     else:
         assert 'r"server up after (\\d+)s(?: \\([^)]*\\))?; (.*)"' in rep, "his cell 4b: unknown server-up regex"
     assert rep.count('open(f"{_w}/dsv41_logs/server.log", errors="replace")') == 2

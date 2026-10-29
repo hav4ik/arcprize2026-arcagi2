@@ -301,3 +301,43 @@ Run 3 timeline:
 
 Run 3's load is 3x faster than run 2's (495 s vs 1525 s): TP3 took 210 s vs 1235 s. The collapse still fails on TP2 and TP3. The cause of the speed-up is not established; one possibility is the host's memory state (fragmentation) right after run 2 freed ~140 GiB.
 The load time under THP compaction varies by a factor of 3 on the same pod; pod 2 took 125 s.
+
+### Run 3 kill test (TP3 SIGKILL, 22:06:37 UTC, ~10 min after server up, 63 requests running)
+Tools: `kill_tp.sh 3` (exactly one process, cmdline `VLLM::Worker_TP3`), `restart_sampler.py` every 5 s, `analyze_restart.py`, and the solver, supervisor and server logs.
+
+| UTC | +s | Event |
+|---|---|---|
+| 22:06:37.4 | 0 | SIGKILL TP3 worker pid 20828 (pre-kill: API server 19687, EngineCore 20496, TP0-2 20827 / 20829 / 20830; supervisor state "up", start 0) |
+| 22:06:49 | 12 | EngineCore notices the dead worker; the API server answers every in-flight request with HTTP 500 (server.log: `EngineDeadError: EngineCore encountered an issue`) |
+| 22:06:50 | 13 | **The API server exits by itself**: "[shutdown] Process manager: force killing remaining process EngineCore pid 20496", force kills TP0-2, then "Finished server process [19687]" |
+| 22:06:50 | 13 | supervisor: `[+1140s] E066 SUPERVISOR: server pid 19687 exited; restart 1/2 (631 min to stop-new)`; state file "restarting" |
+| 22:06:51 | 14 | solver: `server died (code 1); tail: ...` and `external server http://127.0.0.1:18084 (wait 1): started by the notebook, not by the solver` |
+| 22:06:57 | 20 | every old pid is gone and the nvidia-smi compute-app list is empty |
+| 22:07:02 | 25 | relaunch: new vLLM pids (API server 27380, EngineCore 27811, workers 28147-28150); GPU contexts by 22:07:33 |
+| 22:08:13-48 | | load: TP0 / TP1 40 s, TP2 48 s, TP3 75 s (MADV_COLLAPSE failed on TP3); KV pool 1,453,240 tokens, unchanged |
+| 22:09:31 | 174 | supervisor: `[+1292s] E066 SUPERVISOR: start 1 up after 150s: pid 27380, log .../r1/server/server.log`; solver: `server up after 160s (external, start 1); GPU KV cache size: 1,453,240 tokens` |
+| 22:09:31 | 174 | 64 x `re-queue <task>.0#0 after a server-side error (1): TurnError: APIConnectionError: Connection error.` |
+| 22:10:21 | 224 | new server: 19 running + 45 waiting = 64, so every worker is back; generation resumed |
+
+Host RAM (5 s samples):
+- AnonPages went 136.7 GiB before the kill, 14.4 GiB at 22:06:57 (old engine gone), and peaked at 135.7 GiB at 22:09:52 (new engine).
+- **The old and new engines never coexisted.** Minimum MemAvailable was 340 GiB.
+- GPU after the restart: 20.48-20.53 GiB used, 2.04-2.09 GiB free per GPU, the same as at first start.
+
+**Problems found (solver S26, pinned 324ea6ee; identical in the text build):**
+1. The dying server's HTTP 500 is not classed as a server loss.
+   - At 22:06:49-50 there are 64 lines `retry <task>.0#0: TurnError: APIError: The server had an error while processing your request.`
+   - The HTTP body carries no "EngineDeadError" / "EngineCore encountered an issue"; those strings are only in server.log. So `CONN_ERRORS` misses it, and each in-flight attempt used one of its two `ARC_JOB_TRIES`. The retries were sent straight away, to the dying server.
+   - They then failed again at 22:09:31 with `APIConnectionError: Connection error.` and were re-queued free.
+   - The 64 jobs are now at tries = 1. A second death would end every attempt that was in flight at both deaths as an error.
+2. **One attempt is lost**: f4c952f2.0#0.
+   - Its 615 s first turn got the 500. The retry, 0.3 s later on the dying server, got `TurnError: InternalServerError: Error code: 500 - The server had an error while processing your request.`
+   - With no try left it was finalized: `[5] f4c952f2.0#0 pred=no stop=error turns=1 out=0 train_pass=None cuts={} 0.5s`.
+3. Cosmetic: the first window after the restart has negative rates (`server: -246.2 gen tok/s, ... uncached -1396.9 tok/s`) because the server's counters reset.
+
+Suggested fix:
+- Count the vLLM 500 text / InternalServerError as a server loss.
+- Or more robustly: any error while the supervisor state is not "up", or right after a burst of 500s / "server died", is a free re-queue.
+- And do not resubmit until the state is "up" again.
+
+The supervisor itself (cell 2s) behaved as designed: death detected in < 1 s of the API server's exit, the group and GPU apps confirmed gone, a clean relaunch, and "up" in 150 s.

@@ -351,11 +351,14 @@ print("LIGHTENV", json.dumps({{k: os.environ.get(k) for k in ("ARC_TASK_IDS", "E
         self.assertIn(m["entries"][0]["sha256"], c1b)
         self.assertNotIn("model-00001-of-00002", c1b)
         rep = next(c for c in self.cells if c.startswith("# Cell 4b "))
-        self.assertIn(r'server up after (\d+)s(?: \(external\))?; (.*)', rep)
+        self.assertIn(r'server up after (\d+)s(?: \([^)]*\))?; (.*)', rep)
         import re as _re
         rx = _re.search(r'_re_up = None|re.findall\(r"(server up after[^"]+)"', rep).group(1)
         self.assertTrue(_re.findall(rx, "[x] server up after 412s (external); GPU KV cache size: 1,336,475 tokens"))
         self.assertTrue(_re.findall(rx, "[x] server up after 412s; GPU KV cache size: 1 tokens"))
+        self.assertTrue(_re.findall(rx, "[x] server up after 0s (external, start 0); GPU KV cache size: 1 tokens"))
+        s0 = self.cells[1]
+        self.assertIn('("ARC_CONN_TRIES", "12")', s0)
         self.assertIn('globals().get("MANH_SERVER_LOG")', rep)
         self.assertIn('(("contract",) if os.environ.get("ARC_GRID_FORMAT") == "text+image" else ())', rep)
         compile(rep, "cell4b", "exec")
@@ -583,6 +586,13 @@ class TextOnV7(unittest.TestCase):
             if c.startswith(("# Cell 1b", "# Cell 0b", "# Cell 2m", "# Cell 3", "# Cell 4b", "# B32-M fix")):
                 ast.parse(c)
         self.assertNotIn("len(json.load(f))f", next(c for c in cells if c.startswith("# Cell 1b")))
+
+
+class SolverConnErrors(unittest.TestCase):
+    def test_dying_engine_500_is_a_connection_error(self):
+        src_ = (P / "solver_dsv41.py").read_text()
+        block = src_[src_.index("CONN_ERRORS = ("):src_.index("TASK_LIMIT = ")]
+        self.assertIn('"The server had an error while processing your request"', block)  # E066 kill test
 
 
 class LightSmokeChecks(unittest.TestCase):

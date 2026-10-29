@@ -157,7 +157,11 @@ CONN_ERRORS = ("Connection", "ConnectError", "RemoteProtocolError", "ReadError",
                "Incomplete stream", "Connection refused", "ReadTimeout",
                # E055: a dying engine answers in-flight requests with these before the port closes; without them every
                # server death used up one ARC_JOB_TRIES of each in-flight job (43 jobs lost after two deaths)
-               "EngineCore encountered an issue", "EngineDeadError")
+               "EngineCore encountered an issue", "EngineDeadError",
+               # E066 kill test (2026-10-29): Manh's vLLM answers in-flight requests of a dying engine with a plain
+               # OpenAI-style 500 ("APIError: ..." / "InternalServerError: Error code: 500 - ...") before its API server
+               # exits; counted as a try, it cost every in-flight attempt 1 of its 2 ARC_JOB_TRIES and lost one
+               "The server had an error while processing your request")
 TASK_LIMIT = env_num("ARC_TASK_LIMIT", 0, int)
 TASK_IDS = [t for t in E("ARC_TASK_IDS", "").split(",") if t]  # smoke tests: these tasks instead of the first N
 # E046 (opt-in): one attempt per task for tasks with several test inputs (all test inputs in one rollout, the answer

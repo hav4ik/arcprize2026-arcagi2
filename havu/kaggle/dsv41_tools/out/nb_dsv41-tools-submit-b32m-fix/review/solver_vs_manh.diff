@@ -1,6 +1,18 @@
 --- his solver_dsv41.py
 +++ ours solver_dsv41.py
-@@ -164,6 +164,14 @@
+@@ -157,13 +157,25 @@
+                "Incomplete stream", "Connection refused", "ReadTimeout",
+                # E055: a dying engine answers in-flight requests with these before the port closes; without them every
+                # server death used up one ARC_JOB_TRIES of each in-flight job (43 jobs lost after two deaths)
+-               "EngineCore encountered an issue", "EngineDeadError")
++               "EngineCore encountered an issue", "EngineDeadError",
++               # E066 kill test (2026-10-29): Manh's vLLM answers in-flight requests of a dying engine with a plain
++               # OpenAI-style 500 ("APIError: ..." / "InternalServerError: Error code: 500 - ...") before its API server
++               # exits; counted as a try, it cost every in-flight attempt 1 of its 2 ARC_JOB_TRIES and lost one
++               "The server had an error while processing your request")
+ TASK_LIMIT = env_num("ARC_TASK_LIMIT", 0, int)
+ TASK_IDS = [t for t in E("ARC_TASK_IDS", "").split(",") if t]  # smoke tests: these tasks instead of the first N
+ # E046 (opt-in): one attempt per task for tasks with several test inputs (all test inputs in one rollout, the answer
  # is a list of grids). On Flash-1017 it ties per-pair attempts (pass@2 82.6% vs 85.9%) at -41% tokens per task.
  MULTI_TEST = E("ARC_MULTI_TEST", "0") == "1"
  CONTEXT_LIMIT = env_arg("ARC_CONTEXT_LIMIT", int, 1)  # E046 --context-limit: the server's max-model-len (163840)
@@ -15,7 +27,7 @@
  MULTI_BUDGET = env_arg("ARC_MULTI_BUDGET", float, 0)  # E046 --multi-budget f: (1 + f (n - 1)) x budget and turns
  # I5 (opt-in): the harness's --auto-repair (retry a run_python cell once with an identifier typo fixed). Needs
  # evals/auto_repair.py + auto_repair_names.json in the kit's repo/evals (not in the V5 kit): without them it is off.
-@@ -331,7 +339,7 @@
+@@ -331,7 +343,7 @@
  
  
  def server_cmd():
@@ -24,7 +36,7 @@
              "--trust-remote-code", "--tensor-parallel-size", "4", "--distributed-executor-backend", "mp",
              "--kv-cache-dtype", "fp8", "--block-size", "128", "--max-model-len", MAX_MODEL_LEN,
              "--max-num-seqs", MAX_NUM_SEQS, "--max-num-batched-tokens", "2048",
-@@ -340,6 +348,9 @@
+@@ -340,6 +352,9 @@
              "--tokenizer-mode", "deepseek_v41", "--language-model-only", "--reasoning-parser", "deepseek_v41",
              "--tool-call-parser", "deepseek_v41", "--enable-auto-tool-choice", "--enable-prompt-tokens-details",
              "--compilation-config", '{"cudagraph_mode":"FULL"}'] + [str(x) for x in SERVER_EXTRA_ARGS]
@@ -34,7 +46,7 @@
  
  
  def server_alive():
-@@ -442,6 +453,9 @@
+@@ -442,6 +457,9 @@
              log(f"external server {URL}: its supervisor is {status['state']} ({status.get('error')}); no wait left")
              STATE["restarts"] = max(STATE["restarts"], MAX_RESTARTS)
              return False
@@ -44,7 +56,7 @@
          try:
              with urllib.request.urlopen(URL + "/v1/models", timeout=5) as r:
                  ids = [m.get("id") for m in json.loads(r.read())["data"]]
-@@ -754,7 +768,9 @@
+@@ -754,7 +772,9 @@
              return {"train_pass": None, "train_frac": None, "train_trace": "skipped_deadline"}
          return orig_tc(*a, **kw)
      h.train_check = train_check
