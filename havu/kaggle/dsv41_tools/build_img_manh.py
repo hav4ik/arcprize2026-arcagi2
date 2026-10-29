@@ -82,6 +82,54 @@ def contract_image_block():
     return text[start:end]
 
 
+# cell 4b additions (inside his `if not RERUN` block, 4-space indent; _w = WORK, _sl = solver.log text, json/os imported)
+E066_REPORT_CHECKS = """\
+    try:  # E066: cell 2r's patch outcome (fatal unless patched / already_fixed)
+        _pr = json.load(open(f"{_w}/e066_vllm_patch.json"))
+        print("E066 vLLM patch:", [(os.path.basename(x.get("file", "?")), x.get("action")) for x in _pr], flush=True)
+        _b32m_bad += [f"environment: E066 vLLM patch {os.path.basename(x.get('file', '?'))}: {x.get('action')}"
+                      for x in _pr if x.get("action") not in ("patched", "already_fixed")]
+    except Exception as exc:
+        _b32m_bad.append(f"environment: e066_vllm_patch.json: {type(exc).__name__}: {exc}")
+    try:  # E066: cell 1b's names-and-sizes pass over every model file
+        _ms = json.load(open(f"{_w}/smoke_integrity.json")).get("model_stat")
+        print("E066 model files (names, sizes):", _ms, flush=True)
+        if not _ms or _ms["missing"] or _ms["size_mismatch"]:
+            _b32m_bad.append(f"environment: model files {_ms}")
+    except Exception as exc:
+        _b32m_bad.append(f"environment: smoke_integrity.json: {type(exc).__name__}: {exc}")
+"""
+E066_LIGHT_CHECKS = """\
+    if os.environ.get("E066_LIGHT_SMOKE") == "1":  # E066 light smoke: no crash, real answers, a valid submission
+        _b32m_bad += [f"solver.log: {x}" for x in ("server died", "server exited during startup", "solver crashed",
+                                                  "server not up after") if x in _sl]
+        try:
+            _att = [json.loads(x) for x in open(f"{_w}/dsv41_logs/attempts.jsonl") if x.strip()]
+            _ans = [x for x in _att if x.get("pred") and not x.get("error")]
+            print(f"E066 light smoke: {len(_att)} attempt records, {len(_ans)} with an answer,",
+                  sum(bool(x.get("correct")) for x in _att), "correct", flush=True)
+            if not _ans:
+                _b32m_bad.append(f"no attempt produced an answer ({len(_att)} attempt records)")
+        except Exception as exc:
+            _b32m_bad.append(f"attempts.jsonl: {type(exc).__name__}: {exc}")
+        try:
+            _sub = json.load(open(f"{_w}/submission.json"))
+            assert isinstance(_sub, dict) and _sub, "empty"
+        except Exception as exc:
+            _b32m_bad.append(f"no valid submission.json ({type(exc).__name__}: {exc})")
+"""
+WAIT_CELL = """\
+# Cell 3w (E066, commit runs only): cell 2c's API contract runs in a background thread and needs the server. The light
+# smoke's 2 tasks can finish before it does, and cell 4 then stops the server, so wait for it here (at most 15 min).
+import os, time as _wt
+if not RERUN and "_ct_thread" in globals():
+    _wt0 = _wt.time()
+    _ct_thread.join(timeout=900)
+    print("E066: contract thread", "finished" if not _ct_thread.is_alive() else "STILL RUNNING after 900 s",
+          f"(waited {_wt.time() - _wt0:.0f} s)", flush=True)
+"""
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manh-nb", type=Path, required=True, help="`kaggle kernels pull -m` folder of his notebook")
@@ -113,11 +161,14 @@ def main():
         end = s0.index('    print("B32-M LOAD TEST: eval file", _lf[:1], flush=True)\n')
         end += len('    print("B32-M LOAD TEST: eval file", _lf[:1], flush=True)\n')
         s0 = (s0[:start] + '    os.environ.setdefault("ARC_TASK_IDS", "00576224,25ff71a9")  # E066 light smoke: the 2 smallest tasks\n'
+              '    os.environ.setdefault("E066_LIGHT_SMOKE", "1")  # cells 3w and 4b: the light smoke\'s checks\n'
               '    print("E066 LIGHT SMOKE: tasks", os.environ["ARC_TASK_IDS"], flush=True)\n' + s0[end:])
         for k, old_v, new_v in (("ARC_STOP_NEW_S", "2280", "2700"), ("ARC_FORCE_AT_S", "2400", "2820"),
                                 ("ARC_HARD_STOP_S", "2460", "2880"), ("ARC_KILL_AT_S", "2550", "2970")):
             s0 = replace_once(s0, f'os.environ.setdefault("{k}", "{old_v}")', f'os.environ.setdefault("{k}", "{new_v}")')
-        s0 = s0.replace("    # smoke within 43 min of the first cell", "    # E066 light smoke: capped at ~50 min of the first cell (ends when the 2 tasks are done)")
+        line = next(l for l in s0.splitlines() if l.startswith("    # smoke within 43 min of the first cell"))
+        s0 = replace_once(s0, line, "    # E066 light smoke: the solver ends once the 2 tasks are done (model load, contract, generation, final "
+                                    "write); the deadlines below only cap it at ~50 min of the first cell")
     cells[i] = code(s0)
 
     # cell 0b: our pins, his checks + ours
@@ -155,13 +206,34 @@ def main():
     # the chat tool-call probe is fatal with images: give a 2-bit model room to finish thinking before its call
     c2 = replace_once(c2, '"temperature": 0,\n                                          "max_tokens": 1500, "chat_template_kwargs": kw})',
                       '"temperature": 0,\n                                          "max_tokens": 4000, "chat_template_kwargs": kw})')
+    c2 = replace_once(c2, "    threading.Thread(target=contract_thread, daemon=True).start()\n",
+                      "    _ct_thread = threading.Thread(target=contract_thread, daemon=True)  # E066: cell 3w waits for it\n"
+                      "    _ct_thread.start()\n")
     if "import sys" not in c2 and ", sys," not in c2:
         c2 = replace_once(c2, "import re, threading, urllib.request", "import re, sys, threading, urllib.request")
     cells[m] = code(c2)
 
     # cell 1b: commit-run input integrity against the E066 export's manifest (his cell checks E128's)
     q = find(cells, "# Cell 1b ")
-    cells[q] = code(B.integrity_cell(a.model_manifest))
+    ic = B.integrity_cell(a.model_manifest)
+    man = json.load(open(a.model_manifest))
+    ic = re.sub(r"every file of the model \(\d+ files, \d+ GB\)",
+                f"every file of the model ({man['files']} files, {man['total_bytes'] / 1e9:.0f} GB)", ic)
+    ic = replace_once(ic, '        integrity_save(state)\n        log = f"{WORK}/dsv41_logs/solver.log"\n',
+                      '        integrity_save(state)\n'
+                      '        # E066: names and sizes of every model file at once (seconds): the sha256 pass starts at server up and\n'
+                      '        # rarely finishes inside a light smoke, so cell 4b fails the commit run on a missing or short file\n'
+                      '        stat = {"files": len(INTEGRITY["model"]), "missing": [], "size_mismatch": []}\n'
+                      '        for rel, (size, _digest) in INTEGRITY["model"].items():\n'
+                      '            p = os.path.join(model_dir, rel)\n'
+                      '            if not os.path.exists(p):\n'
+                      '                stat["missing"].append(rel)\n'
+                      '            elif os.path.getsize(p) != size:\n'
+                      '                stat["size_mismatch"].append(rel)\n'
+                      '        state["model_stat"] = stat\n'
+                      '        integrity_save(state)\n'
+                      '        log = f"{WORK}/dsv41_logs/solver.log"\n')
+    cells[q] = code(ic)
 
     # cell 4b report: the external solver logs "server up after Ns (external); ..."; his server's log is
     # MANH_SERVER_LOG; with images, a contract failure (tool calls not parsed, image dropped) fails the commit
@@ -179,7 +251,17 @@ def main():
             break
     else:
         raise AssertionError("his cell 4b: the _fatal line was not found")
+    load_if = '    if os.environ.get("B32M_LOAD_TEST") == "1":  # load test'
+    assert rep.count(load_if) == 1
+    rep = rep.replace(load_if, E066_REPORT_CHECKS + load_if)
+    tail = "    B32M_BAD = _b32m_bad  # the verdict cell at the end raises on it"
+    assert rep.count(tail) == 1
+    rep = rep.replace(tail, E066_LIGHT_CHECKS + tail)
     cells[r] = code(rep)
+
+    # cell 3w (new): wait for the contract thread before his cell 4 stops the server
+    w = find(cells, "# Cell 3: the solver")
+    cells.insert(w + 1, code(WAIT_CELL))
 
     nb["cells"] = cells
     out = a.out or HERE / f"out/nb_{a.slug}"

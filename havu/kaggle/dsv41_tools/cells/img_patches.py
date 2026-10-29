@@ -6,7 +6,8 @@
 #   (128, 256, 384) to 6..512 (the CUDA fallback rejects per-layer counts such as 72 or 152).
 # Per file: target hash already -> nothing to do; base hash (5e1bccd07c) -> apply, check the target hash, drop the
 # file's __pycache__ entry; any other hash -> commit runs RAISE; the competition rerun leaves the file as is (a
-# per-layer model then fails to load and the fallback submission stands). Records go to b32m_env.json (cell 2).
+# per-layer model then fails to load and the fallback submission stands). Records go to {WORK}/e066_vllm_patch.json (cell 4b prints them; any action
+# other than patched / already_fixed fails the commit run).
 import base64, glob, hashlib, importlib.metadata as _md, re
 
 IMG_PATCHES = [  # per file: the known wheels' originals -> our target (row chunks are in his wheels from f506afa210)
@@ -110,3 +111,9 @@ if MODE != "fallback":
             print("=" * 100, f"E066 VLLM PATCH FALLBACK (rerun): {_p['rel']} left as is; a per-layer model may not "
                   "load and the fallback submission would stand", "=" * 100, sep="\n", flush=True)
     ROWCHUNK = {**IMG_PATCH_RECORDS[0], "all": IMG_PATCH_RECORDS}
+    try:
+        import json as _pj, os as _po
+        with open(_po.path.join(WORK, "e066_vllm_patch.json"), "w") as _pf:
+            _pj.dump(IMG_PATCH_RECORDS, _pf, indent=1)
+    except Exception as exc:
+        print("E066 VLLM PATCH: record not written:", type(exc).__name__, exc, flush=True)

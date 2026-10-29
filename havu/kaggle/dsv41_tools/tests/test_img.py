@@ -270,7 +270,10 @@ class ManhBase(unittest.TestCase):
         his = set(self.his)
         ours = [c.splitlines()[0][:14] for c in self.cells if c not in his]
         self.assertEqual(ours, ["# E066 image c", "# Cell 0b (E04", "# Cell 1b (smo", "# Cell 2r (E06", "# Cell 2c (B32",
-                                "# Cell 4b (B32"])
+                                "# Cell 3w (E06", "# Cell 4b (B32"])
+        w = next(i for i, c in enumerate(self.cells) if c.startswith("# Cell 3w (E066"))
+        self.assertTrue(self.cells[w - 1].startswith("# Cell 3: the solver"))
+        self.assertTrue(self.cells[w + 1].startswith("# Cell 4: final check"))
         # every other cell is his, in his order
         self.assertEqual([c for c in self.cells if c in his], [c for c in self.his if c.splitlines()[0][:14] not in
                                                                ("# B32-M + MANH", "# Cell 0b (E04", "# Cell 1b (smo",
@@ -305,6 +308,9 @@ ns.update(KIT={str(kit)!r}, MODE="submit", RERUN={rerun!r})
 exec(compile({cell0b!r}, "cell0b", "exec"), ns)
 print("ENV", json.dumps({{k: os.environ.get(k) for k in ("ARC_GRID_FORMAT", "MANH_VISION_MAX_IMAGES", "ARC_WORKERS",
                                                          "MANH_VISION")}}))
+print("LIGHTENV", json.dumps({{k: os.environ.get(k) for k in ("ARC_TASK_IDS", "E066_LIGHT_SMOKE", "ARC_STOP_NEW_S",
+                                                           "ARC_FORCE_AT_S", "ARC_HARD_STOP_S", "ARC_KILL_AT_S",
+                                                           "B32M_LOAD_TEST")}}))
 """
             script = kit.parent / "run_cells.py"
             script.write_text(code_)
@@ -314,6 +320,13 @@ print("ENV", json.dumps({{k: os.environ.get(k) for k in ("ARC_GRID_FORMAT", "MAN
             got = json.loads(r.stdout.split("ENV ", 1)[1].splitlines()[0])
             self.assertEqual(got, {"ARC_GRID_FORMAT": "text+image", "MANH_VISION_MAX_IMAGES": "32", "ARC_WORKERS": "80",
                                    "MANH_VISION": "1"})
+            light = json.loads(r.stdout.split("LIGHTENV ", 1)[1].splitlines()[0])
+            if rerun:  # the scored rerun: none of the light smoke's settings
+                self.assertEqual(light, dict.fromkeys(light))
+            else:
+                self.assertEqual(light, {"ARC_TASK_IDS": "00576224,25ff71a9", "E066_LIGHT_SMOKE": "1", "ARC_STOP_NEW_S": "2700",
+                                         "ARC_FORCE_AT_S": "2820", "ARC_HARD_STOP_S": "2880", "ARC_KILL_AT_S": "2970",
+                                         "B32M_LOAD_TEST": None})
             self.assertEqual(sha(kit / "solver_dsv41.py"), sha(P / "solver_dsv41.py"))
             self.assertEqual(sha(kit / "repo/evals/arc_harness/grid_image.py"), sha(P / "arc_harness/grid_image.py"))
 
@@ -339,6 +352,88 @@ print("ENV", json.dumps({{k: os.environ.get(k) for k in ("ARC_GRID_FORMAT", "MAN
         self.assertIn('globals().get("MANH_SERVER_LOG")', rep)
         self.assertIn('(("contract",) if os.environ.get("ARC_GRID_FORMAT") == "text+image" else ())', rep)
         compile(rep, "cell4b", "exec")
+
+
+def build_manh():
+    out = Path(tempfile.mkdtemp(dir=SCRATCH)) / "nb"
+    r = subprocess.run([sys.executable, str(D / "build_img_manh.py"), "--manh-nb", str(MANH_V4), "--out", str(out),
+                        "--model-source", MODEL, "--model-manifest", str(E72_MANIFEST)], capture_output=True, text=True,
+                       cwd=str(D))
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    return ["".join(c["source"]) for c in json.load(open(out / "dsv41-tools-submit-img-manh.ipynb"))["cells"]]
+
+
+class LightSmokeChecks(unittest.TestCase):
+    """Audit 2026-10-29: the light smoke's verdict needs real answers and no crash, records cell 2r's outcome and the
+    model files' names and sizes, and cell 3w keeps the server up until the contract is done."""
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(D))
+        import build_img_manh as bim
+        cls.bim = bim
+        cells = build_manh()
+        cls.rep = next(c for c in cells if c.startswith("# Cell 4b "))
+        cls.wait = next(c for c in cells if c.startswith("# Cell 3w "))
+
+    def run_checks(self, w, sl):
+        ns = {"_w": str(w), "_sl": sl, "_b32m_bad": [], "json": json, "os": os}
+        for snip in (self.bim.E066_REPORT_CHECKS, self.bim.E066_LIGHT_CHECKS):
+            self.assertIn(snip, self.rep)
+            exec("if True:\n" + snip, ns)
+        return ns["_b32m_bad"]
+
+    def setUp(self):
+        self._old = os.environ.get("E066_LIGHT_SMOKE")
+        os.environ["E066_LIGHT_SMOKE"] = "1"
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("E066_LIGHT_SMOKE", None)
+        else:
+            os.environ["E066_LIGHT_SMOKE"] = self._old
+
+    def test_good_run_passes(self):
+        w = Path(tempfile.mkdtemp(dir=SCRATCH))
+        (w / "dsv41_logs").mkdir()
+        (w / "e066_vllm_patch.json").write_text(json.dumps([{"file": "/v/model.py", "action": "patched"},
+                                                            {"file": "/v/dsv4_topk.py", "action": "already_fixed"}]))
+        (w / "smoke_integrity.json").write_text(json.dumps({"model_stat": {"files": 137, "missing": [], "size_mismatch": []}}))
+        (w / "dsv41_logs/attempts.jsonl").write_text(json.dumps({"task_id": "a", "pred": [[1]], "correct": True}) + "\n")
+        (w / "submission.json").write_text(json.dumps({"a": [{"attempt_1": [[1]], "attempt_2": [[1]]}]}))
+        self.assertEqual(self.run_checks(w, "server up after 9s (external); submission written (final)"), [])
+
+    def test_bad_run_fails_on_each_problem(self):
+        w = Path(tempfile.mkdtemp(dir=SCRATCH))
+        (w / "dsv41_logs").mkdir()
+        (w / "e066_vllm_patch.json").write_text(json.dumps([{"file": "/v/model.py", "action": "failed"}]))
+        (w / "smoke_integrity.json").write_text(json.dumps({"model_stat": {"files": 137, "missing": ["config.json"],
+                                                                           "size_mismatch": []}}))
+        (w / "dsv41_logs/attempts.jsonl").write_text(json.dumps({"task_id": "a", "pred": None, "error": "x"}) + "\n")
+        bad = self.run_checks(w, "server died (exit 1)")
+        self.assertEqual(len(bad), 5, bad)
+        for frag in ("E066 vLLM patch model.py: failed", "model files", "solver.log: server died", "no attempt produced",
+                     "no valid submission.json"):
+            self.assertTrue(any(frag in b for b in bad), (frag, bad))
+        self.assertTrue(all(b.startswith("environment") for b in bad[:2]), bad)
+
+    def test_missing_records_are_failures(self):
+        w = Path(tempfile.mkdtemp(dir=SCRATCH))
+        bad = self.run_checks(w, "")
+        self.assertEqual(len(bad), 4, bad)  # patch record, integrity file, attempts.jsonl, submission.json
+
+    def test_wait_cell_joins_the_contract_thread(self):
+        import io, contextlib, threading, time
+        t = threading.Thread(target=time.sleep, args=(0.3,))
+        t.start()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exec(self.wait, {"RERUN": False, "_ct_thread": t})
+        self.assertFalse(t.is_alive())
+        self.assertIn("contract thread finished", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exec(self.wait, {"RERUN": True})  # the scored rerun: nothing
+        self.assertEqual(out.getvalue(), "")
 
 
 PROBE_TEST = r'''
