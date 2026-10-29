@@ -341,3 +341,15 @@ Suggested fix:
 - And do not resubmit until the state is "up" again.
 
 The supervisor itself (cell 2s) behaved as designed: death detected in < 1 s of the API server's exit, the group and GPU apps confirmed gone, a clean relaunch, and "up" in 150 s.
+
+### Run 3 hourly checks (stability run after the kill test)
+`pod3_scripts/pull_r3.sh` prints the supervisor events, server deaths, error records, host RAM, GPU memory and 10-min windows. `vram_series.py` gives the per-process GPU memory series from the 5 s sampler.
+
+**22:57 (1 h after first server up, 48 min after the restart):**
+- Stability: supervisor state "up", start 1 (pid 27380). No deaths beyond the deliberate kill. The r1 server.log has 0 tracebacks, 400s or 500s, and there are no new error records.
+- Windows after the restart: 607-665 gen/s, 91-95% GPU prefix hits, 0% CPU-restored, KV 0.89-0.90, running 60-64, 2 KV-gate holds, 0 preemptions.
+- Progress: 36 first attempts done, 28 correct; 47 of 344 pairs answered.
+- Host: AnonPages 134.3 GiB; RSS of all processes 136.7 GiB; MemAvailable 342.5 GiB. Run peak AnonPages 139.1 GiB at 21:59.
+- GPU memory per worker process (nvidia-smi compute apps, the same on all 4 GPUs): 20,438 MiB from server up to 22:20, 20,478 MiB at 22:30, 20,580 MiB at 22:50.
+  - That is +142 MiB in 45 min, in steps. Board used went from 20,477-20,531 to 20,619-20,673 MiB, and free from 2,036-2,090 to 1,894-1,948 MiB.
+  - The rate is ~0.09 GiB per 30 min; pod 2 sees ~0.13.

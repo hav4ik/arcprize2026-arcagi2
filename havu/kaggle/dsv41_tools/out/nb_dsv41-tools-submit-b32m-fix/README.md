@@ -49,3 +49,23 @@ python3 kaggle/dsv41_tools/build_img_manh.py --text --manh-nb <Manh v6 pull> --s
 
 Context stays at 163,840. In B32-M's replica, 1 of 480 attempts hit it, but outputs reach 95k tokens at p90 and 128k
 at the max.
+
+## Kaggle commit run: Version 1 (pushed 22:42 UTC, COMPLETE 23:14 UTC, ~32 min)
+
+**B32-M SMOKE OK.**
+
+| Check | Result |
+|---|---|
+| Inputs | E046 CHECK OK; wheel vllm g8cf0c0664b (v11) |
+| Server | MANH SERVER UP after 665 s (+1626 s in the notebook); KV 1,614,903 tokens; model 14.33 GiB/GPU |
+| Contract | passes (tool calls, /tokenize 377, token-id completions 64) |
+| Supervisor | watching, 0 restarts, stopped by cell 3s |
+| Light smoke | 4/4 attempts answered (the test file has no solutions, so 0 correct is expected) |
+| Model files | 136/136 present, sizes correct (the sha256 pass is partial in a short smoke, as designed) |
+| Host RAM | smoke peak 125.9 GiB; projected at 64 workers 142.3 GiB; cgroup 173.0 GiB; **headroom 30.7 GiB** |
+
+- **Cosmetic, commit-only:** 2 tracebacks at the very end, `'list' object has no attribute 'sleep'` in the settings
+  cell's `_smoke_env_sampler`. Our 4b RAM check reused the name `_st`, which that sampler uses for `time`.
+  - No effect on the verdict or the scored rerun: 4b and the sampler run in commit runs only.
+  - Fixed in the builder (`_cgs`) for future builds; Version 1 is unchanged.
+- Log: `scratchpad/kaggle_b32mfix_v1/dsv41-tools-submit-b32m-fix.log` (local).

@@ -284,3 +284,18 @@ Per worker, RssAnon minus Engram is ~15.2 GiB on every rank. That is the 12 GiB/
 - **B's flags were really off:** the workers' /proc/<pid>/environ shows ROW_SHARD=0, SPARSE_INDEXER_LOGITS=0, TP_HOST_GATHER=0 and AR_OVERLAP_CHUNKS=2.
 - **(f) AR_OVERLAP_CHUNKS=0 was skipped:** it is a prefill-only path, so a wrong overlap would have shown as a decode-vs-prefill gap on both servers.
 - **Files:** `ab_decode/` (dec*/pre* JSON, server logs and launch.json). Scripts: `scripts/ab_logprob.py`, `ab_control.py`, `run_srv.py`.
+
+## B32-M fix candidate on E128 (text): commit smoke + rerun replica (from ~23:45 UTC)
+- **Candidate notebook:** `kaggle/dsv41_tools/out/nb_dsv41-tools-submit-b32m-fix/dsv41-tools-submit-b32m-fix.ipynb`, sha256 **bec71fb1e3f1**.
+  - Built on Manh's v6 server cell (no --supervise) with our cell 2s supervisor.
+  - Solver 1ea2b25d, ARC_CONN_TRIES 12. Settings: util 0.90, offload 10 GiB/rank, 64 seqs/workers, context 163840, exec timeout 900 s, MANH_VISION=0.
+  - kernel-metadata pins `nguyennguyen599/vllm-wheels/11`.
+- **Pod inputs:**
+  - **Model:** E128, the Kaggle model chankhavu/dsv41-flash-1017-arc-tool-e128-2bit/PyTorch/default/1 (136 files, 131.09 GB), downloaded sequentially per file (`dl_kaggle_files.py`) to /root/models/e128. E72-152 was deleted first to make room (it is on HF).
+    - Kaggle serves ~30-40 MB/s per 1.15 GB file, so ~25-29 MB/s overall: about 80 min.
+  - **vllm-wheels v11** (listing through every page: 1,669 entries, 9.17 GB):
+    - 293 of its 294 top-level wheels equal v10's by name and size. The vllm wheel changes from gf506afa210 to **g8cf0c0664b** (295,627,100 B); torch is unchanged.
+    - The tree also holds 1,374 files (122 MB) in 4 nested source dirs: dion-0.1.0, liger_kernel-0.8.5, quack-kernels-0.6.5, sonic-moe-0.1.2.post1. These were also missing from the earlier v10 mapping. Manh's cell 3 copies them to /dev/shm, but no cell installs from them: cell 4 installs `/kaggle/working/quack-kernels`, which does not exist on Kaggle either. 1,374 sequential per-file downloads would take ~45 min, so they stay out.
+  - **arc2-2026-src:** v22. The coordinator says any version works, because v6's cell 2m does not use --supervise.
+  - **Unchanged:** cu13-install v2, dsv41-tools-kit v5 (same as the latest), unsloth-main v15.
+- **Tree:** `scripts/make_kaggle_tree.sh` now takes KT_MODEL_SLUG, KT_MODEL_DIR, KT_SRC_DIR and KT_WHEELS_DIR.

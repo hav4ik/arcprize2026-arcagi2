@@ -132,8 +132,8 @@ E066_LIGHT_CHECKS = """\
         try:  # E066: host RAM headroom under Kaggle's cgroup, projected from this smoke to a full load. Pod 2,
             # 2026-10-29: the engine grows ~4 GiB from server up to load; solver + sandboxes + kernel ~0.2 GiB/worker
             _env = [json.loads(x) for x in open(os.environ.get("ARC_SMOKE_ENV_LOG", f"{_w}/smoke_env.jsonl")) if x.strip()]
-            _st = [x["stat"] for x in _env if isinstance(x.get("stat"), dict) and "anon" in x["stat"]]
-            _peak = max((s_["anon"] + s_.get("shmem", 0)) / 2**30 for s_ in _st)
+            _cgs = [x["stat"] for x in _env if isinstance(x.get("stat"), dict) and "anon" in x["stat"]]  # not _st: the
+            _peak = max((s_["anon"] + s_.get("shmem", 0)) / 2**30 for s_ in _cgs)  # settings cell's sampler is time as _st
             _lim = min(float(x["memory.max"]) for x in _env if str(x.get("memory.max", "")).replace(".", "").isdigit()) / 2**30
             _nw = int(os.environ.get("ARC_WORKERS", "64"))
             _proj = _peak + 4 + 0.2 * max(0, _nw - 2)
