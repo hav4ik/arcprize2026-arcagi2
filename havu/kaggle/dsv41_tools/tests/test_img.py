@@ -367,6 +367,24 @@ def build_manh():
     return ["".join(c["source"]) for c in json.load(open(out / "dsv41-tools-submit-img-manh.ipynb"))["cells"]]
 
 
+class ServerFlagOptions(unittest.TestCase):
+    def test_offload_and_util_edit_only_those_tokens(self):
+        out = Path(tempfile.mkdtemp(dir=SCRATCH)) / "nb"
+        r = subprocess.run([sys.executable, str(D / "build_img_manh.py"), "--manh-nb", str(MANH_V4), "--out", str(out),
+                            "--model-source", MODEL, "--model-manifest", str(E72_MANIFEST), "--kv-offload-gib", "6",
+                            "--gpu-util", "0.93"], capture_output=True, text=True, cwd=str(D))
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        cells = ["".join(c["source"]) for c in json.load(open(out / "dsv41-tools-submit-img-manh.ipynb"))["cells"]]
+        meta = json.load(open(MANH_V4 / "kernel-metadata.json"))
+        his = ["".join(c["source"]) for c in json.load(open(MANH_V4 / meta["code_file"]))["cells"]]
+        a = next(c for c in his if c.startswith("# Cell 2m (B32-M + Manh's server)")).splitlines()
+        b = next(c for c in cells if c.startswith("# Cell 2m (B32-M + Manh's server)")).splitlines()
+        diff = [(x, y) for x, y in zip(a, b) if x != y]
+        self.assertEqual(len(diff), 2, diff)  # MANH_SEQS + the one line holding both flags
+        self.assertIn('"--gpu-memory-utilization", "0.93", "--kv-offload-gib-per-rank", "6"', diff[1][1])
+        self.assertEqual(diff[1][0].replace('"0.94"', '"0.93"').replace('"12"', '"6"'), diff[1][1])
+
+
 class LightSmokeChecks(unittest.TestCase):
     """Audit 2026-10-29: the light smoke's verdict needs real answers and no crash, records cell 2r's outcome and the
     model files' names and sizes, and cell 3w keeps the server up until the contract is done."""

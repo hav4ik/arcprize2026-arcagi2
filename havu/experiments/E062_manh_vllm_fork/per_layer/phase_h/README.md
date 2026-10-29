@@ -185,3 +185,31 @@ Per worker, RssAnon minus Engram is ~15.2 GiB on every rank. That is the 12 GiB/
 - **Workload:** /kaggle/input/.../arc-agi_test_challenges.json, byte-identical to evalx2t_s2026_challenges.json (240 tasks, 344 pairs).
 - **Clock:** the full ~12 h Kaggle clock from the solver's own deadlines.
 - **Run dir:** `/root/nbruns/p2_rerun`; /kaggle/working = `/root/kwork_p2_rerun`.
+- **Start:** server up at 20:46:19 (cell 2m: 4.6 min; Engram offload 20:42:30-32; model loading 48.1-48.2 s per rank). The commit-only cells (1b, 2b, 2c, 3w, 4b, 5, verdict) do nothing in rerun mode.
+  - Solver: "attempting 240 tasks, 344 pairs; deadlines: stop-new 10.83h, force 11.17h, hard stop 11.50h".
+- **Monitoring:**
+  - A live grep of server.log, solver.log and the timeline for OOM, engine death, Traceback, ERROR, HTTP 4xx/5xx, context and image-count errors, watchdog lines and the notebook end.
+  - `scripts/p2_report.sh` at each checkpoint: split table (`windows2.py`, pool 2,171,851), attempts scored against evalx2t_s2026_solutions (multi-test pred lists as in `first_correct.py`), gate holds, server errors, host RAM, GPU memory lines, disk.
+
+### Checkpoint ~25 min (21:06 UTC)
+
+| min | gen/s | prompt/s | GPU-hit/s | CPU-restored/s | recompute/s | GPU % | KV | run / wait | done |
+|---|---|---|---|---|---|---|---|---|---|
+| 0-1 | 25 | 3,388 | 288 | 0 | 3,100 | 8.5 | 0.12 | 31 / 49 | 0 |
+| 1-6 | 487 | 5,540 | 3,900 | 0 | 1,640 | 70.4 | 0.35 | 80 / 0 | 3 |
+| 6-11 | 842 | 5,307 | 4,856 | 0 | 451 | 91.5 | 0.47 | 80 / 0 | 7 |
+| 11-17 | 813 | 6,718 | 6,187 | 0 | 531 | 92.1 | 0.56 | 80 / 0 | 11 |
+
+- **Attempts:** 21 first attempts, 15 correct (71%), all submitted, 0 errors.
+- **Health:** 0 gate holds, 0 preemptions. Server: 0 HTTP 4xx/5xx, 0 ERROR, 0 Traceback.
+- **GPU memory per rank:** 19.54 GiB allocated (peak 19.88), 20.28 reserved, 1.05-1.11 GiB free, 0 allocator retries, 0 OOMs.
+- **Host:** used 186 GiB (peak 188), MemAvailable 317 GiB. Disk 16 GB free.
+- **use_thp, phase 2's server:** compaction counters unchanged before vs after the load (Δ 0); 0 MADV_COLLAPSE lines.
+
+  | UTC | AnonPages | AnonHugePages | server tree RSS | PageTables |
+  |---|---|---|---|---|
+  | 20:50 | 161.0 | 64.3 | 144.2 | 423 MiB |
+  | 21:00 | 161.3 | 64.3 | 144.1 | 426 MiB |
+
+  Per worker, VmRSS / AnonHugePages: TP0 21.3 / 2.8, TP1 29.3 / 10.8, TP2 39.2 / 20.7, TP3 48.2 / 29.7 GiB. EngineCore 3.8, API server 2.4 GiB.
+- **Probe caveat:** the probe started before the launcher re-pointed /kaggle/working. Its "after_load" record and log lines came from phase 1's server.log; the values above were re-read from phase 2's own server.log (`mem_probe_after.jsonl`). The probe now ignores a server.log older than its own start.

@@ -13,7 +13,7 @@ small patch to your vLLM so per-layer expert counts load. Everything we changed 
 | [`review/solver_vs_manh.diff`](review/solver_vs_manh.diff) | our pinned solver vs the one in your v6 cell 0b |
 | [`review/harness_vs_manh.diff`](review/harness_vs_manh.diff) | our pinned harness vs the one in your v6 cell 0b (B32's) |
 
-The current build is notebook sha256 `d8993ae3d668`, built on your v6 (scriptVersionId 363607395, the server's
+The current build is notebook sha256 `af16851c02b2`, built on your v6 (scriptVersionId 363607395, the server's
 output root moved into `dsv41_logs`) after the fourth audit's fixes (~20:30 UTC).
 
 Longer record: [`kaggle/dsv41_tools/CANDIDATE_E066_IMG.md`](../../CANDIDATE_E066_IMG.md).
@@ -115,7 +115,15 @@ your main 71dca8bc24. It is not pushed; the diffs are in `kaggle/dsv41_tools/b32
 - **Running now:** 90-min loads of E72-152 and C1 on your v6 cell, and a full-workload stress test of this exact
   notebook. Results go to `experiments/E062_manh_vllm_fork/per_layer/` (`phase_h/`, `pod3_runs/`).
 
-## The model (decided tonight)
+## The model: C1 (decided ~21:00 UTC)
+
+The user picked **C1** (uniform E128 + vision). On the 79 tasks both models have finished, E72-152 is behind C1:
+pass@1 83.0 vs 87.0, pass@2 89.2 vs 93.7. The build uses the Kaggle Model
+`arazzd/deepseek-v41-flash-1017-arc-tool-img-e128-2bit/PyTorch/default/1` (private, Anastasia's account; it must be
+shared with chankhavu). The integrity check uses `c1_gptq_sha256_manifest.json`. Cell 2r still runs; with uniform 128
+experts it changes nothing at runtime. The E72-152 table below is kept for reference.
+
+## The two models compared
 
 The image harness needs the vision tower, so text-only E128 (`--language-model-only`) can't run it. Kaggle's quota
 fits one model.

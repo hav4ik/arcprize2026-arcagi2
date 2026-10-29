@@ -7,10 +7,12 @@ echo "== split table (pool 2171851)"; python3 -I /root/e062pl/windows2.py $L/met
 echo "== attempts"; python3 -I - "$L/attempts.jsonl" /root/data/evalx2t_s2026_solutions.json <<'PY'
 import collections, json, sys
 sol = json.load(open(sys.argv[2])); recs = [json.loads(l) for l in open(sys.argv[1])]
-stops = collections.Counter(r.get("stop") for r in recs); errs = collections.Counter(str(r.get("error"))[:80] for r in recs if r.get("error"))
-def ok(r):
-    t, p, pred = r["task_id"], int(r.get("pair", 0)), r.get("pred")
-    return pred is not None and t in sol and p < len(sol[t]) and pred == sol[t][p]
+stops = collections.Counter(r.get("stop_reason") for r in recs); errs = collections.Counter(str(r.get("error"))[:80] for r in recs if r.get("error"))
+def ok(r):  # as first_correct.py: multi-test records carry the list of all test outputs in pred
+    t, p, pr = r["task_id"], int(r.get("pair", 0)), r.get("pred"); s = sol.get(t)
+    if pr is None or s is None or r.get("error"):
+        return False
+    return (len(s) > 1 and isinstance(pr, list) and len(pr) > p and pr[p] == s[p]) or (len(s) == 1 and pr == s[0])
 pairs = {}
 for r in recs:
     k = (r["task_id"], int(r.get("pair", 0))); pairs.setdefault(k, []).append(r)

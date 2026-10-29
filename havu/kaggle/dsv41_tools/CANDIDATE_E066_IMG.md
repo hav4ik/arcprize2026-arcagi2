@@ -6,7 +6,7 @@ side is ours. The only serving-side addition is our patch that lets his vLLM loa
 ## What it is
 
 - **Notebook:** `build_img_manh.py` takes Manh's notebook as input (`nguyennguyen599/dsv41-tools-submit-b32m-external-server`,
-  pulled with `kaggle kernels pull -m`; built on his **v6**, scriptVersionId 363607395: v5 + the server's output root in `dsv41_logs`; notebook sha256 d8993ae3d668, ~20:30 UTC. Review package for Manh: `out/nb_dsv41-tools-submit-img-manh/README.md`). His install cells,
+  pulled with `kaggle kernels pull -m`; built on his **v6**, scriptVersionId 363607395: v5 + the server's output root in `dsv41_logs`; notebook sha256 af16851c02b2, ~20:30 UTC. Review package for Manh: `out/nb_dsv41-tools-submit-img-manh/README.md`). His install cells,
   production server cell 2m (his `dsv41_vllm.py` launcher, his flags and env: TP4, no DCP, util 0.94, --concurrency 64 (his request ~21:00 UTC; his v6 line says 80, our build edits only that line, `--max-num-seqs`),
   --context 163840, 12 GiB/rank CPU KV offload, lossless host all-reduce MODE 556, row shard, AR overlap), solver cell 3
   (ARC_EXTERNAL_SERVER) and stop cell 4 stay byte-identical. His v5 dropped the GPU gate (0a, commented out) and his
@@ -39,7 +39,10 @@ side is ours. The only serving-side addition is our patch that lets his vLLM loa
     submission.json.
   - **metadata:** our slug `chankhavu/dsv41-tools-submit-img-manh`, `docker_image_pinning_type: latest` (user), the
     E066 Kaggle Model, his datasets (vllm-wheels latest = v10, gf506afa210, frozen through 0 UTC per Manh).
-- **Model:** E72-152 (`DeepSeek-V4.1-Flash-1017-arc-tool-img-E72-152-avg120-2bit`, floor 72 / cap 152 / step 16, 4,800
+- **Model: C1, picked ~21:00 UTC.** Kaggle Model `arazzd/deepseek-v41-flash-1017-arc-tool-img-e128-2bit/PyTorch/default/1`,
+  private under Anastasia's account, uploading ~22:15 UTC. 1b checks it against `c1_gptq_sha256_manifest.json`.
+  Head to head on 79 image tasks, E72-152 trails C1: pass@1 -4.0 [-9.3, +0.8], pass@2 -4.4 [-10.1, 0.0].
+  Earlier option: E72-152 (`DeepSeek-V4.1-Flash-1017-arc-tool-img-E72-152-avg120-2bit`, floor 72 / cap 152 / step 16, 4,800
   experts, vision kept) or C1 (uniform E128 + vision) as the fallback. Kaggle's quota fits one; the user picks.
 
 ## Build

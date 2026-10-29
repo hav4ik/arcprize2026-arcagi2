@@ -53,9 +53,10 @@ def tree(root):
 def logfile():
     hits = sorted(glob.glob(log_glob), key=os.path.getmtime)
     return hits[-1] if hits else None
-def ready():
+T_START = time.time()
+def ready():  # a server.log written after the probe started (not an earlier run's) that says the server is up
     f = logfile()
-    return bool(f) and "Application startup complete" in open(f, errors="replace").read()
+    return bool(f) and os.path.getmtime(f) > T_START and "Application startup complete" in open(f, errors="replace").read()
 def sample():
     root = leader()
     procs, tot = [], 0

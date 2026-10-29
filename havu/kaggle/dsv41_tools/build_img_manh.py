@@ -143,6 +143,10 @@ def main():
                     help="his cell 2m's MANH_SEQS (--concurrency = vLLM max-num-seqs) and our ARC_WORKERS. 64 = Manh, "
                          "2026-10-29 ~21:00 UTC: the value he ran on Kaggle (his v6 cell says 80); his line is the only "
                          "edit to cell 2m")
+    ap.add_argument("--kv-offload-gib", default=None,
+                    help="his --kv-offload-gib-per-rank (v6: 12). Host RAM: his engine ~144 GiB + our solver/sandboxes "
+                         "~17 GiB vs Kaggle's 173 GiB cgroup (2026-10-29); only with Manh's OK")
+    ap.add_argument("--gpu-util", default=None, help="his --gpu-memory-utilization (v6: 0.94); only with Manh's OK")
     ap.add_argument("--model-manifest", type=Path, required=True,
                     help="the E066 export's path/size/sha256 manifest: commit-run input integrity (cell 1b)")
     ap.add_argument("--out", type=Path)
@@ -187,6 +191,11 @@ def main():
     if seqs != a.max_num_seqs:
         c2m = replace_once(c2m, line, f"MANH_CONTEXT, MANH_SEQS = {ctx}, {a.max_num_seqs}  # E066 build: Manh's {seqs} -> "
                                       f"{a.max_num_seqs} (his request, the value he ran on Kaggle)")
+    for flag, val in (("--kv-offload-gib-per-rank", a.kv_offload_gib), ("--gpu-memory-utilization", a.gpu_util)):
+        if val is not None:
+            m_ = re.search(rf'"{flag}", "([0-9.]+)"', c2m)
+            assert m_ and c2m.count(m_.group(0)) == 1, flag
+            c2m = c2m.replace(m_.group(0), f'"{flag}", "{val}"')
     cells[k2] = code(c2m)
 
     # cell 0b: our pins, his checks + ours
