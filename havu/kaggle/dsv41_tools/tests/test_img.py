@@ -245,7 +245,7 @@ if __name__ == "__main__":
 
 
 MANH_V4 = Path("/tmp/claude-1000/-home-vu-Workspace-ARC-AGI-2/81e68821-e1f4-4b05-bad6-9a606f77ad54/scratchpad/"
-               "manh_ext_nb/v5")
+               "manh_ext_nb/v6")
 
 
 E72_MANIFEST = D.parents[1] / "experiments/E066_dsv41_image_pruning/results/e72c152_gptq_sha256_manifest.json"

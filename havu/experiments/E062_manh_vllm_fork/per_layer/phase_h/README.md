@@ -56,4 +56,43 @@ Model: `chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-img-E72-152-avg120-2bit` @ c
   - 0934a4d8 text, 14.9k tokens: v8 vs v10 diverge at token 2 (" analyze" / " inspect"), while v10 vs v10 agree for 125 tokens. That fits reordered prefill sums on the long-prefill path; no large logprob gap.
 
 ## Load run 2: v10 + Manh's production cell (no DCP), 80 workers (`runs/prod_nodcp_w80`, from 19:35 UTC, ~90 min)
-Results are added below as the run progresses.
+Stopped at ~25 min (19:35-20:02 UTC) when the priority moved to the exact-notebook stress test.
+- KV pool: 2,264,661 tokens. Kaggle-equivalent ≈2.35M.
+- Contract: all pass (/tokenize 377, tool call parsed, image +242, token ids, metrics).
+
+| min | gen/s | prompt/s | GPU-hit/s | CPU-restored/s | recompute/s | GPU % | KV | run / wait | done |
+|---|---|---|---|---|---|---|---|---|---|
+| 0-1 | 24 | 3,287 | 279 | 0 | 3,008 | 8.5 | 0.11 | 30 / 50 | 0 |
+| 1-6 | 466 | 5,610 | 3,904 | 0 | 1,705 | 69.6 | 0.33 | 80 / 0 | 3 |
+| 6-11 | 816 | 5,498 | 4,954 | 0 | 544 | 90.1 | 0.43 | 80 / 0 | 9 |
+| 11-16 | 852 | 6,187 | 5,809 | 0 | 377 | 93.9 | 0.53 | 80 / 0 | 11 |
+| 16-22 | 786 | 7,240 | 6,610 | 0 | 630 | 91.3 | 0.60 | 79 / 0 | 19 |
+
+- 0 gate holds; KV never above 0.85 (still climbing, ~17k/stream); 0 preemptions; 0 server errors.
+- First attempts: 23 done, 19/23 correct (82.6%), all submitted.
+
+## Exact notebook end-to-end (from 20:05 UTC)
+- **Notebook:** `kaggle/dsv41_tools/out/nb_dsv41-tools-submit-img-manh/dsv41-tools-submit-img-manh.ipynb`, sha256 c23eb5fbb61c6c77 (GitHub main dd38b0555). That is Manh's v5 cells plus our cells settings, 0b, 1b, 2r, 2c, 3w and 4b.
+- **Runner:** `scripts/run_nb.py` executes it with nbclient in a fresh Kaggle-like Python 3.13 venv (`/root/kenv`: ipykernel, nbclient, numpy, scipy, pandas, psutil, requests, pillow, pyyaml). It runs the cells in order, stops at the first error, logs a cell timeline, and saves the executed notebook with outputs.
+- **/kaggle mapping** (`scripts/make_kaggle_tree.sh`): read-only inputs are symlinks to the verified pod copies.
+  - Datasets: arc2-2026-src v22; cu13-install v2 (107 files, fetched per file, since the whole-dataset download returns 404); dsv41-tools-kit v5; unsloth-main v15.
+  - vllm-wheels v10: v8's 294 top-level wheels plus v10's vllm-0.32.1rc1.dev0+gf506afa210 wheel. Per the API listing, the vllm wheel is the only file that differs.
+  - Model: the verified E72-152 copy at `models/chankhavu/dsv41-flash-1017-arc-tool-img-e72-152-avg120-2bit/pytorch/default/1`.
+  - Competition: `competitions/arc-prize-2026-arc-agi-2` holds the local data/ files. In the rerun phase, arc-agi_test_challenges.json is replaced by the 240-task evalx2t_s2026 workload.
+  - A pass-through `sudo` shim (the pod is root without sudo). Manh's cell 1 really installs the CUDA 13 debs.
+- **Phase 1:** commit mode, the light smoke. **Phase 2:** KAGGLE_IS_COMPETITION_RERUN=1, the full ~12 h CV replica.
+- **cu13-install v2, 5 of 107 files:** the Kaggle API returns 404 for every file whose name holds an epoch colon (`%3a`): default-jre(-headless), libxcomposite1, libxtst6, libxxf86dga1. Encoded variants return 404 or 403.
+  - Those 5 came from the Ubuntu 24.04 archive instead, via `apt-get download <pkg>=<exact version>` (signature-checked by apt).
+  - Their names and byte sizes match the dataset listing. The other 102 files, including the empty `lock`, came from Kaggle.
+- **Launcher** (`scripts/launch_nb.sh <commit|rerun> <name>`):
+  - Fresh /tmp/dsv41, /tmp/arc_vision, /dev/shm/wheels and /kaggle/working.
+  - `env -i`, with HOME=/root, LANG and VIRTUAL_ENV=/root/kenv; PATH = kenv, /usr/local/cuda/bin, then the system dirs. So Manh's `uv pip install` cells install into the kernel venv, as into the kernel's Python on Kaggle. `uv` is /usr/bin/uv 0.13.1.
+  - Host memory is logged every 60 s (`mem.log`).
+  - Outputs go to `/root/nbruns/<name>/`: `nb.timeline`, `nb.ipynb` (the executed notebook with every cell output) and `run_nb.log`.
+- **First commit attempt (p1_commit, 20:10 UTC): the pod's disk filled during the install cells.** This is a pod problem, not a notebook problem.
+  - Manh's cell 4 `uv pip install` wrote ~20 GB into the uv cache (cell 0 puts it in /tmp/dsv41/cache/uv) and copied another ~20 GB into the venv. uv copies rather than hardlinks here: link count 1.
+  - At the same time, cell 1's `dpkg -i ./*.deb` installed new packages: Nsight Compute, Nsight Systems, OpenJDK.
+  - With 46 GB free, the disk reached 0 B. dpkg failed with "No space left on device", and cell 4 raised "CUDA installation failed" (commit mode), so nothing else ran.
+  - Fix: removed the run's /tmp/dsv41 and the regenerable uv cache (/root/b32m/uvcache, 21 GB). Also removed /root/b32m/venv (20 GB): the earlier non-notebook server env, rebuildable from /root/b32m/dl with `freeze.txt` and `install_b32m.sh`; the notebook installs the same stack into /root/kenv.
+  - Recreated /root/kenv fresh (`kenv_fresh_freeze.txt`, 48 packages). That left 59 GB free.
+  - Relaunched as p1b_commit at 20:13 UTC. Kaggle has its own large /tmp, and Manh's notebook installs fine there.

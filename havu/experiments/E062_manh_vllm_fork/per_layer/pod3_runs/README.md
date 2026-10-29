@@ -63,7 +63,11 @@ Scripts: `../pod3_scripts/`. Raw tables and metrics: this folder.
 
 ## Run 2 (main job): the exact submission notebook, C1 copy, RERUN mode, 240-task x2t workload
 - **Notebook:** `kaggle/dsv41_tools/out/nb_dsv41-tools-submit-img-manh/dsv41-tools-submit-img-manh.ipynb` (sha
-  8d1fac9e). In the copy, ONLY cell 1b's model manifest is swapped to C1's 137 entries (sha c31c5d5d; diffed: only
+  8d1fac9e).
+  **Build actually run: 8d1fac9e** (the C1 copy c31c5d5d).
+  - The later rebuild c23eb5fb (fourth audit, GitHub main dd38b0555) changes only commit mode: new cell 3w, the 4b
+    light-smoke checks, the 1b size pass. Its 2r also writes {WORK}/e066_vllm_patch.json.
+  - So rerun behaviour is the same, and this run was not restarted. In the copy, ONLY cell 1b's model manifest is swapped to C1's 137 entries (sha c31c5d5d; diffed: only
   cell 6 differs). Cell 1b runs only in commit runs, so the rerun never uses it.
 - **Runner** (`../pod3_scripts/nb_setup.sh`, `nb_restore_vllm.sh`, `nb_run.sh`):
   - papermill with --log-output, a Python 3.13.18 kernel (the solver venv + ipykernel), cwd /kaggle/working,
@@ -92,7 +96,18 @@ Scripts: `../pod3_scripts/`. Raw tables and metrics: this folder.
   - Kaggle-clock deadlines unshifted (the notebook's own: stop-new 10.83 h, force 11.17 h, kill 11.75 h).
 
 ## Run 2 startup timeline (per rank)
-pending
+| UTC | Event |
+|---|---|
+| 19:58:0x | notebook start (papermill); cells 0-2 done within ~20 s |
+| ~19:59:00 | cell 2m launches Manh's server (PID 7403) |
+| 19:59:31-33 | Engram offloaded to pinned host memory: TP0 1.41 GiB, TP1 5.39, TP2 10.36, TP3 16.31 GiB per rank |
+| 20:00:01 | TP0 model loaded: 14.56 GiB, **36.6 s** |
+| 20:04:00 | TP1 "Engram MADV_COLLAPSE failed; keeping existing pages" |
+| 20:04:04 | TP1 model loaded, **279.9 s** |
+| 20:07:51 | **FLAG: TP2 and TP3 still loading after 8.3 min.** All workers at 125-173% CPU. Host compaction counters since boot: compact_stall 13.1M, compact_fail 12.3M, compact_success 0.74M |
+| pending | TP2 / TP3 loaded, graph capture, server up |
+
+Load time scales with the rank's pinned Engram size. This matches run 1; pod 2 had the server up in 125 s.
 
 ## Run 2 KV pool and contract
 pending

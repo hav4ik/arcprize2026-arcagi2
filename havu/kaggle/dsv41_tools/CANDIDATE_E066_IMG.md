@@ -6,7 +6,7 @@ side is ours. The only serving-side addition is our patch that lets his vLLM loa
 ## What it is
 
 - **Notebook:** `build_img_manh.py` takes Manh's notebook as input (`nguyennguyen599/dsv41-tools-submit-b32m-external-server`,
-  pulled with `kaggle kernels pull -m`; built and tested on his **v5**, 2026-10-29 ~19:40 UTC). His install cells,
+  pulled with `kaggle kernels pull -m`; built on his **v6**, scriptVersionId 363607395: v5 + the server's output root in `dsv41_logs`; notebook sha256 1e773bbc42e8, ~20:30 UTC. Review package for Manh: `out/nb_dsv41-tools-submit-img-manh/README.md`). His install cells,
   production server cell 2m (his `dsv41_vllm.py` launcher, his flags and env: TP4, no DCP, util 0.94, --concurrency 80,
   --context 163840, 12 GiB/rank CPU KV offload, lossless host all-reduce MODE 556, row shard, AR overlap), solver cell 3
   (ARC_EXTERNAL_SERVER) and stop cell 4 stay byte-identical. His v5 dropped the GPU gate (0a, commented out) and his
@@ -31,8 +31,12 @@ side is ours. The only serving-side addition is our patch that lets his vLLM loa
     - `dsv4_topk.py`: Triton router whitelist 6..512 (7e1e101a -> ab32ea7e).
     - Branch `dynamic-count-moe` (66cf71a0b7 on Manh's main 71dca8bc24) in `scratchpad/e062_port/manh_vllm`, not pushed.
   - **2c:** the API contract also requires parsed chat tool calls (probe max_tokens 4000) and an accepted image.
+  - **3w (new, after his solver cell 3):** commit runs wait up to 15 min for the contract thread before his cell 4 stops
+    the server (audit 4).
   - **4b:** the report regex accepts the external solver's `server up after Ns (external);`; it reads MANH_SERVER_LOG;
-    with images, contract failures are fatal.
+    with images, contract failures are fatal. Audit 4 added: 2r's outcome record (`e066_vllm_patch.json`) and 1b's
+    names-and-sizes pass are fatal checks; the light smoke fails on a crash line, zero answered attempts or no
+    submission.json.
   - **metadata:** our slug `chankhavu/dsv41-tools-submit-img-manh`, `docker_image_pinning_type: latest` (user), the
     E066 Kaggle Model, his datasets (vllm-wheels latest = v10, gf506afa210, frozen through 0 UTC per Manh).
 - **Model:** E72-152 (`DeepSeek-V4.1-Flash-1017-arc-tool-img-E72-152-avg120-2bit`, floor 72 / cap 152 / step 16, 4,800
