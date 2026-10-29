@@ -286,7 +286,7 @@ class ManhBase(unittest.TestCase):
         diff = [(a, b) for a, b in zip(his_server.splitlines(), server.splitlines()) if a != b]
         self.assertEqual(len(server.splitlines()), len(his_server.splitlines()))
         self.assertEqual(diff, [("MANH_CONTEXT, MANH_SEQS = 163840, 80", "MANH_CONTEXT, MANH_SEQS = 163840, 64  # E066 build: "
-                                 "Manh's 80 -> 64 (his request, the value he ran on Kaggle)")])  # his server cell, 1 line
+                                 "Manh's 163840, 80 -> 163840, 64 (his request)")])  # his server cell, 1 line
         self.assertEqual(self.meta["model_sources"], [MODEL])
         self.assertEqual(self.meta["docker_image_pinning_type"], "latest")
         self.assertNotIn("docker_image", self.meta)
@@ -380,9 +380,26 @@ class ServerFlagOptions(unittest.TestCase):
         a = next(c for c in his if c.startswith("# Cell 2m (B32-M + Manh's server)")).splitlines()
         b = next(c for c in cells if c.startswith("# Cell 2m (B32-M + Manh's server)")).splitlines()
         diff = [(x, y) for x, y in zip(a, b) if x != y]
-        self.assertEqual(len(diff), 2, diff)  # MANH_SEQS + the one line holding both flags
+        self.assertEqual(len(diff), 2, diff)  # MANH_CONTEXT/MANH_SEQS + the one line holding both flags
         self.assertIn('"--gpu-memory-utilization", "0.93", "--kv-offload-gib-per-rank", "6"', diff[1][1])
         self.assertEqual(diff[1][0].replace('"0.94"', '"0.93"').replace('"12"', '"6"'), diff[1][1])
+
+
+class ContextOption(unittest.TestCase):
+    def test_context_moves_his_line_our_limit_and_the_0b_expectation(self):
+        out = Path(tempfile.mkdtemp(dir=SCRATCH)) / "nb"
+        r = subprocess.run([sys.executable, str(D / "build_img_manh.py"), "--manh-nb", str(MANH_V4), "--out", str(out),
+                            "--model-source", MODEL, "--model-manifest", str(E72_MANIFEST), "--context", "131072"],
+                           capture_output=True, text=True, cwd=str(D))
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        cells = ["".join(c["source"]) for c in json.load(open(out / "dsv41-tools-submit-img-manh.ipynb"))["cells"]]
+        s0 = next(c for c in cells if c.startswith("# E066 image candidate"))
+        self.assertIn('("ARC_CONTEXT_LIMIT", "131072"),', s0)
+        self.assertNotIn('"163840"', s0.split("ARC_CONTEXT_LIMIT", 2)[1][:30])
+        c2m = next(c for c in cells if c.startswith("# Cell 2m (B32-M + Manh's server)"))
+        self.assertIn("MANH_CONTEXT, MANH_SEQS = 131072, 64", c2m)
+        b = next(c for c in cells if c.startswith("# Cell 0b"))
+        self.assertIn('"ARC_CONTEXT_LIMIT": "131072"', b)
 
 
 class LightSmokeChecks(unittest.TestCase):
@@ -422,6 +439,8 @@ class LightSmokeChecks(unittest.TestCase):
         (w / "smoke_integrity.json").write_text(json.dumps({"model_stat": {"files": 137, "missing": [], "size_mismatch": []}}))
         (w / "dsv41_logs/attempts.jsonl").write_text(json.dumps({"task_id": "a", "pred": [[1]], "correct": True}) + "\n")
         (w / "submission.json").write_text(json.dumps({"a": [{"attempt_1": [[1]], "attempt_2": [[1]]}]}))
+        (w / "smoke_env.jsonl").write_text(json.dumps({"memory.max": str(173 * 2**30),
+                                                       "stat": {"anon": 119 * 2**30, "shmem": 7 * 2**30}}) + "\n")
         self.assertEqual(self.run_checks(w, "server up after 9s (external); submission written (final)"), [])
 
     def test_bad_run_fails_on_each_problem(self):
@@ -432,7 +451,7 @@ class LightSmokeChecks(unittest.TestCase):
                                                                            "size_mismatch": []}}))
         (w / "dsv41_logs/attempts.jsonl").write_text(json.dumps({"task_id": "a", "pred": None, "error": "x"}) + "\n")
         bad = self.run_checks(w, "server died (exit 1)")
-        self.assertEqual(len(bad), 5, bad)
+        self.assertEqual(len(bad), 6, bad)  # + no RAM samples
         for frag in ("E066 vLLM patch model.py: failed", "model files", "solver.log: server died", "no attempt produced",
                      "no valid submission.json"):
             self.assertTrue(any(frag in b for b in bad), (frag, bad))
@@ -441,7 +460,36 @@ class LightSmokeChecks(unittest.TestCase):
     def test_missing_records_are_failures(self):
         w = Path(tempfile.mkdtemp(dir=SCRATCH))
         bad = self.run_checks(w, "")
-        self.assertEqual(len(bad), 4, bad)  # patch record, integrity file, attempts.jsonl, submission.json
+        self.assertEqual(len(bad), 5, bad)  # patch record, integrity file, attempts.jsonl, submission.json, RAM samples
+
+    def ram_bad(self, anon_gib, shmem_gib, workers="64"):
+        w = Path(tempfile.mkdtemp(dir=SCRATCH))
+        (w / "dsv41_logs").mkdir()
+        (w / "e066_vllm_patch.json").write_text(json.dumps([{"file": "/v/model.py", "action": "patched"}]))
+        (w / "smoke_integrity.json").write_text(json.dumps({"model_stat": {"files": 1, "missing": [], "size_mismatch": []}}))
+        (w / "dsv41_logs/attempts.jsonl").write_text(json.dumps({"task_id": "a", "pred": [[1]]}) + "\n")
+        (w / "submission.json").write_text(json.dumps({"a": []}) or "{}")
+        (w / "submission.json").write_text(json.dumps({"a": [{"attempt_1": [[1]]}]}))
+        rows = [{"memory.max": str(173 * 2**30), "stat": {"anon": int(anon_gib * 2**30), "shmem": int(shmem_gib * 2**30)}},
+                {"memory.max": str(173 * 2**30), "stat": {"anon": int((anon_gib - 10) * 2**30), "shmem": int(shmem_gib * 2**30)}}]
+        (w / "smoke_env.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+        old_env = os.environ.get("ARC_SMOKE_ENV_LOG"), os.environ.get("ARC_WORKERS")
+        os.environ["ARC_SMOKE_ENV_LOG"] = str(w / "smoke_env.jsonl")
+        os.environ["ARC_WORKERS"] = workers
+        try:
+            return self.run_checks(w, "submission written (final)")
+        finally:
+            for k, v in zip(("ARC_SMOKE_ENV_LOG", "ARC_WORKERS"), old_env):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_ram_headroom_guard(self):
+        # ~147 anon + 7 shmem at smoke peak -> projected 170.4 of 173 (2.6 GiB headroom): fails
+        self.assertTrue(any("host RAM: projected" in b for b in self.ram_bad(147, 7)))
+        # offload 6 GiB/rank: ~119 + 7 -> projected 142.4: passes
+        self.assertEqual(self.ram_bad(119, 7), [])
 
     def test_wait_cell_joins_the_contract_thread(self):
         import io, contextlib, threading, time

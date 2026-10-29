@@ -36,7 +36,8 @@ FILES = {"solver_dsv41.py": P / "solver_dsv41.py", "repo/evals/run_deepseek_tool
          "repo/evals/arc_harness/grid_image.py": P / "arc_harness/grid_image.py",
          "repo/evals/train_check.py": P / "train_check.py", "repo/evals/auto_repair.py": P / "auto_repair.py",
          "repo/evals/auto_repair_names.json": P / "auto_repair_names.json"}
-NEED_EXTRA = {"solver_dsv41.py": ['GRID_FORMAT = E("ARC_GRID_FORMAT"', 'EXTERNAL = E("ARC_EXTERNAL_SERVER"'],
+NEED_EXTRA = {"solver_dsv41.py": ['GRID_FORMAT = E("ARC_GRID_FORMAT"', 'EXTERNAL = E("ARC_EXTERNAL_SERVER"',
+                                  'EXTERNAL_STATUS = E("ARC_EXTERNAL_SERVER_STATUS"'],  # S26 (Manh's PR #2)
               "repo/evals/run_deepseek_tools.py": ["def chat_context_cap", "def text_image_content"],
               "repo/evals/arc_harness/grid_image.py": ["def aligned_cell"]}
 
@@ -117,6 +118,23 @@ E066_LIGHT_CHECKS = """\
             assert isinstance(_sub, dict) and _sub, "empty"
         except Exception as exc:
             _b32m_bad.append(f"no valid submission.json ({type(exc).__name__}: {exc})")
+        try:  # E066: host RAM headroom under Kaggle's cgroup, projected from this smoke to a full load. Pod 2,
+            # 2026-10-29: the engine grows ~4 GiB from server up to load; solver + sandboxes + kernel ~0.2 GiB/worker
+            _env = [json.loads(x) for x in open(os.environ.get("ARC_SMOKE_ENV_LOG", f"{_w}/smoke_env.jsonl")) if x.strip()]
+            _st = [x["stat"] for x in _env if isinstance(x.get("stat"), dict) and "anon" in x["stat"]]
+            _peak = max((s_["anon"] + s_.get("shmem", 0)) / 2**30 for s_ in _st)
+            _lim = min(float(x["memory.max"]) for x in _env if str(x.get("memory.max", "")).replace(".", "").isdigit()) / 2**30
+            _nw = int(os.environ.get("ARC_WORKERS", "64"))
+            _proj = _peak + 4 + 0.2 * max(0, _nw - 2)
+            print(f"E066 host RAM: smoke peak anon+shmem {_peak:.1f} GiB; projected at {_nw} workers {_proj:.1f} GiB; "
+                  f"cgroup limit {_lim:.1f} GiB; headroom {_lim - _proj:.1f} GiB", flush=True)
+            if _lim - _proj < 5:
+                _b32m_bad.append(f"host RAM: projected {_proj:.1f} GiB at {_nw} workers leaves {_lim - _proj:.1f} GiB "
+                                 f"under the {_lim:.1f} GiB cgroup (need >= 5)")
+            elif _lim - _proj < 15:
+                print("E066 host RAM WARNING: headroom under 15 GiB", flush=True)
+        except Exception as exc:
+            _b32m_bad.append(f"host RAM check: {type(exc).__name__}: {exc}")
 """
 WAIT_CELL = """\
 # Cell 3w (E066, commit runs only): cell 2c's API contract runs in a background thread and needs the server. The light
@@ -143,10 +161,19 @@ def main():
                     help="his cell 2m's MANH_SEQS (--concurrency = vLLM max-num-seqs) and our ARC_WORKERS. 64 = Manh, "
                          "2026-10-29 ~21:00 UTC: the value he ran on Kaggle (his v6 cell says 80); his line is the only "
                          "edit to cell 2m")
+    ap.add_argument("--context", type=int, default=None,
+                    help="his MANH_CONTEXT (--context = max-model-len; v6: 163840), our ARC_CONTEXT_LIMIT and 0b's "
+                         "expectation together. C1's image eval: max attempt context 130,371 of 280 (none > 131,072)")
     ap.add_argument("--kv-offload-gib", default=None,
                     help="his --kv-offload-gib-per-rank (v6: 12). Host RAM: his engine ~144 GiB + our solver/sandboxes "
                          "~17 GiB vs Kaggle's 173 GiB cgroup (2026-10-29); only with Manh's OK")
     ap.add_argument("--gpu-util", default=None, help="his --gpu-memory-utilization (v6: 0.94); only with Manh's OK")
+    ap.add_argument("--mm-cache-gb", default=None,
+                    help="adds --vllm-arg=--mm-processor-cache-gb=N to his launcher args (vLLM default 4, held in the API "
+                         "server and EngineCore); only with Manh's OK")
+    ap.add_argument("--exec-timeout-s", default=None,
+                    help="VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS in his server env (vLLM default 300: a slower step kills "
+                         "the engine); only with Manh's OK")
     ap.add_argument("--model-manifest", type=Path, required=True,
                     help="the E066 export's path/size/sha256 manifest: commit-run input integrity (cell 1b)")
     ap.add_argument("--out", type=Path)
@@ -181,6 +208,8 @@ def main():
         s0 = replace_once(s0, line, "    # E066 light smoke: the solver ends once the 2 tasks are done (model load, contract, generation, final "
                                     "write); the deadlines below only cap it at ~75 min of the first cell")
     s0 = replace_once(s0, '(("ARC_WORKERS", "80"),', f'(("ARC_WORKERS", "{a.max_num_seqs}"),')
+    if a.context is not None:
+        s0 = replace_once(s0, '("ARC_CONTEXT_LIMIT", "163840"),', f'("ARC_CONTEXT_LIMIT", "{a.context}"),')
     cells[i] = code(s0)
 
     # cell 2m: his server cell, byte-identical except his max-num-seqs line (Manh asked for 64 on 2026-10-29)
@@ -188,14 +217,24 @@ def main():
     c2m = src(cells[k2])
     line = next(l for l in c2m.splitlines() if l.startswith("MANH_CONTEXT, MANH_SEQS = "))
     ctx, seqs = (int(x) for x in line.split("=")[1].split(","))
-    if seqs != a.max_num_seqs:
-        c2m = replace_once(c2m, line, f"MANH_CONTEXT, MANH_SEQS = {ctx}, {a.max_num_seqs}  # E066 build: Manh's {seqs} -> "
-                                      f"{a.max_num_seqs} (his request, the value he ran on Kaggle)")
+    new_ctx = a.context if a.context is not None else ctx
+    if (seqs, ctx) != (a.max_num_seqs, new_ctx):
+        c2m = replace_once(c2m, line, f"MANH_CONTEXT, MANH_SEQS = {new_ctx}, {a.max_num_seqs}  # E066 build: Manh's "
+                                      f"{ctx}, {seqs} -> {new_ctx}, {a.max_num_seqs} (his request)")
     for flag, val in (("--kv-offload-gib-per-rank", a.kv_offload_gib), ("--gpu-memory-utilization", a.gpu_util)):
         if val is not None:
             m_ = re.search(rf'"{flag}", "([0-9.]+)"', c2m)
             assert m_ and c2m.count(m_.group(0)) == 1, flag
             c2m = c2m.replace(m_.group(0), f'"{flag}", "{val}"')
+    if a.mm_cache_gb is not None:
+        anchor = '"--vllm-arg=--prefix-cache-retention-interval=128"]'
+        assert c2m.count(anchor) == 1
+        c2m = c2m.replace(anchor, f'"--vllm-arg=--prefix-cache-retention-interval=128", '
+                                  f'"--vllm-arg=--mm-processor-cache-gb={a.mm_cache_gb}"]')
+    if a.exec_timeout_s is not None:
+        anchor = '    "VLLM_TP_HOST_GATHER": "1",'
+        assert c2m.count(anchor) == 1 and "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS" not in c2m
+        c2m = c2m.replace(anchor, f'    "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "{a.exec_timeout_s}",  # E066 build (Manh\'s OK)\n' + anchor)
     cells[k2] = code(c2m)
 
     # cell 0b: our pins, his checks + ours
@@ -206,6 +245,9 @@ def main():
     expect["MANH_VISION"] = "1"
     assert expect.get("ARC_WORKERS") == "80", expect.get("ARC_WORKERS")  # his check pins the settings' worker count
     expect["ARC_WORKERS"] = str(a.max_num_seqs)  # else the rerun's 0b check falls back to v3 settings (36 workers)
+    if a.context is not None:
+        assert expect.get("ARC_CONTEXT_LIMIT") == "163840", expect.get("ARC_CONTEXT_LIMIT")
+        expect["ARC_CONTEXT_LIMIT"] = str(a.context)
     need = json_line(his, "_MT_NEED")
     for f, needs in NEED_EXTRA.items():
         need.setdefault(f, [])

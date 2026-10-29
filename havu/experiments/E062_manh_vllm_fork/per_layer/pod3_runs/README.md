@@ -148,7 +148,23 @@ The server's anonymous memory is about 140 GiB. Cell 5's report checks against K
 |---|---|---|---|---|---|---|---|
 | 20:22:52 | loaded, pre-up | 88.5 | 44.2 | 387.5 | 87.8 | 5.24 / 13.20 / 23.13 / 32.11 | 2.82 / 8.81 / 13.73 / 18.73 |
 | 20:24:03 | server up (KV pool + CPU offload allocated) | 142.0 | 44.2 | 334.1 | 139.7 | 17.89 / 25.80 / 35.73 / 44.73 | 2.82 / 8.81 / 13.73 / 18.73 |
-| pending | +10 ... +60 min under load | | | | | | |
+| 20:34:06 | +10 min | 147.4 | 44.2 | 328.8 | 143.5 | 17.95 / 25.93 / 35.81 / 44.81 | 2.82 / 8.81 / 13.73 / 18.73 |
+| 20:44:09 | +20 min | 145.7 | 44.2 | 323.1 | 143.5 | same | same |
+| 20:54:11 | +30 min | 147.6 | 44.2 | 328.5 | 143.8 | same | same |
+| 21:04:14 | +40 min | 147.5 | 44.2 | 328.5 | 144.1 | same | same |
+| 21:14:16 | +50 min | 147.2 | 44.2 | 329.0 | 144.1 | same | same |
+| 21:24:19 | +60 min | 146.7 | 44.2 | 329.5 | 144.1 | same | same |
+
+Columns: AnonPages, AnonHugePages, MemAvailable and tree RSS are host-wide or tree totals in GiB; the last two columns are per rank, GiB.
+Under load, the API server's RssAnon is 2.0 GiB and EngineCore's grows from 0.9 to 4.0 GiB over the first 40 min, then holds.
+Each worker's RssShmem is 2.07 GiB (a shared segment, counted once per process in the tree RSS). VmPTE is 46 / 62 / 82 / 100 MiB.
+The page cache grows from 128 to 159 GiB, which is model files and is reclaimable.
+
+**Steady host RAM of the server (from +40 min): 144.1 GiB tree RSS, 130.6 GiB of it anonymous** (workers 124.5, API server 2.0, EngineCore 4.0).
+That is close to Manh's ~132 GiB with THP, so pod 3 keeps the saving although MADV_COLLAPSE failed on TP1-TP3.
+The failed collapses cost load time (1525 s to server up) but no RAM.
+The CPU KV offload buffers (12 GiB/rank) are not huge-page backed on any rank, so AnonHugePages stays at 44.2 GiB, all of it Engram.
+Host AnonPages with the solver and sandboxes is ~147 GiB. The peak RSS of all pod processes (`mem.log`) is 149.2 GiB, against Kaggle's 173 GiB cgroup.
 
 ## Run 2 KV pool and contract
 - GPU KV pool: 1,878,692 tokens (util 0.94, reserve 256 MiB, no DCP), plus 12 GiB/rank CPU offload.
@@ -156,4 +172,77 @@ The server's anonymous memory is about 140 GiB. Cell 5's report checks against K
 - Startup cost on Kaggle's clock: the solver started 26 min after notebook start, all of it in the server load. The cell-2m deadline is 7200 s and stop-new is 10.83 h.
 
 ## Run 2 load windows (5 min, then hourly)
-pending
+`pod3_scripts/pull_nb.sh` copies the solver logs (no traces) and `metrics_scrape.txt`, then runs `windows.py`.
+Minutes count from the first scrape sample (20:24, solver start). "1st done/corr" are first attempts (pair 0 records) finished by the window's end.
+
+| win (min) | gen/s | prompt/s | GPU-hit % | CPU-rest % | recomp % | KV max | run/wait max | holds | preempt | 1st done | 1st corr |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 25-30 | 673 | 6110 | 91.5 | 0.0 | 8.5 | 0.77 | 80/0 | 0 | 0 | 21 | 14 |
+| 30-35 | 638 | 7712 | 92.3 | 0.0 | 7.7 | 0.83 | 80/0 | 0 | 0 | 28 | 20 |
+| 35-40 | 661 | 7619 | 92.6 | 0.0 | 7.4 | 0.88 | 80/1 | 1 | 0 | 32 | 22 |
+| 40-45 | 665 | 8342 | 94.4 | 0.0 | 5.6 | 0.89 | 78/2 | 1 | 0 | 40 | 30 |
+| 45-50 | 640 | 8762 | 95.2 | 0.0 | 4.8 | 0.90 | 70/3 | 1 | 0 | 45 | 35 |
+| 50-55 | 660 | 6352 | 95.4 | 0.0 | 4.6 | 0.91 | 64/2 | 1 | 0 | 50 | 40 |
+| 55-60 | 599 | 7831 | 93.9 | 0.0 | 6.1 | 0.90 | 57/5 | 1 | 0 | 54 | 44 |
+
+Checkpoint at 1 h (21:29):
+- Server alive. server.log has 0 tracebacks, OOMs, engine deaths, HTTP 400s or image-count errors. The solver has 0 errors and 0 restarts.
+- 56 first attempts done, 73 of 344 pairs answered. 6 KV-gate holds.
+- GPUs at 21.6 of 23.0 GiB, 72 W, SM 1470-1545 MHz.
+- CPU offload restored nothing so far: the GPU pool has held every reused prefix.
+
+## Run 2 paired first-attempt accuracy vs the C1 eval on the E043 stack
+Why: Manh's decode-only paths (DSA indexer row shard, Triton sparse indexer logits, host all-gather) engage only at >= 8 concurrent decodes, and no parity test exercised them.
+Run 2 runs at 55-80 concurrent attempts, so it is the first accuracy evidence for them at scale.
+
+- Script: `pod3_scripts/paired_c1.py`.
+- Comparison: run 2's attempt 0 against `evals/results/tools_persistent_grid_lean2sub_dsv41_low_e066_c1x_img.jsonl` attempt 0, per pair. Multi-test records of the run are split per pair.
+- Id mapping: x2t ids map to eval ids by `evalx2t_s2026_idmap.json` (`orig`). Copies are d8 + colour-permuted versions of the same task.
+- Context: the eval served max-model-len 262,144 and run 2 serves 163,840; both are above C1's ~130k max context.
+
+| snapshot | pairs | n (tasks) | run 2 | eval a0 | run-only | eval-only | McNemar exact p |
+|---|---|---|---|---|---|---|---|
+| 21:26 | originals | 36 (28) | 80.6% | 88.9% | 0 | 3 | 0.25 |
+| 21:26 | copies -> original | 36 (27) | 80.6% | 83.3% | 2 | 3 | 1.0 |
+| 21:26 | all | 72 (55) | 80.6% | 86.1% | 2 | 6 | 0.29 |
+
+Noise control, the eval's own attempt 0 vs attempt 1:
+- They disagree on 21 of 133 pairs (16%). On the eval tasks run 2 covered, it is a0-only 0, a1-only 4.
+- Run 2 against the eval's two attempts: 56/62 on pairs the eval solved 2/2, 2/6 on 1/2, 0/4 on 0/2.
+
+Run 2's misses where the eval was right:
+- 6e453dd6 (orig and copy), 1ae2feb7 pair 2, 4c3d4a41 copy (2 pairs), 8f3a5a89.
+- All are right-shape near misses with 1-36 cells wrong; no garbled output.
+- 5 of the 6 pairs passed the train check; 8f3a5a89 did not (train_frac 0, after 4 auto-repairs).
+
+Decode health of run 2:
+- All 56 attempts submitted; 0 rescues.
+- Tool errors per call 0.093 (eval 0.12).
+- Auto-repair proposals in 8 of 56 attempts; the eval's harness records none.
+
+Verdict at 21:26: no significant difference, and the gap is within the eval's own run-to-run noise. The common set is the easy early finishers, and n = 72 detects only large drops.
+
+## Run 3 (prepared, not started): new build with Manh's restart supervisor, TP-worker kill test
+Plan from the coordinator, ~22:30 UTC on the go:
+1. Stop run 2.
+2. Run the new build (Manh's `--supervise 3`; status file passed to the solver as `ARC_EXTERNAL_SERVER_STATUS`; pinned solver S26, sha 832d3367). Rerun mode, C1, x2t workload, fresh `/kaggle/working`.
+3. ~10 min after server up, SIGKILL one TP worker (TP2 or TP3) and time the supervisor restart.
+4. Continue as the CV replica.
+
+Scripts (`pod3_scripts/`, on the pod in `/root/e066/r3/`):
+
+| Script | What it does |
+|---|---|
+| `stop_run2.sh [--dry]` | Discovers papermill, the kernel, the solver + its sandbox workers and Manh's server (launch.json pid), checking each by cmdline. Kills by process group / PID only: notebook first, then solver, then server (SIGTERM, 30 s, SIGKILL on the group), scraper, memory logger. Prints the GPU process list. Dry run at 21:33: papermill 6900 (pgid 6897), kernel 6902, solver 15554, 50 sandboxes, server 7403. |
+| `dl_src.sh <version>` | Pinned kagglehub download of `nguyennguyen599/arc2-2026-src` (token over stdin). |
+| `setup_run3.sh <nb> <kernel-metadata.json> <src dir> [kit]` | Archives run 2's `/kaggle/working`, `/tmp/dsv41` and `/tmp/arc_vision` to `/root/e066/run2_*` (not deleted). Maps the build's `model_sources` path to the local C1 copy and the src dir. Checks cell 1b's model manifest against C1's. Restores the vLLM files so cell 2r patches them as on Kaggle. |
+| `nb_run3.sh` | papermill in rerun mode, as run 2. Log: `/root/e066/r3/run.log`. |
+| `find_tp.sh` | Live workers by exact cmdline `VLLM::Worker_TP<r>` (padded with NULs), pgid, RSS, parent chain, GPU process list. |
+| `kill_tp.sh <2\|3>` | SIGKILL exactly one worker, after checking that exactly one process has that exact cmdline. Logs the time. |
+| `restart_sampler.py <out> 5 <status glob>` | Every 5 s: meminfo, RSS of all processes and of every vLLM process (pids), GPU compute apps, the status file(s). |
+| `grep_restart.sh` | Expected lines: solver "server died", "(wait 1): started by the notebook", "server up after ... (external, start 1)", re-queue/retry; supervisor lines in the server dir; status files; status.json; attempt errors. |
+
+Differences between the current build (out/nb_dsv41-tools-submit-img-manh, sha af16851c) and run 2's notebook:
+- `model_sources` is `arazzd/deepseek-v41-flash-1017-arc-tool-img-e128-2bit`, and cell 1b's manifest already equals C1's 137 entries, so no manifest swap is needed.
+- ARC_WORKERS and Manh's `--max-num-seqs` are 64 (Manh's Kaggle value); run 2 used 80. Run 3 is therefore the replica of the submitted concurrency.
+- The server root is `{WORK}/dsv41_logs` (server.log under `dsv41_logs/server/`).

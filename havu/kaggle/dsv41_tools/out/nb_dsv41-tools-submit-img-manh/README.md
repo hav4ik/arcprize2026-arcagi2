@@ -13,7 +13,7 @@ small patch to your vLLM so per-layer expert counts load. Everything we changed 
 | [`review/solver_vs_manh.diff`](review/solver_vs_manh.diff) | our pinned solver vs the one in your v6 cell 0b |
 | [`review/harness_vs_manh.diff`](review/harness_vs_manh.diff) | our pinned harness vs the one in your v6 cell 0b (B32's) |
 
-The current build is notebook sha256 `af16851c02b2`, built on your v6 (scriptVersionId 363607395, the server's
+The current build is notebook sha256 `67ad5bc705b6`, built on your v6 (scriptVersionId 363607395, the server's
 output root moved into `dsv41_logs`) after the fourth audit's fixes (~20:30 UTC).
 
 Longer record: [`kaggle/dsv41_tools/CANDIDATE_E066_IMG.md`](../../CANDIDATE_E066_IMG.md).
