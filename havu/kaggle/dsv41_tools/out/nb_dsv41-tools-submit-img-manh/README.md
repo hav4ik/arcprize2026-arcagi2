@@ -13,16 +13,17 @@ small patch to your vLLM so per-layer expert counts load. Everything we changed 
 | [`review/solver_vs_manh.diff`](review/solver_vs_manh.diff) | our pinned solver vs the one in your v6 cell 0b |
 | [`review/harness_vs_manh.diff`](review/harness_vs_manh.diff) | our pinned harness vs the one in your v6 cell 0b (B32's) |
 
-The current build is notebook sha256 `1707e4da22f2`, built on your v6 (scriptVersionId 363607395, the server's
+The current build is notebook sha256 `d8993ae3d668`, built on your v6 (scriptVersionId 363607395, the server's
 output root moved into `dsv41_logs`) after the fourth audit's fixes (~20:30 UTC).
 
 Longer record: [`kaggle/dsv41_tools/CANDIDATE_E066_IMG.md`](../../CANDIDATE_E066_IMG.md).
 
 ## What is yours and what is ours
 
-16 of the 23 cells are yours, byte-identical and in your order. That includes your install cells 1-5, server cell 2m,
-solver cell 3, stop cell 4 and the verdict cell. Your cell 2m ships exactly as in v6: TP4, no DCP, util 0.94, driver
-reserve 256 MiB, `--concurrency 80`, `--context 163840`, 12 GiB/rank CPU KV offload, `--watermark=0.1`, retention 128,
+15 of the 23 cells are yours, byte-identical and in your order. Your cell 2m differs in one line only:
+`MANH_SEQS` 80 -> 64, as you asked (the value you ran on Kaggle); our `ARC_WORKERS` follows it. That includes your install cells 1-5, server cell 2m,
+solver cell 3, stop cell 4 and the verdict cell. Otherwise your cell 2m ships exactly as in v6: TP4, no DCP, util 0.94, driver
+reserve 256 MiB, `--concurrency 64`, `--context 163840`, 12 GiB/rank CPU KV offload, `--watermark=0.1`, retention 128,
 MODE 556 + row shard + AR overlap.
 
 | Cell | Change | Why |
@@ -77,7 +78,7 @@ your main 71dca8bc24. It is not pushed; the diffs are in `kaggle/dsv41_tools/b32
 
 ## Settings that ship (ours)
 
-`ARC_WORKERS=80` (= your `--concurrency 80`), `ARC_MULTI_TEST=1`, `ARC_MULTI_BUDGET=0.5`, `ARC_CONTEXT_LIMIT=163840`
+`ARC_WORKERS=64` (= your `--concurrency 64`), `ARC_MULTI_TEST=1`, `ARC_MULTI_BUDGET=0.5`, `ARC_CONTEXT_LIMIT=163840`
 (= your `--context`), KV admission gate `ARC_KV_ADMIT_MAX=0.85`, auto-repair on, image harness as above.
 
 ## Please vibe-check

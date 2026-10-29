@@ -269,20 +269,24 @@ class ManhBase(unittest.TestCase):
     def test_only_our_cells_change(self):
         his = set(self.his)
         ours = [c.splitlines()[0][:14] for c in self.cells if c not in his]
-        self.assertEqual(ours, ["# E066 image c", "# Cell 0b (E04", "# Cell 1b (smo", "# Cell 2r (E06", "# Cell 2c (B32",
-                                "# Cell 3w (E06", "# Cell 4b (B32"])
+        self.assertEqual(ours, ["# E066 image c", "# Cell 0b (E04", "# Cell 1b (smo", "# Cell 2r (E06", "# Cell 2m (B32",
+                                "# Cell 2c (B32", "# Cell 3w (E06", "# Cell 4b (B32"])
         w = next(i for i, c in enumerate(self.cells) if c.startswith("# Cell 3w (E066"))
         self.assertTrue(self.cells[w - 1].startswith("# Cell 3: the solver"))
         self.assertTrue(self.cells[w + 1].startswith("# Cell 4: final check"))
         # every other cell is his, in his order
         self.assertEqual([c for c in self.cells if c in his], [c for c in self.his if c.splitlines()[0][:14] not in
                                                                ("# B32-M + MANH", "# Cell 0b (E04", "# Cell 1b (smo",
-                                                                "# Cell 2c (B32", "# Cell 4b (B32")])
+                                                                "# Cell 2m (B32", "# Cell 2c (B32", "# Cell 4b (B32")])
         i = next(i for i, c in enumerate(self.cells) if c.startswith("# Cell 2r (E066"))
         self.assertTrue(self.cells[i - 1].startswith("# Manh's cell 5"))
         self.assertTrue(self.cells[i + 1].startswith("# Cell 2 (B32-M)"))
         server = next(c for c in self.cells if c.startswith("# Cell 2m (B32-M + Manh's server)"))
-        self.assertIn(server, self.his)  # his production server cell, byte-identical
+        his_server = next(c for c in self.his if c.startswith("# Cell 2m (B32-M + Manh's server)"))
+        diff = [(a, b) for a, b in zip(his_server.splitlines(), server.splitlines()) if a != b]
+        self.assertEqual(len(server.splitlines()), len(his_server.splitlines()))
+        self.assertEqual(diff, [("MANH_CONTEXT, MANH_SEQS = 163840, 80", "MANH_CONTEXT, MANH_SEQS = 163840, 64  # E066 build: "
+                                 "Manh's 80 -> 64 (his request, the value he ran on Kaggle)")])  # his server cell, 1 line
         self.assertEqual(self.meta["model_sources"], [MODEL])
         self.assertEqual(self.meta["docker_image_pinning_type"], "latest")
         self.assertNotIn("docker_image", self.meta)
@@ -318,7 +322,7 @@ print("LIGHTENV", json.dumps({{k: os.environ.get(k) for k in ("ARC_TASK_IDS", "E
             self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
             self.assertIn("E046 CHECK OK", r.stdout, r.stdout[-1500:])
             got = json.loads(r.stdout.split("ENV ", 1)[1].splitlines()[0])
-            self.assertEqual(got, {"ARC_GRID_FORMAT": "text+image", "MANH_VISION_MAX_IMAGES": "32", "ARC_WORKERS": "80",
+            self.assertEqual(got, {"ARC_GRID_FORMAT": "text+image", "MANH_VISION_MAX_IMAGES": "32", "ARC_WORKERS": "64",
                                    "MANH_VISION": "1"})
             light = json.loads(r.stdout.split("LIGHTENV ", 1)[1].splitlines()[0])
             if rerun:  # the scored rerun: none of the light smoke's settings

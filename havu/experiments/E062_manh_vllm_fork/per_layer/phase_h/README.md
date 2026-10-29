@@ -104,3 +104,84 @@ Stopped at ~25 min (19:35-20:02 UTC) when the priority moved to the exact-notebo
   - A private sources dir was needed: Manh's cuda-keyring deb adds `cuda-ubuntu2404-x86_64.list` (signed-by), which conflicts with the pod image's own `cuda.list`, so plain `apt-get` now fails with "Conflicting values set for option Signed-By".
 - **The launcher now resets /root/kenv** from a pristine copy (`/root/kenv_fresh`, built at /root/kenv so its shebangs are right; freeze identical to `kenv_fresh_freeze.txt`).
 - **Third attempt (p1c_commit, 20:16:35 UTC)** on c23eb5fb. Per the coordinator, phase 1 is then repeated on the v6-based rebuild, sha256 1e773bbc42e85f27, before phase 2. v6 changes one line of cell 2m: the server output root is `{WORK}/dsv41_logs`, so the server log is `dsv41_logs/server/server.log`.
+
+### Phase 1 (commit mode, light smoke) results
+
+| run | notebook | install cells (Manh 1-5) | server up | solver | notebook end | verdict |
+|---|---|---|---|---|---|---|
+| p1c_commit | c23eb5fb (v5-based) | 45 s | +325 s (cell 2m: 4.5 min) | 40 s, 4 attempts | +399 s | B32-M SMOKE OK |
+| p1d_commit | 1e773bbc (v6-based) | 48 s | +328 s | 35 s, 4 attempts | +397 s | B32-M SMOKE OK |
+| p1e_commit | **1707e4da** (v6-based, light-smoke deadlines 4200/4320/4380/4470 s) | 51 s | +341 s | 47 s, 4 attempts | +423 s | B32-M SMOKE OK |
+
+Install times are short because the wheels and the uv cache are on local disk in page cache; Kaggle's FUSE inputs are slower.
+
+Both runs:
+- **2r:** `e066_vllm_patch.json`.
+  - model.py: patched, 029aa62e → ad4ac0fd (base check: ead1e087 / 029aa62e).
+  - dsv4_topk.py: patched, 7e1e101a → ab32ea7e. No .pyc to remove.
+  - The vLLM is the wheel cell 4 installed into the kernel venv: 0.32.1rc1.dev0+gf506afa210, torch 2.14.0+cu130, humming 0.1.18.
+- **Server:** Manh's cell 2m with util 0.94, TP4, no DCP, GPU order 0,2,1,3.
+  - KV 2,171,851 tokens (×1.0377 Kaggle-equivalent ≈ 2.25M).
+  - Model loading 47-48 s per rank, 13.88 GiB.
+  - EngramConfig(cpu_offload=True, use_thp=True).
+- **Contract (2c):** all pass, `fail: []`.
+  - models dsv41 / 163840; reasoning_content and reasoning both carry thinking; /tokenize 377.
+  - completion token ids 64; all 6 metrics present; chat_tool_calls 1; image prompt +242 tokens.
+- **3w:** "E066: contract thread finished (waited 0 s)".
+- **Solver:** 2 tasks / 3 pairs (25ff71a9 x2 pairs, 00576224), 4 attempts. All `stop=submitted`, all train_pass.
+  - Both tasks are also public training tasks with identical test inputs. Scored against `arc-agi_training_solutions.json`, the p1c answers are correct on every pair (attempt_1).
+  - 4b says "0 correct" because the commit-mode test file has no solutions.
+- **The run ends right after the 2 tasks** (solver "done" at +0.11 h), not at the stop-new deadline (0.75 h). Then "submission.json valid" and "Manh's server stopped".
+- **4b lines:**
+  - `E066 vLLM patch: [('model.py', 'patched'), ('dsv4_topk.py', 'patched')]`
+  - `E066 model files (names, sizes): {'files': 137, 'missing': [], 'size_mismatch': []}`
+  - `E066 light smoke: 4 attempt records, 4 with an answer, 0 correct`
+  - Also from 4b: INPUT INTEGRITY OK (every model file matches its sha256).
+  - Minor: the 4b timeline reports `server_start_min: None`. The server is started by cell 2m, not the solver; `server_up_min` is 6.0.
+- **Cell 5:** host MemAvailable min 343 GiB of 503 (no cgroup limit on the pod); GPU peak 21.4 of 23.0 GiB per card; power limit 72 W; tool sandboxes peak 16 processes, 1 GiB RSS.
+- **v6 log layout (1e773bbc):** the server log is `dsv41_logs/server/server.log` next to the solver's files. `dsv41_logs/server` did not exist before the run (fresh /kaggle/working). The final verdict cell passes, with no missing-log raise. Cell 4's archive (`dsv41_traces.tar.gz`) holds only the traces; server.log stays in `dsv41_logs/server/`, which is part of /kaggle/working and so of the Kaggle output.
+- **1707e4da:** the solver printed "deadlines: stop-new 1.17h, force 1.20h, hard stop 1.22h" and still ended at +0.12 h, right after the 2 tasks. Its answers are again correct on every pair.
+- **Full cell outputs:** `runs/nb_p1*_commit_*/nbruns/<run>/nb.ipynb` (executed notebook) and `nb_outputs.txt` (plain text, as Kaggle's log shows them), plus `nb.timeline`.
+
+### Host memory with use_thp=true (pod 2, p1d_commit; for the pod 3 comparison)
+
+`scripts/mem_probe.py` is read-only: /proc/meminfo, per-process /proc/<pid>/status + smaps_rollup, /proc/vmstat. Samples are every 30 s here, because the light smoke's server lives only ~1.5 min. Phase 2 samples every 10 min for the first hour.
+
+- **THP setting:** `transparent_hugepage/enabled` = madvise, defrag = madvise.
+- **Engram tables per rank:** two tables, pinned host memory.
+
+  | rank | Engram tables | total |
+  |---|---|---|
+  | TP0 | 1.41 + 1.41 GiB | 2.82 GiB |
+  | TP1 | 5.39 + 5.39 GiB | 10.78 GiB |
+  | TP2 | 10.36 + 10.35 GiB | 20.71 GiB |
+  | TP3 | 16.31 + 13.38 GiB | 29.69 GiB |
+
+  All ranks logged the offload within 3 s (20:26:21-24). Model loading took 47.4-47.7 s per rank.
+- **No MADV_COLLAPSE lines in server.log, and compaction never ran:** compact_stall / fail / success were 25,755,912 / 24,715,573 / 1,040,339 both before and after the load (Δ 0). The huge pages came straight from free memory: this host had ~390 GiB available and mostly page cache.
+- **Every byte of the Engram tables is THP-backed.** AnonHugePages per worker equals that rank's Engram size: 2.8 / 10.8 / 20.7 / 29.7 GiB (host total 64.2 GiB).
+
+| min after ready | MemAvailable | AnonPages | AnonHugePages | Mlocked | Unevictable | Cached | Shmem | PageTables | server tree RSS |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 343.4 | 136.1 | 64.2 | 0.0 | 0.0 | 231.0 | 6.8 | 355 MiB | 139.6 |
+| 0.5 | 343.8 | 135.9 | 64.2 | 0.0 | 0.0 | 231.1 | 6.9 | 352 MiB | 139.6 |
+| 1 | 343.5 | 136.2 | 64.2 | 0.0 | 0.0 | 295.4 | 7.0 | 353 MiB | 140.2 |
+
+GiB unless noted. "Cached" includes the 120 GiB model read by the warm stage and by the load.
+
+| process | VmRSS | RssAnon | RssShmem | VmPTE | AnonHugePages |
+|---|---|---|---|---|---|
+| API server | 1.4 | 0.9 | 0.0 | 5 MiB | 0.0 |
+| EngineCore | 1.3 | 0.9 | 0.0 | 5 MiB | 0.0 |
+| Worker TP0 | 21.1 | 18.1 | 1.9 | 46 MiB | 2.8 |
+| Worker TP1 | 29.0 | 26.0 | 1.9 | 62 MiB | 10.8 |
+| Worker TP2 | 38.9 | 35.9 | 1.9 | 82 MiB | 20.7 |
+| Worker TP3 | 47.9 | 44.9 | 1.9 | 100 MiB | 29.7 |
+
+Per worker, RssAnon minus Engram is ~15.2 GiB on every rank. That is the 12 GiB/rank KV offload plus the rest. Mlocked stays 0: pinning through cudaHostRegister does not count as mlock here. The server tree totals ~140 GiB, of which 136 GiB is anon, at the start before any KV offload traffic.
+
+## Phase 2: rerun mode, 240-task x2t CV replica (from 20:40:45 UTC)
+- **Notebook:** 1707e4da22f2c6b2, KAGGLE_IS_COMPETITION_RERUN=1 (checked in the runner's environment).
+- **Workload:** /kaggle/input/.../arc-agi_test_challenges.json, byte-identical to evalx2t_s2026_challenges.json (240 tasks, 344 pairs).
+- **Clock:** the full ~12 h Kaggle clock from the solver's own deadlines.
+- **Run dir:** `/root/nbruns/p2_rerun`; /kaggle/working = `/root/kwork_p2_rerun`.

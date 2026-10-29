@@ -111,7 +111,9 @@ Scripts: `../pod3_scripts/`. Raw tables and metrics: this folder.
 | 20:19:31 | TP3 second Engram table (13.38 GiB) |
 | 20:19:56 / 20:19:59 | TP3 MADV_COLLAPSE failed / TP3 model loaded, **1235.4 s** (20.6 min) |
 | 20:20:23 | host all-reduce enabled; TileLang kernel compile, then shm_broadcast "no block in 60 s" while the engine profiles (normal during warm-up) |
-| pending | KV profile, graph capture, server up (cell 2m deadline: 7200 s) |
+| 20:23:04 | KV profile: **GPU KV cache size 1,878,692 tokens**, max concurrency 11.47x at 163,840 |
+| 20:24:00 | **MANH SERVER UP after 1525 s** (+1544 s since notebook start; pod 2: 125 s) |
+| 20:24:00 | cell 3 (solver) starts: 240 tasks, 344 pairs; deadlines stop-new 10.83 h, force 11.17 h, hard stop 11.50 h |
 
 Each rank holds **two** Engram tables, so the pinned Engram totals per rank are TP0 2.82, TP1 10.78, TP2 20.71 and TP3 29.69 GiB.
 Load time scales with that size, and the second table is the slow step: it is logged 4-20 min after the first, and on TP1-TP3 the collapse then fails.
@@ -139,13 +141,19 @@ RssAnon minus Engram is about 2.4 GiB on every rank, so the gap between ranks is
 TP0's tables are fully huge-page backed. On TP1-TP3, where MADV_COLLAPSE failed, the 4 KiB remainder is 2.0, 7.0 and 11.0 GiB.
 The bytes are the same either way. Failed collapses cost load time and page-table size (TP3 VmPTE 74 MiB), not host RAM.
 
+At server up every rank's RssAnon has grown by 12.6 GiB (the 12 GiB/rank CPU KV offload plus about 0.6 GiB). AnonHugePages has not changed, so the offload buffers are 4 KiB pages on every rank.
+The server's anonymous memory is about 140 GiB. Cell 5's report checks against Kaggle's 173 GiB cgroup limit.
+
 | UTC | tag | AnonPages | AnonHugePages | MemAvailable | tree RSS | TP0 / TP1 / TP2 / TP3 RssAnon | TP0 / TP1 / TP2 / TP3 AnonHuge |
 |---|---|---|---|---|---|---|---|
 | 20:22:52 | loaded, pre-up | 88.5 | 44.2 | 387.5 | 87.8 | 5.24 / 13.20 / 23.13 / 32.11 | 2.82 / 8.81 / 13.73 / 18.73 |
-| pending | server up, +10 ... +60 min | | | | | | |
+| 20:24:03 | server up (KV pool + CPU offload allocated) | 142.0 | 44.2 | 334.1 | 139.7 | 17.89 / 25.80 / 35.73 / 44.73 | 2.82 / 8.81 / 13.73 / 18.73 |
+| pending | +10 ... +60 min under load | | | | | | |
 
 ## Run 2 KV pool and contract
-pending
+- GPU KV pool: 1,878,692 tokens (util 0.94, reserve 256 MiB, no DCP), plus 12 GiB/rank CPU offload.
+- Contract: cells 2b (sandbox at full load) and 2c (API contract) are commit-only, so in RERUN mode papermill runs them as no-ops. This is the Kaggle rerun path; there is no contract result for run 2.
+- Startup cost on Kaggle's clock: the solver started 26 min after notebook start, all of it in the server load. The cell-2m deadline is 7200 s and stop-new is 10.83 h.
 
 ## Run 2 load windows (5 min, then hourly)
 pending

@@ -139,6 +139,10 @@ def main():
     ap.add_argument("--commit", choices=["light", "load"], default="light",
                     help="commit run: light = 2 smallest tasks (00576224, 25ff71a9 with 2 test inputs), ends when they are done, "
                          "deadline cap ~75 min (saves quota; load testing is done on pods); load = his 80-task load test")
+    ap.add_argument("--max-num-seqs", type=int, default=64,
+                    help="his cell 2m's MANH_SEQS (--concurrency = vLLM max-num-seqs) and our ARC_WORKERS. 64 = Manh, "
+                         "2026-10-29 ~21:00 UTC: the value he ran on Kaggle (his v6 cell says 80); his line is the only "
+                         "edit to cell 2m")
     ap.add_argument("--model-manifest", type=Path, required=True,
                     help="the E066 export's path/size/sha256 manifest: commit-run input integrity (cell 1b)")
     ap.add_argument("--out", type=Path)
@@ -172,7 +176,18 @@ def main():
         line = next(l for l in s0.splitlines() if l.startswith("    # smoke within 43 min of the first cell"))
         s0 = replace_once(s0, line, "    # E066 light smoke: the solver ends once the 2 tasks are done (model load, contract, generation, final "
                                     "write); the deadlines below only cap it at ~75 min of the first cell")
+    s0 = replace_once(s0, '(("ARC_WORKERS", "80"),', f'(("ARC_WORKERS", "{a.max_num_seqs}"),')
     cells[i] = code(s0)
+
+    # cell 2m: his server cell, byte-identical except his max-num-seqs line (Manh asked for 64 on 2026-10-29)
+    k2 = find(cells, "# Cell 2m (B32-M + Manh's server)")
+    c2m = src(cells[k2])
+    line = next(l for l in c2m.splitlines() if l.startswith("MANH_CONTEXT, MANH_SEQS = "))
+    ctx, seqs = (int(x) for x in line.split("=")[1].split(","))
+    if seqs != a.max_num_seqs:
+        c2m = replace_once(c2m, line, f"MANH_CONTEXT, MANH_SEQS = {ctx}, {a.max_num_seqs}  # E066 build: Manh's {seqs} -> "
+                                      f"{a.max_num_seqs} (his request, the value he ran on Kaggle)")
+    cells[k2] = code(c2m)
 
     # cell 0b: our pins, his checks + ours
     j = find(cells, "# Cell 0b (E046, frozen inputs)")
@@ -180,6 +195,8 @@ def main():
     expect = json_line(his, "_MT_EXPECT")
     expect["ARC_GRID_FORMAT"] = "text+image"
     expect["MANH_VISION"] = "1"
+    assert expect.get("ARC_WORKERS") == "80", expect.get("ARC_WORKERS")  # his check pins the settings' worker count
+    expect["ARC_WORKERS"] = str(a.max_num_seqs)  # else the rerun's 0b check falls back to v3 settings (36 workers)
     need = json_line(his, "_MT_NEED")
     for f, needs in NEED_EXTRA.items():
         need.setdefault(f, [])
