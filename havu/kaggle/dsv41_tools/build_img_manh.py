@@ -258,7 +258,7 @@ def main():
     new_ctx = a.context if a.context is not None else ctx
     if (seqs, ctx) != (a.max_num_seqs, new_ctx):
         c2m = replace_once(c2m, line, f"MANH_CONTEXT, MANH_SEQS = {new_ctx}, {a.max_num_seqs}  # E066 build: Manh's "
-                                      f"{ctx}, {seqs} -> {new_ctx}, {a.max_num_seqs} (Manh 64 + 128k; E066 margins)")
+                                      f"{ctx}, {seqs} -> {new_ctx}, {a.max_num_seqs} (E066 build margins)")
     for flag, val in (("--kv-offload-gib-per-rank", a.kv_offload_gib), ("--gpu-memory-utilization", a.gpu_util)):
         if val is not None:
             m_ = re.search(rf'"{flag}", "([0-9.]+)"', c2m)
@@ -337,6 +337,8 @@ def main():
     q = find(cells, "# Cell 1b ")
     if a.text:  # his cell 1b already checks the E128 model's manifest; only the names-and-sizes pass is added
         ic = src(cells[q])
+        if "len(json.load(f))f\n" in ic:  # his v7 typo (a SyntaxError: the cell, and so the run, would fail)
+            ic = replace_once(ic, "len(json.load(f))f\n", "len(json.load(f))\n")
     else:
         ic = B.integrity_cell(a.model_manifest)
         man = json.load(open(a.model_manifest))
@@ -362,7 +364,10 @@ def main():
     # MANH_SERVER_LOG; with images, a contract failure (tool calls not parsed, image dropped) fails the commit
     r = find(cells, "# Cell 4b ")
     rep = src(cells[r])
-    rep = replace_once(rep, 'r"server up after (\\d+)s; (.*)"', 'r"server up after (\\d+)s(?: \\(external\\))?; (.*)"')
+    if 'r"server up after (\\d+)s; (.*)"' in rep:  # his v6 regex misses "(external)"; his v7 handles it
+        rep = replace_once(rep, 'r"server up after (\\d+)s; (.*)"', 'r"server up after (\\d+)s(?: \\(external\\))?; (.*)"')
+    else:
+        assert 'r"server up after (\\d+)s(?: \\([^)]*\\))?; (.*)"' in rep, "his cell 4b: unknown server-up regex"
     assert rep.count('open(f"{_w}/dsv41_logs/server.log", errors="replace")') == 2
     rep = rep.replace('open(f"{_w}/dsv41_logs/server.log", errors="replace")',
                       'open(globals().get("MANH_SERVER_LOG") or f"{_w}/dsv41_logs/server.log", errors="replace")')

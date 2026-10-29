@@ -289,7 +289,7 @@ class ManhBase(unittest.TestCase):
         diff = [(a, b) for a, b in zip(his_server.splitlines(), server.splitlines()) if a != b]
         self.assertEqual(len(server.splitlines()), len(his_server.splitlines()))
         self.assertEqual(diff, [("MANH_CONTEXT, MANH_SEQS = 163840, 80", "MANH_CONTEXT, MANH_SEQS = 163840, 64  # E066 build: "
-                                 "Manh's 163840, 80 -> 163840, 64 (Manh 64 + 128k; E066 margins)")])  # his server cell, 1 line
+                                 "Manh's 163840, 80 -> 163840, 64 (E066 build margins)")])  # his server cell, 1 line
         self.assertEqual(self.meta["model_sources"], [MODEL])
         self.assertEqual(self.meta["docker_image_pinning_type"], "latest")
         self.assertNotIn("docker_image", self.meta)
@@ -559,6 +559,30 @@ class TextBuild(unittest.TestCase):
                      ("repo/evals/run_deepseek_tools.py", sha(D / "pinned_candb/run_deepseek_tools.py"))):
             self.assertIn(h, b, f)
         self.assertNotIn("grid_image.py", b)
+
+
+class TextOnV7(unittest.TestCase):
+    """--text --no-supervisor on his v7: his supervisor and cell 3 wiring, his cell 1b typo fixed, every cell parses."""
+    V7 = Path("/tmp/claude-1000/-home-vu-Workspace-ARC-AGI-2/81e68821-e1f4-4b05-bad6-9a606f77ad54/scratchpad/manh_ext_nb/v7")
+
+    @unittest.skipUnless(V7.exists(), "his v7 pull not present")
+    def test_build(self):
+        import ast
+        out = Path(tempfile.mkdtemp(dir=SCRATCH)) / "nb"
+        r = subprocess.run([sys.executable, str(D / "build_img_manh.py"), "--text", "--no-supervisor", "--manh-nb",
+                            str(self.V7), "--out", str(out), "--slug", "t", "--gpu-util", "0.90", "--exec-timeout-s", "900"],
+                           capture_output=True, text=True, cwd=str(D))
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        cells = ["".join(c["source"]) for c in json.load(open(out / "t.ipynb"))["cells"]]
+        meta = json.load(open(self.V7 / "kernel-metadata.json"))
+        his = ["".join(c["source"]) for c in json.load(open(self.V7 / meta["code_file"]))["cells"]]
+        self.assertFalse(any(c.startswith(("# Cell 2s", "# Cell 3s", "# Cell 2r")) for c in cells))
+        self.assertIn(next(c for c in his if c.startswith("# Cell 3: the solver")), cells)  # his cell 3, untouched
+        self.assertIn(next(c for c in his if c.startswith("# Cell 4: final check")), cells)
+        for c in cells:
+            if c.startswith(("# Cell 1b", "# Cell 0b", "# Cell 2m", "# Cell 3", "# Cell 4b", "# B32-M fix")):
+                ast.parse(c)
+        self.assertNotIn("len(json.load(f))f", next(c for c in cells if c.startswith("# Cell 1b")))
 
 
 class LightSmokeChecks(unittest.TestCase):

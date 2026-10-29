@@ -290,3 +290,14 @@ Run 3 timeline:
 | 21:47:24-37 | `setup_run3.sh`: run 2's working dirs archived. Model source `arazzd/deepseek-v41-flash-1017-arc-tool-img-e128-2bit/pytorch/default/1` -> C1 copy; cell 1b manifest == C1's (137). vLLM files restored to 029aa62e / 7e1e101a. Run 2's `chankhavu/...` model mapping removed, so the model glob finds one dir as on Kaggle. |
 | 21:47:58 | papermill start (RERUN). Samplers: `restart_sampler.py` every 5 s, `mem.log` every 60 s, `scrape_loop.sh` (re-attaches after restarts) |
 | ~21:48:30 | cell 0b E046 CHECK OK (solver 324ea6ee); dpkg fails as in run 2 ("CUDA installation failed (rerun: continuing...)"); cell 2r PATCHED both files; cell 2m launches the server |
+| 21:49:09-12 | first Engram tables offloaded (TP0 1.41, TP1 5.39, TP2 10.36, TP3 16.31 GiB) |
+| 21:49:46 | TP0 and TP1 loaded in 43.5 s (both second tables in at once) |
+| 21:50:26 | TP2 loaded in 84.0 s (MADV_COLLAPSE failed at 21:50:23) |
+| 21:52:32 | TP3 loaded in 209.7 s (second table at 21:52:03, MADV_COLLAPSE failed at 21:52:29) |
+| 21:55:41 | Available KV cache memory 3.76 GiB per GPU; **GPU KV cache size 1,453,240 tokens** (11.09x at 131,072). util 0.90 is equivalent to 0.8951 without CUDA graphs |
+| 21:56:22 | CUDA graph pool 0.15 GiB actual vs 0.11 estimated |
+| 21:56:31 | **MANH SERVER UP after 495 s** (+513 s since notebook start), max_model_len 131,072, API server pid 19687, EngineCore 20496, workers TP0-TP3 20827 / 20829 / 20830 / 20828. Supervisor: "watching pid 19687 (max 2 restarts, stall 1500s ...)" |
+| 21:56:40 | GPUs 20.48-20.53 of 23.03 GiB used (**2.04-2.09 GiB free**); host 162 GiB used (free -g), 340 GiB available |
+
+Run 3's load is 3x faster than run 2's (495 s vs 1525 s): TP3 took 210 s vs 1235 s. The collapse still fails on TP2 and TP3. The cause of the speed-up is not established; one possibility is the host's memory state (fragmentation) right after run 2 freed ~140 GiB.
+The load time under THP compaction varies by a factor of 3 on the same pod; pod 2 took 125 s.
