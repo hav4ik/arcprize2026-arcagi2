@@ -68,7 +68,8 @@ class Backlog(ThreadingHTTPServer):
 
 class FakeVLLM:
     def __init__(self, token_delay=0.0, return_ids=True, honor_min_tokens=True, continuous_usage=True, drop_first=0,
-                 http_error=False):
+                 http_error=False, render=None):
+        self.render = render or fake_render
         self.drop_first, self.http_error = drop_first, http_error  # close / reject generation requests
         self.token_delay, self.return_ids = token_delay, return_ids
         self.honor_min_tokens, self.continuous_usage = honor_min_tokens, continuous_usage
@@ -111,7 +112,7 @@ class FakeVLLM:
                 if self.path == "/tokenize":
                     with fake.lock:
                         fake.tokenize_calls += 1
-                    ids = fake_render(body["messages"], body.get("tools"), body.get("add_generation_prompt"))
+                    ids = fake.render(body["messages"], body.get("tools"), body.get("add_generation_prompt"))
                     return self._json({"tokens": ids, "count": len(ids), "max_model_len": 100000})
                 if self.path in ("/v1/completions", "/v1/chat/completions"):
                     with fake.lock:
@@ -141,7 +142,8 @@ class FakeVLLM:
     def metrics_text(self):
         with self.lock:
             c, active = dict(self.c), self.active
-        lines = ["# HELP vllm:num_requests_running Number of requests running.", "# TYPE vllm:num_requests_running gauge"]
+        lines = ["# HELP vllm:num_requests_running Number of requests running.",
+                 "# TYPE vllm:num_requests_running gauge"]
         for engine, scale in (("0", 1), ("1", 0)):  # a second, idle engine: values must be summed
             lab = f'{{engine="{engine}",model_name="fake-model"}}'
             lines.append(f"vllm:num_requests_running{lab} {float(active * scale)}")
@@ -168,7 +170,7 @@ class FakeVLLM:
             self.blocks.add(h)
 
     def generate(self, handler, body, chat):
-        prompt = fake_render(body["messages"], body.get("tools"), True) if chat else body["prompt"]
+        prompt = self.render(body["messages"], body.get("tools"), True) if chat else body["prompt"]
         mx = body["max_tokens"]
         forced = body.get("ignore_eos") and body.get("min_tokens") == mx
         n = mx if (forced and self.honor_min_tokens) else max(1, mx // 2)
@@ -371,6 +373,20 @@ class TokensMode(ServerCase):
         grown = reqs[1]["prompt"] + reqs[1]["gen"]  # turn 3 continues from turn 2's generated ids again
         self.assertEqual(reqs[2]["body"]["prompt"][:len(grown)], grown)
 
+    def test_unflagged_resync_is_detected_from_recorded_lengths(self):
+        # the real run re-rendered turn 2 (non-canonical turn-1 output, a parse fallback): its recorded prompt is the
+        # full render, 2 tokens shorter than turn 1's prompt + its sampled ids + the tool result
+        t = make_trace(3, 7)
+        usage = [e["usage"] for e in t["events"] if "usage" in e]
+        usage[0]["completion_tokens"] += 2  # turn 2's recorded prompt stays = len(full render)
+        att = B.parse_trace(t, "k", "s")
+        plan, pred = B.plan_tokens(att, lambda reqs: [fake_render(m, None, g) for m, g in reqs])
+        self.assertEqual([s[0] for s in plan.segs], ["full", "delta"])
+        self.assertEqual(pred, [x.prompt_rec for x in att.turns])
+        att.turns[1].prompt_rec += 2  # a continued history that matches: delta as usual
+        plan, _ = B.plan_tokens(att, lambda reqs: [fake_render(m, None, g) for m, g in reqs])
+        self.assertEqual(plan.segs[0][0], "delta")
+
     def test_same_seed_same_requests(self):
         traces = {f"t{i}_p0_a0": make_trace(2, 30 + i) for i in range(5)}
         d = write_traces(self.tmp / "traces", traces)
@@ -391,8 +407,9 @@ class TokensMode(ServerCase):
         p1 = sorted(len(r["body"]["prompt"]) for r in self.fake.requests)
         self.fake.tokenize_calls = 0
         self.fake.requests.clear()
-        self.run_bench(d, "--prep-cache", cache, out="o2")
-        self.assertEqual(self.fake.tokenize_calls, 0)
+        s = self.run_bench(d, "--prep-cache", cache, out="o2")
+        self.assertEqual(self.fake.tokenize_calls, 1)  # only the check of the cached plans against the server
+        self.assertEqual(s["fidelity"]["server_render_check"], "match")
         self.assertEqual(p1, sorted(len(r["body"]["prompt"]) for r in self.fake.requests))
 
     def test_prepare_only(self):
@@ -413,7 +430,106 @@ class ToolsAuto(ServerCase):
         self.assertEqual(s["fidelity"]["plan"]["prompt_len_exact_frac"], 1.0)
         self.fake.tokenize_calls = 0
         self.run_bench(d, "--tools", "auto", "--prep-cache", cache, out="o2")
-        self.assertEqual(self.fake.tokenize_calls, 0)  # detection and renders both come from the cache
+        self.assertEqual(self.fake.tokenize_calls, 1)  # detection and renders come from the cache; 1 server check
+
+
+TOY_ENCODING = """import json
+
+
+def encode_messages(messages, thinking_mode, context=None, drop_thinking=True, add_default_bos_token=True,
+                    reasoning_effort=None, return_multi_modal_data=False):
+    s = "[%s|%s|%s]" % (thinking_mode, reasoning_effort, drop_thinking)
+    for m in messages:
+        if m.get("tools"):
+            s += "T" + json.dumps(m["tools"], sort_keys=True)
+        s += "<" + m["role"] + ">" + (m.get("reasoning_content") or "") + (m.get("content") or "")
+        s += json.dumps(m.get("tool_calls") or "") + "</>"
+    if messages[-1]["role"] != "assistant":
+        s += "<assistant>"
+    return s
+"""
+
+
+def toy_model_dir(path):
+    """A model dir for --local-render: a toy encoding.py and a char-level tokenizer.json."""
+    from tokenizers import Regex, Tokenizer, models, pre_tokenizers
+    path = Path(path)
+    (path / "encoding").mkdir(parents=True)
+    (path / "encoding/encoding.py").write_text(TOY_ENCODING)
+    vocab = {"[UNK]": 0, **{chr(c): c - 31 for c in range(32, 127)}}
+    tok = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.Split(Regex(r"[\s\S]"), behavior="isolated")  # every char, newlines too
+    tok.save(str(path / "tokenizer.json"))
+    return path
+
+
+def toy_render(messages, tools=None, gen=False):
+    """What LocalRenderer gives for the toy model dir with the default template kwargs."""
+    conv = json.loads(json.dumps(messages))
+    if tools:
+        conv[0]["tools"] = tools
+    ns = {}
+    exec(TOY_ENCODING, ns)
+    text = ns["encode_messages"](conv, "thinking", drop_thinking=True, reasoning_effort=50)
+    return [ord(c) - 31 if 32 <= ord(c) < 127 else 0 for c in text]
+
+
+class LocalRender(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="replay_local_"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.model = toy_model_dir(self.tmp / "model")
+        tools = B.harness_tools(["--answer-tool"])
+        self.traces = {}
+        for i in range(3):  # recorded lengths as the toy server renders them
+            t = make_trace(3, 150 + i, tools=tools)
+            usage = [e["usage"] for e in t["events"] if "usage" in e]
+            asst = [j for j, m in enumerate(t["messages"]) if m["role"] == "assistant"]
+            for k, u in enumerate(usage):
+                u["prompt_tokens"] = len(toy_render(t["messages"][:asst[k]], tools))
+                u["completion_tokens"] = (len(toy_render(t["messages"][:asst[k] + 1], tools))
+                                          - u["prompt_tokens"])
+            self.traces[f"t{i}_p0_a0"] = t
+        self.dir = write_traces(self.tmp / "traces", self.traces)
+
+    def test_renderer_follows_the_fork_wrapper(self):
+        r = B.LocalRenderer(self.model)
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]},
+                {"role": "assistant", "content": "", "reasoning": "why"}]
+        text = r.text(msgs, [{"x": 1}], {"thinking": True, "reasoning_effort": 50})
+        self.assertTrue(text.startswith('[thinking|50|True]T[{"x": 1}]<system>'))  # tools on a new system message
+        self.assertIn("<user>a\n\nb", text)
+        self.assertIn("<assistant>why", text)  # reasoning -> reasoning_content
+        self.assertTrue(r.text(msgs, None, {}).startswith("[thinking|high|True]<user>"))
+        self.assertTrue(r.text(msgs, None, {"reasoning_effort": "none"}).startswith("[chat|high|True]"))
+        want = [ord(c) - 31 if 32 <= ord(c) < 127 else 0 for c in r.text(msgs, None, {})]  # "\n" is unknown: 0
+        self.assertEqual(r.render_many([(msgs, True)], None, {}), [want])
+
+    def test_offline_prep_then_run_against_the_server(self):
+        cache = str(self.tmp / "prep.json.gz")
+        s = B.main(["--traces", str(self.dir), "--prepare-only", "--local-render", str(self.model), "--prep-cache",
+                    cache, "--out", str(self.tmp / "prep"), "--quiet"])  # no server at all
+        self.assertEqual(s["fidelity"]["tools"], {str(self.dir): "auto:--answer-tool"})
+        self.assertEqual(s["fidelity"]["plan"]["prompt_len_exact_frac"], 1.0)
+        tools_file = self.tmp / "prep/tools.json"
+        self.assertEqual(json.loads(tools_file.read_text()), B.harness_tools(["--answer-tool"]))
+        fake = FakeVLLM(render=toy_render)
+        try:  # the pod side: tools from the file, plans from the cache
+            s = B.main(["--base-url", fake.url, "--traces", str(self.dir), "--prep-cache", cache, "--out",
+                        str(self.tmp / "run"), "--window-s", "0.25", "--warmup-s", "0", "--quiet",
+                        "--tools", str(tools_file)])
+            self.assertEqual(fake.tokenize_calls, 1)
+            self.assertEqual(s["fidelity"]["server_render_check"], "match")
+            self.assertEqual(s["requests_all"]["prompt_vs_recorded_exact_frac"], 1.0)
+        finally:
+            fake.close()
+        fake = FakeVLLM()  # a server with another template: the check says so
+        try:
+            s = B.main(["--base-url", fake.url, "--traces", str(self.dir), "--prep-cache", cache, "--out",
+                        str(self.tmp / "run2"), "--window-s", "0.25", "--warmup-s", "0", "--quiet"])
+            self.assertEqual(s["fidelity"]["server_render_check"], "mismatch")
+        finally:
+            fake.close()
 
 
 class Concurrency(ServerCase):

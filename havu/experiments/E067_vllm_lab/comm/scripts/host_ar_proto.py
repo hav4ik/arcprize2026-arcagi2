@@ -236,25 +236,25 @@ def worker(rank, world, init_file, seg_dir, args, q):
         objs[name] = o
     gaps = [int(g) for g in args.gap_us.split(",")]
     gap_cycles = {g: (calibrate_sleep(g) if g else 0) for g in gaps}
-    rows = []
-    for n in SIZES:
-        numel = n // 2
-        g0 = torch.Generator(device="cuda").manual_seed(1234 + rank)
-        x = torch.randn(numel, generator=g0, device="cuda", dtype=torch.float32).to(torch.bfloat16)
-        ref = x.clone()
-        dist.all_reduce(ref)
-        out = torch.empty_like(x)
-        iters = max(10, min(200, (32 << 20) // n))
-        row = {"bytes": n}
-        for name in paths:
+    rows_by = {n: {"bytes": n} for n in SIZES}
+    for name in paths:  # one path at a time: the C++ reducers are per process
+        o = objs.get(name)
+        if isinstance(o, Kernel):
+            o.start()
+        for n in SIZES:
+            row = rows_by[n]
+            numel = n // 2
+            g0 = torch.Generator(device="cuda").manual_seed(1234 + rank)
+            x = torch.randn(numel, generator=g0, device="cuda", dtype=torch.float32).to(torch.bfloat16)
+            out = torch.empty_like(x)
+            iters = max(10, min(200, (32 << 20) // n))
             if name == "nccl":
                 y = x.clone()
-                fn = lambda: dist.all_reduce(y)  # noqa: E731
+                fn = lambda y=y: dist.all_reduce(y)  # noqa: E731
             else:
-                o = objs[name]
-                if isinstance(o, Kernel) and not o.started:
-                    o.start()
-                fn = lambda o=o: o.all_reduce(x, out)  # noqa: E731
+                ref = x.clone()
+                dist.all_reduce(ref)
+                fn = lambda o=o, x=x, out=out: o.all_reduce(x, out)  # noqa: E731
                 dist.barrier(cpu)
                 fn()
                 torch.cuda.synchronize()
@@ -270,11 +270,17 @@ def worker(rank, world, init_file, seg_dir, args, q):
             if name == "nccl" or name.startswith("kernel"):
                 dist.barrier(cpu)
                 row[f"{name}_graph_us"] = time_graph(fn, max(4, min(50, (32 << 20) // n)))
+            if rank == 0:
+                print(name, n, {k: round(v, 1) for k, v in row.items() if k.startswith(name)}, flush=True)
+        if isinstance(o, Kernel):
+            o.close()
+    rows = []
+    for n in SIZES:
         allr = [None] * world
-        dist.all_gather_object(allr, row, group=cpu)
+        dist.all_gather_object(allr, rows_by[n], group=cpu)
         if rank == 0:
             m = {"bytes": n}
-            for k in row:
+            for k in rows_by[n]:
                 if k == "bytes":
                     continue
                 vals = [a[k] for a in allr]
@@ -313,7 +319,16 @@ def main():
     ps = [ctx.Process(target=worker, args=(r, 2, init_file, "/dev/shm", args, q)) for r in range(2)]
     for p in ps:
         p.start()
-    res = q.get(timeout=1500)
+    import queue
+    while True:  # give up as soon as a rank dies
+        try:
+            res = q.get(timeout=2)
+            break
+        except queue.Empty:
+            if any(p.exitcode not in (None, 0) for p in ps):
+                for p in ps:
+                    p.kill()
+                raise SystemExit("a rank failed")
     for p in ps:
         p.join(timeout=120)
     json.dump(res, open(args.out, "w"), indent=1)

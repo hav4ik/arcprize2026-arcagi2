@@ -104,6 +104,8 @@ class State:
         self.inflight = 0
         self.gate_blocked = 0
         self.kv_usage = 0.0
+        self.hit_recent = 1.0  # (local + external cached) / prompt tokens over the last ~10 s
+        self.hist = []
         self.stop = False
         self.t0 = time.time()
 
@@ -118,6 +120,14 @@ async def sampler(session, args, st, fout):
                 m = parse_metrics(await r.text())
             rec.update(m)
             st.kv_usage = m.get("vllm:kv_cache_usage_perc", st.kv_usage)
+            if "vllm:prompt_tokens_total" in m:
+                st.hist.append((t, m["vllm:prompt_tokens_total"],
+                                m.get("vllm:prompt_tokens_cached_total", 0.0)))
+                st.hist = [h for h in st.hist if t - h[0] <= 10.5]
+                dp = st.hist[-1][1] - st.hist[0][1]
+                if dp > 0:
+                    st.hit_recent = (st.hist[-1][2] - st.hist[0][2]) / dp
+            rec["hit_recent"] = round(st.hit_recent, 4)
         except Exception as e:  # noqa: BLE001
             rec["metrics_error"] = str(e)[:100]
         rec["server_rss_mb"] = proc_tree_rss_mb(args.server_pid)
@@ -176,10 +186,11 @@ async def worker(wid, session, args, st, fout, sys_ids):
     while not st.stop and time.time() - st.t0 < args.duration:
         # admission gate for NEW attempts
         t_gate = time.time()
-        if args.gate_kv < 1.0:
+        if args.gate_kv < 1.0 or args.gate_hit > 0.0:
             st.gate_blocked += 1
             while (not st.stop and time.time() - st.t0 < args.duration
-                   and st.active_attempts >= args.gate_min and st.kv_usage >= args.gate_kv):
+                   and st.active_attempts >= args.gate_min
+                   and (st.kv_usage >= args.gate_kv or st.hit_recent < args.gate_hit)):
                 await asyncio.sleep(0.25)
             st.gate_blocked -= 1
             if st.stop or time.time() - st.t0 >= args.duration:
@@ -272,6 +283,8 @@ def main():
     ap.add_argument("--think-max", type=float, default=4.0)
     ap.add_argument("--max-ctx", type=int, default=31000)
     ap.add_argument("--gate-kv", type=float, default=1.0, help="admit new attempts only if KV usage < this")
+    ap.add_argument("--gate-hit", type=float, default=0.0,
+                    help="admit new attempts only if the recent cached fraction of prompt tokens >= this")
     ap.add_argument("--gate-min", type=int, default=4, help="always allow this many active attempts")
     ap.add_argument("--request-timeout", type=float, default=3600)
     ap.add_argument("--sample-interval", type=float, default=1.0)

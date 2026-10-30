@@ -133,3 +133,19 @@ Whole run after the first 10 min of serving: mean 646 gen tok/s, mean running 47
   - a supervisor status change, or a server-log ERROR / Traceback / 500;
   - the notebook runner exiting.
 - **Reports:** a short one every 30 min, the full one hourly.
+
+### Report 3 (04:57 UTC; 3.0 h of solving; `report_0456.txt`)
+**Verdict: stable. VRAM headroom keeps shrinking linearly and slowly: worst cap - peak is 1.58 GiB, falling 0.16 GiB/h, so it reaches 0.26 in ~8 h (~11 h of solving, about at stop-new). Host RAM flat.**
+
+| UTC | worst cap - peak | worst cap - reserved | retries / OOMs | Kaggle-eq (cgroup) | gen tok/s | running / waiting |
+|---|---|---|---|---|---|---|
+| 03:20 | 1.75 | 1.23 | 0 / 0 | ~135 (meminfo form 146.0) | 536 | 38 |
+| 04:20 | 1.60 | 1.10 | 0 / 0 | 133.8 | 491 | 28 |
+| 04:56 | 1.58 | 1.08 | 0 / 0 | 134.5 | 620 | 39-41 / 0-1 |
+
+- **Growing:** peak allocated 19.40 -> 19.57 GiB in 1.6 h; reserved 19.92 -> 20.07. Allocated flat at 18.85.
+- **Not growing:** cgroup rss + shmem; TP-worker RSS 127.8; sandboxes 2.4-3.3 GiB.
+- **Events:** none (0 OOMs, deaths, restarts, retries, errored attempts or APITimeoutError).
+- **Accuracy:** 138 first attempts, 97 correct (70.3%). Stops: 128 submitted, 6 output_budget, 3 max_turns, 1 context.
+  - Accuracy falls as the long, hard attempts finish later.
+- **Throughput:** 3.0-3.5 h: 620 tok/s at 41 running. Whole-run mean after 10 min: 621 tok/s at 44.7 running.

@@ -3,11 +3,11 @@ file and server-log copies). Every 60 s runs state_now.py on the pod, writes a h
 its newest sample is > 240 s old, turns the sampler's 5 s mode on (fast.flag) once cap - peak < 0.35 GiB on any rank or
 after the first allocator retry, and EXITS printing ALERT lines (plus a 5-min timeline and, for engine events, the
 matching server-log lines; the server logs are copied to /root/e066/b32mv3/preserved/<UTC>/) on:
-the first / any further allocator retry, an OOM, an engine-death pattern, a server death or restart; cap - peak below
+the first allocator retry, a retry storm (>= +10 within 10 min; the running count is in every 30-min report), an OOM, an engine-death pattern, a server death or restart; cap - peak below
 0.40 / 0.30 / 0.26 GiB or a drop > 0.1 GiB within 30 min; Kaggle-eq > 155 GiB or rising > 2 GiB/h; any errored attempt,
 APITimeoutError or HTTP 500; gen tok/s at 0 for > 3 min with requests running; waiting > 30; a server ERROR /
 Traceback line; the notebook ending. Also exits with REPORT30 / REPORT60 at the 30-min / hourly marks of the Kaggle
-clock (T0 03:30:40 UTC). Alerts already reported are kept in watch2_state.json, so a restarted watcher does not repeat them.
+clock (T0 03:30:40 UTC). Every 5 min it also refreshes the dashboard files (export_dash.sh). Alerts already reported are kept in watch2_state.json, so a restarted watcher does not repeat them.
 Usage: watch2.py"""
 import datetime as dt, json, os, subprocess, sys, time
 
@@ -60,6 +60,13 @@ def finish(lines, engine=False):
     sys.exit(0)
 
 
+def dash_sync():
+    """Dashboard files every 5 min (export_dash.sh: gpumem.log, ram.tsv, status.json with the automatic verdict)."""
+    r = subprocess.run([f"{S}/export_dash.sh"], capture_output=True, text=True, timeout=600)
+    open(f"{S}/dash_sync.log", "a").write(time.strftime("%H:%M:%S ", time.gmtime()) + (r.stdout.strip().splitlines() or ["?"])[-1] + "\n")
+
+
+next_sync = time.time()
 # the next report mark (Kaggle clock half hours)
 now = time.time()
 k = int((now - T0) // 1800) + 1
@@ -85,7 +92,11 @@ while True:
     if (cp is not None and cp < 0.35 or rmax > 0) and not rep.get("fast"):
         ssh("touch /root/e066/b32mv3/fast.flag"); rep["fast"] = 1
         al.append(f"INFO sampler switched to 5 s (cap-peak {cp}, retries {rmax})")
-    if rmax > rep.get("retries", 0):
+    r10 = [max([r.get("retries", 0) for r in h["ranks"].values()] or [0]) for h in hist if h["t"] >= s["t"] - 600]
+    storm = r10 and rmax - min(r10) >= 10 and s["t"] - rep.get("storm_t", 0) > 1800
+    if storm:
+        rep["storm_t"] = s["t"]
+    if (rmax > 0 and rep.get("retries", 0) == 0) or storm:  # the first retry, then only a storm (>= +10 in 10 min, at most every 30 min)
         al.append(f"ALERT allocator retries now {rmax} (was {rep.get('retries', 0)}): " + ", ".join(f"TP{k} {r.get('retries')}" for k, r in sorted(s['ranks'].items())))
         rep["retries"] = rmax
     ooms = sum(r.get("ooms", 0) for r in s["ranks"].values()) + s["srv"]["oom"]
@@ -125,5 +136,11 @@ while True:
         finish(al, eng)
     if time.time() >= mark:
         finish([("REPORT60" if round((mark - T0) / 1800) % 2 == 0 else "REPORT30") + f" due (Kaggle {(mark - T0) / 3600:.1f} h)"] + al)
+    if time.time() >= next_sync:
+        try:
+            dash_sync()
+        except Exception as exc:
+            open(f"{S}/dash_sync.log", "a").write(f"sync failed: {exc}\n")
+        next_sync = time.time() + 300
     save()
     time.sleep(max(5, 60 - (time.time() - s["t"])))

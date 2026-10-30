@@ -40,6 +40,14 @@ The core test. It runs the frozen notebook code on Kaggle-like hardware with a h
   (`experiments/E055_kaggle_replica/toolkit/workloads/evalx2t_s2026`), so prompts do not share prefix cache.
 - The notebook's own cells via `local_run.py` + `podrun.sh`, launched with `toolkit/replica_run.sh` (Kaggle's deadlines
   moved 600 s earlier for Kaggle's slower startup; memory logging on).
+- **Reliability kit: `kaggle/reliability/` ([README](reliability/README.md), qualification steps 1-5).**
+  - Run the exact notebook with `run_notebook.py` (commit smoke, then the rerun replica).
+  - Hold Kaggle-like GPU headroom with `gpu_hold.py`, calibrated against the Kaggle smoke's allocator-cap lines. A pod
+    without the hold has ~0.5 GiB/GPU more headroom than Kaggle.
+  - Monitor with `sampler.py` + `watcher.py`; judge the run with `report.py` (slopes after warm-up, time to limit, one
+    verdict line).
+  - Host RAM must come from the container's cgroup, never from the host-wide `/proc/meminfo`. VRAM pressure is
+    vLLM's per-rank cap - peak and allocator retries, not nvidia-smi free.
 
 **Duration**
 - **Minimum 6 hours of continuous running.** By then the queue has reached heavy tasks, the KV pool has been under
@@ -69,6 +77,18 @@ metrics) in `experiments/E055_kaggle_replica/runs/` and, for shared data, a priv
 ## Stage 5. Failure paths
 - Server death under load: kill one worker of our own server mid-run (never by name; `experiments/E059_restart_under_load/killer.sh`)
   and confirm the restart stays under Kaggle's memory limit, jobs are re-queued, throughput recovers.
+- **Fault injection with `kaggle/reliability/fault_inject.py`** (a separate ~3 h rerun-mode run under load, within the
+  candidate's restart budget; [README step 4](reliability/README.md#step-4-fault-injection-a-separate-3-h-rerun-mode-run-same-setup-as-step-3)):
+  - `kill-tp <r>`: worker crash;
+  - `gpu-oom-burst <gpu>`: GPU OOM;
+  - `sigstop-engine`: a hang the supervisor's stall detection must catch;
+  - `cpu-stress`: CPU contention.
+
+  Targets are exact (`--dry-run` first). Pass with `fault_inject.py verify`:
+  - no attempt finalized as error;
+  - the death was seen and the in-flight jobs re-queued (retries that spend tries are a WARN);
+  - never two engines' host RAM, and Kaggle-eq under 173 GiB;
+  - server up within 900 s of a kill (hang: the stall limit + 900 s).
 - Tool sandbox: per-session memory/CPU/file limits hold and host memory is returned (`cells/cell2b_sandbox_check.py`).
 - Deadlines: the force cut and the final write run (covered by the replica and the smoke).
 

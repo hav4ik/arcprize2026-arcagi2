@@ -6,7 +6,7 @@
 #
 # Env passed through to the hook: MEMLAB_CAP_MB, MEMLAB_EXPANDABLE_AFTER,
 # MEMLAB_EMPTY_CACHE_EVERY, MEMLAB_SNAP_EVERY, PYTORCH_CUDA_ALLOC_CONF.
-# Writes $LOGDIR/$NAME.server.log, $LOGDIR/$NAME.<pid>.jsonl, $LOGDIR/$NAME.pid
+# NOLOCK=1 skips the flock (caller holds it). Writes $LOGDIR/$NAME.server.log, $LOGDIR/$NAME.<pid>.jsonl, $LOGDIR/$NAME.pid
 # (the process-group id; stop with: kill -TERM -- -$(cat $LOGDIR/$NAME.pid)).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -26,7 +26,9 @@ export PYTHONPATH="$HERE/hook"
 export MEMLAB_LOG="$LOGDIR/$NAME"
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-DEBUG}"
 export HF_HUB_OFFLINE=1
-setsid flock "$LOCK" "$PY" -m vllm.entrypoints.openai.api_server \
+# NOLOCK=1: the caller already holds the GPU-0 lock (see run_locked.sh).
+if [ "${NOLOCK:-0}" = 1 ]; then LOCKCMD=(); else LOCKCMD=(flock "$LOCK"); fi
+setsid "${LOCKCMD[@]}" "$PY" -m vllm.entrypoints.openai.api_server \
   --model "$MODEL" --served-model-name m --port "$PORT" \
   --gpu-memory-utilization "$UTIL" --max-model-len "$MAXLEN" \
   --max-num-batched-tokens "$MBT" --max-num-seqs "$MAXSEQS" \

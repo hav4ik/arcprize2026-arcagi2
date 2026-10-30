@@ -716,8 +716,9 @@ def notebook_done(paths):
     """The runner's end line (run_notebook.py "NOTEBOOK_DONE", papermill wrappers' "nb end rc=") or None."""
     for p in paths:
         try:
-            with open(p, errors="replace") as f:
-                txt = f.read()
+            with open(p, "rb") as f:
+                f.seek(max(0, os.path.getsize(p) - 65536))
+                txt = f.read().decode(errors="replace")
         except OSError:
             continue
         hits = [ln for ln in txt.splitlines() if "NOTEBOOK_DONE" in ln or "nb end rc=" in ln]

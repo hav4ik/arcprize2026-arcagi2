@@ -129,10 +129,11 @@ class Watcher:
         self.s["counts"][key] = value
         return value > old
 
-    def evaluate(self, r, history):
+    def evaluate(self, r, recs, i, clk=None):
+        """Alerts for recs[i] (recs = every sample so far; clk = rc.clock(recs), computed once per poll)."""
         a, s, out = self.a, self.s, []
         t = r["t"]
-        hours, label = rc.clock(history)
+        hours, label = clk or rc.clock(recs[:i + 1])
         tag = " [%s %.2f]" % (label, hours(t))
 
         def emit(level, code, msg):
@@ -237,7 +238,7 @@ class Watcher:
             s["nb_end"] = True
         if t - s.get("last_trend_t", 0) >= a.trend_every_min * 60:
             s["last_trend_t"] = t
-            for code, st, txt in trends(history, a):
+            for code, st, txt in trends(recs[:i + 1], a):
                 prev = s.setdefault("trend", {}).get(code)
                 if st in ("RISK", "FAIL") and (prev is None or prev[0] != st or t - prev[1] >= 3600):
                     emit("WARN", "trend", txt)
@@ -259,8 +260,9 @@ class Watcher:
     def run_once(self, now=None):
         recs = rc.load_records(self.a.samples)
         out = []
+        clk = rc.clock(recs)
         for i in range(self.s["n"], len(recs)):
-            out.extend(self.evaluate(recs[i], recs[:i + 1]))
+            out.extend(self.evaluate(recs[i], recs, i, clk))
         self.s["n"] = len(recs)
         out.extend(self.stale(recs, now or time.time()))
         return out, recs

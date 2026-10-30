@@ -148,7 +148,16 @@ def main():
     ps = [ctx.Process(target=worker, args=(r, 2, init_file, args, q)) for r in range(2)]
     for p in ps:
         p.start()
-    res = q.get(timeout=900)
+    import queue
+    while True:  # give up as soon as a rank dies
+        try:
+            res = q.get(timeout=2)
+            break
+        except queue.Empty:
+            if any(p.exitcode not in (None, 0) for p in ps):
+                for p in ps:
+                    p.kill()
+                raise SystemExit("a rank failed")
     for p in ps:
         p.join(timeout=120)
     json.dump(res, open(args.out, "w"), indent=1)

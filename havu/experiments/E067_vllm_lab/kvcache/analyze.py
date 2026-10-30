@@ -23,6 +23,13 @@ def load(prefix):
     mets = [json.loads(l) for l in open(prefix + ".metrics.jsonl")]
     cfg = json.load(open(prefix + ".config.json"))
     srv = json.load(open(prefix + ".server.json")) if os.path.exists(prefix + ".server.json") else {}
+    sched = [json.loads(l) for l in open(prefix + ".sched.jsonl")] if os.path.exists(prefix + ".sched.jsonl") else []
+    if sched and mets:
+        # align scheduler wall clock to loadgen t (loadgen t0 = first metrics sample time - its t)
+        t0 = os.path.getmtime(prefix + ".config.json")
+        for r in sched:
+            r["t"] = r["t"] - t0
+    srv["sched"] = sched
     return prefix, turns, attempts, mets, cfg, srv
 
 
@@ -84,14 +91,28 @@ def summarize(prefix, w0, w1):
     off_g2c = d(m0, m1, "vllm:kv_offload_total_bytes_total{GPU_to_CPU}")
     off_c2g = d(m0, m1, "vllm:kv_offload_total_bytes_total{CPU_to_GPU}")
     pct = (lambda a, q: float(np.percentile(a, q)) if len(a) else float("nan"))
-    return {
+    sc = srv.get("sched") or []
+    sx = {}
+    if sc:
+        s0 = min(sc, key=lambda r: abs(r["t"] - w0))
+        s1 = min(sc, key=lambda r: abs(r["t"] - w1))
+        sdt = max(s1["t"] - s0["t"], 1e-9)
+        ds = lambda k: s1[k] - s0[k]  # noqa: E731
+        sw = [r for r in sc if w0 <= r["t"] <= w1]
+        sx = {"prefill_tok_s": ds("tok_prefill") / sdt, "decode_tok_s": ds("tok_decode") / sdt,
+              "recompute_frac": ds("tok_recompute") / max(ds("tok_prefill"), 1),
+              "hol_frac": ds("hol_steps") / max(ds("steps"), 1), "steps_s": ds("steps") / sdt,
+              "evictable_ktok": np.mean([r["cached_free_blocks"] for r in sw]) * 16 / 1000 if sw else float("nan"),
+              "loading": np.mean([r["skipped_waiting"] for r in sw]) if sw else float("nan")}
+    ib = d(m0, m1, "vllm:kv_block_idle_before_evict_seconds_sum") / max(d(m0, m1, "vllm:kv_block_idle_before_evict_seconds_count"), 1)
+    rg = d(m0, m1, "vllm:kv_block_reuse_gap_seconds_sum") / max(d(m0, m1, "vllm:kv_block_reuse_gap_seconds_count"), 1)
+    return {**sx, "idle_before_evict_s": ib, "reuse_gap_s": rg,
         "run": os.path.basename(prefix), "C": cfg["concurrency"],
         "gate": cfg["gate_kv"] if cfg["gate_kv"] < 1 else "-",
         "kv_tok": srv.get("kv_tokens"),
         "gen_tok_s": gen / dt, "turns_min": len(tdone) / dt * 60,
         "att_done": sum(1 for a in attempts if a["attempt_done"]),
-        "prompt_tok_s": ptoks / dt, "computed_tok_s": computed / dt,
-        "recompute_frac": (computed - lc) / max(computed, 1),
+        "prompt_tok_s": ptoks / dt, "new_uncached_tok_s": lc / dt,
         "hit_ideal": ideal_reuse(turns, w0, w1)[0], "hit_client": ideal_reuse(turns, w0, w1)[1],
         "hit_gpu_req": lh / max(ptoks, 1), "hit_ext_req": ex / max(ptoks, 1),
         "hit_gpu_prom": ph / max(pq, 1), "prom_q_over_prompt": pq / max(ptoks, 1),

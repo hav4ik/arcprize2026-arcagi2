@@ -7,10 +7,11 @@ assistant message. The request generates exactly the recorded turn's completion 
 max_tokens, temperature 0), so prompt growth and the prefix-cache pattern follow the real run whatever the model writes.
 
 Modes (--mode):
-  tokens     (default) the harness's --token-exact path. Prompts are rendered to token ids once through the server's
-             /tokenize and cached with --prep-cache. Turn k+1 = turn k's prompt ids + the ids the server generated in
-             turn k + the rendered new messages (tool results), sent to /v1/completions. After a turn the real run cut at
-             max_tokens or rewrote (rescue), the next prompt is a fresh render, as in the harness. Text traces only.
+  tokens     (default) the harness's --token-exact path. Prompts are rendered to token ids once, through the server's
+             /tokenize or offline with --local-render MODEL_DIR (DeepSeek-V4.1), and cached with --prep-cache.
+             Turn k+1 = turn k's prompt ids + the ids the server generated in turn k + the rendered new messages (tool
+             results), sent to /v1/completions. After a turn the real run cut at max_tokens or rewrote (rescue), the
+             next prompt is a fresh render, as in the harness. Text traces only.
   chat       /v1/chat/completions with the recorded messages; the server renders them. The recorded assistant turns
              replace what the server generated, so each turn re-prefills the previous turn's output: prefix-cache hits
              come out lower than in the real run. Image traces work here.
@@ -25,10 +26,14 @@ Outputs in --out: windows.jsonl (one record per --window-s, written as the run g
 summary.json and report.md. Server-side numbers come from /metrics (vllm:* counters); --server-log tails vLLM's per-rank
 "GPU memory: ..." and "Capped the PyTorch allocator at ..." lines to report allocator headroom (cap - peak) over time.
 
-  .venv/bin/python evals/serve_replay_bench.py --base-url http://127.0.0.1:8000 \\
-      --traces experiments/E064_manh_notebook_b32_harness/l4e2e/runs/b32m_x2t/out/dsv41_traces.tar.gz \\
-      --concurrency 64 --duration 1200 --warmup-s 300 --seed 0 --server-log server.log \\
-      --prep-cache prep/b32m_x2t.tokens.json.gz --out runs/replay_base
+  T=experiments/E064_manh_notebook_b32_harness/l4e2e/runs/b32m_x2t/out/dsv41_traces.tar.gz
+  # once, on any CPU box: render the traces to token ids
+  .venv/bin/python evals/serve_replay_bench.py --prepare-only --traces $T --local-render data/dsv4_prune/model_meta \\
+      --prep-cache prep/b32m_x2t.tokens.json.gz --out prep/b32m_x2t
+  # per server configuration (~20 min)
+  python evals/serve_replay_bench.py --base-url http://127.0.0.1:8000 --traces $T \\
+      --prep-cache prep/b32m_x2t.tokens.json.gz --tools prep/b32m_x2t/tools.json --concurrency 64 \\
+      --duration 1200 --warmup-s 300 --seed 0 --server-log server.log --out runs/replay_base
 
 How to run it on a pod and do flag ablations: notes/2026-10-30_serve_replay_bench.md. Only the standard library is
 needed; tool schemas for --tools auto / harness:... come from evals/run_deepseek_tools.py (or pass a JSON file).
@@ -56,7 +61,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 EVALS = Path(__file__).resolve().parent
-PREP_VERSION = 1
+PREP_VERSION = 2  # bump when plan_tokens changes: older caches are ignored
 DEFAULT_TEMPLATE_KWARGS = '{"thinking": true, "reasoning_effort": 50}'  # B32 / B32-M solver (ARC_REASONING_EFFORT=50)
 # --tools auto: harness flag sets tried per trace source; the one whose turn-1 render matches the recorded prompt wins
 HARNESS_BASE = ["--mode", "grid"]
@@ -131,7 +136,8 @@ def parse_trace(obj, key, source, digest=None):
     """A harness trace ({"messages": [...], "events": [...]}, as written by evals/run_deepseek_tools.py and the dsv41
     solver) -> Attempt, or None if it is not a trace or has no usable turn. The k-th event with "usage" is the k-th
     model call, whose assistant message is the k-th assistant message (each call appends exactly one)."""
-    if not isinstance(obj, dict) or not isinstance(obj.get("messages"), list) or not isinstance(obj.get("events"), list):
+    if not isinstance(obj, dict) or not isinstance(obj.get("messages"), list) \
+            or not isinstance(obj.get("events"), list):
         return None
     messages, events = obj["messages"], obj["events"]
     usage_events = [e for e in events if isinstance(e, dict) and isinstance(e.get("usage"), dict)]
@@ -421,7 +427,69 @@ def harness_tools(flags):
     return H.tools_for(H.parser().parse_args(HARNESS_BASE + list(flags)))
 
 
-def resolve_tools(spec, attempts, server, model, template_kwargs, cache):
+class ServerRenderer:
+    """Chat messages -> prompt ids through the server's /tokenize (what the harness's --token-exact path calls)."""
+    label = "server /tokenize"
+
+    def __init__(self, server, model):
+        self.server, self.model = server, model
+
+    def render_many(self, reqs, tools, template_kwargs):
+        """reqs: [(messages, add_generation_prompt)] -> [ids]."""
+        return [self.server.tokenize(self.model, m, tools, template_kwargs, gen) for m, gen in reqs]
+
+
+class LocalRenderer:
+    """DeepSeek-V4.1 /tokenize without a server: MODEL_DIR/encoding/encoding.py (the model's reference encoder) and
+    MODEL_DIR/tokenizer.json, applied the way the fork's vllm/tokenizers/deepseek_v41.py renders chat messages (tools on
+    the first system message, thinking / reasoning_effort / drop_thinking from chat_template_kwargs; the generation
+    header is part of encode_messages). Tokenization is batched (encode_batch runs on every core). On 1,191 recorded
+    turns of r1_rerun and b32m_x2t the plans match the recorded prompt_tokens exactly. Loading encoding.py runs code
+    from MODEL_DIR: pass only the model's own files."""
+
+    def __init__(self, model_dir):
+        import importlib.util
+        from tokenizers import Tokenizer
+        d = Path(model_dir)
+        spec = importlib.util.spec_from_file_location("dsv41_encoding_local", d / "encoding" / "encoding.py")
+        self.enc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.enc)
+        self.tok = Tokenizer.from_file(str(d / "tokenizer.json"))
+        self.label = f"local {d}"
+
+    def text(self, messages, tools, kw):
+        conv = json.loads(json.dumps(messages))
+        for m in conv:
+            if "reasoning" in m:
+                m["reasoning_content"] = m["reasoning"]
+            if isinstance(m.get("content"), list):
+                if any(isinstance(p, dict) and p.get("type") != "text" for p in m["content"]):
+                    raise ValueError("--local-render renders text messages only")
+                m["content"] = "\n\n".join(p.get("text", "") for p in m["content"])
+        if tools:
+            system = next((m for m in conv if m.get("role") == "system"), None)
+            if system is None:
+                system = {"role": "system", "content": ""}
+                conv.insert(0, system)
+            system["tools"] = tools
+        kw = kw or {}
+        thinking = bool(kw.get("thinking") or kw.get("enable_thinking"))
+        if "thinking" not in kw and "enable_thinking" not in kw:
+            thinking = True
+        effort = kw.get("reasoning_effort")
+        if effort == "none":
+            thinking, effort = False, None
+        if effort is None:
+            effort = "high"
+        return self.enc.encode_messages(conv, thinking_mode="thinking" if thinking else "chat",
+                                        drop_thinking=kw.get("drop_thinking", True), reasoning_effort=effort)
+
+    def render_many(self, reqs, tools, template_kwargs):
+        texts = [self.text(m, tools, template_kwargs) for m, _ in reqs]
+        return [e.ids for e in self.tok.encode_batch(texts, add_special_tokens=False)]
+
+
+def resolve_tools(spec, attempts, renderer, template_kwargs, cache):
     """--tools -> {source: (tools, label)}. auto: per trace source, the harness flag set whose turn-1 render has the
     recorded prompt length (closest if none is exact; the choice is kept in the prep cache)."""
     sources = {}
@@ -438,19 +506,19 @@ def resolve_tools(spec, attempts, server, model, template_kwargs, cache):
         return {s: (tools, f"file:{spec}") for s in sources}
     out, detected = {}, cache.setdefault("tools", {})
     for source, a in sources.items():
-        key = sha1(f"{a.digest}|{model}|{json.dumps(template_kwargs, sort_keys=True)}")
+        key = sha1(f"{a.digest}|{json.dumps(template_kwargs, sort_keys=True)}")
         if key in detected:
             flags = detected[key]["flags"]
-            out[source] = (harness_tools(flags), "auto:" + " ".join(flags))
+            out[source] = (harness_tools(flags), "auto:" + (" ".join(flags) or "(no flags)"))
             continue
         target, best = a.turns[0].prompt_rec, None
         msgs = a.messages[:a.turns[0].msg_index]
         for flags in TOOL_CANDIDATES:
             tools = harness_tools(flags)
             try:
-                n = len(server.tokenize(model, msgs, tools, template_kwargs, True))
+                n = len(renderer.render_many([(msgs, True)], tools, template_kwargs)[0])
             except Exception as exc:
-                log(f"WARNING /tokenize failed ({type(exc).__name__}: {exc}); --tools auto falls back to "
+                log(f"WARNING render failed ({type(exc).__name__}: {exc}); --tools auto falls back to "
                     f"harness:--answer-tool")
                 return {s: (harness_tools(["--answer-tool"]), "fallback:--answer-tool") for s in sources}
             if best is None or abs(n - target) < abs(best[0] - target):
@@ -462,7 +530,7 @@ def resolve_tools(spec, attempts, server, model, template_kwargs, cache):
         if n != target:
             log(f"WARNING {source}: no harness tool set renders turn 1 at its recorded {target} tokens; closest "
                 f"{' '.join(flags) or '(no flags)'} at {n}. Check --tools / --chat-template-kwargs.")
-        out[source] = (tools, "auto:" + " ".join(flags))
+        out[source] = (tools, "auto:" + (" ".join(flags) or "(no flags)"))
     return out
 
 
@@ -479,21 +547,31 @@ def _arr(ids):
     return array.array("i", ids)
 
 
-def plan_tokens(att, render):
-    """Tokens-mode plan via render(messages, add_generation_prompt) -> ids, mirroring the harness's --token-exact path:
-    only the messages appended since the previous assistant turn are new; a turn after a cut / rewritten turn, or a
-    render that is not prefix-stable, is sent as a full render. -> (plan, predicted prompt length per turn)."""
+def plan_tokens(att, render_many):
+    """Tokens-mode plan, mirroring the harness's --token-exact path: only the messages appended since the previous
+    assistant turn are new; a turn after a cut / rewritten turn, or a render that is not prefix-stable, is sent as a
+    full render. render_many([(messages, add_generation_prompt)]) -> [ids]. -> (plan, predicted prompt length per
+    turn, with the generated history as long as the recorded completions)."""
     t, m = att.turns, att.messages
-    p1 = render(m[:t[0].msg_index], True)
+    reqs = [(m[:t[0].msg_index], True)]
+    for k in range(1, len(t)):
+        reqs.append((m[:t[k].msg_index], True))
+        if not t[k - 1].resync:
+            reqs.append((m[:t[k - 1].msg_index + 1], False))
+    ids = iter(render_many(reqs))
+    p1 = next(ids)
     plan, pred = Plan(_arr(p1)), [len(p1)]
     for k in range(1, len(t)):
-        full = render(m[:t[k].msg_index], True)
+        full = next(ids)
         seg = None
         if not t[k - 1].resync:
-            upto = render(m[:t[k - 1].msg_index + 1], False)
-            if full[:len(upto)] == upto:
+            upto = next(ids)
+            n = pred[-1] + t[k - 1].completion + len(full) - len(upto)
+            # the harness also re-renders after a turn whose output was not canonical (parse_fallbacks), which the
+            # trace does not flag: the recorded prompt then has the full render's length, not the continued history's
+            if full[:len(upto)] == upto and (n == t[k].prompt_rec or len(full) != t[k].prompt_rec):
                 seg = ("delta", _arr(full[len(upto):]), 0)
-                pred.append(pred[-1] + t[k - 1].completion + len(seg[1]))
+                pred.append(n)
         if seg is None:
             seg = ("full", _arr(full), 0)
             pred.append(len(full))
@@ -556,12 +634,14 @@ def save_prep_cache(path, cache):
     os.replace(tmp, path)
 
 
-def prepare_plans(attempts, args, server, model, tools_by_source, template_kwargs, cache):
-    """-> {attempt digest: (plan, predicted lengths)} for tokens / synthetic mode, using and filling the prep cache."""
+def prepare_plans(attempts, args, renderer, tools_by_source, template_kwargs, cache):
+    """-> {attempt digest: (plan, predicted lengths)} for tokens / synthetic mode, using and filling the prep cache.
+    Cache entries are keyed by trace content + tools + template kwargs (not by server or model name: a cache built with
+    --local-render serves a run against the server; check_server_render verifies that on the run)."""
     plans, todo = {}, []
     for a in attempts:
         tools, _ = tools_by_source.get(a.source, (None, ""))
-        settings = {"mode": args.mode, "model": model, "tools": tools, "kwargs": template_kwargs,
+        settings = {"mode": args.mode, "tools": tools, "kwargs": template_kwargs,
                     "vocab": args.synthetic_vocab if args.mode == "synthetic" else None}
         key = f"{a.digest}|{sha1(json.dumps(settings, sort_keys=True))}"
         if key in cache["plans"]:
@@ -576,13 +656,15 @@ def prepare_plans(attempts, args, server, model, tools_by_source, template_kwarg
             plans[a.digest] = plan_synthetic(a, lo, hi)
             cache["plans"][key] = plan_to_json(*plans[a.digest])
         return plans
-    log(f"rendering {len(todo)} attempts via /tokenize ({args.prep_workers} workers)")
+    local = isinstance(renderer, LocalRenderer)
+    log(f"rendering {len(todo)} attempts ({renderer.label}" + ("" if local else f", {args.prep_workers} workers")
+        + ")")
     done, lock, t0 = [0], threading.Lock(), time.monotonic()
 
     def one(item):
         a, tools, key = item
         try:
-            plan, pred = plan_tokens(a, lambda msgs, gen: server.tokenize(model, msgs, tools, template_kwargs, gen))
+            plan, pred = plan_tokens(a, lambda reqs: renderer.render_many(reqs, tools, template_kwargs))
         except Exception as exc:  # the attempt is left out of the run (main reports how many)
             log(f"WARNING render failed for {a.key}: {type(exc).__name__}: {exc}"[:400])
             return
@@ -593,9 +675,30 @@ def prepare_plans(attempts, args, server, model, tools_by_source, template_kwarg
             if done[0] % 50 == 0 or done[0] == len(todo):
                 log(f"  rendered {done[0]}/{len(todo)} attempts ({time.monotonic() - t0:.0f} s)")
 
-    with ThreadPoolExecutor(args.prep_workers) as ex:
+    # local: one attempt at a time, its renders tokenized as one parallel batch; server: attempts in parallel
+    with ThreadPoolExecutor(1 if local else args.prep_workers) as ex:
         list(ex.map(one, todo))
     return plans
+
+
+def check_server_render(attempts, plans, server, model, tools_by_source, template_kwargs):
+    """Tokens mode with cached or locally rendered plans: does the server's /tokenize give the first attempt's planned
+    turn-1 ids? -> "match", "mismatch" (logged loudly) or "unavailable"."""
+    a = next((a for a in attempts if a.digest in plans), None)
+    if a is None:
+        return "unavailable"
+    tools, _ = tools_by_source.get(a.source, (None, ""))
+    try:
+        ids = server.tokenize(model, a.messages[:a.turns[0].msg_index], tools, template_kwargs, True)
+    except Exception as exc:
+        log(f"WARNING cannot check the plans against the server's /tokenize: {type(exc).__name__}: {exc}"[:300])
+        return "unavailable"
+    if ids == plans[a.digest][0].p1.tolist():
+        return "match"
+    log(f"WARNING the server renders {a.key} turn 1 differently from the plan ({len(ids)} vs "
+        f"{len(plans[a.digest][0].p1)} tokens): the prep cache / --local-render does not match this server's "
+        "tokenizer or template; rebuild it")
+    return "mismatch"
 
 
 def plan_fidelity(attempts, plans):
@@ -775,7 +878,8 @@ def make_window(t0, t1, m0, m1, acc, mem=None, gauges=None, warmup_s=0.0, tail_a
                 w["external_hit_tok_s"] = rnd(ext / dt, 1)
     w["counter_reset"] = reset
     if m1 is not None:
-        w.update({"kv_usage": rnd(m1.get("kv_cache_usage_perc"), 4), "kv_usage_max": rnd(m1.get("kv_cache_usage_max"), 4),
+        w.update({"kv_usage": rnd(m1.get("kv_cache_usage_perc"), 4),
+                  "kv_usage_max": rnd(m1.get("kv_cache_usage_max"), 4),
                   "running": m1.get("num_requests_running"), "waiting": m1.get("num_requests_waiting"),
                   "preemptions_total": m1.get("num_preemptions_total")})
     w.update(mem or {})
@@ -1130,7 +1234,8 @@ def write_report(path, summary, windows):
     c, s, al, rq = summary["config"], summary.get("steady") or {}, summary.get("all") or {}, summary["requests_steady"]
     rqa = summary["requests_all"]
     L = [f"# Serve replay bench: {Path(c['out']).name}", "",
-         f"- Server: {c['base_url']} model `{summary['server'].get('model')}`, vLLM {summary['server'].get('version')}, "
+         f"- Server: {c['base_url']} model `{summary['server'].get('model')}`, "
+         f"vLLM {summary['server'].get('version')}, "
          f"KV cache {summary['server'].get('kv_cache_tokens') or '-'} tokens (server log)",
          f"- Workload: {summary['workload']['attempts']} attempts, {summary['workload']['turns']} turns from "
          f"{len(c['traces'])} trace spec(s); mode `{c['mode']}`, concurrency {c['concurrency']}, seed {c['seed']}, "
@@ -1172,14 +1277,15 @@ def write_report(path, summary, windows):
               f"{_f(al.get('mem_ooms'))} / {_f(al.get('mem_retries'))} |"]
     fid = summary.get("fidelity") or {}
     L += ["", "## Fidelity", "",
-          f"- Tools: " + "; ".join(f"{Path(k).name or k}: {v}" for k, v in (fid.get("tools") or {}).items()),
+          "- Tools: " + "; ".join(f"{Path(k).name or k}: {v}" for k, v in (fid.get("tools") or {}).items()),
           f"- Planned prompt lengths vs recorded: {json.dumps(fid.get('plan') or {})}",
           f"- Served prompt tokens vs recorded: exact {_f(rqa.get('prompt_vs_recorded_exact_frac'), 4)}, mean |diff| "
           f"{_f(rqa.get('prompt_vs_recorded_mean_abs_diff'))} tokens",
           f"- Prefix-cache hit: recorded in the traces {_f(rqa.get('recorded_prefix_hit'), 4)}, served (usage) "
           f"{_f(rqa.get('served_prefix_hit'), 4)}, server metrics {_f(al.get('prefix_hit'), 4)}",
           f"- Output length mismatches: {rqa.get('output_len_mismatch')}; turns without returned token ids: "
-          f"{rqa.get('missing_token_ids')}; request errors {rqa.get('errors')}, aborted at the end {rqa.get('aborted')}",
+          f"{rqa.get('missing_token_ids')}; request errors {rqa.get('errors')}, aborted at the end "
+          f"{rqa.get('aborted')}; connection retries {rqa.get('connect_retries')}",
           "", "## Windows", ""]
     rows = windows
     if len(windows) > 60:  # merge consecutive windows into at most 60 rows
@@ -1213,7 +1319,8 @@ def write_report(path, summary, windows):
 # -------------------------------------------------------------------------------------------------------------- main
 def parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", required=True, help="server root or its /v1 URL, e.g. http://127.0.0.1:8000")
+    ap.add_argument("--base-url", help="server root or its /v1 URL, e.g. http://127.0.0.1:8000 (not needed for "
+                    "--prepare-only --local-render)")
     ap.add_argument("--model", help="served model name (default: the first id of /v1/models)")
     ap.add_argument("--api-key", default=os.environ.get("SERVE_BENCH_API_KEY"),
                     help="bearer token (default $SERVE_BENCH_API_KEY; our vLLM servers need none)")
@@ -1243,6 +1350,9 @@ def parser():
     ap.add_argument("--cache-salt", default="auto", help="auto: a fresh salt per run (+ pass index), so nothing cached "
                     "by an earlier run on the same server is reused; none: omit; or a fixed string")
     ap.add_argument("--prep-cache", help="tokens mode: rendered token ids are kept here (.json.gz) and reused")
+    ap.add_argument("--local-render", metavar="MODEL_DIR", help="tokens mode, DeepSeek-V4.1: render with MODEL_DIR's "
+                    "encoding/encoding.py + tokenizer.json instead of the server's /tokenize (build the prep cache "
+                    "on a CPU box: --prepare-only --local-render DIR --prep-cache F, no server needed)")
     ap.add_argument("--prep-workers", type=int, default=8)
     ap.add_argument("--prepare-only", action="store_true", help="load traces, render / plan, report fidelity, exit")
     ap.add_argument("--synthetic-vocab", default="1000:30000", help="synthetic mode: token id range lo:hi")
@@ -1274,21 +1384,33 @@ def main(argv=None):
         f"({load_stats['duplicates']} duplicate files, {load_stats['not_traces']} non-trace files, "
         f"{load_stats['dropped_turns']} turns without usage dropped)")
 
-    server = Server(args.base_url, args.api_key, args.request_timeout)
-    model = args.model
-    try:
-        models = server.models()
-        model = model or models[0]
-    except Exception as exc:
-        raise SystemExit(f"server not reachable at {server.root}/v1/models: {type(exc).__name__}: {exc}")
+    if args.local_render and args.mode != "tokens":
+        raise SystemExit("--local-render is for --mode tokens")
+    offline = bool(args.prepare_only and args.local_render)
+    if not args.base_url and not offline:
+        raise SystemExit("--base-url is required (except for --prepare-only --local-render)")
+    server, model = None, args.model
+    if args.base_url:
+        server = Server(args.base_url, args.api_key, args.request_timeout)
+        try:
+            model = model or server.models()[0]
+        except Exception as exc:
+            if not offline:
+                raise SystemExit(f"server not reachable at {server.root}/v1/models: {type(exc).__name__}: {exc}")
+            server = None
+    renderer = LocalRenderer(args.local_render) if args.local_render else (
+        ServerRenderer(server, model) if server else None)
     cache = load_prep_cache(args.prep_cache) if args.mode == "tokens" else {"version": PREP_VERSION, "plans": {},
                                                                               "tools": {}}
     tools_by_source = {}
     if args.mode in ("tokens", "chat"):
-        tools_by_source = resolve_tools(args.tools, attempts, server, model, template_kwargs, cache)
+        tools_by_source = resolve_tools(args.tools, attempts, renderer, template_kwargs, cache)
+        distinct = {json.dumps(t, sort_keys=True): t for t, _ in tools_by_source.values() if t}
+        for i, t in enumerate(distinct.values()):  # for --tools FILE on a box without evals/run_deepseek_tools.py
+            (out / ("tools.json" if len(distinct) == 1 else f"tools_{i}.json")).write_text(json.dumps(t, indent=1))
     plans = {}
     if args.mode in ("tokens", "synthetic"):
-        plans = prepare_plans(attempts, args, server, model, tools_by_source, template_kwargs, cache)
+        plans = prepare_plans(attempts, args, renderer, tools_by_source, template_kwargs, cache)
         if args.prep_cache and args.mode == "tokens":
             save_prep_cache(args.prep_cache, cache)
         failed = [a for a in attempts if a.digest not in plans]
@@ -1298,7 +1420,11 @@ def main(argv=None):
             if not attempts:
                 raise SystemExit("no attempt could be rendered")
     fid = {"tools": {s: label for s, (_, label) in tools_by_source.items()}, "plan": plan_fidelity(attempts, plans),
-           "max_model_len": server.max_model_len}
+           "renderer": renderer.label if renderer and args.mode == "tokens" else None}
+    if args.mode == "tokens" and server is not None:
+        fid["server_render_check"] = check_server_render(attempts, plans, server, model, tools_by_source,
+                                                         template_kwargs)
+    fid["max_model_len"] = server.max_model_len if server else None
     if fid["plan"]:
         log(f"planned prompt lengths vs recorded: {json.dumps(fid['plan'])}")
         if fid["plan"]["prompt_len_exact_frac"] < 0.95:

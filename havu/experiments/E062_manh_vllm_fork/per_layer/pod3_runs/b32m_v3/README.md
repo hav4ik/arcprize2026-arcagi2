@@ -91,3 +91,33 @@ Dashboard data in `data/`, refreshed every 30 min by `export_dash.sh`:
 - Host: Kaggle-eq 148.8 -> 149.4 GiB (+1.3 GiB/h, all of it sandboxes 3.5 -> 4.0 GiB). Shmem flat at 125.1 GiB; one engine.
 - Health: 0 errors / timeouts / HTTP 500. Running 80, waiting 0, KV 0.31, 0 preemptions; 466 gen tok/s, prefix hit 0.95.
 - Accuracy: 19 first attempts, 15 fully correct; 22 of 344 pairs answered.
+
+**First allocator retry at Kaggle ~1.26 h (04:46 UTC), on all 4 ranks at once.** The auditor's earlier pod replica first retried at 2.5 h, on TP2/3 only.
+- 04:45:20: every rank peak 19.87, reserved 20.30 (0.26 split), 0 retries; free 0.61 (TP0/1) / 0.55 (TP2/3).
+- 04:46:08: gen throughput 237.8 tok/s (from ~450-500), running 78 / waiting 1, KV 36.4%.
+- 04:46:18: prefill burst, 1,206 prompt tok/s.
+- 04:46:21, every rank: 19.34 allocated (peak 19.90), 20.32 reserved, 0.26 split, 1 retry, 0 OOMs.
+  - cap - peak: TP0 0.53, TP1 0.51, TP2 and TP3 0.47.
+- 04:46:28 on: back to 413-495 gen tok/s, running 79-80, waiting 0.
+- The sampler switched to 5 s (`fast.flag`). Repeat retry alerts are now sent at most every 10 min.
+
+**Kaggle 1.5 h (05:01 UTC): stable but tightening.** Allocator retries are climbing (TP0 / TP1 / TP2 / TP3 = 5 / 6 / 9 / 9 by 05:00, from 1 at 04:46; 3-4 at 04:51), 0 OOMs.
+- cap - peak 0.52 / 0.50 / 0.46 / 0.46 GiB (peak 19.91): about -0.07 GiB/h on both hours, so 0.26 is ~2.7 h away (~07:45 UTC, Kaggle ~4.2 h).
+- Kaggle-eq 149.7 GiB, flat. 405-484 gen tok/s, running 79-80, waiting 0. 0 errors, deaths or restarts.
+- Accuracy: 40 first attempts, 34 fully correct; 49 of 344 pairs.
+- Dashboard files now refresh every 5 min (`watch2.py` runs `export_dash.sh`; log `dash_sync.log`), including `data/status.json`.
+
+**Kaggle 2.0 h (05:31 UTC): stable, VRAM growing faster; 0.26 is ~1.8 h away (~07:20 UTC, Kaggle ~3.8 h).**
+
+| Kaggle h | peak | reserved (TP2/3) | cap - peak TP0 / TP1 / TP2 / TP3 | retries TP0 / TP1 / TP2 / TP3 | OOMs |
+|---|---|---|---|---|---|
+| 0.34 | 19.82 | 20.26 | 0.61 / 0.59 / 0.55 / 0.55 | 0 | 0 |
+| 1.01 | 19.86 | 20.30 | 0.57 / 0.55 / 0.51 / 0.51 | 0 | 0 |
+| 1.51 | 19.91 | 20.32 | 0.52 / 0.50 / 0.46 / 0.46 | 5 / 6 / 9 / 9 | 0 |
+| 2.00 | 19.95 | 20.34 | 0.48 / 0.46 / 0.42 / 0.42 | 15 / 15 / 34 / 34 | 0 |
+
+- VRAM: peak +0.091 GiB/h over the last hour (+0.066 the hour before). Retries come in storms (TP2/3 9 -> 23 within 05:01-05:11).
+- Retries cost no visible throughput: 430-461 gen/s in the 30-min windows, prefix hit 95%, running 80, waiting 0, KV 0.40.
+- Host: Kaggle-eq 149.4 -> 149.8 GiB (+0.5 GiB/h); shmem flat at 125.0 GiB.
+- Health: 0 errors, timeouts, HTTP 500 or deaths.
+- Accuracy: 62 first attempts, 52 fully correct; 82 of 344 pairs.

@@ -40,7 +40,9 @@ def R(name, extra=(), env=None, **kw):
     return (name, list(extra), env or {}, kw)
 
 
-OFF = lambda gib: ["--kv-offloading-size", str(gib)]  # noqa: E731  native -> OffloadingConnector
+# native -> OffloadingConnector; vLLM 0.20 refuses it with the hybrid KV manager (HMA) on:
+# "Connector OffloadingConnector does not support HMA". No-op for a dense full-attention model.
+OFF = lambda gib: ["--kv-offloading-size", str(gib), "--disable-hybrid-kv-cache-manager"]  # noqa: E731
 
 SUITES = {
     "smoke": [R("smoke_c8", concurrency=8, duration=60, stagger=5)],
@@ -54,16 +56,21 @@ SUITES = {
     "exp2": [R("e2_off4_c32", OFF(4), concurrency=32), R("e2_off4_c64", OFF(4), concurrency=64),
              R("e2_off12_c32", OFF(12), concurrency=32), R("e2_off12_c64", OFF(12), concurrency=64),
              R("e2_off4_c16", OFF(4), concurrency=16)],
-    # Exp 3: client-side admission gate on KV usage (new attempts only), no offload.
-    "exp3": [R("e3_c64_gate70", concurrency=64, gate_kv=0.70, gate_min=4),
-             R("e3_c64_gate85", concurrency=64, gate_kv=0.85, gate_min=4),
-             R("e3_c64_gate70_off4", OFF(4), concurrency=64, gate_kv=0.70, gate_min=4)],
+    # Exp 3: client-side admission gates on NEW attempts (turns of running attempts never gated).
+    "exp3": [R("e3_c64_gatekv70", concurrency=64, gate_kv=0.70, gate_min=4),
+             R("e3_c64_gatehit80", concurrency=64, gate_hit=0.80, gate_min=4),
+             R("e3_c64_gatekv50", concurrency=64, gate_kv=0.50, gate_min=4)],
+    "exp3b": [R("e3_c64_gatehit80_off4", OFF(4), concurrency=64, gate_hit=0.80, gate_min=4)],
 }
 
 
-def wait_health(proc, timeout=600):
+def wait_health(proc, logpath, timeout=600):
+    """Startup timeout counts only once the server has started logging: an empty log means
+    flock is still waiting for another lab agent to release the GPU lock (no limit on that)."""
     t0 = time.time()
     while time.time() - t0 < timeout:
+        if os.path.getsize(logpath) == 0:
+            t0 = time.time()
         if proc.poll() is not None:
             return False
         try:
@@ -76,16 +83,38 @@ def wait_health(proc, timeout=600):
     return False
 
 
+def _group_alive(pgid, proc=None):
+    """any non-zombie process left in our process group?"""
+    if proc is not None:
+        proc.poll()  # reap flock so it doesn't linger as a zombie
+    for p in os.listdir("/proc"):
+        if p.isdigit():
+            try:
+                with open(f"/proc/{p}/stat") as f:
+                    st = f.read().rsplit(")", 1)[1].split()
+                if int(st[2]) == pgid and st[0] != "Z":
+                    return True
+            except (OSError, ValueError, IndexError):
+                pass
+    return False
+
+
 def stop(proc):
+    """Stop our server: SIGTERM our own process group, wait until every member is gone
+    (flock exits first and would release the GPU lock while vLLM children still hold the GPU)."""
+    pgid = proc.pid
     try:
-        os.killpg(proc.pid, signal.SIGTERM)  # our own session/process group only
+        os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         return
-    try:
-        proc.wait(timeout=60)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait()
+    t0 = time.time()
+    while _group_alive(pgid, proc) and time.time() - t0 < 60:
+        time.sleep(0.5)
+    if _group_alive(pgid, proc):
+        os.killpg(pgid, signal.SIGKILL)
+        while _group_alive(pgid, proc):
+            time.sleep(0.5)
+    proc.wait()
 
 
 def run_one(lname, extra, env_extra, kw):
@@ -101,7 +130,7 @@ def run_one(lname, extra, env_extra, kw):
     print("[suite]", time.strftime("%H:%M:%S"), "start", lname, " ".join(extra), kw, flush=True)
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     try:
-        if not wait_health(proc):
+        if not wait_health(proc, log.name):
             print("[suite] server failed; see", log.name, flush=True)
             return
         txt = open(log.name).read()
