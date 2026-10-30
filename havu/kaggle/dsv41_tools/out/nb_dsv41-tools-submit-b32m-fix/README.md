@@ -95,3 +95,16 @@ at the max.
   - It is likely the torch caching allocator's reserved pool growing toward its cap, not live allocations, but that is
     not proven. Pod 2's replica logs allocated vs reserved hourly.
   - If it ends in an OOM, the supervisor restarts the server while >= 60 min remain before stop-new.
+
+## Kill test on this exact notebook (pod 2 CV replica, E128, 2026-10-30 00:19 UTC): PASS
+
+- **The kill:** SIGKILL of one TP worker (`VLLM::Worker_TP2`) with 63 requests running.
+- **+11 s:** the API server exits; the supervisor status goes to "restarting". In the same second the solver logs
+  `server died`, and **65 in-flight attempts are re-queued for free** ("after a server-side error", the OpenAI 500 fix).
+- **+17 s:** the old group is gone and all 4 GPUs are at 0 MiB.
+- **+116 s:** `server up after 105s (external, start 1)`, with the same KV pool of 1,617,253 tokens.
+- **By 00:27:** 64 running at 857 gen tok/s.
+- **No attempt was finalized as an error.**
+- **Host RAM never held two engines:** anon 129.8 -> ~12 -> 126.6 GiB.
+- **VRAM after the restart:** 2.0 GiB free, 0 allocator retries, 0 OOMs, the same as before. A restart also resets the
+  creep.
