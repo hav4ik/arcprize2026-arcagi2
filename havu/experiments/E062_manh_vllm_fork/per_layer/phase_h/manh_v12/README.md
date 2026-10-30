@@ -226,3 +226,24 @@ Whole run after the first 10 min of serving: mean 646 gen tok/s, mean running 47
   | 7.0-7.5 | 736 | 54.4 |
 
   The 7.0-7.5 h window is higher because second attempts start short, so the KV gate admits more. Whole run after 10 min: 578 tok/s at 38.1 running.
+
+### Reports 8-9 (09:26, 09:57 UTC; 7.5-8 h of solving; `report_0956.txt`)
+**Verdict: stable; margins flat for 5 h; no events.**
+- **Accuracy:**
+
+  | Kaggle h | score so far | tasks answered | first attempts | second attempts |
+  |---|---|---|---|---|
+  | 7.56 | 77.1 | 234 | 166/222 = 74.8% | 46/84 = 54.8% |
+  | 8.05 | 79.2 | 235 | 166/222 = 74.8% | 76/116 = 65.5% |
+
+- **VRAM:** cap - reserved 1.13 / 1.11 / 1.10 / 1.08 GiB, flat. 0 retries, 0 OOMs.
+- **RAM:** Kaggle-eq (cgroup) 134.4 GiB, +0.22 GiB/h.
+- **Throughput:**
+
+  | window (h) | gen tok/s | running |
+  |---|---|---|
+  | 7.0-7.5 | 623 | 41.5 |
+  | 7.5-8.0 | 627 | 47.1 |
+  | 8.0-8.5 | 604 | 42.1 |
+
+  Whole run after 10 min: 582 tok/s at 38.7 running.

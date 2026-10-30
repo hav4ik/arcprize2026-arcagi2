@@ -61,7 +61,8 @@ def request(args, client, grid):
                {"type": "text", "text": QUESTION}]
     msgs = [{"role": "user", "content": content}]
     if args.base_url:
-        extra = {"chat_template_kwargs": {"thinking": True, "reasoning_effort": 50}, "temperature": 1.0, "top_p": 1.0}
+        extra = {"chat_template_kwargs": {"thinking": True, "reasoning_effort": 50}, "temperature": args.temperature,
+                 "top_p": args.top_p}
         model = args.model or "dsv41"
     else:
         extra = {"reasoning_effort": "low", "thinking": {"type": "enabled"}}
@@ -156,6 +157,8 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-tokens", type=int, default=16000)
     ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--temperature", type=float, default=1.0, help="self-hosted only (the API ignores it in thinking mode)")
+    ap.add_argument("--top-p", type=float, default=1.0, help="self-hosted only")
     a = ap.parse_args()
     if a.score:
         report(a.score)

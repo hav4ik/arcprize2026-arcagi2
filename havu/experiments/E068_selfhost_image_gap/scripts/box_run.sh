@@ -5,6 +5,13 @@
 #   ref       E066 full_ref settings: probe, NLL real, NLL grey
 #   kvauto    + --kv-cache-dtype auto (BF16 KV): probe, NLL real
 #   noprefix  + --no-enable-prefix-caching: probe
+#   vitdp     + --mm-encoder-tp-mode data (vision tower replicated per GPU instead of TP-sharded): probe
+#   sdpa      + --mm-encoder-attn-backend TORCH_SDPA (vision attention kernel): probe
+#   causal    + --hf-overrides is_mm_prefix_lm=false --disable-chunked-mm-input: causal LM attention over image spans,
+#             as DeepSeek's reference (inference/model.py get_window_topk_idxs); the fork's config sets
+#             is_mm_prefix_lm = vision_n_layers > 0, i.e. bidirectional image spans. Probe, NLL real, NLL grey.
+# kvauto turned out to be a duplicate of ref: the fork maps --kv-cache-dtype auto to fp8 and accepts only DeepSeek
+# V4.1's native mixed FP8/FP4 KV format ("fp8_ds_mla").
 # Usage: box_run.sh dl            (needs HF_TOKEN; the full checkpoint, ~12 min on E066's box)
 #        box_run.sh <arm>...      (default: ref kvauto noprefix)
 # Outputs: /workspace/dsv4/results/e068/{probe,nll}_<arm>.jsonl; server logs in /workspace/dsv4/runs/e068_<arm>/.
@@ -32,7 +39,7 @@ echo '{"engram_keep": null, "expert_keep": null, "observe": null}' > $CTRL
 
 serve() {  # serve <arm> [extra vllm args]: stop any E068 server, start this arm, wait until it answers
   local arm=$1; shift
-  for r in e068_ref e068_kvauto e068_noprefix; do
+  for r in e068_ref e068_kvauto e068_noprefix e068_vitdp e068_sdpa e068_causal; do
     [ -f $D/runs/$r/server.pid ] && bash $S43/stop.sh $r 0,1,2,3 > /dev/null 2>&1 && rm -f $D/runs/$r/server.pid
   done
   local pf=1; [ "$arm" = noprefix ] && pf=0
@@ -64,13 +71,20 @@ for arm in "${@:-ref kvauto noprefix}"; do
                 probe kvauto & nll kvauto real; wait ;;
       noprefix) serve noprefix || continue
                 probe noprefix ;;
+      vitdp)    serve vitdp --mm-encoder-tp-mode data || continue
+                probe vitdp ;;
+      sdpa)     serve sdpa --mm-encoder-attn-backend TORCH_SDPA || continue
+                probe sdpa ;;
+      causal)   serve causal --hf-overrides '{"is_mm_prefix_lm": false}' --disable-chunked-mm-input || continue
+                grep -q "multimodal-bidirectional" $D/runs/e068_causal/server.log && echo "MM_PREFIX_STILL_ON" || echo "MM_PREFIX_OFF"
+                probe causal & nll causal real; nll causal grey; wait ;;
       *) echo "unknown arm $a" >&2; continue ;;
     esac
     $PY $S/perception_probe.py --score $O/probe_$a.jsonl
     echo "ARM_DONE $a $(date -u +%H:%M)"
   done
 done
-for r in e068_ref e068_kvauto e068_noprefix; do
+for r in e068_ref e068_kvauto e068_noprefix e068_vitdp e068_sdpa e068_causal; do
   [ -f $D/runs/$r/server.pid ] && bash $S43/stop.sh $r 0,1,2,3 > /dev/null 2>&1 && rm -f $D/runs/$r/server.pid
 done
 echo "ALL_DONE $(date -u +%H:%M)"

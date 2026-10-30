@@ -1,5 +1,16 @@
 # Illegal memory access (IMA) on Manh's fork: are V12 and B32-M exposed? (2026-10-30)
 
+> **Update 2026-10-30, root cause found by Manh.** The illegal memory access comes from an upstream vLLM race:
+> - **The race:** on steps of ≤ `VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD` (256) tokens, MoE shared experts run on an aux CUDA stream. Their output is allocated there and consumed by the main stream's `shared + routed` add, with no `record_stream`.
+> - **When it fires:** only once the allocator hits its cap (an allocator retry). With expandable segments (enabled after the fork's cap, commit 46a2cb33de), the allocator unmaps the "free" pages after syncing only the owning (aux) stream, and the queued main-stream add then reads unmapped memory.
+> - **Fix:** `output.record_stream(main)`, nguyen599/vllm commit 22df163d2d.
+> - **It needs three things at once:** an eager ≤256-token step, an allocator retry, and the retry landing in the queue window.
+>   - So it only appears under memory pressure: it is the "IMA cousin" of the OOM mode in notes/2026-10-30_b32m_oom_modes.md.
+>   - Runs that never retry (Manh's V12 replica: 0 retries in 8 h) cannot hit it. Runs at the cap (B32-M: up to 97 retries per server) roll the dice each retry.
+> - **Both wheels have the race** (5e1bccd07c and v11 8cf0c0664b).
+> - **Zero-code mitigation:** `VLLM_DISABLE_SHARED_EXPERTS_STREAM=1`, at the cost of the shared-expert overlap. The real fix is Manh's patch.
+> - **This replaces the ranked hypotheses below** (the NaN top-k sinks remain a separate, unconfirmed hardening item).
+
 This note comes from reading code and logs, plus a search of public GitHub issues. Nothing ran on Kaggle, on pods or
 on local GPUs, and nothing was pushed. **"est."** marks an estimate. Everything else is read in code (file:line, at the
 named revision) or seen in a log.

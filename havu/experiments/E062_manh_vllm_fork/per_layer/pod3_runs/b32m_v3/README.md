@@ -258,3 +258,87 @@ TP2 (= TP3), cycle 2:
   | 6.2 (19) | 21.9 (62) | 25.0 (77) | 32.1 (95) | 37.3 (111) | 40.4 (120) |
 
   The slow steps (h3 +3.1, h5 +5.2) are the hours of the two outages.
+
+### Third OOM (TP2 + TP3) at Kaggle 5.90 h (09:24:53 UTC), 1.74 h into cycle 3
+- `server_restart2.log`, the same signature: `torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 MiB. GPU 3 has a total capacity of 22.04 GiB of which 517.94 MiB is free. Process 66985 has 350.00 MiB memory in use. Including non-PyTorch memory, this process has 21.04 GiB memory in use. 20.37 GiB allowed; Of the allocated memory 20.08 GiB is allocated by PyTorch, ...`. TP2 logged the same; 2 lines each.
+- Just before: retries 52 / 65 / 97 / 97; cap - peak 0.47 / 0.45 / 0.41 / 0.41; gen 430-493 tok/s until 09:24:53, then 0.
+- **The cycles are regular:** 1.87 h, 1.77 h and 1.74 h of server age to the OOM, failing at 20.06 / 20.11 / 20.08 GiB allocated.
+- Logs preserved in `/root/e066/b32mv3/preserved/092505/`.
+- Next: engine death ~09:30, then restart 3, the last the solver allows.
+- **09:29:55:** `EngineDeadError` (server_restart2.log), 302 s after the OOM.
+- **09:30:00:** the 80 in-flight attempts got the HTTP 500. **19 were finalized as `stop=error`** (retried at death 2, last try now used); the rest were retried. Some were already second attempts (`#1`). Then `server died (code 0)`.
+- **09:30:30:** `server start (restart 3)`, **the last one** the solver allows; log `server_restart3.log`. Host Kaggle-eq was 9.7 GiB before the relaunch.
+- Totals: 3 OOM events, 3 deaths, 3 of 3 restarts used; 241 error records; **75 attempts lost** (56 + 19).
+- Logs preserved in `/root/e066/b32mv3/preserved/092505/` and `/093051/`.
+- **09:33:10:** `server up after 160s` (restart 3, the last). **Outage 3, OOM to serving: 8 min 17 s.** Cycle 4 started.
+  - At the cycle-1-3 pattern (OOM 1.74-1.87 h after up), cycle 4 OOMs ~11:18-11:25 UTC (Kaggle ~7.8 h), with no restart left.
+
+**Kaggle 6.5 h (10:01 UTC): 3 blow-ups; cycle 4 (the last restart) serving normally, 28 min after up.** Its first retries came 8 min after up, during the re-prefill burst.
+- TP2/3: cap - peak 0.48 (TP0/1 0.54/0.52); retries 0 / 3 / 3 / 3. Serving: 440-491 gen tok/s, running 79-80, waiting 0. Kaggle-eq 147.4 GiB.
+- **Accuracy: score 48.1**, 143 of 240 tasks answered, first-attempt accuracy 75.2%. By Kaggle hour: 6.2 / 21.9 / 25.0 / 32.1 / 37.3 / 48.1.
+  - No attempt has finished since 5.99 h (restart + re-prefill ~20 min; every in-flight attempt restarted from scratch).
+- The final OOM is expected ~11:05-11:25 UTC (Kaggle ~7.6-7.9 h). With 3 of 3 restarts used, the run has no server after it.
+
+**Kaggle 7.0 h (10:31 UTC): 3 blow-ups; cycle 4 (the last restart) has been at the edge for ~25 min. Final OOM likely within ~1 h, and no server after it.**
+
+| cycle | up | first retry (age) | OOM (age) | attempts lost at its death |
+|---|---|---|---|---|
+| 1 | 03:45 | 1.0 h | 05:37 (1.87 h) | 0 (80 retried) |
+| 2 | 05:45 | 0.6 h | 07:32 (1.77 h) | 56 |
+| 3 | 07:40 | 0.67 h | 09:24 (1.74 h) | 19 |
+| 4 | 09:33 | 0.13 h | - (0.96 h at 10:31) | - |
+
+- Cycle 4 at 10:30: TP2/3 peak 19.95, reserved 20.34, cap - reserved 0.03, 29 retries. Cycles 1-3 failed at 20.06-20.11 GiB allocated.
+- Mean gen tok/s by Kaggle hour: h0 408, h1 446, h2 352, h3 459, h4 294, h5 402, h6 360. The dips are the outage hours.
+- Solver status: 206 attempts done, 167 errors, 194 queued, restarts 3.
+- **Accuracy: score 49.4**, 146 of 240 tasks answered, first-attempt accuracy 75.7%. By Kaggle hour: 6.2 / 21.9 / 25.0 / 32.1 / 37.3 / 48.1 / 49.4.
+- Projection: a cycle-4 OOM by ~11:30 (Kaggle ~8 h) leaves the last ~3.5 h without a server. The score then freezes near its value at that OOM, in the low 50s on this pod. Kaggle's 19-30 min reloads would cost more, consistent with LB 46.5.
+
+### Fourth OOM (TP2 + TP3) at Kaggle 7.17 h (10:40:47 UTC), 1.13 h into cycle 4; no restart left
+- `server_restart3.log`: `torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 MiB. GPU 3 has a total capacity of 22.04 GiB of which 537.94 MiB is free. Process 66985 has 350.00 MiB memory in use. Including non-PyTorch memory, this process has 21.03 GiB memory in use. 20.37 GiB allowed; Of the allocated memory 20.06 GiB is allocated by PyTorch, ...`. TP2 logged the same.
+- Just before: retries 25 / 24 / 49 / 49; cap - peak 0.47 / 0.45 / 0.41 / 0.41. Gen 0 since 10:40:59 with 80 "running".
+- The solver allows no more starts: `MAX_RESTARTS = env_num("ARC_MAX_SERVER_RESTARTS", 3, int)`, and 3 are used.
+- Logs preserved in `/root/e066/b32mv3/preserved/104102/`.
+
+## Final (10:46 UTC, Kaggle 7.26 h): the run ended early, 4.2 h before its 11.5 h hard stop, after the 4th OOM
+
+**End sequence** (the pinned solver 77fe80a3, lines ~954-960: with no restart left it finishes once `running` is empty):
+1. 10:40:47: 4th OOM, TP2 + TP3 (20.06 GiB allocated; the same signature).
+2. 10:45:56-10:46:00: the 80 in-flight attempts got the HTTP 500. **54 were finalized as `stop=error`**; 26 were retried but never ran.
+3. 10:46:00: `server died (code 0)`, then `server down and no restart left; finishing with what we have`, then `submission written (final)`.
+4. 10:46:25: `done`, then `solver exit code 0`.
+5. Cell 4: `submission.json valid`; cells 4b / 5 / verdict are commit-only no-ops in rerun mode. `nb end rc=0 10:46:27`.
+6. Solver status at the end: 263 attempts done, 194 errors, **217 jobs never started**, 203 of 344 pairs with an answer.
+
+**Scores (final):**
+- **Kaggle-style score of the final submission.json: 50.42** over 240 tasks, with 125 tasks having >= 1 pair right (`score_submission.py`: per pair, attempt_1 or attempt_2 right).
+- **acc_series score: 50.6**, 148 of 240 tasks answered, first-attempt accuracy 76.1%.
+- By Kaggle hour: 6.2 / 21.9 / 25.0 / 32.1 / 37.3 / 48.1 / 49.4 / 50.6.
+- For comparison: Kaggle LB 46.5, and ~77.9 on the earlier pod replica, which ran without the VRAM hold and at util 0.938.
+
+**Dynamics:**
+
+| OOM | UTC | Kaggle h | server age | allocated at failure | attempts lost at the death |
+|---|---|---|---|---|---|
+| 1 | 05:37:24 | 2.11 | 1.87 h | 20.06 | 0 (80 retried) |
+| 2 | 07:32:01 | 4.02 | 1.77 h | 20.11 | 56 |
+| 3 | 09:24:53 | 5.90 | 1.74 h | 20.08 | 19 |
+| 4 | 10:40:47 | 7.17 | 1.13 h | 20.06 | 54 (+26 never ran); no restart left |
+
+- **Mechanism:** with Kaggle-like VRAM (cap - reserved 0.66-0.72 GiB at start), every cycle runs the same way:
+  1. +0.4 GiB at warm-up;
+  2. then peak +0.08 GiB/h;
+  3. retry storms from ~0.6 h of server age (cycle 4: 0.13 h);
+  4. finally a 32 MiB all_gather buffer in execute_model fails on TP2 and TP3, the ranks with the lowest cap (20.37 GiB).
+- **Engine path after each OOM:** 300 s hang (rank 0 waits out VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS), then EngineDead, then the API server exits and the solver restarts the server.
+- **Outage per cycle:** 8.2-8.3 min OOM to serving (load 155-160 s with hot caches), then 7-12 min of cold re-prefill.
+- **Lost work:** in-flight attempts get one retry on the V3 solver (it treats the HTTP 500 as a normal error, so each death uses a try), so they are lost at the next death. 129 attempts were finalized as errors in total.
+- **Host RAM never an issue:** Kaggle-eq (cgroup rss + shmem + 7) peaked at 149.9 GiB; shmem flat at 125 GiB; two engines never coexisted; each restart dropped to ~8-10 GiB before the relaunch.
+- **On Kaggle:** each reload takes 19-30 min instead of ~2.7, so the same OOM cadence would lose more serving time per cycle. That is consistent with LB 46.5 being below this pod's 50.4.
+
+**Data:**
+- `data/`: the dashboard files (status.json, tps.tsv, ram.tsv, gpumem.log, attempts.jsonl, solver.log, workload.txt).
+- `raw/`: the solver's dsv41_logs (attempts, metrics, status, server_cmd), `pod/` (the executed notebook nb_rerun_out.ipynb, try1/).
+  - The files over 1 MB moved to the private HF dataset `livobereshka/arc-agi2-vllm-serving-lab` under `replicas/b32m_v3_kaggle_matched/`: dsv41_traces.tar.gz, the final submission.json, mon.jsonl, metrics_scrape.txt, and logs_bundle.tgz with every .log. `raw/README.md` has the paths, checksums and the download command.
+- Secret scan: 0 hits.
+- **Pod state:** the GPU hold, sampler, memory logger and scraper were stopped by PGID at 10:48; no GPU processes are left. The pod is not stopped; the user decides.
