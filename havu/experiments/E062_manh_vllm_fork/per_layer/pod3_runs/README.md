@@ -437,3 +437,29 @@ The pod is not stopped or deleted by us; the user decides. Run 3 was still runni
 - `run1_data/`: the c1_dcp4 status and the pod's copy of `dcp4_slow_load`.
 
 The repo's `.gitignore` skips `*.log`, so the GitHub sync leaves out server.log, solver.log, run.log and mem.log unless they are renamed.
+
+### Run 3 stop (01:31 UTC, credit topped up; pod 3 moves on to the C1 text candidate)
+- `stop_nb.sh` (pod3_scripts) killed papermill (pgid 19182) and the kernel (pgid 19202, taking the cell-2s supervisor thread with it, so it cannot relaunch) at 01:31:43, then the solver + 30 sandboxes. Server group 27380 was gone at 01:31:46 and the GPUs were empty at 01:32:02.
+- At the stop (3.73 h elapsed): 151 attempts done, 207 of 344 pairs answered, no deaths beyond the kill, 2 attempts lost in total. The final copy is in `run3_data/`.
+- **Final paired first-attempt accuracy vs the C1 eval:** 204 pairs (149 tasks), run 3 74.5% vs eval a0 73.0% (run-only 24, eval-only 21, p = 0.77). Originals: 75.5 vs 73.6. Copies: 73.5 vs 72.4.
+
+## c1text: the B32-M fix on C1 with the text harness (tomorrow's candidate)
+Build `kaggle/dsv41_tools/out/nb_dsv41-tools-submit-b32m-fix-c1/`, sha256 73bd117b6a1d:
+- Manh's v6 cells; MANH_VISION=0 (`--language-model-only`); cell 2s supervisor; no 2r.
+- Solver a9983f4c: 1ea2b25d plus `APITimeoutError` / "Request timed out" as a connection error.
+- util 0.90, 10 GiB/rank offload, 64 seqs / workers, context 163,840, vllm-wheels v11.
+
+Scripts: `pod3_scripts/c1text/`.
+- **Inputs:**
+  - `prep_v11.sh`: the v11 tree at `/root/b32m/dl11` is v10's 293 wheels as hardlinks, plus v11's vllm-0.32.1rc1.dev0+g8cf0c0664b wheel (sha256 5039fd7680a4) and .gitattributes, downloaded pinned to versions/11.
+  - `setup_c1text.sh <nb> <kernel-metadata> <commit|rerun> <archive tag>`: archives the previous working dirs, maps wheels v11, cu13-install, C1 and the competition dir (rerun: test file = x2t), checks the cell 1b manifest == C1's (137), reverses run 3's 2r patch.
+  - `fetch_cu13.sh`: see commit attempt 1 below.
+- **Running:** `nb_run.sh <commit|rerun>`: papermill; RERUN sets KAGGLE_IS_COMPETITION_RERUN=1.
+
+**Commit attempt 1 (01:34:23): failed in Manh's cell 4 with `RuntimeError: CUDA installation failed`.**
+- "E066 LIGHT SMOKE: tasks 00576224,25ff71a9" and "E046 CHECK OK" (solver a9983f4c, run_deepseek_tools 882c817f, train_check 8fe36175, auto_repair 2292369c / 571f47eb); cell 3 copied the v11 vllm wheel.
+- In commit mode, Manh's cell-1 `sudo dpkg -i cu13-install/*.deb` must succeed. Pod 3 never had the cu13-install dataset; runs 2 and 3 were rerun mode, where the cell only warns.
+- Fix: `fetch_cu13.sh` builds cu13-install v2 at `/root/kin/cu13`, as pod 2 did:
+  - 102 files per file from Kaggle (versions/2);
+  - the 5 whose names hold an epoch colon (the Kaggle API returns 404) via `apt-get download <pkg>=<version>`;
+  - every file size-checked against the listing (107 files, 4.34 GB).

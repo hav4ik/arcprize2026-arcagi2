@@ -35,6 +35,12 @@ With 3 tries and 12 connection re-queues, attempts survive two deaths. Our solve
 Deadlocks still trap at 600 s (host all-reduce / all-gather `__trap()`). This only keeps a slow but progressing
 step from becoming an engine death, which costs a 3-25 min restart plus the in-flight attempts.
 
+**Apply #2 only together with #1 (added 2026-10-30).** With a 900 s step timeout, a hang that is not caught by the
+600 s trap ends with the solver's 900 s read timeout (`APITimeoutError`) and the engine's death (HTTP 500) at about
+the same time. Solver `11bfaaaa` counts both as job tries, so with `ARC_JOB_TRIES` 2 every in-flight attempt could be
+lost to one hang. With #1 (3 tries, 12 connection re-queues) or our solver (both errors are connection errors), it
+costs one try at most. Traced in `notes/2026-10-30_vllm_failure_paths.md`.
+
 ## 3. Cell 2m: GPU memory utilization 0.935 -> 0.92
 
 ```python
