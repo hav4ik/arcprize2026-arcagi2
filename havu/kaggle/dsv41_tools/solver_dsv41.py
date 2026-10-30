@@ -8,7 +8,9 @@ One process does everything after the vLLM install (the notebook installs the fo
 2. Starts the vLLM server (the E042 RW flags: TP4, fp8 KV, util 0.93, 160K, prefix caching, retention 128) in its
    own session and waits for it. A failed start stops the server's process group before any retry; if it never
    comes up, the fallback submission stays and the solver exits 0. A failed checkpoint pre-flight is retried with
-   backoff for ARC_PREFLIGHT_RETRY_S, then the server starts anyway.
+   backoff for ARC_PREFLIGHT_RETRY_S, then the server starts anyway. S25: with ARC_EXTERNAL_SERVER set, the solver
+   uses a server the notebook already started (it never starts, stops or restarts that one). S26: with
+   ARC_EXTERNAL_SERVER_STATUS set, it follows that server's restart supervisor through its restarts.
 3. Runs E043's tool harness (`run_deepseek_tools.solve`, the sub80s40 + minimal-header config, --token-exact,
    --rescue-code, --train-check) on every test pair, attempt 0 for all pairs first (smallest tasks first), then
    attempt 1, with ARC_WORKERS attempts at once. Tool code runs in `arc_harness.executor.LocalExecutor` (one child
@@ -50,6 +52,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
 import urllib.request
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -125,9 +128,27 @@ STOP_NEW_S = env_num("ARC_STOP_NEW_S", 10 * 3600 + 50 * 60)
 FORCE_AT_S = env_num("ARC_FORCE_AT_S", 11 * 3600 + 10 * 60)
 HARD_STOP_S = env_num("ARC_HARD_STOP_S", 11 * 3600 + 30 * 60)
 UP_TIMEOUT_S = env_num("ARC_SERVER_UP_TIMEOUT_S", 7200)  # /kaggle/input is FUSE: 131 GB at ~50 MB/s is ~45 min
+# S25 (2026-10-30, Manh's server cell): ARC_EXTERNAL_SERVER=http://host:port[/v1] (as in kaggle/src/solver.py) uses a
+# vLLM server the notebook already started with server_cmd()'s model flags and served name dsv41. The solver never
+# starts, stops or restarts it: startup waits up to ARC_SERVER_UP_TIMEOUT_S for /v1/models to list dsv41, and the
+# watchdog calls it dead once its port refuses connections (as for an exited server process). ARC_EXTERNAL_SERVER_LOG
+# (optional): its log, for the KV line at startup and the tail on death. ARC_MODEL_DIR is still required
+# (tokenizer.json for the loop guard). S20 (ARC_STALL_RESTART_S) needs a solver-owned server: leave it off here.
+EXTERNAL = E("ARC_EXTERNAL_SERVER", "").strip()
+EXTERNAL_LOG = E("ARC_EXTERNAL_SERVER_LOG", "")
+EXTERNAL_PROBE_S = 1.0
+EXTERNAL_PROBE_FAILS = 3  # consecutive non-refused connect failures that count as a dead server
+# S26 (2026-10-30): ARC_EXTERNAL_SERVER_STATUS=<supervisor.json> of a supervised external server (Manh's
+# qwen38_server.py / dsv41_vllm.py --supervise N: a detached supervisor restarts it after an exit, N times at most).
+# The watchdog also calls the server dead once the status names another start or says restarting, failed or stopped
+# (a restarted server can answer on the same port before a probe sees the old one gone); start_external() then waits
+# for the next start, takes its log and startup time from the status, and gives up at once when the supervisor has.
+EXTERNAL_STATUS = E("ARC_EXTERNAL_SERVER_STATUS", "")
 # S6: up to 3 server starts after the first (startup retries and restarts after a crash share the count), each only
-# while restart_allowed(): RESTART_MIN_LEFT_S before the hard stop and the server expected up before stop-new
-MAX_RESTARTS = env_num("ARC_MAX_SERVER_RESTARTS", 3, int)
+# while restart_allowed(): RESTART_MIN_LEFT_S before the hard stop and the server expected up before stop-new.
+# S25: 0 with an external server (nothing brings it back); N > 0 waits for it to answer again, N times.
+# S26: 3 again with ARC_EXTERNAL_SERVER_STATUS (its supervisor brings it back).
+MAX_RESTARTS = env_num("ARC_MAX_SERVER_RESTARTS", 0 if EXTERNAL and not EXTERNAL_STATUS else 3, int)
 RESTART_MIN_LEFT_S = env_num("ARC_RESTART_MIN_LEFT_S", 2700)
 RESTART_UP_S = env_num("ARC_RESTART_UP_S", 600)  # S6: expected server start time, at least (the first start's if longer)
 JOB_TRIES = env_num("ARC_JOB_TRIES", 2, int)
@@ -206,7 +227,7 @@ SERVER_ENV_JSON = env_json("ARC_SERVER_ENV_JSON", {})
 SERVER_EXTRA_ARGS = env_json("ARC_SERVER_EXTRA_ARGS", [])
 BIG = 10 ** 9  # completion tokens reported for a cut stream: the harness then stops on its output budget
 
-URL = f"http://127.0.0.1:{PORT}"
+URL = EXTERNAL.rstrip("/").removesuffix("/v1") if EXTERNAL else f"http://127.0.0.1:{PORT}"
 HARNESS = [
     "--mode", "grid", "--effort", "low", "--prompt", "lean2sub", "--answer-tool", "--final-mode", "session",
     "--lenient-parse", "--max-tokens", "64000", "--max-total-output", "80000", "--budget-soft", "40000",
@@ -345,6 +366,8 @@ def server_alive():
 
 def start_server():
     """Start vLLM in its own session; True once /v1/models answers, False if it died or timed out."""
+    if EXTERNAL:
+        return start_external()
     n = STATE["restarts"]
     if server_alive():
         log(f"warning: something already answers on port {PORT}")
@@ -374,6 +397,83 @@ def start_server():
         time.sleep(5)
     log(f"server not up after {time.time() - t:.0f}s; stopping it")
     stop_server()
+    return False
+
+
+def external_status():
+    """S26: the restart supervisor's status (start, state, pid, log, up_s, ...); {} without ARC_EXTERNAL_SERVER_STATUS
+    or while the file cannot be read (the supervisor replaces it atomically)."""
+    if not EXTERNAL_STATUS:
+        return {}
+    try:
+        return json.loads(Path(EXTERNAL_STATUS).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+class ExternalServer:
+    """S25: stands in for the process of an external server: poll() is None while its port accepts a TCP connection
+    (checked at most every EXTERNAL_PROBE_S), then 1 for good, as for a server process that exited. A refused
+    connection (nothing listens) is a dead server at once; any other connect failure (a timeout under a full accept
+    queue, a transient error) only after EXTERNAL_PROBE_FAILS in a row, so one slow probe does not end the run. S26:
+    also 1 once the supervisor's status names another start than `start` (the one it was made for) or says restarting,
+    failed or stopped."""
+    pid = None
+
+    def __init__(self, start=None):
+        u = urllib.parse.urlsplit(URL)
+        self.addr = (u.hostname, u.port or (443 if u.scheme == "https" else 80))
+        self.returncode, self.probe_t, self.start, self.fails = None, 0.0, start, 0
+
+    def poll(self):
+        if self.returncode is None and time.time() - self.probe_t >= EXTERNAL_PROBE_S:
+            self.probe_t = time.time()
+            status = external_status()
+            if status and (status.get("start") != self.start
+                           or status.get("state") in ("restarting", "failed", "stopped")):
+                self.returncode = 1
+                return self.returncode
+            try:
+                socket.create_connection(self.addr, timeout=5).close()
+                self.fails = 0
+            except ConnectionRefusedError:
+                self.returncode = 1
+            except OSError:
+                self.fails += 1
+                if self.fails >= EXTERNAL_PROBE_FAILS:
+                    self.returncode = 1
+        return self.returncode
+
+
+def start_external():
+    """S25: wait for the external server to list dsv41 on /v1/models; True once it does, False if it serves other
+    models or is not up in time. S26: False at once (and no wait left) when its supervisor gave up or was stopped."""
+    log(f"external server {URL} (wait {STATE['restarts']}): started by the notebook, not by the solver")
+    t = time.time()
+    while time.time() - t < UP_TIMEOUT_S and elapsed() < STOP_NEW_S:
+        status = external_status()
+        if status.get("state") in ("failed", "stopped"):
+            log(f"external server {URL}: its supervisor is {status['state']} ({status.get('error')}); no wait left")
+            STATE["restarts"] = max(STATE["restarts"], MAX_RESTARTS)
+            return False
+        try:
+            with urllib.request.urlopen(URL + "/v1/models", timeout=5) as r:
+                ids = [m.get("id") for m in json.loads(r.read())["data"]]
+        except Exception:
+            ids = None
+        if ids is not None:
+            if "dsv41" not in ids:
+                log(f"external server {URL} serves {ids}, not dsv41")
+                return False
+            status = external_status()  # S26: the start that now answers
+            path = status.get("log") or EXTERNAL_LOG or None
+            STATE["server"], STATE["server_log"], STATE["server_ok"] = ExternalServer(status.get("start")), path, True
+            STATE.setdefault("up_s", status.get("up_s") or time.time() - t)
+            start = f", start {status['start']}" if "start" in status else ""
+            log(f"server up after {time.time() - t:.0f}s (external{start}); {grep_kv(path or '')}")
+            return True
+        time.sleep(5)
+    log(f"external server {URL} not up after {time.time() - t:.0f}s")
     return False
 
 
@@ -421,7 +521,7 @@ def stop_server():
     can outlive it and hold GPU memory), then wait up to 120 s for the GPUs to free."""
     proc = STATE.get("server")
     STATE["server_ok"] = False
-    if proc is None:
+    if proc is None or EXTERNAL:  # S25: an external server is the notebook's to stop
         return
     for sig, wait_s in ((signal.SIGTERM, 30), (signal.SIGKILL, 15)):
         try:

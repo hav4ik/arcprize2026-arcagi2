@@ -71,3 +71,13 @@ Exact build command: `REPLICATE.md` section 3.
 
 ## Leaderboard result
 **68.89** (2026-10-28), against the pre-registered 76.2. See experiments/E055_kaggle_replica/README.md (end) for the calibration and the candidate causes.
+
+## B32 + S25 + S26: Manh's server cell (example notebook, not run on Kaggle)
+| | |
+|---|---|
+| What changes | only the solver (`pinned_candb_ext/solver_dsv41.py`, 11bfaaaa = `pinned_candb/` + S25 + S26; S25 as in `pinned_img/`, with its probe rule); the other four pinned files are `pinned_candb/`'s |
+| Why | the notebook starts Manh's vLLM (prod flags, own cell) and hands the solver `ARC_EXTERNAL_SERVER=http://127.0.0.1:<port>/v1`; the solver then never starts, stops or restarts a server |
+| Settings | `ARC_EXTERNAL_SERVER`, `ARC_EXTERNAL_SERVER_LOG` (that server's log), `ARC_EXTERNAL_SERVER_STATUS` (S26: its restart supervisor's status file), `ARC_MODEL_DIR` (the model it serves; tokenizer); every B32 attempt setting unchanged |
+| Behaviour | waits for `/v1/models` to list `dsv41`; without a status file a server death ends new launches (no restart: the notebook owns it) and the run finishes with what it has. S26: with `ARC_EXTERNAL_SERVER_STATUS` (Manh's `dsv41_vllm.py --supervise N` restarts the server after an exit, N times at most) the watchdog also sees a restart on the same port (another `start` in the status, or `restarting`), waits for the next start as for its own restarts (ARC_MAX_SERVER_RESTARTS defaults to 3 again), takes that start's log, and stops waiting at once when the supervisor is `failed` or `stopped` |
+| Tests | `ExternalServer` (S25, with the probe rule) and `SupervisedServer` (S26) in `tests/test_solver.py` (both solvers); `check_imports` clean |
+| Diff vs B32 | `git diff --no-index kaggle/dsv41_tools/pinned_candb kaggle/dsv41_tools/pinned_candb_ext` (the S25 and S26 hunks only; in git: a verbatim-copy commit, then S23, then S24, relabeled S25/S26 after the merge of E066) |
