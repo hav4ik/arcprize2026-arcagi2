@@ -24,6 +24,7 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -119,6 +120,23 @@ flags.DEFINE_bool(
     "use_token_loss_weights",
     True,
     "Apply token-level loss_weights (WIC-alnum=10, final_submit=5, tool_call=2) from train_tokens.npz.",
+)
+flags.DEFINE_bool(
+    "auto_resume",
+    False,
+    "If True, resume from the highest-step `step-*` checkpoint in dsv41_output_dir whose trainable weight files are all present "
+    "(so a Borg preemption + task restart continues instead of retraining from step 0). Trainable weights are restored exactly; "
+    "the deterministic batch order is fast-forwarded; AdamW moments are re-initialized (see resume_lr_rewarmup_steps).",
+)
+flags.DEFINE_string(
+    "resume_from_checkpoint_dir",
+    "",
+    "Explicit `step-XXXXX[-tag]` checkpoint directory to resume from (takes precedence over auto_resume discovery).",
+)
+flags.DEFINE_integer(
+    "resume_lr_rewarmup_steps",
+    4,
+    "Linear LR re-warm-up steps right after a resume to soften the first updates of the re-initialized AdamW moments (0 disables).",
 )
 
 
@@ -447,6 +465,152 @@ def save_dsv41_resumable_checkpoint(
     return ckpt_dir
 
 
+_CKPT_DIR_RE = re.compile(r"^step-(\d{5,})(?:-(.+))?$")
+
+
+def parse_checkpoint_step(ckpt_dir: str) -> tuple[int, str] | None:
+    """Parses `step-00057-epoch_0p50` -> `(57, "epoch_0p50")`; returns None for non-checkpoint names."""
+    m = _CKPT_DIR_RE.match(os.path.basename(ckpt_dir.rstrip("/")))
+    if not m:
+        return None
+    return int(m.group(1)), (m.group(2) or "")
+
+
+def model_has_expert_checkpoint_state(model: dsv41_sft_model.Dsv41SftModel) -> bool:
+    """Mirrors the condition under which `save_dsv41_resumable_checkpoint` writes `expert_lora_rank_XX.pt`."""
+    return bool(
+        model.cfg.routed_expert_lora_r > 0
+        or model.cfg.trainable_routed_experts_dense
+        or (model.cfg.enable_qat and model.cfg.qat_trainable_expert_scales)
+    )
+
+
+def checkpoint_weight_files(
+    ckpt_dir: str, world_size: int, has_expert_state: bool
+) -> list[str]:
+    files = [os.path.join(ckpt_dir, "backbone_trainable.pt")]
+    if has_expert_state:
+        files.extend(
+            os.path.join(ckpt_dir, f"expert_lora_rank_{r:02d}.pt")
+            for r in range(world_size)
+        )
+    return files
+
+
+def find_latest_resumable_checkpoint(
+    output_dir: str, world_size: int, has_expert_state: bool
+) -> str | None:
+    """Returns the highest-step `step-*` directory under `output_dir` that is complete.
+
+    Complete means `COMPLETED.json` is present *and* all trainable weight files exist. The marker is
+    written only after every rank's weight file has been flushed (barrier) so it is the only reliable
+    completeness signal: at v12 step 57 a Borg preemption left all 9 weight files *present* but the
+    backbone file truncated at 528 MB of 2.83 GB. Such marker-less directories are skipped here (they
+    can still be loaded explicitly via `--resume_from_checkpoint_dir`).
+    """
+    if not output_dir or not gfile.Exists(output_dir):
+        return None
+    candidates: list[tuple[int, str]] = []
+    for entry in gfile.ListDir(output_dir):
+        parsed = parse_checkpoint_step(entry)
+        if parsed is None:
+            continue
+        ckpt_dir = os.path.join(output_dir, entry)
+        if not gfile.IsDirectory(ckpt_dir):
+            continue
+        if not gfile.Exists(os.path.join(ckpt_dir, "COMPLETED.json")):
+            continue
+        if all(
+            gfile.Exists(p)
+            for p in checkpoint_weight_files(ckpt_dir, world_size, has_expert_state)
+        ):
+            candidates.append((parsed[0], ckpt_dir))
+    if not candidates:
+        return None
+    return max(candidates)[1]
+
+
+def load_dsv41_resumable_checkpoint(
+    ckpt_dir: str,
+    model: dsv41_sft_model.Dsv41SftModel,
+    rank: int,
+    world_size: int,
+) -> dict[str, Any]:
+    """Restores all trainable parameters of `model` in place from `ckpt_dir` (backbone + this rank's routed-expert state).
+
+    Returns `{"step", "milestone_tag", "loaded_tensors", ["ema_loss", "best_val_loss"]}`; raises if any
+    trainable parameter is missing from the checkpoint or has a mismatched shape.
+    """
+    parsed = parse_checkpoint_step(ckpt_dir)
+    if parsed is None:
+        raise ValueError(f"Not a step-XXXXX checkpoint directory: {ckpt_dir!r}")
+    params = dict(model.named_parameters())
+    trainable = {k for k, p in params.items() if p.requires_grad}
+    loaded: set[str] = set()
+
+    def _load_state_file(path: str) -> None:
+        with gfile.Open(path, "rb") as f:
+            state = torch.load(io.BytesIO(f.read()), map_location="cpu")
+        with torch.no_grad():
+            for k, v in state.items():
+                p = params.get(k)
+                if p is None:
+                    raise KeyError(f"Checkpoint tensor {k!r} from {path} has no parameter in the model.")
+                if tuple(p.shape) != tuple(v.shape):
+                    raise ValueError(
+                        f"Shape mismatch for {k!r}: checkpoint {tuple(v.shape)} vs model {tuple(p.shape)}."
+                    )
+                p.data.copy_(v.to(device=p.device, dtype=p.dtype))
+                loaded.add(k)
+
+    _load_state_file(os.path.join(ckpt_dir, "backbone_trainable.pt"))
+    if model_has_expert_checkpoint_state(model):
+        expert_path = os.path.join(ckpt_dir, f"expert_lora_rank_{rank:02d}.pt")
+        if not gfile.Exists(expert_path):
+            raise FileNotFoundError(
+                f"Missing {expert_path}: checkpoint was saved with a different world size "
+                f"(now world_size={world_size})?"
+            )
+        _load_state_file(expert_path)
+
+    missing = sorted(trainable - loaded)
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} trainable parameters are missing from {ckpt_dir} "
+            f"(e.g. {missing[:3]}); refusing to resume from a partial checkpoint."
+        )
+    info: dict[str, Any] = {
+        "step": parsed[0],
+        "milestone_tag": parsed[1],
+        "loaded_tensors": len(loaded),
+    }
+    marker = os.path.join(ckpt_dir, "COMPLETED.json")
+    if gfile.Exists(marker):
+        with gfile.Open(marker, "r") as f:
+            meta = json.load(f)
+        for key in ("ema_loss", "best_val_loss"):
+            if key in meta:
+                info[key] = float(meta[key])
+    return info
+
+
+def load_metrics_history(output_dir: str, max_step: int) -> list[dict[str, Any]]:
+    """Reads `metrics.jsonl` rows with `step <= max_step` so a resumed run keeps the full loss history."""
+    path = os.path.join(output_dir, "metrics.jsonl")
+    if not gfile.Exists(path):
+        return []
+    rows: list[dict[str, Any]] = []
+    with gfile.Open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if int(row.get("step", -1)) <= max_step:
+                rows.append(row)
+    return rows
+
+
 @torch.no_grad()
 def evaluate_dsv41_validation_loss(
     model: dsv41_sft_model.Dsv41SftModel,
@@ -661,6 +825,43 @@ def _worker_main(rank: int, world_size: int) -> None:
             flush=True,
         )
 
+    # 1b. Optional resume (trainable weights only; AdamW moments restart). Rank 0 decides which
+    #     checkpoint to use and broadcasts it so all ranks restore the same step.
+    resume_dir = str(FLAGS.resume_from_checkpoint_dir or "")
+    if not resume_dir and bool(FLAGS.auto_resume) and rank == 0:
+        resume_dir = (
+            find_latest_resumable_checkpoint(
+                output_dir=FLAGS.dsv41_output_dir,
+                world_size=world_size,
+                has_expert_state=model_has_expert_checkpoint_state(model),
+            )
+            or ""
+        )
+    if is_distributed:
+        resume_obj = [resume_dir]
+        dist.broadcast_object_list(resume_obj, src=0)
+        resume_dir = str(resume_obj[0] or "")
+    resume_step = 0
+    resume_info: dict[str, Any] = {}
+    if resume_dir:
+        t_res = time.time()
+        resume_info = load_dsv41_resumable_checkpoint(
+            ckpt_dir=resume_dir, model=model, rank=rank, world_size=world_size
+        )
+        resume_step = int(resume_info["step"])
+        if rank == 0:
+            print(
+                f"[Rank 0] Resumed trainable weights from {resume_dir} (step {resume_step}) "
+                f"in {time.time() - t_res:.1f}s: {resume_info}. AdamW moments are re-initialized; "
+                f"LR re-warm-up over {int(FLAGS.resume_lr_rewarmup_steps)} step(s).",
+                flush=True,
+            )
+    elif bool(FLAGS.auto_resume) and rank == 0:
+        print(
+            f"[Rank 0] auto_resume: no complete step-* checkpoint under {FLAGS.dsv41_output_dir}; starting from step 0.",
+            flush=True,
+        )
+
     # 2. Load tokenized dataset with `loss_weights`
     train_npz = os.path.join(FLAGS.dsv41_data_dir, "train_tokens.npz")
     val_npz = os.path.join(FLAGS.dsv41_data_dir, "val_tokens.npz")
@@ -695,7 +896,7 @@ def _worker_main(rank: int, world_size: int) -> None:
             flush=True,
         )
 
-    # 3. Initial validation loss before training (Step 0)
+    # 3. Initial validation loss before training (Step 0), or of the restored weights when resuming
     val_metrics_0 = evaluate_dsv41_validation_loss(
         model=model,
         val_dataset=val_dataset,
@@ -708,21 +909,89 @@ def _worker_main(rank: int, world_size: int) -> None:
     best_val_loss = val_metrics_0["val_loss"]
     ema_loss = val_metrics_0["val_loss"]
     metrics_history: list[dict[str, Any]] = [{"step": 0, **val_metrics_0}]
+    if resume_step > 0:
+        ema_loss = float(resume_info.get("ema_loss", ema_loss))
+        best_val_loss = min(best_val_loss, float(resume_info.get("best_val_loss", best_val_loss)))
+        prior_rows = load_metrics_history(FLAGS.dsv41_output_dir, max_step=resume_step)
+        if prior_rows:
+            metrics_history = prior_rows
+        metrics_history.append(
+            {"step": resume_step, "resumed_from": resume_dir, **val_metrics_0}
+        )
     if rank == 0:
+        label = "Initial Validation" if resume_step == 0 else f"Resume Validation (restored step {resume_step})"
         print(
-            f"[Step 00000 / {total_steps:05d}] Initial Validation: {val_metrics_0}",
+            f"[Step {resume_step:05d} / {total_steps:05d}] {label}: {val_metrics_0}",
             flush=True,
         )
-    if not math.isfinite(best_val_loss) or best_val_loss > 3.0:
+    if not math.isfinite(val_metrics_0["val_loss"]) or val_metrics_0["val_loss"] > 3.0:
         raise RuntimeError(
-            f"Step-0 initial validation loss is unexpectedly high ({best_val_loss:.4f} > 3.0); "
+            f"Validation loss of the loaded weights is unexpectedly high ({val_metrics_0['val_loss']:.4f} > 3.0); "
             f"aborting before training to prevent corrupted checkpoint export. stats={load_stats}"
         )
+
+    def _export_milestone(m_tag: str, step: int, row: dict[str, Any], ckpt_dir: str) -> None:
+        export_2bit_dir = os.path.join(FLAGS.dsv41_output_dir, "export_2bit", m_tag)
+        t_exp = time.time()
+        exp_info = dsv41_sft_model.export_dsv41_e128_2bit_checkpoint(
+            model=model,
+            base_model_dir=FLAGS.dsv41_model_dir,
+            export_cns_dir=export_2bit_dir,
+            rank=rank,
+            world_size=world_size,
+        )
+        if rank == 0:
+            marker_path = os.path.join(export_2bit_dir, "EXPORT_COMPLETED.json")
+            with gfile.Open(marker_path, "w") as mf:
+                json.dump(
+                    {
+                        "milestone_tag": m_tag,
+                        "step": step,
+                        "epoch": row["epoch"],
+                        "val_loss": row.get("val_loss"),
+                        "val_wic_alnum_loss": row.get("val_wic_alnum_loss"),
+                        "export_dir": export_2bit_dir,
+                        "elapsed_sec": round(time.time() - t_exp, 2),
+                    },
+                    mf,
+                    indent=2,
+                )
+            print(
+                f"[Milestone {m_tag} @ Step {step:05d}] Saved checkpoint {ckpt_dir} "
+                f"and exported 2-bit checkpoint to {export_2bit_dir} in {time.time() - t_exp:.1f}s: {exp_info}",
+                flush=True,
+            )
+
+    # 3b. A preemption can kill the run between a milestone's checkpoint save and its 2-bit export
+    #     (v12 step 57): if we resumed exactly at such a milestone and its export marker is missing,
+    #     export now so the polling evaluation jobs can start.
+    if resume_step > 0 and resume_step in milestones:
+        m_tag_res = milestones[resume_step]
+        marker_res = os.path.join(
+            FLAGS.dsv41_output_dir, "export_2bit", m_tag_res, "EXPORT_COMPLETED.json"
+        )
+        if not gfile.Exists(marker_res):
+            if rank == 0:
+                print(
+                    f"[Rank 0] Milestone {m_tag_res} export is missing for restored step {resume_step}; exporting now.",
+                    flush=True,
+                )
+            model.eval()
+            _export_milestone(
+                m_tag_res,
+                resume_step,
+                {
+                    "epoch": round(float(resume_step) / float(steps_per_epoch), 4),
+                    **val_metrics_0,
+                },
+                resume_dir,
+            )
 
     # 4. Main SFT training loop
     model.train()
     global_step = 0
     t_train_start = time.time()
+    rewarmup_steps = max(0, int(FLAGS.resume_lr_rewarmup_steps)) if resume_step > 0 else 0
 
     for epoch in range(int(FLAGS.num_epochs)):
         if FLAGS.length_bucketed_batching:
@@ -747,6 +1016,10 @@ def _worker_main(rank: int, world_size: int) -> None:
         for step_in_epoch, batch_indices in enumerate(step_batches):
             if global_step >= total_steps:
                 break
+            if global_step < resume_step:
+                # Fast-forward the deterministic (seeded) batch order consumed before the resume point.
+                global_step += 1
+                continue
 
             t_step = time.time()
             lr_now = train_sft.get_cosine_lr(
@@ -756,6 +1029,8 @@ def _worker_main(rank: int, world_size: int) -> None:
                 warmup_steps=warmup_steps,
                 min_lr_ratio=float(FLAGS.min_lr_ratio),
             )
+            if rewarmup_steps > 0 and (global_step - resume_step) < rewarmup_steps:
+                lr_now *= float(global_step - resume_step + 1) / float(rewarmup_steps)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr_now
 
@@ -931,8 +1206,9 @@ def _worker_main(rank: int, world_size: int) -> None:
                 global_step % int(FLAGS.log_every_steps) == 0 or should_eval
             ):
                 elapsed = time.time() - t_train_start
+                steps_this_run = max(1, global_step - resume_step)
                 eta_min = (
-                    (elapsed / global_step) * (total_steps - global_step) / 60.0
+                    (elapsed / steps_this_run) * (total_steps - global_step) / 60.0
                 )
                 print(
                     f"[Step {global_step:05d}/{total_steps:05d} | ep={row['epoch']:.2f}] "
@@ -969,40 +1245,7 @@ def _worker_main(rank: int, world_size: int) -> None:
                     milestone_tag=m_tag,
                 )
                 if is_milestone:
-                    export_2bit_dir = os.path.join(
-                        FLAGS.dsv41_output_dir,
-                        "export_2bit",
-                        m_tag,
-                    )
-                    t_exp = time.time()
-                    exp_info = dsv41_sft_model.export_dsv41_e128_2bit_checkpoint(
-                        model=model,
-                        base_model_dir=FLAGS.dsv41_model_dir,
-                        export_cns_dir=export_2bit_dir,
-                        rank=rank,
-                        world_size=world_size,
-                    )
-                    if rank == 0:
-                        marker_path = os.path.join(export_2bit_dir, "EXPORT_COMPLETED.json")
-                        with gfile.Open(marker_path, "w") as mf:
-                            json.dump(
-                                {
-                                    "milestone_tag": m_tag,
-                                    "step": global_step,
-                                    "epoch": row["epoch"],
-                                    "val_loss": row.get("val_loss"),
-                                    "val_wic_alnum_loss": row.get("val_wic_alnum_loss"),
-                                    "export_dir": export_2bit_dir,
-                                    "elapsed_sec": round(time.time() - t_exp, 2),
-                                },
-                                mf,
-                                indent=2,
-                            )
-                        print(
-                            f"[Milestone {m_tag} @ Step {global_step:05d}] Saved checkpoint {ckpt_dir} "
-                            f"and exported 2-bit checkpoint to {export_2bit_dir} in {time.time() - t_exp:.1f}s: {exp_info}",
-                            flush=True,
-                        )
+                    _export_milestone(m_tag, global_step, row, ckpt_dir)
 
     if is_distributed and dist.is_initialized():
         dist.barrier()
@@ -1048,6 +1291,9 @@ def _serialize_dsv41_flags_for_children() -> list[str]:
         "use_multi_gpu",
         "length_bucketed_batching",
         "bucket_mega_batch_multiplier",
+        "auto_resume",
+        "resume_from_checkpoint_dir",
+        "resume_lr_rewarmup_steps",
     ]
     args: list[str] = [
         "--undefok=cfs_d_cid_enable,cfs_d_resource_user_override,cfs_default_traffic_class,cfs_max_write_bytes_inflight",

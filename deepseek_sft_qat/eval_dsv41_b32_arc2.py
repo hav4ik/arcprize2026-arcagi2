@@ -779,15 +779,31 @@ def _follower_worker_loop(
 
 
 def _wait_for_exported_checkpoint(ckpt_dir: str, timeout_hours: int) -> dict[str, Any]:
+    """Blocks until the 2-bit checkpoint at `ckpt_dir` is complete.
+
+    For trainer milestone exports (`.../export_2bit/<tag>`) only `EXPORT_COMPLETED.json` counts: the trainer
+    writes it after every rank's shard has been flushed (barrier), whereas the individual files become
+    visible on CNS while still being written. The marker-less fallback is reserved for static, externally
+    produced checkpoint directories (e.g. chankhavu's base `dsv41_e128_2bit`) and requires the full file set.
+    (v12 epoch_0p50 shard 3 died with `SafetensorError: incomplete metadata` after the old fallback
+    accepted a half-written export.)
+    """
     marker = os.path.join(ckpt_dir, "EXPORT_COMPLETED.json")
-    base_marker = os.path.join(ckpt_dir, "gptq", "layer_39.safetensors")
+    is_trainer_export = "/export_2bit/" in (ckpt_dir.rstrip("/") + "/")
+    static_required = [
+        os.path.join(ckpt_dir, "model-00001-of-00002.safetensors"),
+        os.path.join(ckpt_dir, "model-00002-of-00002.safetensors"),
+        os.path.join(ckpt_dir, "model.safetensors.index.json"),
+        os.path.join(ckpt_dir, "config.json"),
+        os.path.join(ckpt_dir, "tokenizer.json"),
+    ] + [os.path.join(ckpt_dir, "gptq", f"layer_{i:02d}.safetensors") for i in range(40)]
     t0 = time.time()
     timeout_s = timeout_hours * 3600.0
     while True:
         if gfile.Exists(marker):
             with gfile.Open(marker, "r") as f:
                 return json.load(f)
-        if gfile.Exists(base_marker) and gfile.Exists(os.path.join(ckpt_dir, "model-00001-of-00002.safetensors")):
+        if not is_trainer_export and all(gfile.Exists(p) for p in static_required):
             return {"status": "ready_existing_2bit_dir", "path": ckpt_dir}
         elapsed = time.time() - t0
         if not FLAGS.poll_for_checkpoint or elapsed >= timeout_s:

@@ -1191,6 +1191,114 @@ class SftPipelineTest(googletest.TestCase):
                 os.path.exists(os.path.join(ckpt_dir, "expert_lora_rank_00.pt"))
             )
 
+            # Resume round-trip (auto_resume after a Borg preemption/restart):
+            # (a) discovery picks the highest step that has COMPLETED.json + all weight files; a
+            #     marker-less directory (preempted mid-save: at v12 step 57 all files existed but the
+            #     backbone was truncated) and a directory with missing files are both skipped;
+            self.assertEqual(
+                train_dsv41_sft.parse_checkpoint_step(ckpt_dir), (4, "epoch_0p25")
+            )
+            self.assertIsNone(train_dsv41_sft.parse_checkpoint_step("export_2bit"))
+            self.assertTrue(train_dsv41_sft.model_has_expert_checkpoint_state(model))
+            with open(os.path.join(tmp_dir, "metrics.jsonl"), "w") as f:
+                for s in (0, 4, 6, 8):
+                    f.write(json.dumps({"step": s, "train_loss": 1.0 / (s + 1)}) + "\n")
+            # Take two more optimizer steps, save as step 6 without the marker.
+            for _ in range(2):
+                optimizer.zero_grad(set_to_none=True)
+                hidden = model.forward_hidden(tokens)
+                loss_sum, n_valid = train_sft.compute_chunked_causal_lm_loss(
+                    hidden_states=hidden,
+                    lm_head=model.head,
+                    labels=labels,
+                    chunk_size=16,
+                    loss_weights=loss_weights,
+                )
+                (loss_sum / float(n_valid)).backward()
+                optimizer.step()
+            ckpt6 = train_dsv41_sft.save_dsv41_resumable_checkpoint(
+                output_dir=tmp_dir,
+                step=6,
+                epoch=0,
+                step_in_epoch=5,
+                model=model,
+                optimizer=optimizer,
+                ema_loss=0.5,
+                best_val_loss=0.4,
+                metrics_history=[{"step": 6}],
+                rank=0,
+                world_size=1,
+            )
+            self.assertEqual(
+                train_dsv41_sft.find_latest_resumable_checkpoint(
+                    tmp_dir, world_size=1, has_expert_state=True
+                ),
+                ckpt6,
+            )
+            os.remove(os.path.join(ckpt6, "COMPLETED.json"))
+            partial_dir = os.path.join(tmp_dir, "step-00008")
+            os.makedirs(partial_dir)
+            with open(os.path.join(partial_dir, "backbone_trainable.pt"), "wb") as f:
+                f.write(b"")  # expert file missing -> incomplete, must be skipped
+            with open(os.path.join(partial_dir, "COMPLETED.json"), "w") as f:
+                f.write("{}")
+            latest = train_dsv41_sft.find_latest_resumable_checkpoint(
+                tmp_dir, world_size=1, has_expert_state=True
+            )
+            self.assertEqual(latest, ckpt_dir)  # step 4: marker + all files; 6 (no marker) and 8 (partial) skipped
+            self.assertIsNone(
+                train_dsv41_sft.find_latest_resumable_checkpoint(
+                    os.path.join(tmp_dir, "does_not_exist"), 1, True
+                )
+            )
+
+            # (b) loading into a fresh model restores every trainable tensor exactly and
+            #     leaves frozen tensors untouched;
+            torch.manual_seed(7)
+            fresh = dsv41_sft_model.Dsv41SftModel(
+                cfg=cfg, ep_rank=0, ep_world_size=1, gradient_checkpointing=True
+            )
+            train_dsv41_sft.configure_dsv41_trainable_parameters(
+                fresh, train_moe_only=True
+            )
+            frozen_before = {
+                n: p.detach().clone()
+                for n, p in fresh.named_parameters()
+                if not p.requires_grad
+            }
+            info = train_dsv41_sft.load_dsv41_resumable_checkpoint(
+                ckpt_dir=ckpt6, model=fresh, rank=0, world_size=1
+            )
+            self.assertEqual(info["step"], 6)
+            self.assertEqual(info["milestone_tag"], "")
+            self.assertNotIn("ema_loss", info)  # marker was removed
+            src_params = dict(model.named_parameters())
+            n_checked = 0
+            for n, p in fresh.named_parameters():
+                if p.requires_grad:
+                    self.assertTrue(torch.equal(p.detach(), src_params[n].detach()), n)
+                    n_checked += 1
+                else:
+                    self.assertTrue(torch.equal(p.detach(), frozen_before[n]), n)
+            self.assertEqual(n_checked, info["loaded_tensors"])
+            self.assertGreater(n_checked, 0)
+            info4 = train_dsv41_sft.load_dsv41_resumable_checkpoint(
+                ckpt_dir=ckpt_dir, model=fresh, rank=0, world_size=1
+            )
+            self.assertEqual(info4["step"], 4)
+            self.assertAlmostEqual(info4["ema_loss"], losses[-1], places=6)
+
+            # (c) metrics history is reloaded up to the resume step;
+            self.assertEqual(
+                [r["step"] for r in train_dsv41_sft.load_metrics_history(tmp_dir, 6)],
+                [0, 4, 6],
+            )
+            # (d) a partial checkpoint is rejected rather than silently resumed.
+            with self.assertRaises(Exception):
+                train_dsv41_sft.load_dsv41_resumable_checkpoint(
+                    ckpt_dir=partial_dir, model=fresh, rank=0, world_size=1
+                )
+
     def test_eval_dsv41_b32_arc2_run_havu_b32_shard_without_vllm(self):
         from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import havu_b32_harness
         from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import prompts_and_selector

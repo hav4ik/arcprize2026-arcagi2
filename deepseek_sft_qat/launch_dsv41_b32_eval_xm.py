@@ -50,6 +50,12 @@ flags.DEFINE_integer("num_attempts", 2, "Candidate B32 attempts per task.")
 flags.DEFINE_integer("max_tasks", 0, "If > 0, cap tasks per milestone (for smoke test).")
 flags.DEFINE_integer("num_gpus", 8, "Number of B200 GPUs per milestone worker.")
 flags.DEFINE_integer("num_shards", 1, "Number of task shards per milestone.")
+flags.DEFINE_string(
+    "only_shard_indices",
+    "",
+    "Optional comma-separated subset of shard indices (0-based, < num_shards) to launch, e.g. `3` to "
+    "relaunch a single failed shard into the same eval_out_root; empty = all shards.",
+)
 flags.DEFINE_bool(
     "enable_qat",
     True,
@@ -104,9 +110,17 @@ def main(argv: list[str]) -> None:
                 m_tag = f"epoch_{float(frac_s):.2f}".replace(".", "p")
                 milestone_ckpts.append((m_tag, f"{FLAGS.sft_output_root}/export_2bit/{m_tag}"))
 
+        only_shards = {
+            int(x) for x in FLAGS.only_shard_indices.split(",") if x.strip()
+        }
+        for bad in sorted(s for s in only_shards if not 0 <= s < FLAGS.num_shards):
+            raise app.UsageError(f"--only_shard_indices entry {bad} is outside [0, {FLAGS.num_shards}).")
+
         for m_tag, ckpt_2bit in milestone_ckpts:
             out_dir = f"{FLAGS.eval_out_root}/{m_tag}"
             for shard_idx in range(FLAGS.num_shards):
+                if only_shards and shard_idx not in only_shards:
+                    continue
                 job_suffix = (
                     f"{m_tag}_s{shard_idx}" if FLAGS.num_shards > 1 else m_tag
                 )

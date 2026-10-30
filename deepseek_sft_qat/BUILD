@@ -200,21 +200,6 @@ py_binary(
     ],
 )
 
-py_binary(
-    name = "soup_checkpoints",
-    srcs = ["soup_checkpoints.py"],
-    deps = [
-        ":export_and_quantize_lib",
-        "//file/cns2",
-        "//file/liball",
-        "//pyglib:gfile",
-        "//third_party/py/absl:app",
-        "//third_party/py/absl/flags",
-        "//third_party/py/g3lib",
-        "//third_party/py/torch:pytorch",
-    ],
-)
-
 py_library(
     name = "evaluate_difficulty_argon_lib",
     srcs = ["evaluate_difficulty_argon.py"],
@@ -380,39 +365,16 @@ py_binary(
 )
 
 py_binary(
-    name = "gen_dsv41_before_after",
-    srcs = ["gen_dsv41_before_after.py"],
+    name = "load_dsv41_2bit_example",
+    srcs = ["load_dsv41_2bit_example.py"],
     deps = [
         ":dsv41_sft_model",
-        ":eval_dsv41_b32_arc2_lib",
-        ":export_and_quantize_lib",
-        ":train_sft_lib",
-        "//experimental/users/arazdai/kaggle/arc_agi_2/pilot_2:havu_b32_harness",
-        "//experimental/users/gaoxiao/deploy_qwen_h100:cuda_platform",
         "//file/cns2",
         "//file/liball",
         "//pyglib:gfile",
-        "//pyglib/contrib/g3_multiprocessing",
-        "//third_party/py/absl:app",
-        "//third_party/py/absl/flags",
         "//third_party/py/g3lib",
-        "//third_party/py/numpy",
         "//third_party/py/tokenizers",
         "//third_party/py/torch:pytorch",
-        "//third_party/py/vllm",
-    ],
-)
-
-py_binary(
-    name = "launch_gen_dsv41_before_after_xm",
-    srcs = ["launch_gen_dsv41_before_after_xm.py"],
-    deps = [
-        "//third_party/py/absl:app",
-        "//third_party/py/absl/flags",
-        "//third_party/py/xmanager:xm_flags",
-        "//third_party/py/xmanager/contrib/internal:requirements_flag",
-        "//third_party/py/xmanager/xm",
-        "//third_party/py/xmanager/xm_abc",
     ],
 )
 
@@ -442,18 +404,5 @@ py_test(
         "//third_party/py/torch:pytorch",
         "//third_party/py/transformers:v5",
         "//third_party/py/vllm",
-    ],
-)
-
-py_binary(
-    name = "repair_dsv41_export_shared_scales",
-    srcs = ["repair_dsv41_export_shared_scales.py"],
-    deps = [
-        ":dsv41_sft_model",
-        "//pyglib:gfile",
-        "//third_party/py/absl:app",
-        "//third_party/py/absl/flags",
-        "//third_party/py/safetensors:torch",
-        "//third_party/py/torch:pytorch",
     ],
 )

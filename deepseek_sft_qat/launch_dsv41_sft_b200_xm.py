@@ -98,6 +98,18 @@ flags.DEFINE_bool("use_token_loss_weights", True, "Apply token-level loss_weight
 flags.DEFINE_bool("length_bucketed_batching", True, "Length-bucket trajectories per step and balance tokens across ranks.")
 flags.DEFINE_integer("bucket_mega_batch_multiplier", 8, "Mega-batch multiplier for length bucketing.")
 flags.DEFINE_integer("grad_ckpt_stride", 1, "Gradient checkpointing stride (1 = checkpoint all 40 layers).")
+flags.DEFINE_bool(
+    "auto_resume",
+    True,
+    "Resume from the latest complete step-* checkpoint in the output dir on (re)start, so a Borg preemption + task restart "
+    "continues training instead of retraining from step 0 (trainable weights restored exactly; AdamW moments re-initialized).",
+)
+flags.DEFINE_string(
+    "resume_from_checkpoint_dir",
+    "",
+    "Explicit step-XXXXX[-tag] checkpoint directory to resume from (overrides auto_resume discovery).",
+)
+flags.DEFINE_integer("resume_lr_rewarmup_steps", 4, "Linear LR re-warm-up steps after a resume (0 disables).")
 
 
 def main(argv: list[str]) -> None:
@@ -169,6 +181,9 @@ def main(argv: list[str]) -> None:
                 "length_bucketed_batching": FLAGS.length_bucketed_batching,
                 "bucket_mega_batch_multiplier": FLAGS.bucket_mega_batch_multiplier,
                 "grad_ckpt_stride": FLAGS.grad_ckpt_stride,
+                "auto_resume": FLAGS.auto_resume,
+                "resume_from_checkpoint_dir": FLAGS.resume_from_checkpoint_dir,
+                "resume_lr_rewarmup_steps": FLAGS.resume_lr_rewarmup_steps,
             }
             wu.add(
                 xm.Job(
