@@ -1225,7 +1225,7 @@ class SftPipelineTest(googletest.TestCase):
                 optimizer=optimizer,
                 ema_loss=0.5,
                 best_val_loss=0.4,
-                metrics_history=[{"step": 6}],
+                metrics_history=[{"step": s, "train_loss": 1.0 / (s + 1)} for s in (0, 4, 6, 8)],
                 rank=0,
                 world_size=1,
             )
