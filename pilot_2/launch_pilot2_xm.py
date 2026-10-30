@@ -12,7 +12,30 @@ from xmanager import xm_flags
 from xmanager.contrib.internal import requirements_flag
 from xmanager.xm_abc import restricted_borg_overrides
 
-from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import prompts_and_selector
+try:
+  from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import prompts_and_selector  # pylint: disable=g-import-not-at-top
+  _VALID_HYPOTHESES = tuple(prompts_and_selector.PILOT2_HYPOTHESES.keys())
+  _DEFAULT_CNS_ROOT = prompts_and_selector.FROZEN_BASELINE_CONFIG["cns_output_root"]
+  _DEFAULT_MODEL_PATH = prompts_and_selector.FROZEN_BASELINE_CONFIG["model_path"]
+except ModuleNotFoundError:
+  prompts_and_selector = None
+  _VALID_HYPOTHESES = (
+      "h1_Prompt_diversity_roles",
+      "h2_sandbox_dsl_and_autocheck",
+      "h3_more_max_turns_40",
+      "h4_falsification_and_equivariance",
+      "h5_extended_budget_56k",
+      "h6_combined_best_of_all",
+      "h7_qwen_native_xml_and_graceful_nudge",
+      "h8_evolutionary_two_wave_repair",
+      "e031_deepseek_teaching",
+      "e031_deepseek_teaching_bo4",
+      "e031_deepseek_teaching_fast",
+      "havu_b32",
+      "havu_b32_bo4",
+  )
+  _DEFAULT_CNS_ROOT = "/cns/lu-d/home/arazdai/kaggle/arc_agi_2/pilot2_results"
+  _DEFAULT_MODEL_PATH = "/cns/lu-d/home/arazdai/models/Qwen3.8-27B-FP8"
 
 
 FLAGS = flags.FLAGS
@@ -29,7 +52,7 @@ flags.DEFINE_string(
 )
 flags.DEFINE_list(
     "exp_ids",
-    list(prompts_and_selector.PILOT2_HYPOTHESES.keys()),
+    list(_VALID_HYPOTHESES),
     "Comma-separated list of pilot_2 hypothesis IDs to launch.",
 )
 flags.DEFINE_integer(
@@ -44,12 +67,12 @@ flags.DEFINE_list(
 )
 flags.DEFINE_string(
     "cns_output_root",
-    prompts_and_selector.FROZEN_BASELINE_CONFIG["cns_output_root"],
+    _DEFAULT_CNS_ROOT,
     "CNS root directory where each hypothesis writes its reasoning and code traces.",
 )
 flags.DEFINE_string(
     "model_path",
-    prompts_and_selector.FROZEN_BASELINE_CONFIG["model_path"],
+    _DEFAULT_MODEL_PATH,
     "CNS path to the Qwen3.8-27B-FP8 (base or SFT merged FP8) checkpoint.",
 )
 flags.DEFINE_string(
@@ -85,12 +108,12 @@ flags.DEFINE_integer(
 def main(argv: list[str]) -> None:
   del argv
   for exp_id in FLAGS.exp_ids:
-    if exp_id not in prompts_and_selector.PILOT2_HYPOTHESES:
+    if exp_id not in _VALID_HYPOTHESES:
       raise ValueError(
-          f"Unknown hypothesis {exp_id!r}. Valid IDs: "
-          f"{sorted(prompts_and_selector.PILOT2_HYPOTHESES.keys())}"
+          f"Unknown hypothesis {exp_id!r}. Valid IDs: {sorted(_VALID_HYPOTHESES)}"
       )
-    prompts_and_selector.PILOT2_HYPOTHESES[exp_id].validate()
+    if prompts_and_selector is not None:
+      prompts_and_selector.PILOT2_HYPOTHESES[exp_id].validate()
 
   with xm_abc.create_experiment(
       experiment_title=FLAGS.experiment_title,

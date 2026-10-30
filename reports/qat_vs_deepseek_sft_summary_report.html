@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Summary Report: Quantization-Aware Training (QAT) vs. Pruned DeepSeek-V4.1 SFT Pipeline</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: #1f2937;
+      line-height: 1.65;
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 32px 24px;
+      background-color: #f9fafb;
+    }
+    .container {
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 12px;
+      padding: 36px 42px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+    }
+    h1 {
+      color: #111827;
+      font-size: 26px;
+      border-bottom: 3px solid #2563eb;
+      padding-bottom: 12px;
+      margin-top: 0;
+    }
+    h2 {
+      color: #1e40af;
+      font-size: 20px;
+      margin-top: 34px;
+      border-bottom: 1px solid #e5e7eb;
+      padding-bottom: 8px;
+    }
+    h3 {
+      color: #111827;
+      font-size: 16px;
+      margin-top: 22px;
+      margin-bottom: 8px;
+    }
+    p, li {
+      font-size: 14.5px;
+    }
+    code {
+      background: #f3f4f6;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px;
+      color: #b91c1c;
+    }
+    pre {
+      background: #111827;
+      color: #f9fafb;
+      padding: 16px;
+      border-radius: 8px;
+      overflow-x: auto;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    pre code {
+      background: transparent;
+      color: #e5e7eb;
+      padding: 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 18px 0;
+      font-size: 13.5px;
+    }
+    th, td {
+      border: 1px solid #d1d5db;
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background-color: #eff6ff;
+      color: #1e3a8a;
+      font-weight: 600;
+    }
+    tr:nth-child(even) {
+      background-color: #f9fafb;
+    }
+    .callout {
+      background-color: #eff6ff;
+      border-left: 4px solid #2563eb;
+      padding: 14px 18px;
+      margin: 18px 0;
+      border-radius: 4px;
+    }
+    .warn {
+      background-color: #fef2f2;
+      border-left: 4px solid #dc2626;
+      padding: 14px 18px;
+      margin: 18px 0;
+      border-radius: 4px;
+    }
+    .success {
+      background-color: #ecfdf5;
+      border-left: 4px solid #059669;
+      padding: 14px 18px;
+      margin: 18px 0;
+      border-radius: 4px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      font-size: 11.5px;
+      font-weight: 700;
+      border-radius: 9999px;
+      text-transform: uppercase;
+    }
+    .badge-p0 { background: #fee2e2; color: #991b1b; }
+    .badge-p1 { background: #fef3c7; color: #92400e; }
+    .badge-p2 { background: #dbeafe; color: #1e40af; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>Summary Report: Quantization-Aware Training (QAT) vs. Our Pruned DeepSeek-V4.1 (<code>Tool E128</code>) SFT Pipeline &amp; Improvement Roadmap</h1>
+  <p><strong>Date:</strong> 2026-10-29 &nbsp;|&nbsp; <strong>Target Architecture:</strong> Pruned DeepSeek-V4.1 (<code>Tool E128</code>, <code>dsv41_e128_2bit</code>) on 8&times; NVIDIA B200 GPUs</p>
+
+  <div class="callout">
+    <strong>Executive Takeaway:</strong> Standard <strong>Quantization-Aware Training (QAT)</strong> simulates low-bit weight and scale discretization inside the <code>forward()</code> pass using a Straight-Through Estimator (STE) and updates <code>FP32</code> master weights—often guided by Forward KL Distillation (QAD) against a frozen teacher. By contrast, our current Pruned DeepSeek-V4.1 SFT pipeline in <code>train_dsv41_sft.py</code> and <code>dsv41_sft_model.py</code> is a <strong>"De-quantize to BF16 &rarr; Train in Continuous BF16 &rarr; Data-Free Post-Training Re-Quantize"</strong> pipeline. Because 2-bit routed experts only have 4 discrete levels (<code>{0, 1, 2, 3}</code>) and <code>shared_experts</code> use <code>UE8M0</code> power-of-two block scales, re-quantizing after continuous <code>BF16</code> training introduces severe discretization shock and disrupts Havu's GPTQ Hessian calibration. Adopting QAT/QAD principles directly resolves these bottlenecks.
+  </div>
+
+  <h2>1. What is Quantization-Aware Training (QAT) &amp; Distillation (QAD)?</h2>
+  <p>While <strong>Post-Training Quantization (PTQ)</strong> compresses a model only after high-precision training is finished, <strong>QAT</strong> makes the training loop explicitly aware of the target low-bit quantization grid at every optimization step:</p>
+  <ol>
+    <li><strong>Fake-Quantization in <code>forward()</code> + Straight-Through Estimator (STE) in <code>backward()</code>:</strong>
+      Before every linear projection, master weights $W_{\text{master}}$ are quantized and immediately de-quantized back to the compute dtype:
+      $$\widehat{W} = W_{\text{master}} + \text{stop\_grad}\big(\text{Dequant}(\text{Quant}(W_{\text{master}})) - W_{\text{master}}\big)$$
+      In the forward pass, activations see the exact discrete weights $\widehat{W}$ (including rounding errors, clamping, and block-scale jumps). In the backward pass, STE passes gradients $\nabla_{\widehat{W}} \mathcal{L}$ straight through to $W_{\text{master}}$.</li>
+    <li><strong><code>FP32</code> Master Weights:</strong>
+      At SFT learning rates (<code>1e-6</code> to <code>1e-5</code>), single-step updates ($\Delta w \sim 10^{-6}$) are smaller than the <code>BF16</code> unit in the last place ($\text{ULP} \approx 7.8 \times 10^{-4}$ for $|w| \approx 0.1$). QAT stores trainable master weights in <code>FP32</code> so tiny updates accumulate smoothly across steps until they cross a discrete 2-bit or FP8 threshold.</li>
+    <li><strong>Preserving Calibrated Codebooks / Group Scales:</strong>
+      When starting from an activation-calibrated checkpoint (such as GPTQ), the integer codes $q$ and zero-points $z$ were solved using the input activation Hessian ($H = X X^\top$) so quantization errors cancel across channels. Ultra-low-bit QAT preserves this calibration either by <strong>freezing $(q, z)$ and training the continuous group scales $s$</strong>, or by running STE with locked zero-points $z_{\text{orig}}$.</li>
+    <li><strong>Selective Precision Guardrails (NVIDIA Nemotron NVFP4, <em>arXiv:2509.25149</em>):</strong>
+      Sensitive layers—embeddings, LM head, RMSNorms, attention projections, MoE router gates (<code>DifferentiableGate</code>), and the final ~15% of blocks—are kept in higher precision while heavy MoE expert FFNs operate in low precision.</li>
+    <li><strong>Quantization-Aware Distillation (QAD, <em>arXiv:2601.20088</em>):</strong>
+      Training 2-bit/4-bit models with hard one-hot cross-entropy causes high gradient variance and shifts hidden-state norms entering frozen MoE routers. QAD minimizes <strong>Forward KL Divergence</strong> ($D_{\text{KL}}(P_{\text{teacher}} \parallel P_{\text{quant-student}})$ at $T=1.0$) against the teacher's full probability distribution, providing smooth gradients that stabilize MoE routing and multi-step reasoning.</li>
+  </ol>
+
+  <h2>2. Differences Between Our Current Pruned DeepSeek-V4.1 SFT Pipeline and QAT</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Pipeline Stage / Mechanism</th>
+        <th>Standard QAT / QAD Methodology</th>
+        <th>Our Current Pruned DeepSeek-V4.1 (<code>Tool E128</code>) SFT Pipeline</th>
+        <th>Risk / Impact on Our Run</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>1. Load Checkpoint</strong></td>
+        <td>Retains quantization grid metadata (scales $s$, zero-points $z$) to simulate the exact target format during training.</td>
+        <td><code>load_dequantized_dsv41_e128()</code> unpacks <code>FP8</code> block-32 and <code>uint2</code> <code>(q, s, z)</code> weights into dense <code>BF16</code> tensors and <strong>discards the original <code>(q, s, z)</code></strong>.</td>
+        <td><strong>High:</strong> Loses Havu's GPTQ integer lattice and zero-points during training.</td>
+      </tr>
+      <tr>
+        <td><strong>2. Forward Pass Computation</strong></td>
+        <td>Applies <code>FakeQuant(W)</code> on every forward pass so downstream layers and routers adapt to quantization noise.</td>
+        <td>Runs purely in <strong>continuous <code>BF16</code></strong> (<code>LoRALinear.forward</code> and <code>SwiGLUExpert.forward</code> have no fake-quantization).</td>
+        <td><strong>High:</strong> Model relies on fine continuous weight changes that vanish or jump at export.</td>
+      </tr>
+      <tr>
+        <td><strong>3. 2-Bit Routed Expert Export (<code>uint2</code> Humming)</strong></td>
+        <td>Zero export shock—exported weights are identical to the fake-quantized weights used in the forward pass.</td>
+        <td><code>quantize_uint2_humming_expert_tensor()</code> merges $W_0 + \frac{\alpha}{r} B A$ and runs a <strong>data-free 16-point min-max L2 grid search</strong> over $z \in \{0,1,2,3\}$ and $\text{shrink} \in \{1.0..0.85\}$.</td>
+        <td><strong>Critical:</strong> Unweighted L2 re-quantization flips integer codes $q$ and zero-points $z$, destroying GPTQ's activation-Hessian error cancellation; small LoRA deltas round back to 0.</td>
+      </tr>
+      <tr>
+        <td><strong>4. Shared Expert Export (<code>FP8</code> + <code>UE8M0</code>)</strong></td>
+        <td>Simulates block-scale quantization in <code>forward()</code> so weights adjust to scale boundaries.</td>
+        <td><code>quantize_fp8_block32_torch()</code> computes <code>amax / 448.0</code> and applies an <strong>IEEE-754 power-of-two ceiling (<code>exp_ceil</code>)</strong> only at milestone export.</td>
+        <td><strong>Medium-High:</strong> If 1 weight in a 32-element block crosses a $2^k \times 448$ threshold, the block scale <strong>doubles ($2\times$)</strong>, halving FP8 resolution for all 31 other weights in that block.</td>
+      </tr>
+      <tr>
+        <td><strong>5. Master Weight Dtype</strong></td>
+        <td>Stores trainable master weights in <strong><code>FP32</code></strong>.</td>
+        <td>Stores trainable <code>shared_experts</code> and <code>lora_A/B</code> in <strong><code>torch.bfloat16</code></strong>.</td>
+        <td><strong>Medium:</strong> At <code>lr=8e-6</code>, small updates underflow <code>BF16</code> precision ($\text{ULP} \approx 8 \times 10^{-4}$).</td>
+      </tr>
+      <tr>
+        <td><strong>6. Loss Objective &amp; Frozen Routers</strong></td>
+        <td>Uses <strong>Forward KL Distillation (QAD)</strong> to preserve hidden-state norms entering frozen MoE gates.</td>
+        <td>Uses hard-label token-weighted Cross-Entropy (<code>WIC-alnum=10.0, submit=5.0, tool=2.0</code>) with frozen 128-expert gates.</td>
+        <td><strong>Medium:</strong> High-weight hard CE updates can shift hidden states and cause routing drift in deeper frozen gates.</td>
+      </tr>
+      <tr>
+        <td><strong>7. Validation Metric</strong></td>
+        <td>Selects checkpoints using <strong>quantized validation loss (<code>val_quant_loss</code>)</strong>.</td>
+        <td><code>evaluate_dsv41_validation_loss()</code> evaluates continuous <strong><code>BF16</code> <code>val_loss</code></strong>.</td>
+        <td><strong>High:</strong> <code>BF16</code> <code>val_loss</code> can improve while exported 2-bit/FP8 performance degrades.</td>
+      </tr>
+      <tr>
+        <td><strong>8. Engram Conditional Memory</strong></td>
+        <td>Includes all inference-time modules during training.</td>
+        <td><code>forward_hidden()</code> passes <code>engram_hash_ids=None</code>, bypassing layers 1 &amp; 14 <code>CompactEngramModule</code>.</td>
+        <td><strong>Medium:</strong> Train-test residual mismatch on layers 1 and 14 when evaluated in SGLang/Hummingbird.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>3. Concrete Roadmap: How Our Pruned DeepSeek SFT Run Can Be Improved</h2>
+
+  <div class="success">
+    <h3><span class="badge badge-p0">Priority 0</span> 1. Direct Group-Scale QAT (Trainable Per-Group Scales <code>s</code> with Frozen GPTQ <code>q, z</code>)</h3>
+    <p>Instead of de-quantizing the 2-bit routed experts into dense <code>BF16</code>, adding a <code>BF16</code> LoRA adapter, and re-running a destructive data-free L2 grid search at export:</p>
+    <ul>
+      <li><strong>Keep Havu's GPTQ 2-bit integer codes <code>q</code> and zero-points <code>z</code> frozen</strong>, and make the per-group scale tensor <code>s</code> (<code>[N, K // group]</code>, where <code>group=128</code> for <code>w1, w3</code> and <code>group=64</code> for <code>w2</code>) directly trainable in <code>FP32</code> (parameterized as $s = s_{\text{orig}} \cdot (1 + \Delta s)$).</li>
+      <li><strong>Why this is transformative:</strong>
+        <ol>
+          <li><strong>100% Preservation of GPTQ Hessian Calibration:</strong> Because $q$ and $z$ never change, the intra-group error cancellation calibrated by Havu's GPTQ Hessian is completely preserved.</li>
+          <li><strong>Zero Export Discrepancy:</strong> At milestone export, we write <code>s.to(torch.bfloat16)</code> directly into <code>gptq/layer_XX.safetensors</code> alongside the original <code>q</code> and <code>z</code>. The exported checkpoint is bit-for-bit identical to the training forward pass.</li>
+          <li><strong>High Expressivity + Faster Export:</strong> Across 40 layers &times; 128 experts, group scales <code>s</code> provide <strong>1.34B trainable parameters globally (167.8M per GPU)</strong>—exceeding <code>r=32</code> LoRA (<code>1.21B</code> globally)—while eliminating the slow 16-point grid search at export.</li>
+        </ol>
+      </li>
+    </ul>
+  </div>
+
+  <div class="callout">
+    <h3><span class="badge badge-p0">Priority 0</span> 2. Upgrade Trainable Master Weights (<code>shared_experts</code> &amp; <code>lora_A/B</code>) to <code>FP32</code></h3>
+    <p>In <code>dsv41_sft_model.py</code> (<code>LoRALinear.__init__</code> and <code>SwiGLUExpert.__init__</code>), store trainable master parameters in <code>torch.float32</code> and cast to <code>bfloat16</code> inside <code>forward()</code>. Across 40 layers, upgrading <code>1.15B</code> trainable parameters per GPU from <code>BF16</code> to <code>FP32</code> costs only <strong>+2.3 GiB VRAM per GPU</strong> (on 180 GiB B200 GPUs with &gt;45 GiB free headroom) and completely eliminates low-LR <code>BF16</code> mantissa underflow.</p>
+  </div>
+
+  <div class="callout">
+    <h3><span class="badge badge-p1">Priority 1</span> 3. Inject STE Fake-Quantization into <code>SwiGLUExpert.forward</code> &amp; <code>LoRALinear.forward</code></h3>
+    <ul>
+      <li><strong>Shared Experts (<code>FP8 + UE8M0</code> STE):</strong> Wrap <code>shared_experts</code> weights in <code>w_ste = w + (dequant_fp8(quant_fp8(w)) - w).detach()</code> during <code>forward()</code> so the optimizer immediately feels and compensates for any <code>UE8M0</code> power-of-two scale doubling during training.</li>
+      <li><strong>Routed Experts (Locked-<code>z</code> 2-Bit STE):</strong> If using LoRA on routed experts, retain Havu's original unpacked zero-point <code>z_orig</code> in memory at load time and apply fast 1-step group-wise STE rounding around <code>z_orig</code> in <code>LoRALinear.forward</code> and at export, rather than running the unweighted 16-point search over $z \in \{0,1,2,3\}$.</li>
+    </ul>
+  </div>
+
+  <div class="callout">
+    <h3><span class="badge badge-p1">Priority 1</span> 4. Add Quantized Validation Loss (<code>val_quant_loss</code>) for Milestone Selection</h3>
+    <p>In <code>train_dsv41_sft.py</code> (<code>evaluate_dsv41_validation_loss</code>), compute and log <code>val_quant_loss</code> and <code>val_quant_wic_alnum_loss</code> with fake-quantization enabled. Select the best milestone checkpoint for Candidate B32 ARC-AGI-2 evaluation based on <strong>quantized</strong> validation loss rather than unquantized <code>BF16</code> loss.</p>
+  </div>
+
+  <div class="callout">
+    <h3><span class="badge badge-p2">Priority 2</span> 5. Enable Compact Engram Tables (Layers 1 &amp; 14) &amp; Forward KL Anchor (QAD)</h3>
+    <ul>
+      <li>Load the sharded <code>engram/layer_01</code> and <code>engram/layer_14</code> compact tables during SFT and pass <code>engram_hash_ids</code> into <code>Dsv41SftModel.forward_hidden()</code> so downstream experts train on the exact post-Engram residual stream used at inference.</li>
+      <li>Add a Forward KL regularization term ($0.2 \cdot D_{\text{KL}}(P_{\text{base}} \parallel P_{\text{quant}}) + 0.8 \cdot \mathcal{L}_{\text{CE}}$) using the frozen base weights $W_0$ to prevent hidden-state drift across the 40 frozen 128-expert router gates.</li>
+    </ul>
+  </div>
+</div>
+</body>
+</html>

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections import Counter
+import copy
 import hashlib
 import json
 import os
+import re
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -413,9 +415,9 @@ def split_by_parent_puzzle_id(
     for rec in records:
         pid = get_parent_puzzle_id(rec["task_id"], rec.get("parent"))
         by_parent.setdefault(pid, []).append(dict(rec))
-        # If a parent appears in arc2_train, label it arc2_train for stratification
+        # If a parent appears in arc2_train / kaggle_arc2_training, label it arc2_train for stratification
         src = rec.get("source", "unknown")
-        if pid not in parent_source or src == "arc2_train":
+        if pid not in parent_source or src in ("arc2_train", "kaggle_arc2_training") or rec.get("batch") == "arc2_train":
             parent_source[pid] = src
 
     # Group parent IDs by source so both arc2_train and nvarc_training are split ~90/10
@@ -561,22 +563,41 @@ def audit_rollout_file(
                 bad_reason_counts[r] += 1
             continue
 
-        verified_records.append(
-            {
-                "task_id": tid,
-                "pair": int(row["pair"]),
-                "attempt": int(row["attempt"]),
-                "batch": str(row["batch"]),
-                "source": str(row["source"]),
-                "parent": par,
-                "parent_id": get_parent_puzzle_id(tid, par),
-                "turns": int(row["turns"]),
-                "tool_calls": int(row["tool_calls"]),
-                "prompt_tokens": int(row["prompt_tokens"]),
-                "completion_tokens": int(row["completion_tokens"]),
-                "messages": messages,
-            }
-        )
+        qual = analyze_trajectory_quality(messages, events)
+        rec: dict[str, Any] = {
+            "task_id": tid,
+            "pair": int(row["pair"]),
+            "attempt": int(row["attempt"]),
+            "batch": str(row["batch"]),
+            "source": str(row["source"]),
+            "parent": par,
+            "parent_id": get_parent_puzzle_id(tid, par),
+            "turns": int(row["turns"]),
+            "tool_calls": int(row["tool_calls"]),
+            "prompt_tokens": int(row["prompt_tokens"]),
+            "completion_tokens": int(row["completion_tokens"]),
+            "py_error_turns": qual["py_error_turns"],
+            "ident_syntax_error_turns": qual["ident_syntax_error_turns"],
+            "wasted_post_pass_turns": qual["wasted_post_pass_turns"],
+            "post_pass_completion_tokens": qual["post_pass_completion_tokens"],
+            "doubt_markers_count": qual["doubt_markers_count"],
+            "messages": messages,
+        }
+        # Optional Top-10K v8 metadata (absent in Vu's E031-E038 parquet schema).
+        for opt_key in (
+            "learning_tier",
+            "learning_signal_score",
+            "dataset",
+            "thinking_tokens",
+            "code_rescues",
+            "cap_nudges",
+            "all_3_levels_verified",
+            "verified_clean_sft",
+        ):
+            val = row.get(opt_key)
+            if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                rec[opt_key] = val.item() if hasattr(val, "item") else val
+        verified_records.append(rec)
 
     stats = {
         "file": os.path.basename(fpath),
@@ -600,9 +621,21 @@ def audit_rollout_file(
         "bad_turn_rows_among_verified": bad_turn_rows,
         "bad_reason_counts": dict(bad_reason_counts),
         "verified_clean_count": len(verified_records),
+        "zero_py_error_among_verified": sum(1 for r in verified_records if r["py_error_turns"] == 0),
+        "zero_ident_syntax_error_among_verified": sum(
+            1 for r in verified_records if r["ident_syntax_error_turns"] == 0
+        ),
+        "zero_wasted_post_pass_turns_among_verified": sum(
+            1 for r in verified_records if r["wasted_post_pass_turns"] == 0
+        ),
         "elapsed_sec": round(time.time() - t0, 2),
     }
     return stats, verified_records
+
+
+def read_rollout_rows_from_file(fpath: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Reads rollout rows from either a .parquet or .jsonl file on CNS."""
+    return _read_rollout_rows_from_file(fpath)
 
 
 def discover_top10k_rollout_shards(top10k_dir: str) -> list[str]:
@@ -622,3 +655,517 @@ def discover_top10k_rollout_shards(top10k_dir: str) -> list[str]:
         for f in entries
         if f.startswith("rollouts_shard_") and f.endswith(".parquet")
     ]
+
+
+def load_argon_ratings(argon_path: str) -> dict[str, dict[str, Any]]:
+    """Loads Gemini 4 Argon difficulty ratings keyed by both puzzle_id and family_id."""
+    ratings: dict[str, dict[str, Any]] = {}
+    if not argon_path or not gfile.Exists(argon_path):
+        return ratings
+    with gfile.Open(argon_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+                pid = str(row.get("puzzle_id") or row.get("representative_puzzle_id") or "")
+                fid = str(row.get("family_id") or "")
+                if pid:
+                    ratings[pid] = row
+                if fid and fid not in ratings:
+                    ratings[fid] = row
+            except Exception:
+                continue
+    return ratings
+
+
+def filter_records_by_argon_difficulty(
+    records: Sequence[Mapping[str, Any]],
+    argon_ratings: Mapping[str, Mapping[str, Any]],
+    min_qwen38_difficulty: int = 6,
+    max_qwen38_difficulty: int = 9,
+    only_argon_recommended: bool = True,
+    keep_unrated_official_arc: bool = True,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Filters SFT records using Gemini 4 Argon Qwen3.8-27B difficulty ratings."""
+    kept: list[dict[str, Any]] = []
+    stats = {
+        "input_records": len(records),
+        "matched_argon_rating": 0,
+        "kept_hard_for_qwen38": 0,
+        "kept_unrated_official": 0,
+        "dropped_trivial_or_low_diff": 0,
+        "dropped_not_recommended_or_ambiguous": 0,
+    }
+    for rec in records:
+        tid = str(rec.get("task_id") or "")
+        pid = get_parent_puzzle_id(tid, str(rec.get("parent") or ""))
+        rating = argon_ratings.get(tid) or argon_ratings.get(pid)
+        if rating is None:
+            if keep_unrated_official_arc:
+                rec_copy = dict(rec)
+                kept.append(rec_copy)
+                stats["kept_unrated_official"] += 1
+            continue
+
+        stats["matched_argon_rating"] += 1
+        q_diff = int(rating.get("qwen38_difficulty_score", 5))
+        rec_inc = bool(rating.get("sft_recommend_include", True))
+        if q_diff < min_qwen38_difficulty:
+            stats["dropped_trivial_or_low_diff"] += 1
+            continue
+        if q_diff > max_qwen38_difficulty or (only_argon_recommended and not rec_inc):
+            stats["dropped_not_recommended_or_ambiguous"] += 1
+            continue
+
+        rec_copy = dict(rec)
+        rec_copy["qwen38_difficulty_score"] = q_diff
+        rec_copy["sft_value_score"] = float(rating.get("sft_value_score", 0.0))
+        rec_copy["sft_priority_tier"] = str(rating.get("sft_priority_tier", ""))
+        kept.append(rec_copy)
+        stats["kept_hard_for_qwen38"] += 1
+
+    return kept, stats
+
+
+# ============================================================
+# DeepSeek-V4.1 Trajectory Quality & Native DSML Tokenization
+# ============================================================
+
+PYERR_RE = re.compile(r"Traceback|\w+Error:|\w+Exception:")
+IDENT_SYNTAX_ERR_RE = re.compile(
+    r"\b(?:NameError|AttributeError|ImportError|ModuleNotFoundError|SyntaxError|IndentationError|UnboundLocalError):"
+)
+OUTPUT_REF_RE = re.compile(
+    r"""\[\s*['"]output['"]\s*\]|\.get\(\s*['"]output['"]|\bexp(?:ected)?\b|\btarget\b|\bgt\b|\bwant\b"""
+)
+COMPARE_RE = re.compile(
+    r"array_equal|==|!=|\.all\(\)|\ball\(|np\.sum\(|\.sum\(\)|\bcompare|\bcheck|\bverify|\bmatch"
+)
+NEG_VERDICT_RE = re.compile(
+    r"\bFalse\b|\bFAIL|\bfail(?:ed|s)?\b|\bwrong\b|\bincorrect\b|\bmismatch(?:es)?\b(?!\D{0,4}\b0\b)"
+    r"|✗|\bnot match|\bno match\b|\bdiffer(?:s|ent)?\b|\bMISMATCH"
+)
+NUM_BAD_RE = re.compile(
+    r"\b(?:diff|diffs|ndiff|mismatch(?:es)?|errors?|wrong|bad|nwrong|ndiffs|diff_count|n_diff)\b[^\d\n]{0,12}?(\d+)",
+    re.I,
+)
+POS_VERDICT_RE = re.compile(r"\bTrue\b|\bOK\b|\bPASS(?:ED)?\b|\bpassed\b|\bcorrect\b|✓")
+ALL_LINE_RE = re.compile(r"\ball\b[^\n]{0,40}\b(?:True|match|pass|correct|OK|ok|equal)", re.I)
+CORE_DOUBT_RE = re.compile(
+    r"\b[Ww]ait\b|\b[Hh]m{2,}\b|\b[Aa]ctually\b|double[- ]?check|\bre-?check|\bre-?verify"
+    r"|verify (?:it |this |that )?again|check (?:it |this |that )?again|[Ll]et me (?:also )?(?:re-?)?verify"
+    r"|[Ll]et me confirm|sanity[- ]check|\b[Hh]old on\b|\b[Oo]ops\b|\b[Hh]ang on\b"
+    r"|\bnot (?:entirely |fully |so |100% )?sure\b|\bunsure\b|\buncertain\b"
+    r"|\breconsider|\bre-?think|\bre-?examine|\bre-?read"
+)
+WORD_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _detect_all_train_pass(code: str, out: str, n_train: int) -> bool:
+    """Returns True if `code` checks training outputs and `out` reports all training pairs passing."""
+    if not code or PYERR_RE.search(out) or not (OUTPUT_REF_RE.search(code) and COMPARE_RE.search(code)):
+        return False
+    body = out.split("[budget:")[0].replace("[completed]", "")
+    lines = [ln for ln in body.split("\n") if not re.search(r"test", ln, re.I)]
+    body = "\n".join(lines)
+    if NEG_VERDICT_RE.search(body):
+        return False
+    for m in NUM_BAD_RE.finditer(body):
+        if int(m.group(1)) > 0:
+            return False
+    pos_lines = sum(bool(POS_VERDICT_RE.search(ln) or NUM_BAD_RE.search(ln)) for ln in lines)
+    if pos_lines >= max(1, n_train) or ALL_LINE_RE.search(body) or body.strip() == "True":
+        return True
+    if "all(" in code and any(ln.strip() == "True" for ln in lines):
+        return True
+    return False
+
+
+def analyze_trajectory_quality(
+    messages: Sequence[Mapping[str, Any]],
+    events: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Extracts per-trajectory Python error counts, identifier/syntax typo counts, and post-pass tail stats."""
+    user_text = next((str(m.get("content") or "") for m in messages if m.get("role") == "user"), "")
+    n_train = max(1, len(re.findall(r"--Example \d+--", user_text)))
+    usage_events = [e for e in events if isinstance(e, Mapping) and e.get("usage")]
+
+    py_error_turns = 0
+    ident_syntax_error_turns = 0
+    doubt_markers_count = 0
+    first_pass_turn: int | None = None
+    turn_comp_tokens: list[int] = []
+    turn_has_submit: list[bool] = []
+
+    asst_idx = 0
+    n_msgs = len(messages)
+    for i, m in enumerate(messages):
+        if m.get("role") != "assistant":
+            continue
+        think = str(m.get("reasoning_content") or "")
+        content = str(m.get("content") or "")
+        doubt_markers_count += len(CORE_DOUBT_RE.findall(think))
+
+        code_parts: list[str] = []
+        has_submit = False
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            fn_name = fn.get("name", "")
+            raw_args = fn.get("arguments") or "{}"
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except Exception:
+                args = {}
+            c_str = str(args.get("code", "")) if isinstance(args, Mapping) else ""
+            if fn_name == "submit_answer":
+                has_submit = True
+            else:
+                code_parts.append(c_str)
+        code = "\n".join(code_parts)
+
+        outs: list[str] = []
+        j = i + 1
+        while j < n_msgs and messages[j].get("role") == "tool":
+            outs.append(str(messages[j].get("content") or ""))
+            j += 1
+        out = "\n".join(outs)
+
+        if out and PYERR_RE.search(out):
+            py_error_turns += 1
+            if IDENT_SYNTAX_ERR_RE.search(out):
+                ident_syntax_error_turns += 1
+
+        if first_pass_turn is None and _detect_all_train_pass(code, out, n_train):
+            first_pass_turn = asst_idx
+
+        ev = usage_events[asst_idx] if asst_idx < len(usage_events) else {}
+        comp_tok = int((ev.get("usage") or {}).get("completion_tokens") or 0)
+        if comp_tok <= 0:
+            comp_tok = max(1, (len(think) + len(content) + len(code)) // 4)
+        turn_comp_tokens.append(comp_tok)
+        turn_has_submit.append(has_submit)
+        asst_idx += 1
+
+    n_asst = asst_idx
+    if first_pass_turn is not None:
+        if turn_has_submit[first_pass_turn]:
+            wasted_post_pass_turns = 0
+            post_pass_completion_tokens = 0
+        else:
+            # Ideal is calling submit_answer on turn `first_pass_turn + 1` (0 wasted turns).
+            wasted_post_pass_turns = max(0, (n_asst - 1) - (first_pass_turn + 1))
+            post_pass_completion_tokens = int(sum(turn_comp_tokens[first_pass_turn + 1 :]))
+    else:
+        wasted_post_pass_turns = 0
+        post_pass_completion_tokens = 0
+
+    return {
+        "py_error_turns": py_error_turns,
+        "ident_syntax_error_turns": ident_syntax_error_turns,
+        "wasted_post_pass_turns": wasted_post_pass_turns,
+        "post_pass_completion_tokens": post_pass_completion_tokens,
+        "doubt_markers_count": doubt_markers_count,
+    }
+
+
+# DeepSeek-V4.1 special tokens & DSML formatting (byte-identical to encoding/encoding.py)
+DS41_BOS_TOKEN = "<｜begin▁of▁sentence｜>"
+DS41_EOS_TOKEN = "<｜end▁of▁sentence｜>"
+DS41_SYSTEM_SP_TOKEN = "<｜System｜>"
+DS41_USER_SP_TOKEN = "<｜User｜>"
+DS41_ASSISTANT_SP_TOKEN = "<｜Assistant｜>"
+DS41_THINK_START = "<think>"
+DS41_THINK_END = "</think>"
+DS41_TOKEN = "｜DSML｜"
+
+DS41_TOOLS_TEMPLATE = """## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<｜DSML｜ calls>" block like the following:
+
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="$TOOL_NAME">
+<｜DSML｜ parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜ parameter>
+...
+</｜DSML｜ invoke>
+<｜DSML｜ invoke name="$TOOL_NAME2">
+...
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.
+
+Otherwise, output directly after </think> with tool calls or final response.
+
+### Available Tool Schemas
+
+{tool_schemas}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+"""
+
+
+def _ds41_to_json(val: Any) -> str:
+    try:
+        return json.dumps(val, ensure_ascii=False)
+    except Exception:
+        return json.dumps(val, ensure_ascii=True)
+
+
+def _ds41_encode_args_to_dsml(raw_arguments: Any) -> str:
+    args = raw_arguments
+    if not isinstance(args, dict):
+        for _ in range(2):
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    break
+            else:
+                break
+        if not isinstance(args, dict):
+            args = {"arguments": raw_arguments}
+    parts: list[str] = []
+    for k, v in args.items():
+        is_str = "true" if isinstance(v, str) else "false"
+        val_str = v if isinstance(v, str) else _ds41_to_json(v)
+        parts.append(f'<{DS41_TOKEN} parameter name="{k}" string="{is_str}">{val_str}</{DS41_TOKEN} parameter>')
+    return "\n".join(parts)
+
+
+def render_deepseek_v41_with_spans(
+    messages: Sequence[Mapping[str, Any]],
+    reasoning_effort: int = 50,
+    tools: bool = True,
+) -> dict[str, Any]:
+    """Renders messages into DeepSeek-V4.1 DSML format and returns char spans for loss masking & weighting.
+
+    Matches `tokenize_rollouts.py:render_with_roles` + `encoding/encoding.py` byte-for-byte.
+    Returns dict with:
+      - `text`: full rendered string starting with `<｜begin▁of▁sentence｜>`
+      - `asst_spans`: list of `(start_char, end_char)` for every assistant message's generated suffix
+      - `tc_spans`: list of `(start_char, end_char)` for every DSML tool-call block (`<｜DSML｜ calls>...`)
+      - `final_submit_span`: `(start_char, end_char)` of the final assistant message
+    """
+    msgs = [copy.deepcopy(dict(m)) for m in messages]
+    last_asst = max(i for i, m in enumerate(msgs) if m.get("role") == "assistant")
+    msgs = msgs[: last_asst + 1]
+    if tools:
+        if msgs[0].get("role") != "system":
+            msgs.insert(0, {"role": "system", "content": ""})
+        msgs[0]["tools"] = copy.deepcopy(TOOL_SPECS_LEAN2SUB)
+
+    # Merge tool messages into user content_blocks in call order (matching encoding.py)
+    merged: list[dict[str, Any]] = []
+    for msg in msgs:
+        role = msg.get("role")
+        if role == "tool":
+            tool_block = {
+                "type": "tool_result",
+                "tool_use_id": msg.get("tool_call_id", ""),
+                "content": msg.get("content", ""),
+            }
+            if merged and merged[-1].get("role") == "user" and "content_blocks" in merged[-1]:
+                merged[-1]["content_blocks"].append(tool_block)
+            else:
+                merged.append({"role": "user", "content_blocks": [tool_block]})
+        elif role == "user":
+            c_blocks = msg.get("content_blocks")
+            if c_blocks is None:
+                c = msg.get("content", "")
+                c_blocks = c if isinstance(c, list) else [{"type": "text", "text": c}]
+            if merged and merged[-1].get("role") == "user" and "content_blocks" in merged[-1]:
+                merged[-1]["content_blocks"].extend(c_blocks)
+            else:
+                new_m = dict(msg)
+                new_m["content_blocks"] = c_blocks
+                merged.append(new_m)
+        else:
+            merged.append(dict(msg))
+
+    # Sort tool_result blocks by preceding assistant tool_calls order
+    last_tc_order: dict[str, int] = {}
+    for msg in merged:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            last_tc_order = {}
+            for idx, tc in enumerate(msg["tool_calls"]):
+                tc_id = tc.get("id") or tc.get("function", {}).get("id", "")
+                if tc_id:
+                    last_tc_order[tc_id] = idx
+        elif msg.get("role") == "user" and msg.get("content_blocks"):
+            t_blocks = [b for b in msg["content_blocks"] if b.get("type") == "tool_result"]
+            if len(t_blocks) > 1 and last_tc_order:
+                s_blocks = sorted(t_blocks, key=lambda b: last_tc_order.get(b.get("tool_use_id", ""), 0))
+                s_idx = 0
+                new_b = []
+                for b in msg["content_blocks"]:
+                    if b.get("type") == "tool_result":
+                        new_b.append(s_blocks[s_idx])
+                        s_idx += 1
+                    else:
+                        new_b.append(b)
+                msg["content_blocks"] = new_b
+
+    text = DS41_BOS_TOKEN
+    asst_spans: list[tuple[int, int]] = []
+    tc_spans: list[tuple[int, int]] = []
+
+    for idx, msg in enumerate(merged):
+        role = msg.get("role")
+        piece = ""
+        if idx == 0:
+            effort_str = (
+                f"Reasoning Effort: {reasoning_effort} "
+                "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+                if reasoning_effort > 0
+                else ""
+            )
+            if effort_str or role == "system":
+                piece += DS41_SYSTEM_SP_TOKEN
+            piece += effort_str
+
+        if role == "system":
+            if idx > 0:
+                piece += DS41_SYSTEM_SP_TOKEN
+            piece += msg.get("content") or ""
+            if msg.get("tools"):
+                fn_schemas = [_ds41_to_json(dict(t["function"])) for t in msg["tools"]]
+                piece += "\n\n" + DS41_TOOLS_TEMPLATE.format(tool_schemas="\n".join(fn_schemas))
+            if idx + 1 >= len(merged) or merged[idx + 1].get("role") in ("assistant", "latest_reminder"):
+                if idx > 0:
+                    piece += DS41_ASSISTANT_SP_TOKEN + DS41_THINK_START
+            text += piece
+
+        elif role == "user":
+            piece += DS41_USER_SP_TOKEN
+            c_blocks = msg.get("content_blocks")
+            if c_blocks:
+                parts = []
+                for b in c_blocks:
+                    if b.get("type") == "text":
+                        parts.append(b.get("text", ""))
+                    elif b.get("type") == "tool_result":
+                        parts.append(f"<tool_result>{b.get('content', '')}</tool_result>")
+                piece += "\n\n".join(parts)
+            else:
+                piece += msg.get("content") or ""
+            if idx + 1 >= len(merged) or merged[idx + 1].get("role") in ("assistant", "latest_reminder"):
+                piece += DS41_ASSISTANT_SP_TOKEN + DS41_THINK_START
+            text += piece
+
+        elif role == "assistant":
+            rc = msg.get("reasoning_content") or ""
+            summary_content = msg.get("content") or ""
+            thinking_part = f"{rc}{DS41_THINK_END}"
+            tc_content = ""
+            if msg.get("tool_calls"):
+                tc_list = []
+                for tc in msg["tool_calls"]:
+                    fn = tc["function"]
+                    name = fn["name"]
+                    arg_str = _ds41_encode_args_to_dsml(fn.get("arguments", "{}"))
+                    tc_list.append(
+                        f'<{DS41_TOKEN} invoke name="{name}">\n{arg_str}\n</{DS41_TOKEN} invoke>'
+                    )
+                tc_joined = "\n".join(tc_list)
+                tc_content = f"\n\n<{DS41_TOKEN} calls>\n{tc_joined}\n</{DS41_TOKEN} calls>"
+
+            asst_start = len(text)
+            body_before_tc = f"{thinking_part}{summary_content}"
+            tc_start = asst_start + len(body_before_tc)
+            piece = f"{body_before_tc}{tc_content}{DS41_EOS_TOKEN}"
+            asst_end = asst_start + len(piece)
+            asst_spans.append((asst_start, asst_end))
+            if tc_content:
+                tc_spans.append((tc_start, asst_end))
+            text += piece
+        else:
+            raise ValueError(f"Unsupported role in DeepSeek-V4.1 render: {role}")
+
+    return {
+        "text": text,
+        "asst_spans": asst_spans,
+        "tc_spans": tc_spans,
+        "final_submit_span": asst_spans[-1] if asst_spans else None,
+    }
+
+
+def tokenize_deepseek_v41_and_build_weights(
+    messages: Sequence[Mapping[str, Any]],
+    tokenizer: Any,
+    reasoning_effort: int = 50,
+    wic_alnum_weight: int = 10,
+    tool_call_weight: int = 2,
+    final_submit_weight: int = 5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
+    """Tokenizes a rollout in DeepSeek-V4.1 DSML format and builds `input_ids`, `loss_mask`, and `loss_weights`.
+
+    `loss_weights` (`uint8`) assigns:
+      - `0` on non-assistant tokens (system, user, tool_result, `<｜Assistant｜><think>` header)
+      - `1` on standard assistant reasoning tokens
+      - `tool_call_weight` (default 2) on DSML tool-call blocks (`<｜DSML｜ calls>...`)
+      - `final_submit_weight` (default 5) on the final `submit_answer` turn
+      - `wic_alnum_weight` (default 10) on word-internal alphanumeric continuation tokens (`WIC-alnum`)
+        inside assistant spans, targeting the 75% BPE split-mixing typo concentration in pruned E128.
+    """
+    rendered = render_deepseek_v41_with_spans(messages, reasoning_effort=reasoning_effort, tools=True)
+    text = rendered["text"]
+    asst_spans = rendered["asst_spans"]
+    tc_spans = rendered["tc_spans"]
+    final_span = rendered["final_submit_span"]
+
+    # Support both `tokenizers.Tokenizer` and `transformers.PreTrainedTokenizerFast`
+    if hasattr(tokenizer, "encode") and not hasattr(tokenizer, "vocab_size"):
+        enc = tokenizer.encode(text, add_special_tokens=False)
+        ids = np.asarray(enc.ids, dtype=np.int32)
+        offsets = enc.offsets
+    else:
+        enc_out = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        ids = np.asarray(enc_out["input_ids"], dtype=np.int32)
+        offsets = enc_out["offset_mapping"]
+
+    starts = np.asarray([s for s, _ in offsets], dtype=np.int64)
+    loss_mask = np.zeros(len(ids), dtype=np.uint8)
+    loss_weights = np.zeros(len(ids), dtype=np.uint8)
+
+    for s, e in asst_spans:
+        sel = (starts >= s) & (starts < e)
+        loss_mask[sel] = 1
+        loss_weights[sel] = 1
+
+    for s, e in tc_spans:
+        sel = (starts >= s) & (starts < e) & (loss_mask == 1)
+        loss_weights[sel] = np.maximum(loss_weights[sel], tool_call_weight)
+
+    if final_span is not None:
+        fs, fe = final_span
+        sel = (starts >= fs) & (starts < fe) & (loss_mask == 1)
+        loss_weights[sel] = np.maximum(loss_weights[sel], final_submit_weight)
+
+    # Identify WIC-alnum tokens (2nd+ token of a word [A-Za-z_][A-Za-z0-9_]* splitting two alphanumerics)
+    words = [(m.start(), m.end()) for m in WORD_IDENT_RE.finditer(text)]
+    wi = 0
+    n_words = len(words)
+    wic_alnum_count = 0
+    for k, (a, b) in enumerate(offsets):
+        if loss_mask[k] == 0 or a >= b:
+            continue
+        while wi < n_words and words[wi][1] <= a:
+            wi += 1
+        if wi < n_words and words[wi][0] < b and a < words[wi][1]:
+            w_start = words[wi][0]
+            if a > w_start and text[a - 1].isalnum() and text[a].isalnum():
+                loss_weights[k] = max(int(loss_weights[k]), wic_alnum_weight)
+                wic_alnum_count += 1
+
+    tok_stats = {
+        "n_asst_turns": len(asst_spans),
+        "n_wic_alnum_tokens": wic_alnum_count,
+        "n_tool_call_tokens": int(((loss_weights == tool_call_weight) | (loss_weights == wic_alnum_weight)).sum()),
+    }
+    return ids, loss_mask, loss_weights, tok_stats
+
+

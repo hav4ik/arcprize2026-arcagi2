@@ -200,23 +200,260 @@ py_binary(
     ],
 )
 
+py_binary(
+    name = "soup_checkpoints",
+    srcs = ["soup_checkpoints.py"],
+    deps = [
+        ":export_and_quantize_lib",
+        "//file/cns2",
+        "//file/liball",
+        "//pyglib:gfile",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/g3lib",
+        "//third_party/py/torch:pytorch",
+    ],
+)
+
+py_library(
+    name = "evaluate_difficulty_argon_lib",
+    srcs = ["evaluate_difficulty_argon.py"],
+    deps = [
+        ":data_pipeline",
+        "//pyglib:gfile",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/numpy",
+    ],
+)
+
+py_binary(
+    name = "evaluate_difficulty_argon",
+    srcs = ["evaluate_difficulty_argon.py"],
+    deps = [
+        ":data_pipeline",
+        "//file/cns2",
+        "//file/liball",
+        "//pyglib:gfile",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/g3lib",
+        "//third_party/py/numpy",
+    ],
+)
+
+py_binary(
+    name = "inspect_and_download_chankhavu_e128",
+    srcs = ["inspect_and_download_chankhavu_e128.py"],
+    deps = [
+        ":export_and_quantize_lib",
+        "//file/cns2",
+        "//file/liball",
+        "//pyglib:gfile",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/g3lib",
+        "//third_party/py/numpy",
+    ],
+)
+
+py_library(
+    name = "dsv41_sft_model",
+    srcs = ["dsv41_sft_model.py"],
+    deps = [
+        ":export_and_quantize_lib",
+        ":train_sft_lib",
+        "//pyglib:gfile",
+        "//third_party/py/numpy",
+        "//third_party/py/safetensors",
+        "//third_party/py/safetensors:torch",
+        "//third_party/py/torch:pytorch",
+    ],
+)
+
+py_library(
+    name = "train_dsv41_sft_lib",
+    srcs = ["train_dsv41_sft.py"],
+    deps = [
+        ":dsv41_sft_model",
+        ":export_and_quantize_lib",
+        ":train_full_sft_lib",
+        ":train_sft_lib",
+        "//pyglib:gfile",
+        "//pyglib/contrib/g3_multiprocessing",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/numpy",
+        "//third_party/py/torch:pytorch",
+    ],
+)
+
+py_binary(
+    name = "train_dsv41_sft",
+    srcs = ["train_dsv41_sft.py"],
+    deps = [
+        ":dsv41_sft_model",
+        ":export_and_quantize_lib",
+        ":train_full_sft_lib",
+        ":train_sft_lib",
+        "//experimental/users/gaoxiao/deploy_qwen_h100:cuda_platform",
+        "//file/cns2",
+        "//file/liball",
+        "//pyglib:gfile",
+        "//pyglib/contrib/g3_multiprocessing",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/g3lib",
+        "//third_party/py/numpy",
+        "//third_party/py/safetensors",
+        "//third_party/py/safetensors:torch",
+        "//third_party/py/torch:pytorch",
+    ],
+)
+
+py_binary(
+    name = "launch_dsv41_sft_b200_xm",
+    srcs = ["launch_dsv41_sft_b200_xm.py"],
+    deps = [
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/xmanager:xm_flags",
+        "//third_party/py/xmanager/contrib/internal:requirements_flag",
+        "//third_party/py/xmanager/xm",
+        "//third_party/py/xmanager/xm_abc",
+    ],
+)
+
+py_library(
+    name = "eval_dsv41_b32_arc2_lib",
+    srcs = ["eval_dsv41_b32_arc2.py"],
+    deps = [
+        ":dsv41_sft_model",
+        ":export_and_quantize_lib",
+        "//experimental/users/arazdai/kaggle/arc_agi_2/pilot_2:havu_b32_harness",
+        "//experimental/users/arazdai/kaggle/arc_agi_2/pilot_2:prompts_and_selector",
+        "//pyglib:gfile",
+        "//pyglib/contrib/g3_multiprocessing",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/numpy",
+        "//third_party/py/tokenizers",
+        "//third_party/py/torch:pytorch",
+        "//third_party/py/vllm",
+    ],
+)
+
+py_binary(
+    name = "eval_dsv41_b32_arc2",
+    srcs = ["eval_dsv41_b32_arc2.py"],
+    deps = [
+        ":dsv41_sft_model",
+        ":export_and_quantize_lib",
+        "//experimental/users/arazdai/kaggle/arc_agi_2/pilot_2:havu_b32_harness",
+        "//experimental/users/arazdai/kaggle/arc_agi_2/pilot_2:prompts_and_selector",
+        "//experimental/users/gaoxiao/deploy_qwen_h100:cuda_platform",
+        "//file/cns2",
+        "//file/liball",
+        "//pyglib:gfile",
+        "//pyglib/contrib/g3_multiprocessing",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/g3lib",
+        "//third_party/py/numpy",
+        "//third_party/py/tokenizers",
+        "//third_party/py/torch:pytorch",
+        "//third_party/py/vllm",
+    ],
+)
+
+py_binary(
+    name = "launch_dsv41_b32_eval_xm",
+    srcs = ["launch_dsv41_b32_eval_xm.py"],
+    deps = [
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/xmanager:xm_flags",
+        "//third_party/py/xmanager/contrib/internal:requirements_flag",
+        "//third_party/py/xmanager/xm",
+        "//third_party/py/xmanager/xm_abc",
+    ],
+)
+
+py_binary(
+    name = "gen_dsv41_before_after",
+    srcs = ["gen_dsv41_before_after.py"],
+    deps = [
+        ":dsv41_sft_model",
+        ":eval_dsv41_b32_arc2_lib",
+        ":export_and_quantize_lib",
+        ":train_sft_lib",
+        "//experimental/users/arazdai/kaggle/arc_agi_2/pilot_2:havu_b32_harness",
+        "//experimental/users/gaoxiao/deploy_qwen_h100:cuda_platform",
+        "//file/cns2",
+        "//file/liball",
+        "//pyglib:gfile",
+        "//pyglib/contrib/g3_multiprocessing",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/g3lib",
+        "//third_party/py/numpy",
+        "//third_party/py/tokenizers",
+        "//third_party/py/torch:pytorch",
+        "//third_party/py/vllm",
+    ],
+)
+
+py_binary(
+    name = "launch_gen_dsv41_before_after_xm",
+    srcs = ["launch_gen_dsv41_before_after_xm.py"],
+    deps = [
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/xmanager:xm_flags",
+        "//third_party/py/xmanager/contrib/internal:requirements_flag",
+        "//third_party/py/xmanager/xm",
+        "//third_party/py/xmanager/xm_abc",
+    ],
+)
+
 py_test(
     name = "sft_test",
     size = "medium",
     srcs = ["sft_test.py"],
     deps = [
         ":data_pipeline",
+        ":dsv41_sft_model",
+        ":eval_dsv41_b32_arc2_lib",
+        ":evaluate_difficulty_argon_lib",
         ":export_and_quantize_lib",
         ":fast_deltanet",
+        ":train_dsv41_sft_lib",
         ":train_full_sft_lib",
         ":train_sft_lib",
+        "//experimental/users/arazdai/kaggle/arc_agi_2/pilot_2:havu_b32_harness",
+        "//experimental/users/arazdai/kaggle/arc_agi_2/pilot_2:prompts_and_selector",
         "//pyglib:gfile",
         "//testing/pybase",
         "//third_party/py/numpy",
         "//third_party/py/pandas",
         "//third_party/py/peft",
         "//third_party/py/pyarrow",
+        "//third_party/py/safetensors:torch",
         "//third_party/py/torch:pytorch",
         "//third_party/py/transformers:v5",
+        "//third_party/py/vllm",
+    ],
+)
+
+py_binary(
+    name = "repair_dsv41_export_shared_scales",
+    srcs = ["repair_dsv41_export_shared_scales.py"],
+    deps = [
+        ":dsv41_sft_model",
+        "//pyglib:gfile",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/safetensors:torch",
+        "//third_party/py/torch:pytorch",
     ],
 )

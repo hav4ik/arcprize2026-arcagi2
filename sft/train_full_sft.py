@@ -119,6 +119,38 @@ flags.DEFINE_bool(
     False,
     "Run pre-launch smoke test verification (DeltaNet grad check, param update check, save/reload/resume test, partial batch test).",
 )
+# ---- Round-2 flags ----
+flags.DEFINE_bool(
+    "length_bucketed_batching",
+    False,
+    "Group similar-length trajectories into each optimizer step and balance tokens across ranks (kills the straggler wait; "
+    "same per-step token-mean loss, no numerics change).",
+)
+flags.DEFINE_integer(
+    "bucket_mega_batch_multiplier",
+    8,
+    "Length-bucketing sorts within mega-batches of `effective_batch * multiplier` random trajectories, then shuffles steps.",
+)
+flags.DEFINE_bool(
+    "no_decay_norm_bias_deltanet",
+    False,
+    "Exclude 1-D params, biases, norms, and DeltaNet A_log / dt_bias / conv1d from AdamW weight decay.",
+)
+flags.DEFINE_float(
+    "save_every_epoch_fraction",
+    0.0,
+    "If > 0, overrides --save_every_steps with round(steps_per_epoch * fraction).",
+)
+flags.DEFINE_float(
+    "export_fp8_every_epoch_fraction",
+    0.0,
+    "If > 0, overrides --export_fp8_every_steps with round(steps_per_epoch * fraction).",
+)
+flags.DEFINE_float(
+    "milestone_every_epoch_fraction",
+    0.0,
+    "If > 0, overrides --milestone_every_steps with round(steps_per_epoch * fraction).",
+)
 
 
 def compute_chunked_causal_lm_loss_functional(
@@ -290,16 +322,66 @@ def build_epoch_batches(
     world_size: int,
     micro_batch_size: int,
     grad_accum_steps: int,
+    lengths: np.ndarray | None = None,
+    bucket_rng: np.random.Generator | None = None,
+    mega_batch_multiplier: int = 8,
 ) -> list[list[int | None]]:
-    """Partitions `order` into steps of size `effective_batch`, padding the final partial batch with `None`."""
+    """Partitions `order` into steps of size `effective_batch`, padding the final partial batch with `None`.
+
+    When `lengths` is given, trajectories are length-bucketed: each mega-batch of
+    `effective_batch * mega_batch_multiplier` random trajectories is sorted by length and cut into
+    steps of similar length; the step order is then shuffled with `bucket_rng` (deterministic given
+    `order` + rng state, so checkpoint resume rebuilds the identical schedule). Within a step, the
+    trajectories are assigned to ranks greedily (longest first, to the rank with the fewest tokens)
+    so all ranks finish their `grad_accum_steps` micro-batches at about the same time. Slot layout
+    is preserved: rank r consumes `batch_slots[r::world_size]`.
+    """
     assert effective_batch == world_size * micro_batch_size * grad_accum_steps
     batches: list[list[int | None]] = []
     n = len(order)
-    for start in range(0, n, effective_batch):
-        chunk = [int(x) for x in order[start : start + effective_batch]]
-        if len(chunk) < effective_batch:
-            chunk.extend([None] * (effective_batch - len(chunk)))
-        batches.append(chunk)
+    if lengths is None:
+        for start in range(0, n, effective_batch):
+            chunk = [int(x) for x in order[start : start + effective_batch]]
+            if len(chunk) < effective_batch:
+                chunk.extend([None] * (effective_batch - len(chunk)))
+            batches.append(chunk)
+        return batches
+
+    slots_per_rank = micro_batch_size * grad_accum_steps
+    mega = effective_batch * max(1, mega_batch_multiplier)
+    full_steps: list[list[int]] = []
+    partial_step: list[int] | None = None
+    for start in range(0, n, mega):
+        chunk = [int(x) for x in order[start : start + mega]]
+        chunk.sort(key=lambda i: (-int(lengths[i]), i))
+        for j in range(0, len(chunk), effective_batch):
+            group = chunk[j : j + effective_batch]
+            if len(group) == effective_batch:
+                full_steps.append(group)
+            else:
+                assert partial_step is None, "Only the final step may be partial"
+                partial_step = group
+    if bucket_rng is not None and len(full_steps) > 1:
+        perm = bucket_rng.permutation(len(full_steps))
+        full_steps = [full_steps[i] for i in perm]
+    if partial_step is not None:
+        full_steps.append(partial_step)
+
+    for group in full_steps:
+        # Greedy longest-processing-time assignment across ranks, respecting slots_per_rank
+        group_sorted = sorted(group, key=lambda i: (-int(lengths[i]), i))
+        rank_items: list[list[int]] = [[] for _ in range(world_size)]
+        rank_tokens = [0] * world_size
+        for idx in group_sorted:
+            candidates = [r for r in range(world_size) if len(rank_items[r]) < slots_per_rank]
+            r_best = min(candidates, key=lambda r: (rank_tokens[r], r))
+            rank_items[r_best].append(idx)
+            rank_tokens[r_best] += int(lengths[idx])
+        batch_slots: list[int | None] = [None] * effective_batch
+        for r in range(world_size):
+            for j, idx in enumerate(rank_items[r]):
+                batch_slots[r + world_size * j] = idx
+        batches.append(batch_slots)
     return batches
 
 
@@ -629,7 +711,9 @@ def load_distributed_checkpoint(
                 if name not in param_map:
                     raise KeyError(f"Parameter {name} missing from model during checkpoint load")
                 p = param_map[name]
-                _to_local_tensor(p).copy_(saved_local.to(device=device, dtype=p.dtype))
+                # Direct CPU -> device copy with dtype cast; avoids a per-tensor GPU temporary that the
+                # caching allocator would keep reserved (this OOM'd the resumed run of xid 304951546).
+                _to_local_tensor(p).copy_(saved_local, non_blocking=False)
 
             for name, saved_opt_entry in part_data["optimizer"].items():
                 p = param_map[name]
@@ -648,7 +732,12 @@ def load_distributed_checkpoint(
                     else:
                         restored_st[k] = v.to(device=device, dtype=torch.float32)
                 optimizer.state[p] = restored_st
+            part_data["model"].clear()
     del part_data_list
+    gc.collect()
+    if torch.cuda.is_available() and device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
 
     for pg, saved_pg in zip(optimizer.param_groups, rank_state.get("optimizer_param_groups", [])):
         for k, v in saved_pg.items():
@@ -1060,8 +1149,31 @@ def _train_worker(rank: int, world_size: int) -> None:
         )
 
     trainable_params = [p for p in full_model.parameters() if p.requires_grad]
+    if FLAGS.no_decay_norm_bias_deltanet:
+        no_decay_markers = ("A_log", "dt_bias", "conv1d", "norm", "bias")
+        decay_params: list[nn.Parameter] = []
+        no_decay_params: list[nn.Parameter] = []
+        for name, p in full_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim < 2 or any(m in name for m in no_decay_markers):
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+        optimizer_param_groups: list[dict[str, Any]] = [
+            {"params": decay_params, "weight_decay": FLAGS.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        if is_main:
+            print(
+                f"AdamW param groups: decay={len(decay_params)} tensors "
+                f"({sum(p.numel() for p in decay_params):,} params), "
+                f"no_decay={len(no_decay_params)} tensors ({sum(p.numel() for p in no_decay_params):,} params)"
+            )
+    else:
+        optimizer_param_groups = [{"params": trainable_params, "weight_decay": FLAGS.weight_decay}]
     optimizer = torch.optim.AdamW(
-        trainable_params,
+        optimizer_param_groups,
         lr=FLAGS.learning_rate,
         betas=(FLAGS.adam_beta1, FLAGS.adam_beta2),
         weight_decay=FLAGS.weight_decay,
@@ -1080,6 +1192,26 @@ def _train_worker(rank: int, world_size: int) -> None:
     lr_horizon_steps = steps_per_epoch * FLAGS.num_epochs
     warmup_steps = int(round(lr_horizon_steps * FLAGS.warmup_ratio))
 
+    # Checkpoint / FP8-export / milestone cadence, optionally expressed as a fraction of an epoch
+    def _cadence(flag_steps: int, frac: float) -> int:
+        if frac > 0:
+            return max(1, int(round(steps_per_epoch * frac)))
+        return int(flag_steps)
+
+    save_every_steps = _cadence(FLAGS.save_every_steps, FLAGS.save_every_epoch_fraction)
+
+    def _multiple_of_save(flag_steps: int, frac: float) -> int:
+        # Exports / milestones only happen at save steps, so snap them to integer multiples of the save cadence.
+        if frac > 0 and FLAGS.save_every_epoch_fraction > 0:
+            return save_every_steps * max(1, int(round(frac / FLAGS.save_every_epoch_fraction)))
+        return _cadence(flag_steps, frac)
+
+    export_fp8_every_steps = _multiple_of_save(FLAGS.export_fp8_every_steps, FLAGS.export_fp8_every_epoch_fraction)
+    milestone_every_steps = _multiple_of_save(FLAGS.milestone_every_steps, FLAGS.milestone_every_epoch_fraction)
+    train_lengths = np.asarray(
+        [int(train_dataset.lengths[i]) for i in train_dataset.valid_indices], dtype=np.int64
+    )
+
     if is_main:
         print(
             f"Training plan: {len(train_dataset)} samples/epoch, world_size={world_size}, "
@@ -1087,7 +1219,26 @@ def _train_worker(rank: int, world_size: int) -> None:
             f"effective_batch={effective_batch}, steps_per_epoch={steps_per_epoch} (includes final partial batch), "
             f"total_steps={total_steps}, lr_horizon_steps={lr_horizon_steps}, warmup_steps={warmup_steps}, "
             f"save_optimizer_state={FLAGS.save_optimizer_state}, save_weights_dtype={FLAGS.save_weights_dtype}, "
-            f"keep_last_n_checkpoints={FLAGS.keep_last_n_checkpoints}, milestone_every_steps={FLAGS.milestone_every_steps}"
+            f"keep_last_n_checkpoints={FLAGS.keep_last_n_checkpoints}, milestone_every_steps={milestone_every_steps}, "
+            f"save_every_steps={save_every_steps}, export_fp8_every_steps={export_fp8_every_steps}, "
+            f"length_bucketed_batching={FLAGS.length_bucketed_batching}"
+        )
+        log_event(
+            {
+                "phase": "training_plan",
+                "train_samples": len(train_dataset),
+                "effective_batch": effective_batch,
+                "steps_per_epoch": steps_per_epoch,
+                "total_steps": total_steps,
+                "warmup_steps": warmup_steps,
+                "save_every_steps": save_every_steps,
+                "export_fp8_every_steps": export_fp8_every_steps,
+                "milestone_every_steps": milestone_every_steps,
+                "length_bucketed_batching": FLAGS.length_bucketed_batching,
+                "no_decay_norm_bias_deltanet": FLAGS.no_decay_norm_bias_deltanet,
+                "train_tokens_per_epoch": int(train_lengths.sum()),
+                "train_seq_len_mean": float(train_lengths.mean()) if len(train_lengths) else 0.0,
+            }
         )
 
     ckpt_root_dir = os.path.join(FLAGS.output_dir, "checkpoints")
@@ -1144,6 +1295,10 @@ def _train_worker(rank: int, world_size: int) -> None:
             torch.cuda.empty_cache()
         log_event({"step": 0, "phase": "eval", **val0})
 
+    # HF models are constructed in eval mode; on a fresh start the step-0 validation above happens to flip the
+    # model to train mode, but on resume it is skipped — leaving gradient checkpointing inactive (it requires
+    # `self.training`) and OOMing the first 32k-token forward (xid 304951546 restart, xid 305093497).
+    full_model.train()
     optimizer.zero_grad(set_to_none=True)
     step_times: list[float] = []
 
@@ -1162,6 +1317,13 @@ def _train_worker(rank: int, world_size: int) -> None:
             world_size=world_size,
             micro_batch_size=FLAGS.micro_batch_size,
             grad_accum_steps=FLAGS.grad_accum_steps,
+            lengths=train_lengths if FLAGS.length_bucketed_batching else None,
+            bucket_rng=(
+                np.random.default_rng(int(FLAGS.seed) * 1_000_003 + int(epoch))
+                if FLAGS.length_bucketed_batching
+                else None
+            ),
+            mega_batch_multiplier=FLAGS.bucket_mega_batch_multiplier,
         )
 
         # In smoke_test_mode, also force the last step to exercise the final partial batch!
@@ -1341,7 +1503,8 @@ def _train_worker(rank: int, world_size: int) -> None:
                     torch.cuda.empty_cache()
                 log_event({"step": global_step, "phase": "eval", **val_metrics})
 
-            if FLAGS.save_every_steps > 0 and global_step % FLAGS.save_every_steps == 0:
+            is_last_step = global_step >= total_steps
+            if save_every_steps > 0 and global_step % save_every_steps == 0 and not is_last_step:
                 ckpt_name = f"step-{global_step:05d}"
                 if is_main:
                     print(
@@ -1374,15 +1537,15 @@ def _train_worker(rank: int, world_size: int) -> None:
                     extra_meta={"train_loss": round(step_loss, 5), "grad_norm": round(grad_norm, 4)},
                     num_parts=FLAGS.num_ckpt_parts_per_rank,
                     keep_last_n=FLAGS.keep_last_n_checkpoints,
-                    milestone_every_steps=FLAGS.milestone_every_steps,
+                    milestone_every_steps=milestone_every_steps,
                     save_optimizer_state=FLAGS.save_optimizer_state,
                     save_weights_dtype=FLAGS.save_weights_dtype,
                 )
                 log_event({"step": global_step, "phase": "checkpoint_saved", "ckpt_dir": saved_dir})
 
                 if (
-                    FLAGS.export_fp8_every_steps > 0
-                    and global_step % FLAGS.export_fp8_every_steps == 0
+                    export_fp8_every_steps > 0
+                    and global_step % export_fp8_every_steps == 0
                 ):
                     fp8_root = os.path.join(FLAGS.output_dir, "fp8_checkpoints")
                     fp8_dir = os.path.join(fp8_root, ckpt_name)
@@ -1524,13 +1687,13 @@ def _train_worker(rank: int, world_size: int) -> None:
         extra_meta=final_val,
         num_parts=FLAGS.num_ckpt_parts_per_rank,
         keep_last_n=FLAGS.keep_last_n_checkpoints,
-        milestone_every_steps=FLAGS.milestone_every_steps,
+        milestone_every_steps=milestone_every_steps,
         save_optimizer_state=FLAGS.save_optimizer_state,
         save_weights_dtype=FLAGS.save_weights_dtype,
     )
     log_event({"step": global_step, "phase": "final_checkpoint_saved", "ckpt_dir": final_ckpt_dir})
 
-    if FLAGS.export_fp8_every_steps > 0:
+    if export_fp8_every_steps > 0:
         fp8_root = os.path.join(FLAGS.output_dir, "fp8_checkpoints")
         fp8_final_dir = os.path.join(fp8_root, "final")
         if is_main:
@@ -1598,6 +1761,12 @@ def _serialize_flags_for_children() -> list[str]:
         "attn_implementation",
         "use_multi_gpu",
         "smoke_test_mode",
+        "length_bucketed_batching",
+        "bucket_mega_batch_multiplier",
+        "no_decay_norm_bias_deltanet",
+        "save_every_epoch_fraction",
+        "export_fp8_every_epoch_fraction",
+        "milestone_every_epoch_fraction",
     ]
     args: list[str] = [
         "--undefok=cfs_d_cid_enable,cfs_d_resource_user_override,cfs_default_traffic_class,cfs_max_write_bytes_inflight",

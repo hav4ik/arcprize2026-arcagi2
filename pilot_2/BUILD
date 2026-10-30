@@ -36,9 +36,42 @@ py_library(
 )
 
 py_library(
+    name = "havu_auto_repair",
+    srcs = ["havu_auto_repair.py"],
+    data = ["auto_repair_names.json"],
+    deps = [
+        "//third_party/py/numpy",
+        "//third_party/py/scipy",
+    ],
+)
+
+# Stdlib-only pre-TPU fork server; must stay dependency-free so the zygote is tiny.
+py_library(
+    name = "havu_sandbox_zygote",
+    srcs = ["havu_sandbox_zygote.py"],
+)
+
+py_library(
+    name = "havu_b32_harness",
+    srcs = ["havu_b32_harness.py"],
+    deps = [
+        ":havu_auto_repair",
+        ":havu_sandbox_zygote",
+        ":prompts_and_selector",
+        "//pyglib:gfile",
+        "//third_party/py/IPython:ipython-libs",
+        "//third_party/py/numpy",
+        "//third_party/py/scipy",
+        "//third_party/py/vllm",
+    ],
+)
+
+py_library(
     name = "pilot2_eval_lib",
     srcs = ["pilot2_eval.py"],
     deps = [
+        ":havu_b32_harness",
+        ":havu_sandbox_zygote",
         ":prompts_and_selector",
         ":sandbox_verifier",
         "//experimental/users/arazdai/kaggle/arc_agi_2/pilot_1/setB/tpu_vllm:prompts_and_voting",
@@ -57,9 +90,24 @@ py_test(
     srcs = ["pilot2_test.py"],
     deps = [
         ":arc_dsl_and_summary",
+        ":havu_auto_repair",
+        ":havu_b32_harness",
         ":pilot2_eval_lib",
         ":prompts_and_selector",
         ":sandbox_verifier",
+        "//testing/pybase",
+        "//third_party/py/numpy",
+    ],
+)
+
+py_test(
+    name = "havu_b32_harness_test",
+    size = "medium",
+    srcs = ["havu_b32_harness_test.py"],
+    deps = [
+        ":havu_b32_harness",
+        ":havu_sandbox_zygote",
+        ":prompts_and_selector",
         "//testing/pybase",
     ],
 )
@@ -68,6 +116,8 @@ py_binary(
     name = "pilot2_eval",
     srcs = ["pilot2_eval.py"],
     deps = [
+        ":havu_b32_harness",
+        ":havu_sandbox_zygote",
         ":prompts_and_selector",
         ":sandbox_verifier",
         "//experimental/users/arazdai/kaggle/sft:export_and_quantize_lib",

@@ -8,6 +8,8 @@ import tempfile
 
 from google3.testing.pybase import googletest
 from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import arc_dsl_and_summary
+from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import havu_auto_repair
+from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import havu_b32_harness
 from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import pilot2_eval
 from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import prompts_and_selector
 from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import sandbox_verifier
@@ -30,7 +32,7 @@ class Pilot2Test(googletest.TestCase):
     self.test_input = [[0, 0, 1, 0], [0, 1, 1, 1]]
 
   def test_all_hypotheses_preserve_frozen_baseline_invariants(self) -> None:
-    self.assertLen(prompts_and_selector.PILOT2_HYPOTHESES, 11)
+    self.assertLen(prompts_and_selector.PILOT2_HYPOTHESES, 13)
     for exp_id, cfg in prompts_and_selector.PILOT2_HYPOTHESES.items():
       cfg.validate()
       self.assertEqual(cfg.temperature, 1.0, f"{exp_id} violated temperature=1.0")
@@ -308,6 +310,55 @@ class Pilot2Test(googletest.TestCase):
       self.assertEqual(do, 1)
       self.assertEqual(ver, 1)
       self.assertIn("demo_task", sub)
+
+  def test_e031_equivariance_diff_feedback_and_wave2_seed(self) -> None:
+    sb = sandbox_verifier.Pilot2AttemptSandbox(
+        train_pairs=self.train_pairs,
+        test_input=self.test_input,
+        use_arc_helpers=False,
+        auto_check_on_solve=False,
+        run_equivariance_audit=True,
+        use_e031_ipython_mode=True,
+    )
+    # 1. Define a non-`solve` 1-arg user function (`transform`) that fails on train pair 1
+    sb.execute_run_python(
+        code=(
+            "def transform(g):\n"
+            "    return [[2 if v == 1 and r == 0 else v for v in row] for r, row in enumerate(g)]"
+        ),
+        turn_idx=0,
+        cum_gen_tokens=400,
+    )
+    rej_resp, rej_done = sb.execute_submit_answer_code(
+        code="transform(test_input)",
+        turn_idx=1,
+        cum_gen_tokens=500,
+    )
+    self.assertFalse(rej_done)
+    self.assertIn("submission rejected", rej_resp)
+    self.assertIn("Pair 1: FAIL", rej_resp)
+    self.assertTrue(sb.best_partial_pair_reports)
+
+    # Check Wave 2 evolutionary repair seed in E031 mode
+    seed_note = prompts_and_selector.build_wave2_evolutionary_seed([sb], 2)
+    self.assertIn("submit_answer", seed_note)
+    self.assertIn("Pair 1: FAIL", seed_note)
+
+    # 2. Fix function so it passes all train pairs and has D8 equivariance > 0
+    sb.execute_run_python(
+        code="def solve(g):\n    return [[2 if v == 1 else v for v in row] for row in g]",
+        turn_idx=2,
+        cum_gen_tokens=800,
+    )
+    ok_resp, ok_done = sb.execute_submit_answer_code(
+        code="solve(test_input)",
+        turn_idx=3,
+        cum_gen_tokens=900,
+    )
+    self.assertTrue(ok_done)
+    self.assertIn("answer accepted", ok_resp)
+    self.assertEqual(sb.first_tp_pred, [[0, 0, 2, 0], [0, 2, 2, 2]])
+    self.assertGreater(sb.first_tp_equivariance_bonus, 0.0)
 
 
 if __name__ == "__main__":

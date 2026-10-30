@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DeepSeek-V4.1-Flash-1017 Pruning &amp; SFT Technical Report</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --bg-alt: #f8fafc;
+      --bg-header: #f1f5f9;
+      --border: #e2e8f0;
+      --border-strong: #cbd5e1;
+      --text: #0f172a;
+      --text-secondary: #334155;
+      --text-muted: #64748b;
+      --blue: #0284c7;
+      --blue-bg: #f0f9ff;
+      --blue-border: #bae6fd;
+      --green: #059669;
+      --green-bg: #ecfdf5;
+      --green-border: #a7f3d0;
+      --amber: #d97706;
+      --amber-bg: #fffbeb;
+      --amber-border: #fde68a;
+      --purple: #7c3aed;
+      --purple-bg: #f5f3ff;
+      --purple-border: #ddd6fe;
+      --red: #dc2626;
+      --red-bg: #fef2f2;
+      --red-border: #fecaca;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      line-height: 1.58;
+      font-size: 14px;
+    }
+
+    .container {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 28px 24px 68px;
+    }
+
+    header.hero {
+      background: var(--bg-alt);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 26px 30px;
+      margin-bottom: 26px;
+    }
+
+    .eyebrow {
+      display: inline-block;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--blue);
+      background: var(--blue-bg);
+      border: 1px solid var(--blue-border);
+      padding: 3px 10px;
+      border-radius: 999px;
+      margin-bottom: 10px;
+    }
+
+    header.hero h1 {
+      margin: 0 0 8px 0;
+      font-size: 26px;
+      font-weight: 800;
+      color: var(--text);
+      letter-spacing: -0.02em;
+    }
+
+    header.hero p.subtitle {
+      margin: 0 0 20px 0;
+      color: var(--text-secondary);
+      font-size: 14.5px;
+      max-width: 1080px;
+    }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+      gap: 12px;
+    }
+
+    .kpi {
+      background: #ffffff;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+
+    .kpi-label {
+      font-size: 11.5px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+
+    .kpi-val {
+      font-family: var(--font-mono);
+      font-size: 22px;
+      font-weight: 800;
+      color: var(--text);
+    }
+
+    .kpi-val.green { color: var(--green); }
+    .kpi-val.blue { color: var(--blue); }
+    .kpi-val.purple { color: var(--purple); }
+
+    .kpi-sub {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+
+    section {
+      margin-bottom: 34px;
+    }
+
+    .section-title {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+      border-bottom: 2px solid var(--border);
+      padding-bottom: 8px;
+      margin-bottom: 16px;
+    }
+
+    .section-title h2 {
+      margin: 0;
+      font-size: 18.5px;
+      font-weight: 700;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 9px;
+    }
+
+    .num-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      background: var(--text);
+      color: #ffffff;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .section-meta {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .callout {
+      background: var(--bg-alt);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--blue);
+      border-radius: 8px;
+      padding: 13px 16px;
+      margin-bottom: 16px;
+      font-size: 13.5px;
+      color: var(--text-secondary);
+    }
+
+    .callout.green {
+      background: var(--green-bg);
+      border-color: var(--green-border);
+      border-left-color: var(--green);
+    }
+
+    .callout.amber {
+      background: var(--amber-bg);
+      border-color: var(--amber-border);
+      border-left-color: var(--amber);
+    }
+
+    .callout.purple {
+      background: var(--purple-bg);
+      border-color: var(--purple-border);
+      border-left-color: var(--purple);
+    }
+
+    .callout strong { color: var(--text); }
+
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--border-strong);
+      border-radius: 10px;
+      background: #ffffff;
+      margin-bottom: 18px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13.5px;
+      text-align: left;
+    }
+
+    thead th {
+      background: var(--bg-header);
+      color: var(--text-secondary);
+      font-weight: 700;
+      font-size: 11.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      padding: 11px 13px;
+      border-bottom: 1px solid var(--border-strong);
+      white-space: nowrap;
+    }
+
+    tbody td {
+      padding: 11px 13px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+      color: var(--text-secondary);
+    }
+
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr:hover { background: #f8fafc; }
+
+    tr.row-best { background: #ecfdf5; }
+    tr.row-best:hover { background: #d1fae5; }
+    tr.row-sft { background: #f0f9ff; }
+    tr.row-sft:hover { background: #e0f2fe; }
+    tr.row-warn { background: #fffbeb; }
+
+    .mono { font-family: var(--font-mono); font-size: 12.5px; }
+    .num { font-family: var(--font-mono); text-align: right; white-space: nowrap; }
+    .center { text-align: center; }
+
+    .score-lg {
+      font-family: var(--font-mono);
+      font-size: 15px;
+      font-weight: 800;
+      color: var(--text);
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .badge-yes { background: var(--green-bg); color: var(--green); border: 1px solid var(--green-border); }
+    .badge-info { background: var(--blue-bg); color: var(--blue); border: 1px solid var(--blue-border); }
+    .badge-warn { background: var(--amber-bg); color: var(--amber); border: 1px solid var(--amber-border); }
+    .badge-purple { background: var(--purple-bg); color: var(--purple); border: 1px solid var(--purple-border); }
+    .badge-red { background: var(--red-bg); color: var(--red); border: 1px solid var(--red-border); }
+
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 14px;
+      margin-bottom: 16px;
+    }
+
+    .card {
+      background: #ffffff;
+      border: 1px solid var(--border-strong);
+      border-radius: 10px;
+      padding: 16px 18px;
+    }
+
+    .card h3 {
+      margin: 0 0 8px 0;
+      font-size: 14.5px;
+      font-weight: 700;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .card p, .card ul {
+      margin: 0 0 8px 0;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .card ul { padding-left: 18px; }
+    .card li { margin-bottom: 5px; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      background: var(--bg-header);
+      border: 1px solid var(--border);
+      padding: 1px 5px;
+      border-radius: 4px;
+      color: #0f172a;
+    }
+
+    pre {
+      background: #0f172a;
+      color: #f8fafc;
+      font-family: var(--font-mono);
+      font-size: 12.2px;
+      line-height: 1.5;
+      padding: 14px 18px;
+      border-radius: 10px;
+      overflow-x: auto;
+      margin: 10px 0 16px 0;
+      border: 1px solid #1e293b;
+    }
+
+    pre code {
+      background: transparent;
+      border: none;
+      color: inherit;
+      padding: 0;
+      font-size: inherit;
+    }
+
+    footer {
+      margin-top: 40px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header class="hero">
+      <div class="eyebrow">ARC-AGI-2 &bull; DeepSeek-V4.1-Flash-1017 &bull; E042 / E043 / E046 / E051–E056 &amp; SFT</div>
+      <h1>DeepSeek-V4.1-Flash-1017 Pruning, 2-Bit GPTQ &amp; SFT Technical Report</h1>
+      <p class="subtitle">
+        Detailed analysis of collaborator (<code>havu</code> / <code>chankhavu</code>) experiments pruning <code>DeepSeek-V4.1-Flash-1017</code> from 384 to 128 routed experts per layer + 2-bit asymmetric GPTQ + 64 GiB Engram to achieve <strong>72.8%–76.5% Pass@1 / 82.5%–85.6% Pass@2</strong> on 4&times;L4 GPUs, followed by the exact procedure, code, and time estimates for <strong>unquantizing / rebuilding pre-quantized weights</strong> and running <strong>Supervised Fine-Tuning (SFT)</strong>.
+      </p>
+      <div class="kpi-grid">
+        <div class="kpi">
+          <div class="kpi-label">Pruned Tool E128 Pass@1</div>
+          <div class="kpi-val green">72.8% &rarr; 76.5%</div>
+          <div class="kpi-sub">72.8% (E043) &bull; 73.7% (E046 MT) &bull; 76.5% (E052 Auto-Repair)</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Pruned Tool E128 Pass@2</div>
+          <div class="kpi-val blue">82.5% &rarr; 85.6%</div>
+          <div class="kpi-sub">vs. 84.9% Full 384-Expert API Model (120 tasks)</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Model Compression</div>
+          <div class="kpi-val">510 GB &rarr; 131 GB</div>
+          <div class="kpi-sub">128/384 experts (uint2 GPTQ) &bull; 16.87 GiB/GPU on 4&times;L4</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">4&times;L4 Tool Throughput</div>
+          <div class="kpi-val purple">340.5 tok/s</div>
+          <div class="kpi-sub">48 streams &bull; 96.7% prefix cache hit &bull; +3.4&times; w/ E051 KV offload</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">SFT Prep + Training Time</div>
+          <div class="kpi-val">1.5 – 4.5 hrs</div>
+          <div class="kpi-sub">~20m CPU/GPU unquantize + 1–3h SFT on 8&times;B200 + 30m GPTQ</div>
+        </div>
+      </div>
+    </header>
+
+    <!-- SECTION 1: BENCHMARK COMPARISON -->
+    <section>
+      <div class="section-title">
+        <h2><span class="num-badge">1</span> End-to-End Benchmark &amp; Architecture Comparison (120 Official ARC-AGI-2 Eval Tasks)</h2>
+        <span class="section-meta">Source: E043 / E046 / E052 / E056</span>
+      </div>
+
+      <div class="callout green">
+        <strong>Core Takeaway — Why Expert Count Beats Bit-Width (<code>E128 @ 2-bit</code> &gg; <code>E72 @ 4-bit</code>):</strong>
+        In <code>DeepSeek-V4.1-Flash-1017</code>, top-6 routing is broad: a decode batch of 48 streams touches <strong>~110 distinct experts per layer</strong> (121.7 effective experts/layer in tool mode). Pruning to 72 experts in 4-bit MXFP4 (<code>E72</code>) drops ~30% of routed traffic and collapses to <strong>29.3% Pass@1</strong>. Keeping <strong>128 experts at 2-bit GPTQ (<code>Tool E128</code>)</strong> covers <strong>87.5%</strong> of routing traffic while reading half the bytes per active expert—making <code>E128 2-bit</code> both <strong>1.66&times; faster</strong> (<code>340.5</code> vs <code>205 tok/s</code>) and <strong>+43.5 pp more accurate</strong> than <code>E72 4-bit</code>!
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model / Configuration</th>
+              <th>Routed Experts</th>
+              <th>Expert Precision</th>
+              <th>Engram Host RAM</th>
+              <th class="num">Disk Size</th>
+              <th class="num">4&times;L4 Weights/GPU</th>
+              <th class="num">4&times;L4 Decode Speed</th>
+              <th class="num">Python Err Rate</th>
+              <th class="num">ARC-AGI-2 Pass@1</th>
+              <th class="num">ARC-AGI-2 Pass@2</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Full Base Model (API E030)</strong><br/><span class="mono">sub80s40 + minimal header</span></td>
+              <td class="mono">384 / 384 (100%)</td>
+              <td>Native MXFP4</td>
+              <td class="mono">188.8 GiB (100%)</td>
+              <td class="num">510.3 GB</td>
+              <td class="num"><span class="badge badge-red">OOM (&gt;30 GiB)</span></td>
+              <td class="num">N/A</td>
+              <td class="num">2.3%</td>
+              <td class="num"><span class="score-lg">74.5%</span></td>
+              <td class="num"><span class="score-lg">84.9%</span></td>
+            </tr>
+            <tr>
+              <td><strong>Full Base + 64 GiB Engram Control</strong><br/><span class="mono">Self-hosted 8&times;RTX PRO 6000 (s20x60)</span></td>
+              <td class="mono">384 / 384 (100%)</td>
+              <td>Native MXFP4</td>
+              <td class="mono">64.0 GiB (34%)</td>
+              <td class="num">379.0 GB</td>
+              <td class="num"><span class="badge badge-red">OOM on 4&times;L4</span></td>
+              <td class="num">N/A</td>
+              <td class="num">2.7%</td>
+              <td class="num">69.7% <span class="mono">(vs 67.4% full)</span></td>
+              <td class="num">—</td>
+            </tr>
+            <tr class="row-warn">
+              <td><strong>Pruned E72 Tool (w=30)</strong><br/><span class="mono">4-bit MXFP4 + --rescue-code</span></td>
+              <td class="mono">72 / 384 (69% cov)</td>
+              <td>Native MXFP4</td>
+              <td class="mono">64.0 GiB (34%)</td>
+              <td class="num">118.5 GB</td>
+              <td class="num">16.64 GiB</td>
+              <td class="num">205.0 tok/s</td>
+              <td class="num">44.6%</td>
+              <td class="num">29.3%</td>
+              <td class="num">—</td>
+            </tr>
+            <tr>
+              <td><strong>Pruned E96 Tool (w=10)</strong><br/><span class="mono">2/3-bit GPTQ (w13 uint2, w2 uint3)</span></td>
+              <td class="mono">96 / 384 (81% cov)</td>
+              <td><code>uint2</code> / <code>uint3</code> GPTQ</td>
+              <td class="mono">64.0 GiB (34%)</td>
+              <td class="num">116.5 GB</td>
+              <td class="num">15.10 GiB</td>
+              <td class="num">453.5 tok/s</td>
+              <td class="num">37.4%</td>
+              <td class="num">64.9%</td>
+              <td class="num">75.8%</td>
+            </tr>
+            <tr class="row-sft">
+              <td><strong>Pruned Tool E128 2-Bit (E043)</strong><br/><span class="mono">w=10 keep set + percdamp=1.0 GPTQ</span></td>
+              <td class="mono">128 / 384 (87.5% cov)</td>
+              <td><code>uint2</code> GPTQ (g128/g64)</td>
+              <td class="mono">64.0 GiB (34%)</td>
+              <td class="num">131.1 GB</td>
+              <td class="num">16.87 GiB</td>
+              <td class="num">340.5 tok/s</td>
+              <td class="num">14.2%</td>
+              <td class="num"><span class="score-lg">72.8%</span></td>
+              <td class="num"><span class="score-lg">82.5%</span></td>
+            </tr>
+            <tr class="row-best">
+              <td><strong>Tool E128 2-Bit + Multi-Test (E046 Run 7)</strong><br/><span class="mono">--multi-test --multi-budget 0.5 --token-exact</span></td>
+              <td class="mono">128 / 384 (87.5% cov)</td>
+              <td><code>uint2</code> GPTQ (g128/g64)</td>
+              <td class="mono">64.0 GiB (34%)</td>
+              <td class="num">131.1 GB</td>
+              <td class="num">16.87 GiB</td>
+              <td class="num">318–341 tok/s</td>
+              <td class="num">14.0%</td>
+              <td class="num"><span class="score-lg">73.7%</span> <span class="mono">(74.0% pair)</span></td>
+              <td class="num"><span class="score-lg">84.6%</span> <span class="mono">(85.6% pair)</span></td>
+            </tr>
+            <tr class="row-best">
+              <td><strong>Tool E128 2-Bit + Auto-Repair (E052)</strong><br/><span class="mono">AST/OSA retry-once typo repair + Candidate B</span></td>
+              <td class="mono">128 / 384 (87.5% cov)</td>
+              <td><code>uint2</code> GPTQ (g128/g64)</td>
+              <td class="mono">64.0 GiB (34%)</td>
+              <td class="num">131.1 GB</td>
+              <td class="num">16.87 GiB</td>
+              <td class="num">341+ tok/s</td>
+              <td class="num">~5.5% eff.</td>
+              <td class="num"><span class="score-lg">76.5%</span> <span class="mono">(+5.1 pp vs ctrl)</span></td>
+              <td class="num"><span class="score-lg">~85.5%+</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- SECTION 2: MAIN COMPONENTS, HYPERPARAMETERS & PRUNING PROCESS -->
+    <section>
+      <div class="section-title">
+        <h2><span class="num-badge">2</span> Main Pruning &amp; Quantization Components, Hyperparameters &amp; Tricks</h2>
+        <span class="section-meta">havu/experiments/E043_dsv41_real_pruning</span>
+      </div>
+
+      <div class="card-grid">
+        <div class="card">
+          <h3>1. Lossless Engram Row Frequency Pruning <span class="badge badge-yes">189 GiB &rarr; 64 GiB</span></h3>
+          <ul>
+            <li><strong>Problem:</strong> The 2-layer Engram n-gram table (layers 1 &amp; 14, <code>384M &times; 1280</code> FP8 + scales) is <strong>188.8 GiB</strong> in pinned host RAM—exceeding Kaggle's 173 GiB cgroup limit.</li>
+            <li><strong>Census (<code>engram_census.py</code>):</strong> Replayed 10,001 Flash-1017 tool rollouts (<strong>251.8M tokens</strong>, 6.04B lookups/layer). Only 58.2% of rows (110 GiB) are ever touched; top rows hit &gt;64K times carry 39% of all lookups.</li>
+            <li><strong>Mask Selection:</strong> Kept the <strong>top 34% most frequent rows</strong> globally (<code>engram_top64gib.json</code>: 35% on layer 1, 32% on layer 14 = <strong>64.0 GiB</strong>, or 15.8 GiB/rank across 4 GPUs).</li>
+            <li><strong>Remapping Trick (<code>apply_compact_engram.py</code>):</strong> Added <code>int32</code> tensor <code>layers.{1,14}.engram.embed_tokens.row_map</code> (2.9 GiB) mapping kept rows to <code>0..K-1</code> and dropped rows to <code>-1</code> (read as zero vector before $W_{kv}$).</li>
+            <li><strong>Result:</strong> 97.6% calibration hit rate, 94.0% eval hit rate (~100% on prompt/grids). <strong>+0.00% to +0.04% NLL change</strong> (lossless).</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <h3>2. Protected Contribution Expert Pruning <span class="badge badge-info">384 &rarr; 128 Experts</span></h3>
+          <ul>
+            <li><strong>Why Plain REAP Failed:</strong> Plain REAP ranks experts by conditional mean amplitude when selected ($\mathbb{E}[\|y_e\| \mid e \in \text{top-}6]$). It kept rare, high-norm outlier experts covering only <strong>32%</strong> of routing traffic at E64. Iterative pruning also lost to one-shot selection (0.879 vs 0.822 NLL at E72).</li>
+            <li><strong>Base Rule (<code>contrib_dec</code>):</strong> Recorded native weighted expert output L2 norms $a_{t,e} = r_{t,e}\|\text{Expert}_e(x_t)\|_2$ over <strong>10.04M calibration tokens</strong>. Summed over all tokens on encoder layers <code>0..19</code> and over <strong>model-generated tokens only</strong> on decoder layers <code>20..39</code>.</li>
+            <li><strong>Critical Trick — Tool-Block Upweighting (<code>w = 10</code>):</strong> DSML tool-call blocks (<code>&lt;/think&gt;</code> token 128822 to EOS) are only ~6% of tokens. Without upweighting (<code>w=0</code>), pruned models forget how to close <code>&lt;｜DSML｜function_calls&gt;</code> tags. Scoring with $\text{Score} = \text{Contrib}_{\text{dec}} + 9 \times \text{Contrib}_{\text{tool\_block}}$ (<code>keep_contrib_dec_sp0_w10_e128.npy</code>) preserves &gt;95% of tool-block contribution and achieves <strong>0 format failures across 334 eval attempts</strong>.</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <h3>3. Per-Expert 2-Bit Asymmetric GPTQ <span class="badge badge-purple">percdamp = 1.0</span></h3>
+          <ul>
+            <li><strong>Selective Quantization:</strong> Attention, router (sliced to 128 rows), shared MXFP8 expert, norms, embeddings, LM head, and Engram remain <strong>untouched</strong>. Only the <code>40 &times; 128 = 5,120</code> routed experts are quantized to <code>uint2</code>:
+              <ul>
+                <li><code>w1, w3</code> (gate/up, <code>[2304, 5120]</code>): <strong><code>uint2</code>, group size <code>g13 = 128</code></strong>, BF16 scale, <code>uint2</code> zero-point.</li>
+                <li><code>w2</code> (down, <code>[5120, 2304]</code>): <strong><code>uint2</code>, group size <code>g2 = 64</code></strong>, BF16 scale, <code>uint2</code> zero-point.</li>
+              </ul>
+            </li>
+            <li><strong>Pruned-Mask Calibration:</strong> 61 tool rollouts (1.42M tokens, 10% rows = <strong>142,138 vectors</strong>) replayed <em>under the E128 mask</em>. <code>w2</code> Hessian $H_2 = u^\top u$ uses quantized <code>w13</code> outputs with native V4.1 clamps: $u = r_e \cdot \text{SiLU}(\min(g, 10)) \odot \text{clamp}(u_{\text{up}}, -10, 10)$.</li>
+            <li><strong>Critical Hyperparameter (<code>--percdamp 1.0</code>):</strong> Each expert sees only ~3.4K rows for a 5,120-dim input ($N &lt; d$). Standard <code>percdamp=0.01</code> overfits the Hessian and loses to RTN on held-out tokens (15.0% vs 13.2%). Setting <code>percdamp=1.0</code> slashes relative output error to <strong>2.5% on <code>w13</code> (vs 10.9% RTN)</strong> and <strong>5.5% on <code>w2</code> (vs 12.7% RTN)</strong>.</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <h3>4. Harness, Multi-Test &amp; Serving Tricks <span class="badge badge-yes">+3.7 pp Pass@1</span></h3>
+          <ul>
+            <li><strong><code>sub80s40</code> + Minimal Header:</strong> 80k total output cap, 40k soft wrap-up budget, 64k/turn, <code>effort=50</code> (low), <code>T=1.0</code>.</li>
+            <li><strong><code>--token-exact</code> (E046):</strong> Passes exact sampled token IDs across turns instead of re-tokenizing text (1 in 8 turns samples non-canonically), keeping prefix cache hits at <strong>96.7%</strong>.</li>
+            <li><strong><code>--multi-test --multi-budget 0.5</code> (E046 Run 7):</strong> Solves all test pairs of a task in one shared trajectory, lifting Task Pass@1 to <strong>73.7%</strong> and Pass@2 to <strong>84.6%</strong> while cutting tokens by <strong>-17% overall (-30% on multi-test tasks)</strong>.</li>
+            <li><strong><code>auto_repair.py</code> (E052):</strong> Catches identifier errors, rewrites unique OSA edit-distance $\le 2$ typos (<code>[auto-corrected: coms -&gt; comps]</code>), and re-runs once—lifting Task Pass@1 to <strong>76.5%</strong>.</li>
+            <li><strong>Candidate B (E051 + E054 + E056):</strong> 32 GiB CPU KV offload (<strong>3.4–4.0&times; tok/s</strong> at high concurrency) + <code>dsv41_indexer.py</code> grid-stride context skip (<strong>-6.5% decode step time</strong>, bit-identical logits).</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="callout amber">
+        <strong>Root Cause of Pruned Model Errors — BPE Sub-Word Split-Mixing (<code>analysis/typos/REPORT.md</code>):</strong>
+        Expert pruning (not 2-bit quantization) increases Python identifier errors from <code>0.23%</code> to <code>8.22%</code> in E128 (<code>coms</code> for <code>comps</code>, <code>scpy</code> for <code>scipy</code>, <code>dequeue</code> for <code>deque</code>, <code>dbool</code> for <code>dtype=bool</code>). Why? <strong>94%</strong> of typos occur in multi-token identifiers and <strong>88%</strong> start strictly at a <strong>word-internal alphanumeric continuation (<code>WIC-alnum</code>) token boundary</strong>. Because BPE tokenizes <code> comps</code> after a space as <code>['Ġcomp', 's']</code> (<strong>0 typos in 5,971 uses!</strong>) but tokenizes <code>=comps</code> after punctuation as <code>['=', 'com', 'ps']</code> (<strong>15%–81% typo rate!</strong>), the pruned model emits the first piece of the punctuation split (<code>com</code>) and the continuation of the space split (<code>s</code>) &rarr; <code>coms</code>. Upweighting <code>WIC-alnum</code> tokens during SFT directly heals this transition!
+      </div>
+    </section>
+
+    <!-- SECTION 3: UNQUANTIZING / REBUILDING PRUNED DEEPSEEK -->
+    <section>
+      <div class="section-title">
+        <h2><span class="num-badge">3</span> How to Unquantize / Rebuild Pruned DeepSeek E128 Into BF16 for SFT</h2>
+        <span class="section-meta">Source: PREQUANT_E128.md &bull; verify_prequant.py &bull; e043_humming.py</span>
+      </div>
+
+      <div class="callout purple">
+        <strong>Key Discovery from <code>PREQUANT_E128.md</code> (2026-10-26): You Have Two Ways to Obtain Unquantized BF16 Pruned Weights!</strong><br/>
+        1. <strong>Path A (Recommended — Lossless Pre-2-Bit Rebuild + Exact BF16 Decode):</strong> In the 2-bit HF repo (<code>chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-E128-2bit</code>), every non-expert tensor is already byte-identical to the base model, and <code>e043_manifest.json</code> records the exact 128 kept expert IDs per layer (<code>keep_contrib_dec_sp0_w10_e128.npy</code>). By slicing those 128 experts from the released base checkpoint (<code>deepseek-ai/DeepSeek-V4.1-Flash-1017@1bae0e10</code> or our local <code>/tfhub/prod/tammam-ds4/deepseek-v4.1-flash-1017/1</code>) and decoding their native MXFP4 weights to BF16 (which is <strong>mathematically bit-exact with zero rounding error</strong>), you avoid starting SFT from 2-bit quantization noise (<code>cos &approx; 0.89–0.93</code>)!<br/>
+        2. <strong>Path B (Direct Dequantization of 2-Bit <code>gptq/</code> Tensors to BF16):</strong> If you only have the 131.1 GB 2-bit checkpoint on disk or want SFT to specifically adapt to the 2-bit quantized weights, you can directly unpack <code>gptq/layer_00..39.safetensors</code> (<code>e{0..127}.{w1,w2,w3}.{q,s,z}</code>) into BF16 via $W = (q - z) \times s$ in ~5 minutes.
+      </div>
+
+      <h3>Path A (Recommended): Lossless CPU Rebuild of Pre-Quantized E128 + Bit-Exact MXFP4/FP8 &rarr; BF16 Decode</h3>
+      <pre><code>export HF_TOKEN=&lt;token_with_read_access_to_chankhavu&gt;
+E043=/path/to/arcprize2026-arcagi2/havu/experiments/E043_dsv41_real_pruning
+
+# 1. Use local /tfhub/prod/tammam-ds4/deepseek-v4.1-flash-1017/1 or download base (510 GB),
+#    plus ONLY the 64 GiB Engram shards &amp; JSON manifests (~72 GB) from the 2-bit repo:
+hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+    --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 --local-dir base
+hf download chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-E128-2bit \
+    --include "model-engram-*" "*.json" --local-dir e128_2bit
+
+# 2. Rebuild [40, 384] boolean keep mask &amp; verify SHA256 (f4c946c3...a56d) against config.json:
+python $E043/scripts/verify_prequant.py keep \
+    --manifest e128_2bit/e043_manifest.json \
+    --config e128_2bit/config.json \
+    --out keep_tool_e128.npy
+
+# 3. Export pre-quantized E128 (renumbers kept experts 0..127, slices router to 128 rows,
+#    drops DSpark/vision, hardlinks 64 GiB compact Engram -> writes 178 GB total in ~5 min):
+python $E043/scripts/export_pruned.py \
+    --src base --expert-keep keep_tool_e128.npy \
+    --engram-from e128_2bit --text-only --out e128_prequant
+
+# 4. Verify byte-for-byte parity of router rows and all 5,120 experts against base:
+python $E043/scripts/verify_prequant.py check --export e128_prequant --base base --all</code></pre>
+
+      <p>To decode the native <code>MXFP4</code> routed experts and <code>MXFP8</code> dense/shared-expert weights into standard <code>torch.bfloat16</code> tensors (362.4 GB for all 5,120 experts + 18.5 GB backbone = ~381 GB total in BF16):</p>
+      <pre><code>import torch
+
+E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
+
+def mxfp4_to_bf16(weight: torch.Tensor, scale: torch.Tensor, device="cuda") -&gt; torch.Tensor:
+    """Bit-exact decode of DeepSeek-V4.1 MXFP4 expert weight [N, K//2] + UE8M0 scale [N, K//32] -&gt; BF16 [N, K]."""
+    w = weight.to(device).view(torch.uint8)
+    codes = torch.stack([w &amp; 0x0F, w &gt;&gt; 4], dim=-1).reshape(*w.shape[:-1], w.shape[-1] * 2).long()
+    mag = E2M1.to(device)[codes &amp; 7]
+    val = torch.where((codes &amp; 8) != 0, -mag, mag)
+    s = scale.to(device).view(torch.uint8).to(torch.int32)
+    return (val * torch.exp2((s - 127).float()).repeat_interleave(32, dim=-1)).to(torch.bfloat16)
+
+def mxfp8_to_bf16(weight: torch.Tensor, scale: torch.Tensor, device="cuda") -&gt; torch.Tensor:
+    """Bit-exact decode of DeepSeek-V4.1 FP8 (E4M3fn + UE8M0 scale) dense/shared-expert weight -&gt; BF16 [N, K]."""
+    w = weight.to(device).view(torch.float8_e4m3fn).to(torch.float32)
+    s = scale.to(device).view(torch.uint8).to(torch.int32)
+    return (w * torch.exp2((s - 127).float()).repeat_interleave(32, dim=-1)).to(torch.bfloat16)</code></pre>
+
+      <h3>Path B: Direct Unpacking / Dequantization of the 2-Bit <code>gptq/layer_LL.safetensors</code> Weights to BF16</h3>
+      <p>If starting strictly from the 131.1 GB 2-bit checkpoint (<code>chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-E128-2bit</code>), each <code>gptq/layer_{00..39}.safetensors</code> stores <code>e{0..127}.{w1,w2,w3}.{q,s,z}</code> where <code>q</code> is <code>int32 [N, K//16]</code> (16 &times; <code>uint2</code> codes packed LSB-first along $K$), <code>s</code> is <code>bfloat16 [N, K//group]</code> (<code>group=128</code> for <code>w1/w3</code>, <code>group=64</code> for <code>w2</code>), and <code>z</code> is <code>int32 [N//16, K//group]</code> (16 &times; <code>uint2</code> zero-points packed LSB-first <strong>along $N$</strong>):</p>
+      <pre><code>from pathlib import Path
+import torch
+from safetensors import safe_open
+
+SHIFTS = torch.arange(0, 32, 2, dtype=torch.int32)  # 16 x uint2 per int32, LSB first
+
+def unpack_uint2(packed_int32: torch.Tensor) -&gt; torch.Tensor:
+    shifts = SHIFTS.to(packed_int32.device)
+    return ((packed_int32.unsqueeze(-1) &gt;&gt; shifts) &amp; 3).reshape(*packed_int32.shape[:-1], -1)
+
+def dequant_gptq_expert_tensor(q: torch.Tensor, s: torch.Tensor, z: torch.Tensor, group: int) -&gt; torch.Tensor:
+    """Unpacks Humming packed 2-bit (q, s, z) into exact BF16 [N, K] weight matrix: W = (q - z) * s."""
+    q_u2 = unpack_uint2(q).to(torch.float32)                                  # [N, K]
+    z_u2 = unpack_uint2(z.T.contiguous()).T.contiguous().to(torch.float32)    # [N, K // group]
+    s_f32 = s.to(torch.float32)                                               # [N, K // group]
+    w_f32 = (q_u2 - z_u2.repeat_interleave(group, dim=-1)) * s_f32.repeat_interleave(group, dim=-1)
+    return w_f32.to(torch.bfloat16)
+
+def unquantize_layer_experts(gptq_dir: str, layer_idx: int, n_experts: int = 128, device: str = "cuda"):
+    path = Path(gptq_dir) / f"layer_{layer_idx:02d}.safetensors"
+    bf16_experts = {}
+    with safe_open(str(path), framework="pt", device=device) as f:
+        for e in range(n_experts):
+            for proj, group in (("w1", 128), ("w3", 128), ("w2", 64)):
+                w_bf16 = dequant_gptq_expert_tensor(
+                    f.get_tensor(f"e{e}.{proj}.q"),
+                    f.get_tensor(f"e{e}.{proj}.s"),
+                    f.get_tensor(f"e{e}.{proj}.z"),
+                    group,
+                )
+                bf16_experts[f"layers.{layer_idx}.ffn.experts.{e}.{proj}.weight"] = w_bf16.cpu()
+    return bf16_experts</code></pre>
+    </section>
+
+    <!-- SECTION 4: SFT PROCEDURE, RECIPES & RE-QUANTIZATION -->
+    <section>
+      <div class="section-title">
+        <h2><span class="num-badge">4</span> SFT Recipes on Pruned DeepSeek E128 &amp; Post-SFT 2-Bit Re-Quantization</h2>
+        <span class="section-meta">8&times;B200 FSDP2 &bull; google3/experimental/users/arazdai/kaggle/sft</span>
+      </div>
+
+      <div class="card-grid">
+        <div class="card">
+          <h3>Strategy 1 (Fastest &amp; Highest ROI): "Healing LoRA" on Attention + Shared Experts <span class="badge badge-yes">No GPTQ Needed!</span></h3>
+          <ul>
+            <li><strong>Key Architectural Insight:</strong> In <code>Tool E128 2-bit</code>, all attention projections (<code>q_a_proj</code>, <code>q_b_proj</code>, <code>kv_a_proj_with_mqa</code>, <code>kv_b_proj</code>, <code>o_proj</code>), routers, and shared experts (<code>shared_experts.w1/w2/w3</code>) are <strong>NOT 2-bit quantized</strong>—they run in native BF16/FP8!</li>
+            <li><strong>Zero Re-Quantization Path:</strong> Keep the 128 routed experts frozen (in BF16 during FSDP2 forward/backward) and train LoRA (<code>r=32, alpha=64, lr=1e-4</code>) on <strong>attention + shared experts</strong>. Merge the trained LoRA directly into the dense/shared shards and keep the existing <code>gptq/layer_00..39.safetensors</code> untouched!</li>
+            <li><strong><code>WIC-alnum</code> Loss Upweighting (&times;10–20):</strong> Apply a &times;10–20 loss multiplier on word-internal alphanumeric continuation tokens (<code>WIC-alnum</code>, ~6% of code tokens) and DSML tags on 1.5k–3k zero-typo Flash-1017 winning tool traces.</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <h3>Strategy 2: Full / Routed-Expert SFT on 8&times;B200 + 2-Bit GPTQ Re-Export <span class="badge badge-info">Full Adaptation</span></h3>
+          <ul>
+            <li><strong>8&times;B200 Memory Layout (1,440 GB HBM3e):</strong>
+              <ul>
+                <li>BF16 weights (381 GB total across 8 GPUs): <strong>47.6 GB / GPU</strong>.</li>
+                <li>BF16 gradients: <strong>47.6 GB / GPU</strong>.</li>
+                <li>8-bit AdamW or CPU-offloaded optimizer states: <strong>~24 GB / GPU</strong>.</li>
+                <li>Leaves <strong>~60 GB / GPU</strong> for activation checkpointing at 32k–64k context!</li>
+              </ul>
+            </li>
+            <li><strong>Hyperparameters (<code>train_full_sft.py</code>):</strong> <code>lr = 5e-6</code> to <code>1e-5</code>, cosine schedule, <code>warmup_ratio = 0.05</code>, <code>global_batch_size = 16–32</code>, <code>freeze_engram = True</code>.</li>
+            <li><strong>Mandatory Post-SFT 2-Bit GPTQ Re-Quantization:</strong> Because 4&times;L4 only fits 2-bit routed experts, run <code>gptq_experts.py --percdamp 1.0 --bits13 2 --bits2 2 --group13 128 --group2 64</code> across 8 GPUs (5 layers/GPU in parallel = <strong>~8 min</strong>) followed by <code>make_lowbit_export.py</code>.</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3>Post-SFT 2-Bit GPTQ Re-Quantization Commands (When Routed Experts Are Modified)</h3>
+      <pre><code># Run per-expert asymmetric 2-bit GPTQ (percdamp=1.0) in parallel across 8 GPUs (5 layers per GPU):
+for g in 0 1 2 3 4 5 6 7; do
+  CUDA_VISIBLE_DEVICES=$g python $E043/scripts/gptq_experts.py \
+    --calx /dev/shm/e043/calx_by_layer \
+    --model-dir /path/to/sft_e128_checkpoint \
+    --layers $((g*5)) $((g*5+1)) $((g*5+2)) $((g*5+3)) $((g*5+4)) \
+    --bits13 2 --bits2 2 --group13 128 --group2 64 \
+    --percdamp 1.0 \
+    --out /dev/shm/e043/gptq_sft_e128_u2 &amp;
+done
+wait
+
+# Package into the 131.1 GB Humming GPTQ-only deployment layout for Kaggle 4xL4:
+python $E043/scripts/make_lowbit_export.py \
+  --base /path/to/sft_e128_checkpoint \
+  --precomputed /dev/shm/e043/gptq_sft_e128_u2 \
+  --precomputed-ids compact \
+  --keep keep_tool_e128.npy \
+  --schema '{"bits":2,"group":128,"zero":true,"scale":"bfloat16"}' \
+  --schema-w2 '{"bits":2,"group":64,"zero":true,"scale":"bfloat16"}' \
+  --name E128-SFT \
+  --out export/tool_e128_sft_gptq</code></pre>
+    </section>
+
+    <!-- SECTION 5: TIME & RESOURCE ESTIMATES -->
+    <section>
+      <div class="section-title">
+        <h2><span class="num-badge">5</span> End-to-End Time &amp; Hardware Estimates</h2>
+        <span class="section-meta">CPU + 8&times; NVIDIA B200 (1,440 GB HBM3e)</span>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Stage</th>
+              <th>Procedure / Script</th>
+              <th>Hardware</th>
+              <th class="num">Time Estimate</th>
+              <th>Output / Memory Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>1a. Lossless Pre-Quant Rebuild (Path A)</strong></td>
+              <td><code>verify_prequant.py keep</code> + <code>export_pruned.py</code> from base + 2-bit manifest</td>
+              <td>CPU (16 GB RAM, NVMe/shm)</td>
+              <td class="num"><strong>5–20 min</strong></td>
+              <td>178 GB (<code>e128_prequant</code>); ~5 min if reading local <code>/tfhub/prod/tammam-ds4/...</code></td>
+            </tr>
+            <tr>
+              <td><strong>1b. Or Direct 2-Bit Unpack (Path B)</strong></td>
+              <td><code>unquantize_layer_experts()</code> on <code>gptq/layer_00..39.safetensors</code></td>
+              <td>1 GPU or 16-core CPU</td>
+              <td class="num"><strong>4–8 min</strong></td>
+              <td>Unpacks 23.6 GB packed <code>uint2</code> into 362.4 GB BF16 expert weights</td>
+            </tr>
+            <tr>
+              <td><strong>2. MXFP4 / FP8 &rarr; BF16 Decode</strong></td>
+              <td><code>mxfp4_to_bf16()</code> + <code>mxfp8_to_bf16()</code> across 40 layers</td>
+              <td>8 GPUs (or on-the-fly)</td>
+              <td class="num"><strong>5–10 min</strong></td>
+              <td>381 GB BF16 weights + 64 GiB frozen Engram (0 min if decoded on load)</td>
+            </tr>
+            <tr>
+              <td><strong>3. SFT Dataset &amp; Token Mask Prep</strong></td>
+              <td>Filter 1.5k–3k zero-typo Flash-1017 tool traces + <code>tokenize_rollouts.py</code> + <code>WIC-alnum</code> mask</td>
+              <td>32-core CPU</td>
+              <td class="num"><strong>10–15 min</strong></td>
+              <td>~40M–80M tokens with exact DSML chat template &amp; token-boundary weights</td>
+            </tr>
+            <tr class="row-best">
+              <td><strong>4a. Strategy 1: Healing LoRA SFT</strong></td>
+              <td>LoRA (<code>r=32</code>) on Attention + Shared Experts (1.5k traces, 1 epoch, <code>WIC-alnum &times;10</code>)</td>
+              <td>8&times; NVIDIA B200 (FSDP2)</td>
+              <td class="num"><strong>45–90 min</strong></td>
+              <td>~55 GB/GPU HBM; <strong>merges directly into backbone with 0 GPTQ re-quantization!</strong></td>
+            </tr>
+            <tr class="row-sft">
+              <td><strong>4b. Strategy 2: Full / Expert SFT</strong></td>
+              <td>FSDP2 Full BF16 SFT or Routed-Expert LoRA (1.5k–3k traces, 1 epoch)</td>
+              <td>8&times; NVIDIA B200 (FSDP2)</td>
+              <td class="num"><strong>2.0–3.5 hours</strong></td>
+              <td>~120–145 GB/GPU HBM (with 8-bit AdamW or CPU optimizer offload)</td>
+            </tr>
+            <tr>
+              <td><strong>5. Post-SFT 2-Bit GPTQ Re-Export</strong><br/><span class="mono">(Only needed for Strategy 2)</span></td>
+              <td><code>replay_reap.py --dump-x</code> (61 traces) + <code>gptq_experts.py --percdamp 1.0</code> + <code>make_lowbit_export.py</code></td>
+              <td>8&times; B200 (5 layers/GPU)</td>
+              <td class="num"><strong>25–35 min</strong></td>
+              <td>~15 min calibration dump + ~8 min parallel GPTQ + ~5 min packaging &rarr; 131.1 GB</td>
+            </tr>
+            <tr>
+              <td><strong>6. Parity &amp; Dev Verification</strong></td>
+              <td><code>check_lowbit_export.py</code> + 64-trace NLL screen + 32-task Dev ARC Probe</td>
+              <td>4&times;L4 / 4&times;4090 / B200</td>
+              <td class="num"><strong>20–30 min</strong></td>
+              <td>Confirms NLL &lt; 0.796, 25/25 valid DSML calls, and reduced Python typo rate</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer>
+      <div>Generated on 2026-10-27 &bull; DeepSeek-V4.1-Flash-1017 Pruning &amp; SFT Report</div>
+      <div class="mono">//experimental/users/arazdai/kaggle/arc_agi_2/reports/deepseek_pruning_and_sft_report.html</div>
+    </footer>
+  </div>
+</body>
+</html>

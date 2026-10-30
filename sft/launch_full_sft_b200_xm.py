@@ -101,6 +101,20 @@ flags.DEFINE_bool(
     False,
     "Enable pre-launch smoke test verification (save/reload/resume, partial batch, grad checks).",
 )
+# ---- Round-2 flags ----
+flags.DEFINE_bool("length_bucketed_batching", False, "Length-bucket trajectories per step and balance tokens across ranks.")
+flags.DEFINE_integer("bucket_mega_batch_multiplier", 8, "Mega-batch multiplier for length bucketing.")
+flags.DEFINE_bool("no_decay_norm_bias_deltanet", False, "Exclude norms/biases/A_log/dt_bias/conv1d from weight decay.")
+flags.DEFINE_float("save_every_epoch_fraction", 0.0, "If > 0, save a BF16 checkpoint every this fraction of an epoch.")
+flags.DEFINE_float("export_fp8_every_epoch_fraction", 0.0, "If > 0, export FP8 every this fraction of an epoch.")
+flags.DEFINE_float("milestone_every_epoch_fraction", 0.0, "If > 0, keep milestone checkpoints every this fraction of an epoch.")
+flags.DEFINE_float("adam_beta2", 0.95, "AdamW beta2.")
+flags.DEFINE_string(
+    "resume_output_dir",
+    "",
+    "If set, reuse this existing XID-keyed output dir (…/xid_<old>_<exp_name>) so the trainer resumes from its "
+    "latest completed checkpoint instead of creating a fresh dir for the new XID.",
+)
 
 
 def main(argv: list[str]) -> None:
@@ -129,7 +143,11 @@ def main(argv: list[str]) -> None:
             ]
         )
 
-        output_dir = f"{FLAGS.output_cns_base}/xid_{experiment.experiment_id}_{FLAGS.exp_name}"
+        output_dir = (
+            FLAGS.resume_output_dir.rstrip("/")
+            if FLAGS.resume_output_dir
+            else f"{FLAGS.output_cns_base}/xid_{experiment.experiment_id}_{FLAGS.exp_name}"
+        )
 
         async def run_full_sft_job(wu: xm.WorkUnit, **unused_kwargs) -> None:
             job_args = {
@@ -165,6 +183,13 @@ def main(argv: list[str]) -> None:
                 "use_torch_compile_norms": FLAGS.use_torch_compile_norms,
                 "attn_implementation": FLAGS.attn_implementation,
                 "smoke_test_mode": FLAGS.smoke_test_mode,
+                "length_bucketed_batching": FLAGS.length_bucketed_batching,
+                "bucket_mega_batch_multiplier": FLAGS.bucket_mega_batch_multiplier,
+                "no_decay_norm_bias_deltanet": FLAGS.no_decay_norm_bias_deltanet,
+                "save_every_epoch_fraction": FLAGS.save_every_epoch_fraction,
+                "export_fp8_every_epoch_fraction": FLAGS.export_fp8_every_epoch_fraction,
+                "milestone_every_epoch_fraction": FLAGS.milestone_every_epoch_fraction,
+                "adam_beta2": FLAGS.adam_beta2,
             }
             wu.add(
                 xm.Job(

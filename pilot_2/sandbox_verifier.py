@@ -420,6 +420,24 @@ class Pilot2AttemptSandbox:
         should_eval_solve = callable(solve_fn) and (
             require_solve or (solve_fn is not prev_solve) or ("def solve" in code)
         )
+        if not should_eval_solve and self.use_e031_ipython_mode and not require_solve:
+          try:
+            fn_tree = ast.parse(code, "<fn_scan>", "exec")
+            defined_1arg_names = [
+                node.name
+                for node in fn_tree.body
+                if isinstance(node, ast.FunctionDef)
+                and not node.name.startswith("_")
+                and len(node.args.args) >= 1
+                and len(node.args.args) - len(node.args.defaults) <= 1
+            ]
+            if defined_1arg_names:
+              cand_fn = self.env.get(defined_1arg_names[-1])
+              if callable(cand_fn):
+                solve_fn = cand_fn
+                should_eval_solve = True
+          except SyntaxError:
+            pass
         if should_eval_solve:
           result["defined_solve"] = True
           saved_train = self.env.pop("train", None)
@@ -523,7 +541,12 @@ class Pilot2AttemptSandbox:
                   try:
                     t_in = op(pair["input"].copy())
                     t_out_exp = op(pair["output"].copy())
-                    t_got = solve_fn(t_in)
+                    try:
+                      t_got = solve_fn(
+                          to_grid(t_in) if self.use_e031_ipython_mode else t_in
+                      )
+                    except Exception:
+                      t_got = solve_fn(t_in)
                     if not is_valid_grid(t_got):
                       all_op_ok = False
                       break
@@ -569,7 +592,13 @@ class Pilot2AttemptSandbox:
                 swap_ok = True
                 for pair in self._train_np:
                   try:
-                    s_got = solve_fn(_swap(pair["input"]))
+                    sw_in = _swap(pair["input"])
+                    try:
+                      s_got = solve_fn(
+                          to_grid(sw_in) if self.use_e031_ipython_mode else sw_in
+                      )
+                    except Exception:
+                      s_got = solve_fn(sw_in)
                     if not is_valid_grid(s_got):
                       swap_ok = False
                       break
@@ -917,6 +946,102 @@ class Pilot2AttemptSandbox:
         False,
     )
 
+  def _compute_e031_equivariance_bonus(
+      self,
+      cand_fn: Any,
+      code: str,
+  ) -> float:
+    """Compute D8 dihedral + foreground color-swap equivariance score for a training-passing E031 callable."""
+    if not self.run_equivariance_audit or cand_fn is None or not self._train_np:
+      return 0.0
+    eq_score = 0.0
+    d8_ops = [
+        lambda g: np.rot90(g, 1),
+        lambda g: np.rot90(g, 2),
+        lambda g: np.rot90(g, 3),
+        lambda g: np.fliplr(g),
+        lambda g: np.flipud(g),
+    ]
+    d8_passed = 0
+    d8_tested = 0
+    for op in d8_ops:
+      all_op_ok = True
+      for pair in self._train_np:
+        try:
+          t_in = op(pair["input"].copy())
+          t_out_exp = op(pair["output"].copy())
+          try:
+            t_got = cand_fn(to_grid(t_in))
+          except Exception:
+            t_got = cand_fn(t_in)
+          if not is_valid_grid(t_got):
+            all_op_ok = False
+            break
+          t_got_arr = np.asarray(t_got, dtype=int)
+          if t_got_arr.shape != t_out_exp.shape or not np.array_equal(
+              t_got_arr, t_out_exp
+          ):
+            all_op_ok = False
+            break
+        except Exception:
+          all_op_ok = False
+          break
+      d8_tested += 1
+      if all_op_ok:
+        d8_passed += 1
+    if d8_tested > 0:
+      eq_score += 1.5 * (d8_passed / d8_tested)
+
+    bg_c = int(arc_dsl_and_summary._bg_colour_host(self._train_np[0]["input"]))
+    fg_cols = sorted(
+        {
+            int(c)
+            for pair in self._train_np
+            for c in np.unique(pair["input"])
+            if int(c) != bg_c
+        }
+    )
+    if len(fg_cols) >= 2:
+      c1, c2 = fg_cols[0], fg_cols[1]
+
+      def _swap(arr: np.ndarray) -> np.ndarray:
+        out = arr.copy()
+        m1 = arr == c1
+        m2 = arr == c2
+        out[m1] = c2
+        out[m2] = c1
+        return out
+
+      swap_ok = True
+      for pair in self._train_np:
+        try:
+          sw_in = _swap(pair["input"])
+          try:
+            s_got = cand_fn(to_grid(sw_in))
+          except Exception:
+            s_got = cand_fn(sw_in)
+          if not is_valid_grid(s_got):
+            swap_ok = False
+            break
+          s_got_arr = np.asarray(s_got, dtype=int)
+          s_exp = _swap(pair["output"])
+          if s_got_arr.shape != s_exp.shape or not np.array_equal(
+              s_got_arr, s_exp
+          ):
+            swap_ok = False
+            break
+        except Exception:
+          swap_ok = False
+          break
+      if swap_ok:
+        eq_score += 1.0
+
+    full_source = "\n".join(self.helper_cells + [code])
+    penalty = ast_constant_lint_penalty(
+        full_source, self.train_pairs, self.test_input
+    )
+    return max(0.0, round(eq_score - penalty, 4))
+
   def _check_e031_train_reproduction(
       self,
       code: str,
@@ -925,13 +1050,15 @@ class Pilot2AttemptSandbox:
     import copy  # pylint: disable=g-import-not-at-top
     import types  # pylint: disable=g-import-not-at-top
 
-    total = max(1, len(self._train_np))
     test_names = ("test_in", "test_input")
+    self._last_e031_check_reports: list[str] = []
+    self._last_e031_winning_fn: Any = None
 
-    def _eval_candidate_fn(cand_fn: Any) -> tuple[bool, int, float]:
+    def _eval_candidate_fn(cand_fn: Any) -> tuple[bool, int, float, list[str]]:
       passed = 0
       cell_accs: list[float] = []
-      for pair in self._train_np:
+      reports: list[str] = []
+      for idx, pair in enumerate(self._train_np):
         try:
           try:
             got_raw = cand_fn(copy.deepcopy(to_grid(pair["input"])))
@@ -939,9 +1066,13 @@ class Pilot2AttemptSandbox:
             got_raw = cand_fn(pair["input"].copy())
           if not is_valid_grid(got_raw):
             cell_accs.append(0.0)
+            reports.append(
+                f"train[{idx}]: FAIL (returned invalid grid: {type(got_raw).__name__})"
+            )
             continue
           got_arr = np.asarray(got_raw, dtype=int)
           exp_arr = pair["output"]
+          reports.append(format_pair_diff(got_arr, exp_arr, idx))
           if got_arr.shape == exp_arr.shape and np.array_equal(got_arr, exp_arr):
             passed += 1
             cell_accs.append(1.0)
@@ -949,10 +1080,11 @@ class Pilot2AttemptSandbox:
             cell_accs.append(float(np.mean(got_arr == exp_arr)))
           else:
             cell_accs.append(0.0)
-        except Exception:
+        except Exception as exc:
           cell_accs.append(0.0)
+          reports.append(f"train[{idx}]: ERROR ({type(exc).__name__}: {exc})")
       mean_acc = float(np.mean(cell_accs)) if cell_accs else 0.0
-      return (passed == len(self._train_np)), passed, mean_acc
+      return (passed == len(self._train_np)), passed, mean_acc, reports
 
     best_res: tuple[bool, int, float] = (False, 0, 0.0)
 
@@ -968,11 +1100,15 @@ class Pilot2AttemptSandbox:
           local_env["test_in"] = inp_grid
           return eval(comp_expr, local_env)  # pylint: disable=eval-used
 
-        tp, p_cnt, m_acc = _eval_candidate_fn(_expr_runner)
+        tp, p_cnt, m_acc, reps = _eval_candidate_fn(_expr_runner)
         if tp:
+          self._last_e031_check_reports = reps
+          self._last_e031_winning_fn = _expr_runner
           return True, p_cnt, m_acc
-        if (p_cnt, m_acc) > (best_res[1], best_res[2]):
+        if (p_cnt, m_acc) > (best_res[1], best_res[2]) or not self._last_e031_check_reports:
           best_res = (tp, p_cnt, m_acc)
+          self._last_e031_check_reports = reps
+          self._last_e031_winning_fn = _expr_runner
       except SyntaxError:
         pass
 
@@ -1010,11 +1146,15 @@ class Pilot2AttemptSandbox:
         candidate_fns.append(u_fn)
 
     for cand_fn in candidate_fns:
-      tp, p_cnt, m_acc = _eval_candidate_fn(cand_fn)
+      tp, p_cnt, m_acc, reps = _eval_candidate_fn(cand_fn)
       if tp:
+        self._last_e031_check_reports = reps
+        self._last_e031_winning_fn = cand_fn
         return True, p_cnt, m_acc
-      if (p_cnt, m_acc) > (best_res[1], best_res[2]):
+      if (p_cnt, m_acc) > (best_res[1], best_res[2]) or not self._last_e031_check_reports:
         best_res = (tp, p_cnt, m_acc)
+        self._last_e031_check_reports = reps
+        self._last_e031_winning_fn = cand_fn
 
     return best_res
 
@@ -1064,7 +1204,7 @@ class Pilot2AttemptSandbox:
     """Execute E031 `submit_answer(code)` in the persistent IPython session and return `(tool_response_text, should_terminate)`."""
     self._refresh_task_globals()
 
-    def _eval_and_check() -> tuple[Any, Grid | None, Grid | None, bool, int, float]:
+    def _eval_and_check() -> tuple[Any, Grid | None, Grid | None, bool, int, float, float, list[str]]:
       try:
         val = eval(compile(code, "<submit_answer>", "eval"), self.env)  # pylint: disable=eval-used
       except SyntaxError:
@@ -1085,10 +1225,17 @@ class Pilot2AttemptSandbox:
         s_grid = to_grid(val[1])
 
       if p_grid is None:
-        return val, None, None, False, 0, 0.0
+        return val, None, None, False, 0, 0.0, 0.0, []
 
       tp, p_cnt, m_acc = self._check_e031_train_reproduction(code)
-      return val, p_grid, s_grid, tp, p_cnt, m_acc
+      reps = list(getattr(self, "_last_e031_check_reports", []))
+      win_fn = getattr(self, "_last_e031_winning_fn", None)
+      eq_b = (
+          self._compute_e031_equivariance_bonus(win_fn, code)
+          if tp and win_fn is not None
+          else 0.0
+      )
+      return val, p_grid, s_grid, tp, p_cnt, m_acc, eq_b, reps
 
     out_tuple, eval_err = self._run_with_hard_timeout(_eval_and_check, timeout_s=15.0)
     if eval_err is not None or out_tuple is None:
@@ -1098,7 +1245,7 @@ class Pilot2AttemptSandbox:
           False,
       )
 
-    _, primary_grid, secondary_grid, train_pass, passed_cnt, mean_acc = out_tuple
+    _, primary_grid, secondary_grid, train_pass, passed_cnt, mean_acc, eq_bonus, pair_reports = out_tuple
 
     if primary_grid is None:
       return (
@@ -1119,15 +1266,16 @@ class Pilot2AttemptSandbox:
               code=code,
               turn_idx=turn_idx,
               cum_gen_tokens=cum_gen_tokens,
-              equivariance_bonus=0.0,
+              equivariance_bonus=eq_bonus,
           )
       )
-      if self.first_tp_pred is None:
-        self.first_tp_pred = primary_grid
-        self.first_tp_code = code
-        self.first_tp_turn = turn_idx
-        self.first_tp_gen_tokens = cum_gen_tokens
-        self.first_tp_equivariance_bonus = 0.0
+      # Always promote an explicitly submitted & train-verified answer to the primary verified prediction
+      # (while any earlier verified drafts from `run_python` remain in `self.verified_variants` as secondary).
+      self.first_tp_pred = primary_grid
+      self.first_tp_code = code
+      self.first_tp_turn = turn_idx
+      self.first_tp_gen_tokens = cum_gen_tokens
+      self.first_tp_equivariance_bonus = eq_bonus
       if secondary_grid is not None:
         self.verified_variants.append(
             VerifiedVariant(
@@ -1135,7 +1283,7 @@ class Pilot2AttemptSandbox:
                 code=code + " # [grid_2]",
                 turn_idx=turn_idx,
                 cum_gen_tokens=cum_gen_tokens,
-                equivariance_bonus=0.0,
+                equivariance_bonus=max(0.0, round(eq_bonus - 0.05, 4)),
             )
         )
     else:
@@ -1145,7 +1293,11 @@ class Pilot2AttemptSandbox:
           self.best_partial_cell_acc,
       ):
         self.best_partial_pred = primary_grid
-        self.best_partial_code = code
+        recent_def_cells = [c for c in self.helper_cells[-3:] if "def " in c]
+        self.best_partial_code = (
+            "\n\n".join(recent_def_cells + [code]) if recent_def_cells else code
+        )
+        self.best_partial_pair_reports = list(pair_reports)
         self.best_partial_train_frac = t_frac
         self.best_partial_cell_acc = mean_acc
         self.best_partial_gen_tokens = cum_gen_tokens
@@ -1164,11 +1316,11 @@ class Pilot2AttemptSandbox:
             train_total_count=len(self.train_pairs),
             train_frac=passed_cnt / max(1, len(self.train_pairs)),
             mean_cell_acc=mean_acc,
-            pair_reports=[],
+            pair_reports=list(pair_reports),
             test_pred_shape=(len(primary_grid), len(primary_grid[0])),
             sanity_ok=True,
             sanity_reason="ok",
-            equivariance_bonus=0.0,
+            equivariance_bonus=eq_bonus,
             cum_gen_tokens=cum_gen_tokens,
         )
     )
@@ -1190,9 +1342,11 @@ class Pilot2AttemptSandbox:
     ):
       self._rejected_submit_codes.add(norm_code)
       total_tr = len(self.train_pairs)
+      fail_lines = [r for r in pair_reports if "PASS" not in r][:4]
+      fail_detail = ("\n" + "\n".join(fail_lines) + "\n") if fail_lines else " "
       return (
           f"[submission rejected: your rule only matched {passed_cnt}/{total_tr} training pairs "
-          f"(mean cell accuracy {100.0 * mean_acc:.1f}%). Inspect the failing training pairs in "
+          f"(mean cell accuracy {100.0 * mean_acc:.1f}%).{fail_detail}Inspect the failing training pairs in "
           "`run_python`, fix your rule so it reproduces ALL training outputs, and call `submit_answer` again.]",
           False,
       )

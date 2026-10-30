@@ -12,8 +12,11 @@ import torch
 import transformers
 
 from google3.experimental.users.arazdai.kaggle.sft import data_pipeline
+from google3.experimental.users.arazdai.kaggle.sft import dsv41_sft_model
+from google3.experimental.users.arazdai.kaggle.sft import evaluate_difficulty_argon
 from google3.experimental.users.arazdai.kaggle.sft import export_and_quantize
 from google3.experimental.users.arazdai.kaggle.sft import fast_deltanet
+from google3.experimental.users.arazdai.kaggle.sft import train_dsv41_sft
 from google3.experimental.users.arazdai.kaggle.sft import train_full_sft
 from google3.experimental.users.arazdai.kaggle.sft import train_sft
 from google3.testing.pybase import googletest
@@ -838,6 +841,1129 @@ class SftPipelineTest(googletest.TestCase):
                     self.assertEqual(n1, n2)
                     self.assertTrue(torch.allclose(p1, p2))
 
+    def test_argon_difficulty_prompt_parsing_and_filtering(self):
+        candidate = {
+            "puzzle_id": "nvarc_syn_001",
+            "family_id": "nvarc_syn",
+            "source_dataset": "NVARC-Synthetic-103k",
+            "empirical_difficulty": {
+                "bucket_3level": "0/2",
+                "pass_rate_3level": 0.0,
+                "has_direct_empirical": True,
+            },
+            "puzzle": {
+                "train": [
+                    {"input": [[0, 1], [2, 0]], "output": [[1, 0], [0, 2]]}
+                ],
+                "test": [{"input": [[0, 3], [4, 0]], "output": [[3, 0], [0, 4]]}],
+            },
+        }
+        rollout_row = {
+            "task_id": "nvarc_syn_001",
+            "turns": 6,
+            "tool_calls": 5,
+            "prompt_tokens": 9000,
+            "completion_tokens": 5000,
+            "thinking_tokens": 3500,
+            "train_pass": True,
+            "correct": True,
+            "all_3_levels_verified": True,
+            "submitted_solve_code": "def solve(g):\n    return [row[::-1] for row in g]\n",
+        }
+        prompt = evaluate_difficulty_argon.build_argon_difficulty_prompt(
+            candidate, rollout_row
+        )
+        self.assertIn("Qwen3.8-27B", prompt)
+        self.assertIn("nvarc_syn_001", prompt)
+        self.assertIn("def solve(g):", prompt)
+
+        raw_json = """```json
+        {
+          "qwen38_difficulty_score": 8,
+          "algorithmic_complexity": "hard_multi_step",
+          "qwen38_failure_modes_targeted": ["multi_step_composition", "marker_relative_indexing"],
+          "transformation_rule_summary": "Marker-anchored reflection with parity shift.",
+          "solution_code_quality": 5,
+          "sft_recommend_include": true,
+          "sft_priority_tier": "tier1_high_value_hard_for_qwen",
+          "qwen38_sft_rationale": "Targets multi-step marker-relative coordinate reasoning."
+        }
+        ```"""
+        parsed = evaluate_difficulty_argon.parse_argon_json_response(raw_json)
+        self.assertEqual(parsed["qwen38_difficulty_score"], 8)
+        self.assertTrue(parsed["sft_recommend_include"])
+        score = evaluate_difficulty_argon.compute_composite_sft_value_score(
+            parsed, rollout_row=rollout_row, candidate=candidate
+        )
+        self.assertGreaterEqual(score, 90.0)
+
+        with tempfile.TemporaryDirectory(prefix="argon_filter_test_") as tmp_dir:
+            ratings_path = os.path.join(tmp_dir, "argon_ratings.jsonl")
+            with open(ratings_path, "w") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "puzzle_id": "nvarc_syn_001",
+                            "family_id": "nvarc_syn",
+                            **parsed,
+                            "sft_value_score": score,
+                        }
+                    )
+                    + "\n"
+                )
+                f.write(
+                    json.dumps(
+                        {
+                            "puzzle_id": "trivial_1d_001",
+                            "family_id": "trivial_1d",
+                            "qwen38_difficulty_score": 2,
+                            "sft_recommend_include": False,
+                            "sft_priority_tier": "tier3_skip_trivial_or_redundant",
+                            "sft_value_score": 12.0,
+                        }
+                    )
+                    + "\n"
+                )
+            ratings_map = data_pipeline.load_argon_ratings(ratings_path)
+            records = [
+                {"task_id": "nvarc_syn_001", "parent": "nvarc_syn"},
+                {"task_id": "trivial_1d_001", "parent": "trivial_1d"},
+                {"task_id": "official_arc_001", "parent": "official_arc_001"},
+            ]
+            kept, fstats = data_pipeline.filter_records_by_argon_difficulty(
+                records,
+                argon_ratings=ratings_map,
+                min_qwen38_difficulty=6,
+                max_qwen38_difficulty=9,
+                only_argon_recommended=True,
+                keep_unrated_official_arc=True,
+            )
+            self.assertEqual(len(kept), 2)
+            self.assertEqual(fstats["kept_hard_for_qwen38"], 1)
+            self.assertEqual(fstats["dropped_trivial_or_low_diff"], 1)
+            self.assertEqual(fstats["kept_unrated_official"], 1)
+
+    def test_dsv41_dequant_2bit_quant_and_differentiable_sft_forward_backward(self):
+        torch.manual_seed(1234)
+        # 1. Verify FP8 block32 quantize -> dequantize round-trip
+        w_orig = torch.randn((32, 64), dtype=torch.float32) * 0.25
+        w_fp8, s_fp8 = dsv41_sft_model.quantize_fp8_block32_torch(w_orig, block_size=32)
+        self.assertEqual(w_fp8.dtype, torch.float8_e4m3fn)
+        self.assertEqual(s_fp8.dtype, torch.float8_e8m0fnu)
+        self.assertEqual(tuple(s_fp8.shape), (32, 2))
+        w_deq = dsv41_sft_model.dequantize_fp8_block32_torch(
+            w_fp8, s_fp8, out_dtype=torch.float32
+        )
+        rel_err_fp8 = float(
+            (w_deq - w_orig).norm() / w_orig.norm().clamp(min=1e-6)
+        )
+        self.assertLess(rel_err_fp8, 0.15)
+
+        # 2. Verify 2-bit Humming uint2 quantize -> dequantize round-trip & shapes
+        # Construct an exact 4-level grid per group so 2-bit quantization is near-exact
+        n_out, k_in, g_size = 32, 128, 64
+        q_levels = torch.randint(0, 4, (n_out, k_in // g_size, g_size), dtype=torch.float32)
+        # Ensure both 0 and 3 appear in each group so scale recovery is exact
+        q_levels[:, :, 0] = 0.0
+        q_levels[:, :, 1] = 3.0
+        scales_true = torch.full((n_out, k_in // g_size, 1), 0.125, dtype=torch.float32)
+        zp_true = torch.full((n_out, k_in // g_size, 1), 1.0, dtype=torch.float32)
+        w_4level = ((q_levels - zp_true) * scales_true).reshape(n_out, k_in)
+
+        q_p, s_p, z_p = dsv41_sft_model.quantize_uint2_humming_expert_tensor(
+            w_4level, group=g_size
+        )
+        self.assertEqual(tuple(q_p.shape), (n_out, k_in // 16))
+        self.assertEqual(tuple(s_p.shape), (n_out, k_in // g_size))
+        self.assertEqual(tuple(z_p.shape), (n_out // 16, k_in // g_size))
+        self.assertEqual(q_p.dtype, torch.int32)
+        self.assertEqual(s_p.dtype, torch.bfloat16)
+        self.assertEqual(z_p.dtype, torch.int32)
+
+        w_2bit_deq = dsv41_sft_model.dequant_gptq_expert_tensor(
+            q_p, s_p, z_p, group=g_size, out_dtype=torch.float32
+        )
+        self.assertEqual(tuple(w_2bit_deq.shape), (n_out, k_in))
+        self.assertTrue(torch.allclose(w_2bit_deq, w_4level, atol=2e-3, rtol=2e-2))
+
+        # 3. Verify differentiable Dsv41SftModel forward + backward with token-level loss_weights
+        cfg = dsv41_sft_model.Dsv41E128Config.tiny_test_config()
+        model = dsv41_sft_model.Dsv41SftModel(
+            cfg=cfg,
+            ep_rank=0,
+            ep_world_size=1,
+            gradient_checkpointing=True,
+        )
+        # Initialize LoRA B with non-zero weights so w1/w2/w3 base weights also receive gradients
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if "lora_B" in n or "experts." in n:
+                    p.normal_(0.0, 0.02)
+
+        seq_len = 24
+        tokens = torch.randint(0, cfg.vocab_size, (1, seq_len), dtype=torch.long)
+        labels = tokens.clone()
+        labels[:, :6] = -100  # mask prompt prefix
+        loss_weights = torch.ones((1, seq_len), dtype=torch.float32)
+        loss_weights[:, :6] = 0.0
+        loss_weights[:, 10:14] = 10.0  # WIC-alnum tokens
+        loss_weights[:, 18:] = 5.0     # final submit turn tokens
+
+        hidden = model.forward_hidden(tokens)
+        loss_sum, n_valid = train_sft.compute_chunked_causal_lm_loss(
+            hidden_states=hidden,
+            lm_head=model.head,
+            labels=labels,
+            chunk_size=16,
+            loss_weights=loss_weights,
+        )
+        self.assertEqual(n_valid, seq_len - 6)
+        mean_loss = loss_sum / float(n_valid)
+        self.assertTrue(torch.isfinite(mean_loss))
+        mean_loss.backward()
+
+        # Verify gradients flowed into backbone, attention, shared experts, and routed expert LoRA
+        self.assertIsNotNone(model.head.weight.grad)
+        self.assertIsNotNone(model.layers[0].attn.wq_a.weight.grad)
+        self.assertIsNotNone(model.layers[0].ffn.shared_experts.w1.weight.grad)
+        lora_grads = [
+            p.grad
+            for n, p in model.named_parameters()
+            if "lora_B" in n and p.grad is not None
+        ]
+        self.assertGreater(len(lora_grads), 0)
+
+        # 4. Verify milestone step computation (0.25, 0.50, 0.75, 1.00 epoch) and optimizer parameter groups
+        milestones = train_dsv41_sft.compute_milestone_steps(
+            steps_per_epoch=114,
+            total_steps=114,
+            fractions_csv="0.25,0.50,0.75,1.00",
+        )
+        self.assertEqual(
+            milestones,
+            {
+                28: "epoch_0p25",
+                57: "epoch_0p50",
+                86: "epoch_0p75",
+                114: "epoch_1p00",
+            },
+        )
+        groups, p_stats = train_dsv41_sft.build_dsv41_optimizer_param_groups(
+            model, weight_decay=0.01
+        )
+        self.assertEqual(len(groups), 2)
+        self.assertGreater(p_stats["decay_tensors"], 0)
+        self.assertGreater(p_stats["no_decay_tensors"], 0)
+
+        # 5. Verify build_length_bucketed_step_batches on a synthetic PackedTrajectoryDataset
+        with tempfile.TemporaryDirectory(prefix="dsv41_bucket_test_") as tmp_dir:
+            npz_path = os.path.join(tmp_dir, "synth_tokens.npz")
+            lengths = np.array([12, 24, 18, 30, 16], dtype=np.int32)
+            offsets = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
+            total_tok = int(offsets[-1])
+            np.savez(
+                npz_path,
+                input_ids=np.ones(total_tok, dtype=np.int32),
+                loss_mask=np.ones(total_tok, dtype=np.uint8),
+                loss_weights=np.ones(total_tok, dtype=np.float32),
+                offsets=offsets,
+                lengths=lengths,
+            )
+            ds = train_sft.PackedTrajectoryDataset(npz_path, max_seq_len=64)
+            step_batches = train_dsv41_sft.build_length_bucketed_step_batches(
+                dataset=ds,
+                seed=42,
+                epoch=0,
+                effective_batch=4,
+                world_size=2,
+                grad_accum=2,
+                mega_batch_multiplier=2,
+            )
+            self.assertEqual(len(step_batches), 2)
+            self.assertEqual(len(step_batches[0]), 4)
+            self.assertEqual(len(step_batches[1]), 4)
+            real_seen = [idx for b in step_batches for idx in b if idx is not None]
+            self.assertCountEqual(real_seen, [0, 1, 2, 3, 4])
+
+    def test_dsv41_moe_only_freezing_and_loss_decrease(self):
+        torch.manual_seed(2026)
+        cfg = dsv41_sft_model.Dsv41E128Config.tiny_test_config()
+        cfg.routed_expert_lora_r = 8
+        cfg.routed_expert_lora_alpha = 16.0
+        cfg.trainable_routed_experts_dense = False
+        model = dsv41_sft_model.Dsv41SftModel(
+            cfg=cfg,
+            ep_rank=0,
+            ep_world_size=1,
+            gradient_checkpointing=True,
+        )
+        # Initialize expert base weights so routed expert forward/backward is non-trivial
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if "experts." in n and "lora_" not in n:
+                    p.normal_(0.0, 0.02)
+
+        freeze_stats = train_dsv41_sft.configure_dsv41_trainable_parameters(
+            model, train_moe_only=True
+        )
+        self.assertGreater(freeze_stats["trainable_tensors"], 0)
+        self.assertGreater(freeze_stats["frozen_tensors"], 0)
+
+        # Verify attention, ngrams (engram), router gate, embed, head, mHC, and norms are all frozen
+        for name, p in model.named_parameters():
+            if any(
+                k in name
+                for k in (
+                    "embed.",
+                    "head.",
+                    ".attn.",
+                    ".engram.",
+                    ".ffn.gate.",
+                    ".hc_",
+                    "norm",
+                )
+            ):
+                self.assertFalse(
+                    p.requires_grad, f"Expected {name} to be frozen when train_moe_only=True"
+                )
+            elif ".ffn.shared_experts." in name or (
+                ".ffn.experts." in name and "lora_" in name
+            ):
+                self.assertTrue(
+                    p.requires_grad, f"Expected MoE parameter {name} to be trainable"
+                )
+
+        param_groups, p_stats = train_dsv41_sft.build_dsv41_optimizer_param_groups(
+            model, weight_decay=0.01
+        )
+        self.assertGreater(p_stats["decay_tensors"], 0)
+        optimizer = torch.optim.AdamW(param_groups, lr=5e-3)
+
+        tokens = torch.randint(0, cfg.vocab_size, (1, 20), dtype=torch.long)
+        labels = tokens.clone()
+        labels[:, :4] = -100
+        loss_weights = torch.ones((1, 20), dtype=torch.float32)
+        loss_weights[:, 8:12] = 10.0
+
+        losses: list[float] = []
+        for _ in range(4):
+            optimizer.zero_grad(set_to_none=True)
+            hidden = model.forward_hidden(tokens)
+            loss_sum, n_valid = train_sft.compute_chunked_causal_lm_loss(
+                hidden_states=hidden,
+                lm_head=model.head,
+                labels=labels,
+                chunk_size=16,
+                loss_weights=loss_weights,
+            )
+            loss = loss_sum / float(n_valid)
+            losses.append(float(loss.detach().item()))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], max_norm=1.0
+            )
+            optimizer.step()
+
+        # Verify training loss strictly decreases across the 4 MoE-only steps
+        self.assertLess(losses[-1], losses[0])
+
+        # Verify resumable checkpoint saving succeeds
+        with tempfile.TemporaryDirectory(prefix="dsv41_moe_ckpt_") as tmp_dir:
+            ckpt_dir = train_dsv41_sft.save_dsv41_resumable_checkpoint(
+                output_dir=tmp_dir,
+                step=4,
+                epoch=0,
+                step_in_epoch=3,
+                model=model,
+                optimizer=optimizer,
+                ema_loss=losses[-1],
+                best_val_loss=losses[-1],
+                metrics_history=[{"step": 4, "train_loss": losses[-1]}],
+                rank=0,
+                world_size=1,
+                milestone_tag="epoch_0p25",
+            )
+            self.assertTrue(os.path.exists(os.path.join(ckpt_dir, "COMPLETED.json")))
+            self.assertTrue(
+                os.path.exists(os.path.join(ckpt_dir, "backbone_trainable.pt"))
+            )
+            self.assertTrue(
+                os.path.exists(os.path.join(ckpt_dir, "expert_lora_rank_00.pt"))
+            )
+
+    def test_eval_dsv41_b32_arc2_run_havu_b32_shard_without_vllm(self):
+        from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import havu_b32_harness
+        from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import prompts_and_selector
+        from google3.experimental.users.arazdai.kaggle.sft import eval_dsv41_b32_arc2
+
+        eval_dsv41_b32_arc2._install_vllm_sampling_params_shim()
+        import vllm  # type: ignore
+
+        self.assertEqual(
+            vllm.sampling_params.RequestOutputKind.CUMULATIVE, "CUMULATIVE"
+        )
+        sp = vllm.SamplingParams(temperature=1.0, top_p=1.0, top_k=-1, max_tokens=64)
+        self.assertEqual(sp.max_tokens, 64)
+
+        cfg = dsv41_sft_model.Dsv41E128Config.tiny_test_config()
+        model = dsv41_sft_model.Dsv41SftModel(
+            cfg=cfg,
+            ep_rank=0,
+            ep_world_size=1,
+            gradient_checkpointing=False,
+            ep_replicated_input=True,
+        ).eval()
+
+        class _DummyTok:
+            eos_token_id = 1
+
+            def encode(self, s: str, add_special_tokens: bool = False) -> list[int]:
+                del add_special_tokens
+                if s == havu_b32_harness.DS41_EOS_TOKEN:
+                    return [1]
+                return [min(cfg.vocab_size - 1, max(2, ord(c) % cfg.vocab_size)) for c in s[:16]] or [2]
+
+            def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
+                del skip_special_tokens
+                if ids:
+                    return '</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="submit_answer">\n<｜DSML｜ parameter name="code" string="true">[[0]]</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜>'
+                return "thinking..."
+
+        engine = eval_dsv41_b32_arc2.Dsv41DistributedStepEngine(
+            model=model,
+            tokenizer=_DummyTok(),  # type: ignore[arg-type]
+            device=torch.device("cpu"),
+            max_model_len=2048,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ds_dir = os.path.join(tmp, "eval_data")
+            out_dir = os.path.join(tmp, "eval_out")
+            os.makedirs(ds_dir, exist_ok=True)
+            with open(os.path.join(ds_dir, "00000001.json"), "w") as f:
+                json.dump(
+                    {
+                        "train": [{"input": [[0]], "output": [[0]]}],
+                        "test": [{"input": [[0]], "output": [[0]]}],
+                    },
+                    f,
+                )
+            base_cfg = prompts_and_selector.PILOT2_HYPOTHESES["havu_b32"]
+            eval_cfg = prompts_and_selector.Pilot2HypothesisConfig(
+                **{
+                    **base_cfg.__dict__,
+                    "exp_id": "dsv41_e128_b32_epoch_0p25",
+                    "title": "DeepSeek-V4.1 E128 B32 Test",
+                    "num_attempts": 1,
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                }
+            )
+            recs = havu_b32_harness.run_havu_b32_shard(
+                llm=engine,
+                cfg=eval_cfg,
+                dataset_dir=ds_dir,
+                out_dir=out_dir,
+                shard_index=0,
+                num_shards=1,
+                max_tasks=1,
+                model_path="/tmp/dsv41_e128",
+            )
+            self.assertEqual(len(recs), 1)
+            self.assertTrue(recs[0]["pass1"])
+
+    def test_dsv41_qat_qad_nemotron_and_kv_cached_parity(self):
+        torch.manual_seed(20261029)
+        # 1. Verify 2D [out//32, in//32] FP8 block-32 quantize/dequantize & STE
+        w_orig = torch.randn((64, 96), dtype=torch.float32) * 0.2
+        w_fp8_2d, s_fp8_2d = dsv41_sft_model.quantize_fp8_block32_torch(
+            w_orig, block_size=32, scale_2d=True
+        )
+        self.assertEqual(tuple(s_fp8_2d.shape), (2, 3))
+        w_deq_2d = dsv41_sft_model.dequantize_fp8_block32_torch(
+            w_fp8_2d, s_fp8_2d, out_dtype=torch.float32
+        )
+        self.assertEqual(tuple(w_deq_2d.shape), (64, 96))
+
+        # 2. Verify locked-z_orig 2-bit Humming zero-degradation round-trip & train-to-export parity
+        n_out, k_in, g_size = 32, 128, 64
+        q_init = torch.randint(0, 4, (n_out, k_in // g_size, g_size), dtype=torch.uint8)
+        z_init = torch.randint(0, 4, (n_out, k_in // g_size), dtype=torch.uint8)
+        s_init = (torch.rand((n_out, k_in // g_size), dtype=torch.bfloat16) * 0.08 + 0.02)
+        w_init = (
+            (q_init.to(torch.float32) - z_init.to(torch.float32).unsqueeze(-1))
+            * s_init.to(torch.float32).unsqueeze(-1)
+        ).reshape(n_out, k_in).to(torch.bfloat16)
+
+        q_packed_orig = dsv41_sft_model.pack_uint2_torch(
+            q_init.reshape(n_out, k_in)
+        )
+        z_packed_orig = (
+            dsv41_sft_model.pack_uint2_torch(z_init.T.contiguous()).T.contiguous()
+        )
+
+        lora_lin = dsv41_sft_model.LoRALinear(
+            in_features=k_in,
+            out_features=n_out,
+            lora_r=8,
+            lora_alpha=16.0,
+            group=g_size,
+            enable_qat=True,
+            trainable_scale=True,
+            lock_gptq_codes=False,
+        )
+        lora_lin.set_gptq_state(w_init, s_init, z_packed_orig)
+
+        # At delta W == 0, export_humming_2bit must be 100% bit-for-bit identical to Havu's GPTQ checkpoint
+        q_exp0, s_exp0, z_exp0 = lora_lin.export_humming_2bit()
+        self.assertTrue(torch.equal(q_exp0, q_packed_orig))
+        self.assertTrue(torch.equal(s_exp0, s_init))
+        self.assertTrue(torch.equal(z_exp0, z_packed_orig))
+
+        # After non-zero LoRA + qat_scale updates, forward QAT weight must match exported 2-bit dequant exactly
+        with torch.no_grad():
+            lora_lin.lora_B.normal_(0.0, 0.05)
+            lora_lin.qat_scale.mul_(1.07)
+        q_exp1, s_exp1, z_exp1 = lora_lin.export_humming_2bit()
+        self.assertTrue(torch.equal(z_exp1, z_packed_orig))  # z_orig remains locked!
+        w_deq_exp1 = dsv41_sft_model.dequant_gptq_expert_tensor(
+            q_exp1, s_exp1, z_exp1, group=g_size, out_dtype=torch.bfloat16
+        )
+        x_probe = torch.randn((2, k_in), dtype=torch.bfloat16)
+        x_probe_q = dsv41_sft_model.act_quant_fp8_ste(x_probe, block_size=32)
+        y_qat = lora_lin(x_probe)
+        y_exp = torch.nn.functional.linear(x_probe_q, w_deq_exp1)
+        self.assertTrue(torch.allclose(y_qat, y_exp, atol=1e-3, rtol=1e-3))
+
+        # 2b. Non-QAT (plain bf16 + LoRA SFT) must NOT materialize the int8 `d_orig` cache (it cost
+        # ~22.6 GB/rank and OOM'd the v11b SFT run), yet must export bit-identically to the QAT path.
+        self.assertGreater(lora_lin.d_orig.numel(), 0)
+        lora_plain = dsv41_sft_model.LoRALinear(
+            in_features=k_in,
+            out_features=n_out,
+            lora_r=8,
+            lora_alpha=16.0,
+            group=g_size,
+            enable_qat=False,
+        )
+        lora_plain.set_gptq_state(w_init, s_init, z_packed_orig)
+        self.assertTrue(lora_plain.has_gptq_state)
+        self.assertEqual(lora_plain.d_orig.numel(), 0)
+        q_plain0, s_plain0, z_plain0 = lora_plain.export_humming_2bit()
+        self.assertEqual(lora_plain.d_orig.numel(), 0)  # export must not populate the cache either
+        self.assertTrue(torch.equal(q_plain0, q_packed_orig))
+        self.assertTrue(torch.equal(s_plain0, s_init))
+        self.assertTrue(torch.equal(z_plain0, z_packed_orig))
+        with torch.no_grad():
+            lora_plain.lora_A.copy_(lora_lin.lora_A.to(lora_plain.lora_A.dtype))
+            lora_plain.lora_B.copy_(lora_lin.lora_B.to(lora_plain.lora_B.dtype))
+        lora_ref = dsv41_sft_model.LoRALinear(
+            in_features=k_in,
+            out_features=n_out,
+            lora_r=8,
+            lora_alpha=16.0,
+            group=g_size,
+            enable_qat=True,
+            trainable_scale=False,
+        )
+        lora_ref.set_gptq_state(w_init, s_init, z_packed_orig)
+        with torch.no_grad():
+            lora_ref.lora_A.copy_(lora_plain.lora_A.float())
+            lora_ref.lora_B.copy_(lora_plain.lora_B.float())
+        self.assertGreater(lora_ref.d_orig.numel(), 0)
+        q_plain1, s_plain1, z_plain1 = lora_plain.export_humming_2bit()
+        q_ref1, s_ref1, z_ref1 = lora_ref.export_humming_2bit()
+        self.assertTrue(torch.equal(q_plain1, q_ref1))
+        self.assertTrue(torch.equal(s_plain1, s_ref1))
+        self.assertTrue(torch.equal(z_plain1, z_ref1))
+
+        # 3. Verify Nemotron QAT/QAD forward + backward with frozen teacher reference and MoE-only training
+        cfg = dsv41_sft_model.Dsv41E128Config.tiny_test_config()
+        cfg.enable_qat = True
+        cfg.qat_trainable_expert_scales = True
+        cfg.qat_lock_gptq_codes = False
+        model = dsv41_sft_model.Dsv41SftModel(
+            cfg=cfg,
+            ep_rank=0,
+            ep_world_size=1,
+            gradient_checkpointing=True,
+        )
+        # Populate synthetic GPTQ states on all routed experts and non-zero LoRA B
+        with torch.no_grad():
+            for layer in model.layers:
+                for exp in layer.ffn.experts:
+                    for proj in (exp.w1, exp.w2, exp.w3):
+                        proj.weight.normal_(0.0, 0.05)
+                        q_p, s_p, z_p = dsv41_sft_model.quantize_uint2_humming_expert_tensor(
+                            proj.weight, group=proj.group
+                        )
+                        w_deq = dsv41_sft_model.dequant_gptq_expert_tensor(
+                            q_p, s_p, z_p, group=proj.group, out_dtype=torch.bfloat16
+                        )
+                        proj.set_gptq_state(w_deq, s_p, z_p)
+                        proj.lora_B.normal_(0.0, 0.02)
+        model.snapshot_teacher_weights()
+
+        freeze_stats = train_dsv41_sft.configure_dsv41_trainable_parameters(
+            model, train_moe_only=True
+        )
+        self.assertGreater(freeze_stats["qat_scale_params"], 0)
+        self.assertEqual(
+            model.layers[0].ffn.shared_experts.w1.weight.dtype, torch.float32
+        )
+
+        param_groups, p_stats = train_dsv41_sft.build_dsv41_optimizer_param_groups(
+            model, weight_decay=0.01
+        )
+        self.assertGreater(p_stats["no_decay_tensors"], 0)
+        optimizer = torch.optim.AdamW(param_groups, lr=5e-3)
+
+        tokens = torch.randint(0, cfg.vocab_size, (1, 16), dtype=torch.long)
+        labels = tokens.clone()
+        labels[:, :4] = -100
+        loss_weights = torch.ones((1, 16), dtype=torch.float32)
+
+        with torch.no_grad():
+            model.set_teacher_mode(True)
+            teacher_hidden = model.forward_hidden(tokens).detach()
+            model.set_teacher_mode(False)
+
+        student_hidden = model.forward_hidden(tokens)
+        total_loss_sum, n_valid, kl_sum = (
+            train_dsv41_sft.compute_chunked_qat_qad_loss(
+                student_hidden=student_hidden,
+                teacher_hidden=teacher_hidden,
+                lm_head=model.head,
+                labels=labels,
+                chunk_size=8,
+                loss_weights=loss_weights,
+                qat_kl_weight=0.2,
+                qat_kl_temperature=1.0,
+            )
+        )
+        self.assertEqual(n_valid, 12)
+        self.assertGreater(float(total_loss_sum.item()), 0.0)
+        self.assertGreaterEqual(float(kl_sum), 0.0)
+        (total_loss_sum / float(n_valid)).backward()
+
+        # Attention & Engram must have None grad; MoE shared_experts, lora_A/B, and qat_scale must have finite grad
+        self.assertIsNone(model.layers[0].attn.wq_a.weight.grad)
+        self.assertIsNotNone(model.layers[0].ffn.shared_experts.w1.weight.grad)
+        exp0 = model.layers[0].ffn.experts[0]
+        self.assertIsNotNone(exp0.w1.lora_A.grad)
+        self.assertIsNotNone(exp0.w1.lora_B.grad)
+        self.assertIsNotNone(exp0.w1.qat_scale.grad)
+        optimizer.step()
+
+        # 4. Verify incremental KV-cached forward_hidden_cached parity with uncached forward_hidden
+        model.eval()
+        model.set_teacher_mode(True)
+        with torch.no_grad():
+            seq_tokens = torch.randint(0, cfg.vocab_size, (1, 12), dtype=torch.long)
+            full_h = model.forward_hidden(seq_tokens)
+            kv_cache = model.create_kv_cache()
+            # Prefill first 8 tokens, then decode 4 tokens one-by-one
+            h_prefill = model.forward_hidden_cached(seq_tokens[:, :8], kv_cache)
+            h_steps = [h_prefill]
+            for pos in range(8, 12):
+                h_step = model.forward_hidden_cached(
+                    seq_tokens[:, pos : pos + 1], kv_cache
+                )
+                h_steps.append(h_step)
+            cached_h = torch.cat(h_steps, dim=1)
+            self.assertEqual(kv_cache["seqlen"], 12)
+            self.assertTrue(
+                torch.allclose(full_h, cached_h, atol=2e-2, rtol=2e-2)
+            )
+
+            # 4b. Verify batched multi-stream decode (`begin/step/end_batched_decode`) matches
+            # independent single-stream decode: partial window (6 < window_size=8), mixed
+            # ratio-2 compressor phases (even vs odd start), candidate-source layer, and
+            # continued single-stream decoding on the written-back caches afterwards.
+            seq_a = torch.randint(0, cfg.vocab_size, (1, 16), dtype=torch.long)
+            seq_b = torch.randint(0, cfg.vocab_size, (1, 20), dtype=torch.long)
+            pre_a, pre_b, n_batched, n_tail = 6, 11, 5, 2
+            cache_a_single = model.create_kv_cache()
+            cache_b_single = model.create_kv_cache()
+            _ = model.forward_hidden_cached(seq_a[:, :pre_a], cache_a_single)
+            _ = model.forward_hidden_cached(seq_b[:, :pre_b], cache_b_single)
+
+            cache_a_batch = model.create_kv_cache()
+            cache_b_batch = model.create_kv_cache()
+            _ = model.forward_hidden_cached(seq_a[:, :pre_a], cache_a_batch)
+            _ = model.forward_hidden_cached(seq_b[:, :pre_b], cache_b_batch)
+
+            session = model.begin_batched_decode(
+                [cache_a_batch, cache_b_batch], max_steps=n_batched
+            )
+            for step_i in range(n_batched):
+                tok_a = seq_a[:, pre_a + step_i : pre_a + step_i + 1]
+                tok_b = seq_b[:, pre_b + step_i : pre_b + step_i + 1]
+                ha_s = model.forward_hidden_cached(tok_a, cache_a_single)
+                hb_s = model.forward_hidden_cached(tok_b, cache_b_single)
+                h_ab = model.step_batched_decode(
+                    torch.cat([tok_a, tok_b], dim=0), session
+                )
+                self.assertTrue(
+                    torch.allclose(ha_s, h_ab[0:1], atol=1e-2, rtol=1e-2),
+                    f"step {step_i} stream a: {(ha_s - h_ab[0:1]).abs().max().item()}",
+                )
+                self.assertTrue(
+                    torch.allclose(hb_s, h_ab[1:2], atol=1e-2, rtol=1e-2),
+                    f"step {step_i} stream b: {(hb_s - h_ab[1:2]).abs().max().item()}",
+                )
+            model.end_batched_decode(session)
+            self.assertEqual(cache_a_batch["seqlen"], pre_a + n_batched)
+            self.assertEqual(cache_b_batch["seqlen"], pre_b + n_batched)
+
+            # Written-back caches must be usable by the single-stream path afterwards
+            for step_i in range(n_tail):
+                pa = pre_a + n_batched + step_i
+                pb = pre_b + n_batched + step_i
+                tok_a = seq_a[:, pa : pa + 1]
+                tok_b = seq_b[:, pb : pb + 1]
+                ha_s = model.forward_hidden_cached(tok_a, cache_a_single)
+                hb_s = model.forward_hidden_cached(tok_b, cache_b_single)
+                ha_c = model.forward_hidden_cached(tok_a, cache_a_batch)
+                hb_c = model.forward_hidden_cached(tok_b, cache_b_batch)
+                self.assertTrue(torch.allclose(ha_s, ha_c, atol=1e-2, rtol=1e-2))
+                self.assertTrue(torch.allclose(hb_s, hb_c, atol=1e-2, rtol=1e-2))
+
+            # One-shot convenience wrapper (begin + 1 step + end) must agree too
+            pa = pre_a + n_batched + n_tail
+            pb = pre_b + n_batched + n_tail
+            tok_a = seq_a[:, pa : pa + 1]
+            tok_b = seq_b[:, pb : pb + 1]
+            ha_s = model.forward_hidden_cached(tok_a, cache_a_single)
+            hb_s = model.forward_hidden_cached(tok_b, cache_b_single)
+            h_ab = model.forward_hidden_cached_batch(
+                torch.cat([tok_a, tok_b], dim=0), [cache_a_batch, cache_b_batch]
+            )
+            self.assertTrue(torch.allclose(ha_s, h_ab[0:1], atol=1e-2, rtol=1e-2))
+            self.assertTrue(torch.allclose(hb_s, h_ab[1:2], atol=1e-2, rtol=1e-2))
+
+        # 5. Verify _load_compact_engram_from_shards with CNS single-integer `rows_{r0}` keys and shard 00009 row_map
+        with tempfile.TemporaryDirectory() as eng_tmp:
+            from safetensors.torch import save_file
+
+            eng_blk = next(b for b in model.layers if b.engram is not None)
+            eng_lid = eng_blk.layer_id
+            eng_mod = eng_blk.engram
+            assert eng_mod is not None
+            t_rows = eng_mod.table_rows
+            h_dim = eng_mod.head_dim
+            p_vocab = eng_mod.part_vocab_idx_end - eng_mod.vocab_start_idx if hasattr(eng_mod, "part_vocab_idx_end") else eng_mod.part_vocab_size
+
+            # Shard 1: scale, Shard 2: rows_0, Shard 9: row_map
+            save_file(
+                {
+                    f"layers.{eng_lid}.engram.embed.scale": torch.full(
+                        (t_rows, h_dim // 32), 127, dtype=torch.uint8
+                    ),
+                },
+                os.path.join(eng_tmp, "model-engram-00001-of-00016.safetensors"),
+            )
+            save_file(
+                {
+                    f"layers.{eng_lid}.engram.embed.weight.rows_0": torch.ones(
+                        (t_rows, h_dim), dtype=torch.float32
+                    ).to(torch.float8_e4m3fn),
+                },
+                os.path.join(eng_tmp, "model-engram-00002-of-00016.safetensors"),
+            )
+            save_file(
+                {
+                    f"layers.{eng_lid}.engram.embed_tokens.row_map": torch.zeros(
+                        (p_vocab,), dtype=torch.int32
+                    ),
+                },
+                os.path.join(eng_tmp, "model-engram-00009-of-00016.safetensors"),
+            )
+            loaded_slices = dsv41_sft_model._load_compact_engram_from_shards(
+                eng_tmp, model, torch.device("cpu"), False, 0, 1
+            )
+            self.assertEqual(loaded_slices, 3)
+            self.assertTrue(eng_mod.has_compact_table)
+
+            # 6. With the compact Engram table active, batched decode (batched n-gram hashing
+            #    fast path + per-stream `engram_tail` bookkeeping) must still match single-stream.
+            model.eval()
+            with torch.no_grad():
+                seq_c = torch.randint(0, cfg.vocab_size, (1, 12), dtype=torch.long)
+                seq_d = torch.randint(0, cfg.vocab_size, (1, 15), dtype=torch.long)
+                pre_c, pre_d, n_steps = 5, 9, 4
+                cc_s, cd_s = model.create_kv_cache(), model.create_kv_cache()
+                cc_b, cd_b = model.create_kv_cache(), model.create_kv_cache()
+                for cache in (cc_s, cc_b):
+                    _ = model.forward_hidden_cached(seq_c[:, :pre_c], cache)
+                for cache in (cd_s, cd_b):
+                    _ = model.forward_hidden_cached(seq_d[:, :pre_d], cache)
+                self.assertIsNotNone(cc_b.get("engram_tail"))
+                sess = model.begin_batched_decode([cc_b, cd_b], max_steps=n_steps)
+                for step_i in range(n_steps):
+                    tok_c = seq_c[:, pre_c + step_i : pre_c + step_i + 1]
+                    tok_d = seq_d[:, pre_d + step_i : pre_d + step_i + 1]
+                    hc_s = model.forward_hidden_cached(tok_c, cc_s)
+                    hd_s = model.forward_hidden_cached(tok_d, cd_s)
+                    h_cd = model.step_batched_decode(torch.cat([tok_c, tok_d], dim=0), sess)
+                    self.assertTrue(
+                        torch.allclose(hc_s, h_cd[0:1], atol=1e-2, rtol=1e-2),
+                        f"engram step {step_i} stream c: {(hc_s - h_cd[0:1]).abs().max().item()}",
+                    )
+                    self.assertTrue(
+                        torch.allclose(hd_s, h_cd[1:2], atol=1e-2, rtol=1e-2),
+                        f"engram step {step_i} stream d: {(hd_s - h_cd[1:2]).abs().max().item()}",
+                    )
+                model.end_batched_decode(sess)
+                self.assertTrue(torch.equal(cc_s["engram_tail"], cc_b["engram_tail"]))
+                self.assertTrue(torch.equal(cd_s["engram_tail"], cd_b["engram_tail"]))
+
+            # 7. Mid-session rollback: stream `e` keeps only k of the S session steps (as after an
+            #    EOS / stop string inside a decode chunk) and must then be identical to a stream
+            #    that only ever saw those k tokens; stream `f` keeps all S steps.
+            with torch.no_grad():
+                seq_e = torch.randint(0, cfg.vocab_size, (1, 20), dtype=torch.long)
+                seq_f = torch.randint(0, cfg.vocab_size, (1, 22), dtype=torch.long)
+                pre_e, pre_f, n_sess = 6, 9, 7
+                for k_keep in (0, 1, 3, 4):
+                    ce_b, cf_b = model.create_kv_cache(), model.create_kv_cache()
+                    _ = model.forward_hidden_cached(seq_e[:, :pre_e], ce_b)
+                    _ = model.forward_hidden_cached(seq_f[:, :pre_f], cf_b)
+                    sess = model.begin_batched_decode([ce_b, cf_b], max_steps=n_sess)
+                    for step_i in range(n_sess):
+                        tok_e = seq_e[:, pre_e + step_i : pre_e + step_i + 1]
+                        tok_f = seq_f[:, pre_f + step_i : pre_f + step_i + 1]
+                        _ = model.step_batched_decode(torch.cat([tok_e, tok_f], dim=0), sess)
+                    model.end_batched_decode(sess, valid_steps=[k_keep, n_sess])
+                    self.assertEqual(ce_b["seqlen"], pre_e + k_keep)
+                    self.assertEqual(cf_b["seqlen"], pre_f + n_sess)
+
+                    # Reference: single-stream cache that saw exactly pre_e + k_keep tokens
+                    ce_ref = model.create_kv_cache()
+                    _ = model.forward_hidden_cached(seq_e[:, : pre_e + k_keep], ce_ref)
+                    # Continue both for 3 more tokens single-stream and compare hidden states
+                    for j in range(3):
+                        pos = pre_e + k_keep + j
+                        tok = seq_e[:, pos : pos + 1]
+                        h_ref = model.forward_hidden_cached(tok, ce_ref)
+                        h_rb = model.forward_hidden_cached(tok, ce_b)
+                        self.assertTrue(
+                            torch.allclose(h_ref, h_rb, atol=1e-2, rtol=1e-2),
+                            f"rollback k={k_keep} continue step {j}: {(h_ref - h_rb).abs().max().item()}",
+                        )
+                    self.assertTrue(torch.equal(ce_ref["engram_tail"], ce_b["engram_tail"]))
+                    # Stream f (no rollback) must match a plain single-stream run too
+                    cf_ref = model.create_kv_cache()
+                    _ = model.forward_hidden_cached(seq_f[:, : pre_f + n_sess], cf_ref)
+                    pos = pre_f + n_sess
+                    tok = seq_f[:, pos : pos + 1]
+                    self.assertTrue(
+                        torch.allclose(
+                            model.forward_hidden_cached(tok, cf_ref),
+                            model.forward_hidden_cached(tok, cf_b),
+                            atol=1e-2,
+                            rtol=1e-2,
+                        )
+                    )
+
+    def test_dsv41_stacked_eval_moe_parity_in_inference_config(self):
+        """Regression: stacked zero-sync MoE eval path must match the per-expert loop.
+
+        Reproduces the production Candidate B32 evaluation configuration
+        (`enable_qat=False`, `routed_expert_lora_r=0`, non-dense bf16 experts,
+        `model.eval()` + `torch.no_grad()`), where `merged_weight()` aliases the live
+        nn.Parameter.  A previous version released the parameters before
+        `torch.stack`, producing an empty `[E, 0]` `w2` stack and crashing with
+        `size mismatch ... vec (0)` on the first prefill.
+        """
+        torch.manual_seed(7)
+        cfg = dsv41_sft_model.Dsv41E128Config.tiny_test_config()
+        cfg.enable_qat = False
+        cfg.routed_expert_lora_r = 0
+        cfg.trainable_routed_experts_dense = False
+        cfg.qat_trainable_expert_scales = False
+        model = dsv41_sft_model.Dsv41SftModel(
+            cfg=cfg, ep_rank=0, ep_world_size=1, gradient_checkpointing=False
+        )
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if "experts." in n:
+                    p.normal_(0.0, 0.05)
+        model.eval()
+
+        moe0 = model.layers[0].ffn
+        exp0 = moe0.experts[moe0.experts_start_idx]
+        # Production aliasing precondition: merged_weight() returns the live Parameter.
+        self.assertIs(exp0.w2.merged_weight(), exp0.w2.weight)
+        self.assertEqual(exp0.w2.weight.dtype, torch.bfloat16)
+        self.assertFalse(exp0.trainable_dense)
+
+        long_tokens = torch.randint(0, cfg.vocab_size, (1, 80), dtype=torch.long)
+        short_tokens = long_tokens[:, :16]
+
+        # Reference outputs via the per-expert loop (grad enabled => stacked path disabled,
+        # and the per-expert parameters are guaranteed to still be intact).
+        with torch.enable_grad():
+            self.assertFalse(moe0._can_use_stacked_eval_path())
+            ref_long = model.forward_hidden(long_tokens).detach()
+            ref_short = model.forward_hidden(short_tokens).detach()
+            self.assertIsNone(moe0._stacked_w13)
+            self.assertGreater(exp0.w2.weight.numel(), 0)
+
+        n_local = moe0.n_local_experts
+        with torch.no_grad():
+            self.assertTrue(moe0._can_use_stacked_eval_path())
+            # Prefill path (l_tok > 64)
+            out_long = model.forward_hidden(long_tokens)
+            self.assertIsNotNone(moe0._stacked_w13)
+            self.assertIsNotNone(moe0._stacked_w2)
+            self.assertEqual(
+                tuple(moe0._stacked_w13.shape),
+                (n_local, 2 * cfg.moe_inter_dim, cfg.dim),
+            )
+            self.assertEqual(
+                tuple(moe0._stacked_w2.shape), (n_local, cfg.dim, cfg.moe_inter_dim)
+            )
+            # Per-expert parameters must have been released (memory-neutral stacking)...
+            for proj in (exp0.w1, exp0.w2, exp0.w3):
+                self.assertEqual(proj.weight.numel(), 0)
+            # ...but the stacked copies must hold the real (non-zero) weights.
+            self.assertGreater(float(moe0._stacked_w2.float().abs().sum()), 0.0)
+            self.assertTrue(torch.isfinite(out_long).all())
+            self.assertTrue(
+                torch.allclose(ref_long, out_long, atol=2e-2, rtol=2e-2),
+                f"prefill max abs diff = {(ref_long - out_long).abs().max().item()}",
+            )
+
+            # Decode fast path (l_tok <= 64), evaluated after the parameters were released
+            out_short = model.forward_hidden(short_tokens)
+            self.assertTrue(torch.isfinite(out_short).all())
+            self.assertTrue(
+                torch.allclose(ref_short, out_short, atol=2e-2, rtol=2e-2),
+                f"decode max abs diff = {(ref_short - out_short).abs().max().item()}",
+            )
+
+            # KV-cached single-stream + batched multi-stream decode also run on the stacked path
+            cache_a = model.create_kv_cache()
+            cache_b = model.create_kv_cache()
+            _ = model.forward_hidden_cached(long_tokens[:, :70], cache_a)
+            _ = model.forward_hidden_cached(long_tokens[:, :12], cache_b)
+            h_ab = model.forward_hidden_cached_batch(
+                torch.cat([long_tokens[:, 70:71], long_tokens[:, 12:13]], dim=0),
+                [cache_a, cache_b],
+            )
+            self.assertEqual(tuple(h_ab.shape), (2, 1, ref_long.shape[-1]))
+            self.assertTrue(torch.isfinite(h_ab).all())
+            self.assertEqual(cache_a["seqlen"], 71)
+            self.assertEqual(cache_b["seqlen"], 13)
+
+        # Trainer-style configs (LoRA / trainable QAT scales) must keep the per-expert path:
+        # no stacked copies are built and nothing is released during validation forwards.
+        cfg_tr = dsv41_sft_model.Dsv41E128Config.tiny_test_config()
+        cfg_tr.enable_qat = True
+        cfg_tr.routed_expert_lora_r = 8
+        cfg_tr.trainable_routed_experts_dense = False
+        cfg_tr.qat_trainable_expert_scales = True
+        model_tr = dsv41_sft_model.Dsv41SftModel(
+            cfg=cfg_tr, ep_rank=0, ep_world_size=1, gradient_checkpointing=False
+        )
+        model_tr.eval()
+        moe_tr = model_tr.layers[0].ffn
+        with torch.no_grad():
+            self.assertFalse(moe_tr._can_use_stacked_eval_path())
+            _ = model_tr.forward_hidden(short_tokens)
+            self.assertIsNone(moe_tr._stacked_w13)
+            self.assertIsNone(moe_tr._shared_prequant_cache)
+            exp_tr = moe_tr.experts[moe_tr.experts_start_idx]
+            self.assertGreater(exp_tr.w2.weight.numel(), 0)
+
+    def test_dsv41_two_step_sft_export_reload_and_long_moe_ckpt_parity(self):
+        """Verifies >=512-token MoE checkpointing parity and 2-step SFT -> 2-bit export -> reload -> eval."""
+        import safetensors
+        from safetensors.torch import save_file
+
+        torch.manual_seed(20261030)
+        cfg = dsv41_sft_model.Dsv41E128Config.tiny_test_config()
+        cfg.enable_qat = False
+        cfg.routed_expert_lora_r = 8
+        cfg.routed_expert_lora_alpha = 16.0
+        cfg.trainable_routed_experts_dense = False
+
+        # 1. Build a synthetic Havu-format 2-bit GPTQ + cross-shard FP8 block-32 base checkpoint
+        with tempfile.TemporaryDirectory(prefix="dsv41_e2e_pipe_") as tmp:
+            base_dir = os.path.join(tmp, "base_2bit")
+            export_dir = os.path.join(tmp, "export_2bit_step2")
+            os.makedirs(os.path.join(base_dir, "gptq"), exist_ok=True)
+            with open(os.path.join(base_dir, "config.json"), "w") as f:
+                json.dump({"model_type": "deepseek_v4_1"}, f)
+
+            ref_init = dsv41_sft_model.Dsv41SftModel(
+                cfg=cfg, ep_rank=0, ep_world_size=1, gradient_checkpointing=True
+            )
+            with torch.no_grad():
+                for _, p in ref_init.named_parameters():
+                    p.normal_(0.0, 0.04)
+
+            # Split backbone across shard 1 & shard 2 with `layers.0.ffn.shared_experts.w1.weight`
+            # in shard 1 and its `.scale` in shard 2 (reproducing the production boundary split).
+            shard1: dict[str, torch.Tensor] = {}
+            shard2: dict[str, torch.Tensor] = {}
+            for name, p in ref_init.named_parameters():
+                if ".experts." in name or "lora_" in name:
+                    continue
+                t = p.detach().float()
+                if (
+                    name.endswith(".weight")
+                    and t.dim() == 2
+                    and t.size(0) % 32 == 0
+                    and t.size(1) % 32 == 0
+                    and not name.startswith("embed.")
+                    and not name.startswith("head.")
+                    and ".gate." not in name
+                ):
+                    use_2d = ".shared_experts." in name
+                    q_fp8, s_e8 = dsv41_sft_model.quantize_fp8_block32_torch(
+                        t, block_size=32, scale_2d=use_2d
+                    )
+                    s_key = name[: -len(".weight")] + ".scale"
+                    shard1[name] = q_fp8
+                    if name == "layers.0.ffn.shared_experts.w1.weight":
+                        shard2[s_key] = s_e8
+                    else:
+                        shard1[s_key] = s_e8
+                else:
+                    shard2[name] = p.detach().clone()
+            for bname, b in ref_init.named_buffers():
+                if bname.endswith(".bias_vl"):
+                    shard2[bname] = b.detach().clone()
+
+            save_file(shard1, os.path.join(base_dir, "model-00001-of-00002.safetensors"))
+            save_file(shard2, os.path.join(base_dir, "model-00002-of-00002.safetensors"))
+
+            for lid, blk in enumerate(ref_init.layers):
+                layer_gptq: dict[str, torch.Tensor] = {}
+                for eid, exp in enumerate(blk.ffn.experts):
+                    assert exp is not None
+                    for pname in ("w1", "w2", "w3"):
+                        proj = getattr(exp, pname)
+                        q_p, s_p, z_p = (
+                            dsv41_sft_model.quantize_uint2_humming_expert_tensor(
+                                proj.weight.detach(), group=proj.group
+                            )
+                        )
+                        layer_gptq[f"e{eid}.{pname}.q"] = q_p
+                        layer_gptq[f"e{eid}.{pname}.s"] = s_p
+                        layer_gptq[f"e{eid}.{pname}.z"] = z_p
+                save_file(
+                    layer_gptq,
+                    os.path.join(base_dir, f"gptq/layer_{lid:02d}.safetensors"),
+                )
+
+            # 2. Load base checkpoint into trainable SFT model and verify >=512-token MoE ckpt path
+            sft_model = dsv41_sft_model.Dsv41SftModel(
+                cfg=cfg, ep_rank=0, ep_world_size=1, gradient_checkpointing=True
+            )
+            stats_base = dsv41_sft_model.load_dequantized_dsv41_e128(
+                model_dir=base_dir, model=sft_model, device=torch.device("cpu")
+            )
+            self.assertGreater(stats_base["fp8_dequantized_tensors"], 0)
+            self.assertEqual(
+                stats_base["gptq_2bit_experts_unpacked"],
+                cfg.n_layers * cfg.n_routed_experts,
+            )
+
+            train_dsv41_sft.configure_dsv41_trainable_parameters(
+                sft_model, train_moe_only=True
+            )
+            groups, _ = train_dsv41_sft.build_dsv41_optimizer_param_groups(
+                sft_model, weight_decay=0.01
+            )
+            opt = torch.optim.AdamW(groups, lr=1e-2)
+
+            # Run 2 SFT steps on a 544-token sequence so `x_flat.size(0) >= 512` triggers
+            # the checkpointed shared_experts + routed-expert path.
+            long_seq = torch.randint(0, cfg.vocab_size, (1, 544), dtype=torch.long)
+            long_labels = long_seq.clone()
+            long_labels[:, :16] = -100
+            step_losses: list[float] = []
+            for _ in range(2):
+                opt.zero_grad(set_to_none=True)
+                hid = sft_model.forward_hidden(long_seq)
+                l_sum, n_val = train_sft.compute_chunked_causal_lm_loss(
+                    hidden_states=hid,
+                    lm_head=sft_model.head,
+                    labels=long_labels,
+                    chunk_size=128,
+                )
+                loss = l_sum / float(n_val)
+                step_losses.append(float(loss.detach().item()))
+                loss.backward()
+                opt.step()
+            self.assertLess(step_losses[-1], step_losses[0])
+
+            # 3. Export 2-bit Humming + FP8 block-32 checkpoint after 2 steps
+            exp_stats = dsv41_sft_model.export_dsv41_e128_2bit_checkpoint(
+                model=sft_model,
+                base_model_dir=base_dir,
+                export_cns_dir=export_dir,
+                rank=0,
+                world_size=1,
+            )
+            self.assertGreater(exp_stats["exported_files_count"], 0)
+
+            # Verify `layers.0.ffn.shared_experts.w1.scale` was re-homed next to `.weight` in shard 1
+            # and updated to match the trained `.weight`
+            with safetensors.safe_open(
+                os.path.join(export_dir, "model-00001-of-00002.safetensors"),
+                framework="pt",
+            ) as f1:
+                w1_q_exp = f1.get_tensor("layers.0.ffn.shared_experts.w1.weight")
+                s1_exp = f1.get_tensor("layers.0.ffn.shared_experts.w1.scale")
+                w1_deq_exp = dsv41_sft_model.dequantize_fp8_block32_torch(
+                    w1_q_exp, s1_exp, out_dtype=torch.float32
+                )
+                w1_trained = sft_model.layers[0].ffn.shared_experts.w1.weight.detach().float()
+                rel_err = float(
+                    (w1_deq_exp - w1_trained).norm() / (w1_trained.norm() + 1e-12)
+                )
+                self.assertLess(rel_err, 0.08)
+
+            # 4. Reload exported checkpoint into a pure-inference model (routed_expert_lora_r=0)
+            #    and verify stacked-eval forward + KV-cached decode work cleanly.
+            cfg_eval = dsv41_sft_model.Dsv41E128Config.tiny_test_config()
+            cfg_eval.enable_qat = False
+            cfg_eval.routed_expert_lora_r = 0
+            cfg_eval.trainable_routed_experts_dense = False
+            eval_model = dsv41_sft_model.Dsv41SftModel(
+                cfg=cfg_eval,
+                ep_rank=0,
+                ep_world_size=1,
+                gradient_checkpointing=False,
+                ep_replicated_input=True,
+            ).eval()
+            stats_eval = dsv41_sft_model.load_dequantized_dsv41_e128(
+                model_dir=export_dir,
+                model=eval_model,
+                device=torch.device("cpu"),
+            )
+            self.assertEqual(
+                stats_eval["fp8_dequantized_tensors"],
+                stats_base["fp8_dequantized_tensors"],
+            )
+            self.assertEqual(
+                stats_eval["gptq_2bit_experts_unpacked"],
+                cfg.n_layers * cfg.n_routed_experts,
+            )
+            with torch.no_grad():
+                kv = eval_model.create_kv_cache()
+                h_pre = eval_model.forward_hidden_cached(long_seq[:, :12], kv)
+                h_dec = eval_model.forward_hidden_cached(long_seq[:, 12:13], kv)
+                logits_dec = eval_model.head(h_dec)
+                self.assertTrue(torch.isfinite(h_pre).all())
+                self.assertTrue(torch.isfinite(logits_dec).all())
+
 
 if __name__ == "__main__":
     googletest.main()
+
+

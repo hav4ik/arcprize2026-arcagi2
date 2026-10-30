@@ -16,6 +16,9 @@ How far can a single open-weights 27B model go on **ARC-AGI-2** (`120` official 
 
 All experiment reports and catalogs are organized in the **[`reports/`](reports/)** folder:
 
+* **[`reports/dsv41_e128_sft_v12_audit_report.md`](reports/dsv41_e128_sft_v12_audit_report.md)** — **Pruned DeepSeek-V4.1 (`Tool E128` 2-bit) SFT v12 + Candidate-B32 eval audit (2026-10-29)**: harness fidelity vs. Havu's B32 (one gap: missing minimal effort header), model identity + Havu baselines (E043 72.8/82.5, E046 73.7/84.6), our base-eval numbers/xids/ETAs, step-by-step SFT pipeline and ranked bug list (blocker: the 2-bit export is byte-identical to the base — the LoRA is lost at re-quantization), transcript legitimacy checks.
+* **[`reports/deepseek_pruning_and_sft_report.md`](reports/deepseek_pruning_and_sft_report.md)**, **[`reports/qat_vs_deepseek_sft_summary_report.md`](reports/qat_vs_deepseek_sft_summary_report.md)**, **[`reports/qat_sft_nemotron_vs_dsv41_report.md`](reports/qat_sft_nemotron_vs_dsv41_report.md)** — How Havu pruned/quantized DeepSeek-V4.1-Flash-1017 to `E128` 2-bit, and how to SFT it (de-quantize → train → re-quantize) vs. QAT/QAD.
+* **[`reports/havu_b32_vs_pilot2_harness_comparison.md`](reports/havu_b32_vs_pilot2_harness_comparison.md)** — The 12 architectural differences between Havu's Candidate B32 and `pilot_2`, with the Qwen3.8-27B R2-A results (+13.6 pp Pass@2 from the harness alone) and the fidelity audit of our port.
 * **[`reports/qwen_sft_harness_fix_mini_report.html`](reports/qwen_sft_harness_fix_mini_report.html)** & **[`reports/qwen_sft_harness_fix_mini_report.md`](reports/qwen_sft_harness_fix_mini_report.md)** — **Post-Harness Fix Mini-Report (`55.00%` Official Kaggle Pass@2 / `51.50%` Pair Pass@2)**: Compares Comparable Baselines, LoRA SFT, and Full SFT (all in Block-FP8 at `N=2`), includes median token counts, and explains the 5 evaluation harness fixes in plain English.
 * **[`reports/qwen_sft_lora_report.html`](reports/qwen_sft_lora_report.html)** — Comprehensive interactive HTML report on Full FSDP2 SFT vs. LoRA SFT training architecture, Triton Gated DeltaNet kernels, validation loss curves, and baseline ablations.
 * **[`reports/PILOT_2_EXPERIMENTS.md`](reports/PILOT_2_EXPERIMENTS.md)** — Controlled 8-stage (`h1`–`h8`) pure-model harness progression on `Qwen3.8-27B-FP8`.
@@ -63,26 +66,39 @@ All runs below use **Block-FP8 (`FP8 E4M3`, `128×128` block scales) model weigh
 │   ├── arc_agi_2_gemma4_eval_report.md         # Gemma-4 31B Dense vs 26B MoE benchmark
 │   └── arc_agi2_gemma4_experiment_report.html
 │
-├── sft/                               # Qwen3.8-27B Full FSDP2 SFT & LoRA SFT Pipeline
+├── sft/                               # Qwen3.8-27B Full FSDP2 SFT & LoRA SFT Pipeline + Pruned DeepSeek-V4.1 (E128 2-bit) SFT
 │   ├── BUILD                          # Blaze targets for data prep, training, FP8 export & tests
 │   ├── README.md                      # Detailed SFT architecture & training documentation
-│   ├── data_pipeline.py               # 3-gate filtering, D8 de-contamination, 90/10 split & ChatML
-│   ├── audit_and_prepare_data.py      # CLI to build train/val Parquet & JSONL datasets
+│   ├── data_pipeline.py               # 3-gate filtering, D8 de-contamination, 90/10 split, ChatML + DeepSeek DSML rendering & token weights
+│   ├── audit_and_prepare_data.py      # CLI to build train/val Parquet & JSONL / npz datasets
 │   ├── fast_deltanet.py               # Custom @triton.jit chunk-recurrent Gated DeltaNet kernels
 │   ├── train_full_sft.py              # 8×B200 Native PyTorch FSDP2 (26.9B) trainer + parallel FP8 export
 │   ├── train_sft.py                   # 1×B200 LoRA (r=64, α=128) trainer with chunked cross-entropy
 │   ├── export_and_quantize.py         # FP32 merge + 128×128 block-wise FP8 (float8_e4m3fn) quantizer
 │   ├── launch_full_sft_b200_xm.py     # XManager launcher for 8×B200 Full FSDP2 SFT
 │   ├── launch_sft_b200_xm.py          # XManager launcher for B200 LoRA SFT
+│   ├── dsv41_sft_model.py             # Pruned DeepSeek-V4.1 E128: 2-bit/FP8 de-quant, differentiable forward (MLA/DSA, mHC, Engram, EP MoE, LoRA, QAT/STE), KV-cached decode, 2-bit Humming exporter
+│   ├── train_dsv41_sft.py             # 8×B200 expert-parallel SFT trainer for E128 (MoE-only / QAT / QAD options, milestone 2-bit exports)
+│   ├── launch_dsv41_sft_b200_xm.py    # XManager launcher for the E128 SFT
+│   ├── eval_dsv41_b32_arc2.py         # 8×B200 PyTorch step engine that runs Havu's Candidate B32 harness on exported E128 checkpoints
+│   ├── launch_dsv41_b32_eval_xm.py    # XManager launcher for milestone B32 evals (polls for EXPORT_COMPLETED.json)
+│   ├── gen_dsv41_before_after.py      # Before/after SFT sanity check (teacher-forced NLL + greedy generations)
+│   ├── inspect_and_download_chankhavu_e128.py  # Streams chankhavu's Kaggle E128 2-bit model to CNS
+│   ├── repair_dsv41_export_shared_scales.py    # One-off repair of exports that lost cross-shard FP8 scales
 │   ├── e031_audit_summary.json        # Verified dataset audit summary
-│   └── sft_test.py                    # Unit tests for loss masking, split isolation & FP8 quantization
+│   └── sft_test.py                    # Unit tests for loss masking, split isolation, FP8/2-bit quantization, E128 model parity
 │
-├── pilot_2/                           # Main Agentic Python Evaluation Harness (TPU & GPU vLLM)
-│   ├── BUILD                          # Blaze targets for pilot2_eval, launch_pilot2_xm & pilot2_test
+├── pilot_2/                           # Main Agentic Python Evaluation Harness (TPU & GPU vLLM) + Havu Candidate B32 port
+│   ├── BUILD                          # Blaze targets for pilot2_eval, launch_pilot2_xm & tests
 │   ├── prompts_and_selector.py        # System/user prompts (tier=xhigh, XML tools) & candidate selector
 │   ├── sandbox_verifier.py            # Stateful IPython sandbox, verify_submit & session salvage
 │   ├── arc_dsl_and_summary.py         # Grid connected-components/symmetry analyzer & DSL helpers
 │   ├── pilot2_eval.py                 # Async vLLM multi-turn evaluation loop (2-stage nudge, compaction)
+│   ├── havu_b32_harness.py            # Port of Havu's Candidate B32 (multi-test, token-exact, auto-repair, 4-path train_check, ranked_answers) for Qwen (ChatML) and DeepSeek (DSML)
+│   ├── havu_auto_repair.py            # Havu's zero-token identifier auto-repair (OSA ≤ 2, AST side-effect scan)
+│   ├── havu_sandbox_zygote.py         # Pre-TPU/GPU fork server providing isolated sandbox processes on Borg
+│   ├── auto_repair_names.json         # Module/attribute name index for auto-repair
+│   ├── havu_b32_harness_test.py       # 35 vLLM-free tests of the B32 port
 │   ├── launch_pilot2_xm.py            # XManager multi-shard TPU evaluation launcher
 │   └── pilot2_test.py                 # Unit tests for prompts, XML parser, sandbox & selector
 │

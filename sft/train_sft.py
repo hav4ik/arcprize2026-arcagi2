@@ -134,7 +134,7 @@ flags.DEFINE_float(
 
 
 class PackedTrajectoryDataset(Dataset):
-    """Loads packed `input_ids` and `loss_mask` arrays from CNS `.npz` files."""
+    """Loads packed `input_ids`, `loss_mask`, and optional `loss_weights` arrays from CNS `.npz` files."""
 
     def __init__(self, npz_path: str, max_seq_len: int = 65536):
         with gfile.Open(npz_path, "rb") as f:
@@ -142,6 +142,7 @@ class PackedTrajectoryDataset(Dataset):
         with np.load(io.BytesIO(raw_bytes)) as data:
             self.flat_ids = data["input_ids"]
             self.flat_mask = data["loss_mask"]
+            self.flat_weights = data["loss_weights"] if "loss_weights" in data else None
             self.offsets = data["offsets"]
             self.lengths = data["lengths"]
 
@@ -163,12 +164,17 @@ class PackedTrajectoryDataset(Dataset):
         ids = torch.from_numpy(self.flat_ids[start:end].astype(np.int64))
         mask = torch.from_numpy(self.flat_mask[start:end].astype(np.int64))
         labels = torch.where(mask == 1, ids, torch.full_like(ids, -100))
-        return {
+        item: dict[str, Any] = {
             "input_ids": ids,
             "labels": labels,
             "seq_len": int(end - start),
             "supervised_tokens": int(mask.sum().item()),
         }
+        if self.flat_weights is not None:
+            item["loss_weights"] = torch.from_numpy(
+                self.flat_weights[start:end].astype(np.float32)
+            )
+        return item
 
 
 def compute_chunked_causal_lm_loss(
@@ -176,10 +182,14 @@ def compute_chunked_causal_lm_loss(
     lm_head: torch.nn.Module,
     labels: torch.Tensor,
     chunk_size: int = 4096,
+    loss_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Computes exact next-token cross-entropy loss in sequence chunks without materializing full [B, S, V] logits."""
     shift_hidden = hidden_states[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
+    shift_weights = (
+        loss_weights[:, 1:].contiguous() if loss_weights is not None else None
+    )
     seq_len = shift_hidden.shape[1]
 
     valid_mask = shift_labels != -100
@@ -188,19 +198,37 @@ def compute_chunked_causal_lm_loss(
         return hidden_states.sum() * 0.0, 0
 
     total_loss_sum = torch.zeros((), device=hidden_states.device, dtype=torch.float32)
+    out_features = (
+        lm_head.out_features
+        if hasattr(lm_head, "out_features")
+        else lm_head.weight.shape[0]
+    )
     for start in range(0, seq_len, chunk_size):
         end = min(start + chunk_size, seq_len)
         chunk_labels = shift_labels[:, start:end].reshape(-1)
         if not torch.any(chunk_labels != -100):
             continue
         chunk_h = shift_hidden[:, start:end, :]
-        chunk_logits = lm_head(chunk_h).float().reshape(-1, lm_head.out_features)
-        chunk_loss = F.cross_entropy(
-            chunk_logits,
-            chunk_labels,
-            ignore_index=-100,
-            reduction="sum",
-        )
+        chunk_logits = lm_head(chunk_h).float().reshape(-1, out_features)
+        if shift_weights is not None:
+            chunk_w = shift_weights[:, start:end].reshape(-1).float()
+            per_tok = F.cross_entropy(
+                chunk_logits,
+                chunk_labels,
+                ignore_index=-100,
+                reduction="none",
+            )
+            valid_w = torch.where(chunk_labels != -100, chunk_w, torch.zeros_like(chunk_w))
+            w_mean = valid_w.sum() / torch.clamp((chunk_labels != -100).float().sum(), min=1.0)
+            norm_w = valid_w / torch.clamp(w_mean, min=1e-6)
+            chunk_loss = (per_tok * norm_w).sum()
+        else:
+            chunk_loss = F.cross_entropy(
+                chunk_logits,
+                chunk_labels,
+                ignore_index=-100,
+                reduction="sum",
+            )
         total_loss_sum = total_loss_sum + chunk_loss
 
     return total_loss_sum, num_valid

@@ -1,0 +1,122 @@
+<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 14px; line-height: 1.55; color: #202124; max-width: 900px;">
+  <h1 style="font-size: 20px; color: #1a73e8; border-bottom: 2px solid #e8eaed; padding-bottom: 8px;">Quantization-Aware SFT: NVIDIA Nemotron (NVFP4) vs. Pruned DeepSeek-V4.1 (Tool E128)</h1>
+
+  <p><strong>Executive Summary:</strong> When post-training (SFT/RL) models deployed at ultra-low bitwidths (<code>2-bit</code> to <code>4-bit</code>), standard <em>"De-quantize to BF16 &rarr; SFT in BF16 &rarr; Post-Training Re-Quantize (PTQ)"</em> loses a significant fraction of SFT gains at export time. NVIDIA's <strong>Nemotron NVFP4</strong> recipe—spanning <strong>NVFP4 Pretraining</strong> (<a href="https://arxiv.org/abs/2509.25149">arXiv:2509.25149</a>) and <strong>Quantization-Aware Distillation (QAD)</strong> (<a href="https://arxiv.org/abs/2601.20088">arXiv:2601.20088</a>)—shows that preserving reasoning and MoE routing accuracy requires:</p>
+  <ol>
+    <li><strong>Simulated Quantization (Fake-Quant + STE) in the Forward Pass</strong> during training.</li>
+    <li><strong>FP32 Master Weights</strong> so small SFT updates (<code>1e-6</code> to <code>1e-5</code>) do not underflow <code>BF16</code> mantissa precision before crossing quantization thresholds.</li>
+    <li><strong>Quantization-Aware Distillation (QAD) via Forward KL (T = 1.0)</strong> from a frozen high-precision teacher to stabilize MoE router inputs and multi-step reasoning chains.</li>
+    <li><strong>Activation-Aware Scale Preservation</strong> rather than data-free Frobenius/L2 re-packing.</li>
+  </ol>
+
+  <h2 style="font-size: 17px; color: #202124; margin-top: 24px;">1. How NVIDIA / Nemotron Does NVFP4-Aware Pretraining &amp; SFT</h2>
+  <ul>
+    <li><strong>NVFP4 Format (W4A4):</strong> 16-element micro-blocks in 4-bit <code>E2M1</code> (<code>&plusmn;{0, 0.5, 1, 1.5, 2, 3, 4, 6}</code>) with local <code>FP8 (E4M3)</code> micro-block scales + global per-tensor <code>FP32</code> scale. Both weights and activations are quantized in the forward pass.</li>
+    <li><strong>NVFP4 Pretraining Guardrails (arXiv:2509.25149):</strong>
+      <ul>
+        <li><strong>Selective Layer Precision (~15% kept in BF16/FP32):</strong> Embeddings, LM head, RMSNorms, attention QKV/softmax, <strong>MoE router gates</strong>, and the <strong>final ~15% of transformer blocks</strong> stay in high precision.</li>
+        <li><strong>2D Block Scaling (16&times;16) for Weights vs. 1D (1&times;16) for Activations:</strong> Ensures weight representations match between forward (<code>W</code>) and backward (<code>W^T</code>) passes.</li>
+        <li><strong>Random Hadamard Transforms (16&times;16 RHT):</strong> Flattens outlier spikes on weight-gradient GEMM inputs.</li>
+        <li><strong>FP32 Master Weights + Stochastic Rounding on Gradients:</strong> Prevents update stalling/bias on narrow bitwidths.</li>
+      </ul>
+    </li>
+    <li><strong>Nemotron Post-Training / SFT Recipe (QAT &amp; QAD, arXiv:2601.20088):</strong>
+      <ul>
+        <li><strong>Fake-Quantization (STE) Inside <code>forward()</code>:</strong> Linear layers apply <code>W_hat = Dequant(Quant(W_master))</code> with Straight-Through Estimator gradients so the optimizer places weights directly onto valid low-bit lattice points.</li>
+        <li><strong>Quantization-Aware Distillation (QAD) over Hard-Label CE:</strong> Standard hard-label cross-entropy under 2-bit/4-bit quantization causes high gradient variance and shifts hidden states entering downstream <strong>MoE routers</strong>. QAD freezes the high-precision teacher and minimizes <strong>Forward KL Divergence at T = 1.0</strong> (<code>KL(P_teacher || P_quant_student)</code>), recovering near-lossless accuracy on <em>Nemotron 3 Nano 30B-A3B MoE</em>.</li>
+      </ul>
+    </li>
+  </ul>
+
+  <h2 style="font-size: 17px; color: #202124; margin-top: 24px;">2. Summary of Our Current SFT Protocol on Pruned DeepSeek-V4.1 (Tool E128)</h2>
+  <ul>
+    <li><strong>Base Checkpoint Format (<code>dsv41_e128_2bit</code>):</strong>
+      <ul>
+        <li><strong>Backbone (<code>model-00001/00002.safetensors</code>):</strong> <code>float8_e4m3fn</code> weights + <code>UE8M0</code> power-of-two block-32 scales (<code>2^(e - 127)</code>).</li>
+        <li><strong>128 Routed Experts/Layer (<code>gptq/layer_00..39.safetensors</code>):</strong> <strong>2-bit Humming (<code>uint2</code>)</strong> asymmetric GPTQ format <code>(q, s, z)</code> with <code>group=128</code> (<code>w1, w3</code>) and <code>group=64</code> (<code>w2</code>), originally calibrated with activation-aware GPTQ Hessians.</li>
+      </ul>
+    </li>
+    <li><strong>Step-by-Step Current Pipeline (<code>train_dsv41_sft.py</code> &amp; <code>dsv41_sft_model.py</code>):</strong>
+      <ol>
+        <li><strong>De-quantize to BF16 at Load:</strong> Unpacks all FP8 block-32 backbone weights and 2-bit <code>(q, s, z)</code> experts into dense <code>BF16</code> tensors across 8&times; B200 GPUs; discards original <code>(q, s, z)</code> and <code>UE8M0</code> scales.</li>
+        <li><strong>Train MoE Only (<code>train_moe_only=True</code>):</strong> Freezes attention, routers, mHC, norms, embed, and head. Trains <code>shared_experts</code> densely in <code>BF16</code> + 128 <code>routed_experts</code> via <code>LoRALinear (r=32, alpha=64)</code> in <code>BF16</code> at <code>lr=8e-6</code>. (Compact Engram lookup on layers 1 &amp; 14 is currently bypassed during SFT).</li>
+        <li><strong>Unquantized Forward &amp; Validation:</strong> Runs forward/backward and <code>val_loss</code> in continuous <code>BF16</code> with hard-label token-weighted CE (<code>WIC=10.0, submit=5.0, tool=2.0</code>).</li>
+        <li><strong>Data-Free PTQ Re-Quantization at Milestone Export:</strong> Merges LoRA into routed experts (<code>W_base + B @ A * (alpha/r)</code>) and runs a 16-point min-max L2 grid search over <code>z in {0..3}</code> and <code>shrink in {1.0, 0.95, 0.90, 0.85}</code>; re-quantizes <code>shared_experts</code> using IEEE-754 power-of-two ceiling (<code>exp_ceil</code>) <code>UE8M0</code> block-32 scales.</li>
+      </ol>
+    </li>
+  </ul>
+
+  <h2 style="font-size: 17px; color: #202124; margin-top: 24px;">3. Key Differences &amp; Quantization Vulnerabilities</h2>
+  <table style="border-collapse: collapse; width: 100%; border: 1px solid #dadce0; font-family: sans-serif; font-size: 13px; margin-top: 10px;">
+    <thead>
+      <tr style="background-color: #f1f3f4;">
+        <th style="border: 1px solid #dadce0; padding: 10px 12px; text-align: left; font-weight: 600;">Dimension</th>
+        <th style="border: 1px solid #dadce0; padding: 10px 12px; text-align: left; font-weight: 600;">NVIDIA Nemotron (NVFP4 QAT/QAD)</th>
+        <th style="border: 1px solid #dadce0; padding: 10px 12px; text-align: left; font-weight: 600;">Our DSV4.1 E128 (2-Bit/FP8) SFT</th>
+        <th style="border: 1px solid #dadce0; padding: 10px 12px; text-align: left; font-weight: 600;">Vulnerability in Our Setup</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px; font-weight: 600;">1. Forward Pass</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">Fake-Quant (STE) active during training</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">Continuous BF16 (quantized only at export)</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">Small LoRA updates get rounded back to zero or trigger discrete jumps at export.</td>
+      </tr>
+      <tr>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px; font-weight: 600;">2. 2-Bit Expert Export</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">Activation-calibrated scales preserved/trained</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">Data-free L2 min-max grid search on <code>W + LoRA</code></td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">Flipping <code>(s, z)</code> via unweighted L2 search destroys Havu's GPTQ Hessian error compensation across the 64/128-weight group.</td>
+      </tr>
+      <tr>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px; font-weight: 600;">3. Block Scales (UE8M0)</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">Smooth FP8 micro-scales visible in forward pass</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">Power-of-2 ceiling (<code>exp_ceil</code>) applied at export</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">Crossing a <code>2^k</code> boundary at export halves FP8 precision for all 32 weights in that block.</td>
+      </tr>
+      <tr>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px; font-weight: 600;">4. Master Weights</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">FP32 master weights</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">BF16 parameters (<code>lr=8e-6</code>)</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">Updates (<code>~1e-6</code>) fall below BF16 ULP (<code>~8e-4</code> for <code>|w|~0.1</code>), causing update underflow.</td>
+      </tr>
+      <tr>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px; font-weight: 600;">5. Loss &amp; Eval</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">Forward KL Distillation (QAD) + quantized eval</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;">Hard-label CE + BF16 validation</td>
+        <td style="border: 1px solid #dadce0; padding: 10px 12px;"><code>val_loss</code> improves in BF16 while exported 2-bit checkpoint degrades and shifts frozen MoE routing.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 style="font-size: 17px; color: #202124; margin-top: 24px;">4. Prioritized Improvements to Implement</h2>
+  <ol>
+    <li><strong>Add STE Fake-Quantization in <code>forward()</code> &amp; Preserve GPTQ <code>(q, z)</code> Structure:</strong>
+      <ul>
+        <li>Wrap <code>shared_experts</code> weights in an STE fake-quantizer calling <code>quantize_fp8_block32_torch</code> + <code>dequantize_fp8_block32_torch</code> so training sees exact <code>UE8M0</code> power-of-two scale ceilings.</li>
+        <li>For <strong>2-bit Humming routed experts</strong>: instead of LoRA + destructive 2-bit L2 re-packing, <strong>freeze Havu's GPTQ integer codes <code>q</code> and zero-points <code>z</code> and directly train the per-group scales <code>s</code></strong> (or apply STE with locked <code>z_orig</code>). Training <code>s</code> (<code>~360M</code> parameters across 40 layers) preserves 100% of GPTQ Hessian compensation and exports to <code>gptq/layer_XX.safetensors</code> with <strong>zero re-packing error</strong>.</li>
+      </ul>
+    </li>
+    <li><strong>Keep Trainable Master Weights in FP32:</strong>
+      <ul>
+        <li>Store trainable <code>shared_experts</code> and <code>lora_A/lora_B</code> (or group scales <code>s</code>) in <code>torch.float32</code> and cast to <code>bfloat16</code> in <code>forward()</code>. Adds <code>&lt; 2.5 GiB/GPU</code> on B200 and eliminates BF16 underflow at <code>lr=8e-6</code>.</li>
+      </ul>
+    </li>
+    <li><strong>Evaluate Validation Loss on Quantized Weights (<code>val_quant_loss</code>):</strong>
+      <ul>
+        <li>Run <code>evaluate_dsv41_validation_loss</code> with fake-quantized weights enabled so checkpoint selection reflects true post-export 2-bit/FP8 perplexity.</li>
+      </ul>
+    </li>
+    <li><strong>Add Forward KL Regularization (Nemotron QAD Objective):</strong>
+      <ul>
+        <li>Blend weighted CE with a Forward KL penalty (<code>T = 1.0</code>) against the frozen base E128 model's logits so quantized expert updates do not perturb downstream frozen 128-expert routers.</li>
+      </ul>
+    </li>
+    <li><strong>Enable Compact Engram Lookup (Layers 1 &amp; 14) During SFT &amp; Eval:</strong>
+      <ul>
+        <li>Load the compact Engram tables during SFT and B32 evaluation so layers 1 and 14 match inference-time residual distributions.</li>
+      </ul>
+    </li>
+  </ol>
+</div>

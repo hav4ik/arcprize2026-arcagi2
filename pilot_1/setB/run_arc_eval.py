@@ -198,8 +198,8 @@ _OUT_DIR = flags.DEFINE_string(
 )
 _API_KEY = flags.DEFINE_string(
     "api_key",
-    "AQ.Ab8RN6IRn0fpv5yBRybeBUbG0scGVpVCJnI9kZ0JgoqaTvcq2w",
-    "Optional Gemini API key for direct AI Studio calls.",
+    os.environ.get("GEMINI_API_KEY", ""),
+    "Optional Gemini API key for direct AI Studio calls (defaults to $GEMINI_API_KEY).",
 )
 _REVERSE = flags.DEFINE_bool(
     "reverse",

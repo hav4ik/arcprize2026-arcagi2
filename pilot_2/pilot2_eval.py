@@ -20,11 +20,18 @@ import os
 import time
 from typing import Any
 
-from absl import flags
+# Pre-TPU sandbox zygote for Havu B32 `LocalExecutor` workers. MUST fork before `absl`, `gfile`,
+# `jax`, `vllm`, or `libtpu` are imported: hermetic google3 binaries have `sys.executable is None`
+# on Borg, so sandbox children can only be obtained by forking a clean, thread-free process.
+from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import havu_sandbox_zygote  # pylint: disable=g-bad-import-order
 
-from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import prompts_and_selector
-from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import sandbox_verifier
-from google3.pyglib import gfile
+havu_sandbox_zygote.ensure_started()
+
+from absl import flags  # pylint: disable=g-import-not-at-top,g-bad-import-order
+
+from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import prompts_and_selector  # pylint: disable=g-import-not-at-top,g-bad-import-order
+from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import sandbox_verifier  # pylint: disable=g-import-not-at-top,g-bad-import-order
+from google3.pyglib import gfile  # pylint: disable=g-import-not-at-top,g-bad-import-order
 
 
 FLAGS = flags.FLAGS
@@ -313,9 +320,11 @@ def build_attempt_candidate_summary(
   has_tp = sb.first_tp_pred is not None
   secondary: list[tuple[list[list[int]], int, int, float]] = []
   if has_tp and len(sb.verified_variants) > 1:
-    first_key = sandbox_verifier.grid_to_canonical_key(sb.first_tp_pred)
-    for var in sb.verified_variants[1:]:
-      if sandbox_verifier.grid_to_canonical_key(var.grid) != first_key:
+    seen_keys = {sandbox_verifier.grid_to_canonical_key(sb.first_tp_pred)}
+    for var in sb.verified_variants:
+      v_key = sandbox_verifier.grid_to_canonical_key(var.grid)
+      if v_key not in seen_keys:
+        seen_keys.add(v_key)
         secondary.append(
             (var.grid, var.turn_idx, var.cum_gen_tokens, var.equivariance_bonus)
         )
@@ -1124,6 +1133,71 @@ def main(argv: list[str]) -> None:
       cfg.exp_id,
   )
   gfile.MakeDirs(out_dir)
+
+  if cfg.use_havu_b32_harness:
+    from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import havu_b32_harness  # pylint: disable=g-import-not-at-top
+
+    if FLAGS.lora_adapter_path or FLAGS.full_sft_ckpt_dir:
+      from google3.experimental.users.arazdai.kaggle.sft import export_and_quantize  # pylint: disable=g-import-not-at-top
+      export_and_quantize.ensure_sharded_fp8_export(
+          lora_adapter_path=FLAGS.lora_adapter_path,
+          output_fp8_path=FLAGS.model_path,
+          shard_index=FLAGS.shard_index,
+          num_shards=FLAGS.num_shards,
+          full_sft_ckpt_dir=FLAGS.full_sft_ckpt_dir,
+      )
+    shard_tasks, _ = havu_b32_harness.load_eval_tasks(
+        dataset_dir=FLAGS.dataset_dir,
+        shard_index=FLAGS.shard_index,
+        num_shards=FLAGS.num_shards,
+        max_tasks=FLAGS.max_tasks,
+    )
+    shard_tag = f"shard_{FLAGS.shard_index:02d}_of_{FLAGS.num_shards:02d}"
+    existing_pairs, _ = havu_b32_harness._load_existing_pair_records(  # pylint: disable=protected-access
+        os.path.join(out_dir, f"pairs_{shard_tag}.jsonl")
+    )
+    if all(
+        all(gp in existing_pairs for gp in t.global_pair_indices)
+        for t in shard_tasks
+    ):
+      print(
+          f"[havu_b32] All {len(shard_tasks)} tasks already completed for {shard_tag}.",
+          flush=True,
+      )
+      return
+
+    import jax  # pylint: disable=g-import-not-at-top
+    import vllm  # pylint: disable=g-import-not-at-top
+
+    fb = prompts_and_selector.FROZEN_BASELINE_CONFIG
+    num_tpus = jax.device_count()
+    device_kind = jax.devices()[0].device_kind if num_tpus > 0 else "unknown"
+    t_init0 = time.time()
+    llm = vllm.LLM(
+        model=FLAGS.model_path,
+        tensor_parallel_size=fb["tensor_parallel_size"],
+        max_model_len=fb["max_model_len"],
+        max_num_batched_tokens=fb["max_num_batched_tokens"],
+        max_num_seqs=fb["max_num_seqs"],
+        gpu_memory_utilization=fb["gpu_memory_utilization"],
+        enable_prefix_caching=fb["enable_prefix_caching"],
+        load_format="tpu_streaming_loader",
+    )
+    print(
+        f"[havu_b32] vLLM initialized in {time.time() - t_init0:.1f}s on {num_tpus}x {device_kind}",
+        flush=True,
+    )
+    havu_b32_harness.run_havu_b32_shard(
+        llm=llm,
+        cfg=cfg,
+        dataset_dir=FLAGS.dataset_dir,
+        out_dir=out_dir,
+        shard_index=FLAGS.shard_index,
+        num_shards=FLAGS.num_shards,
+        max_tasks=FLAGS.max_tasks,
+        model_path=FLAGS.model_path,
+    )
+    return
 
   shard_tag = f"shard_{FLAGS.shard_index:02d}_of_{FLAGS.num_shards:02d}"
   config_path = os.path.join(out_dir, f"config_{shard_tag}.json")

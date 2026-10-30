@@ -72,6 +72,7 @@ class Pilot2HypothesisConfig:
   use_two_stage_think_nudge: bool = False
   use_evolutionary_two_wave: bool = False
   use_transcript_compaction: bool = False
+  use_havu_b32_harness: bool = False
 
   temperature: float = FROZEN_BASELINE_CONFIG["temperature"]
   top_p: float = FROZEN_BASELINE_CONFIG["top_p"]
@@ -331,11 +332,12 @@ PILOT2_HYPOTHESES: dict[str, Pilot2HypothesisConfig] = {
     ),
     "e031_deepseek_teaching_bo4": Pilot2HypothesisConfig(
         exp_id="e031_deepseek_teaching_bo4",
-        title="E031 DeepSeek Teaching Interface (lean2sub + xhigh Tier + 8k 2-Stage Think Nudge, N=4)",
+        title="E031 DeepSeek Teaching Interface (lean2sub + xhigh Tier + 2-Wave Evolutionary Repair & Anti-Overfit, N=4)",
         hypothesis_summary=(
-            "Optimal E031 / E032 DeepSeek teaching harness with N=4 attempts per test pair, `xhigh` tier header, "
-            "8k 2-stage graceful think nudge, train-verified selection, equivariance tie-breaking, and "
-            "3-tier session fallback (`answer` -> `solve(test_input)` -> `salvage_answer`)."
+            "Optimal E031 / E032 DeepSeek teaching harness with N=4 attempts scheduled in 2 evolutionary waves "
+            "(Wave 1 runs 2 parallel attempts; Wave 2 runs evolutionary code repair on near-miss rules or "
+            "counterfactual anti-overfit verification), `xhigh` tier header, 8k 2-stage graceful think nudge, "
+            "D8+color equivariance tie-breaking, and 3-tier session fallback."
         ),
         num_attempts=4,
         max_turns=40,
@@ -350,7 +352,7 @@ PILOT2_HYPOTHESES: dict[str, Pilot2HypothesisConfig] = {
         use_equivariance_audit=True,
         use_native_xml_tools=True,
         use_two_stage_think_nudge=True,
-        use_evolutionary_two_wave=False,
+        use_evolutionary_two_wave=True,
         use_transcript_compaction=True,
     ),
     "e031_deepseek_teaching_fast": Pilot2HypothesisConfig(
@@ -377,6 +379,59 @@ PILOT2_HYPOTHESES: dict[str, Pilot2HypothesisConfig] = {
         use_two_stage_think_nudge=True,
         use_evolutionary_two_wave=False,
         use_transcript_compaction=True,
+    ),
+    "havu_b32": Pilot2HypothesisConfig(
+        exp_id="havu_b32",
+        title="Havu Candidate B32 Harness (Multi-Test + Auto-Repair + Token-Exact + 80k/40k Gentle + 64k Uninterrupted + 4-Path Train-Check, N=2)",
+        hypothesis_summary=(
+            "Exact replica of Havu's latest best-performing Candidate B32 harness from hav4ik/arcprize2026-arcagi2: "
+            "ARC_MULTI_TEST=1 with ARC_MULTI_BUDGET=0.5, retry-once AST-safe identifier typo auto-repair (ARC_AUTO_REPAIR=1), "
+            "--token-exact prompt IDs with zero mid-run <think> compaction, 64k uninterrupted per-turn max_tokens, "
+            "80k/40k gentle budget notes, isolated child-process LocalExecutor (style='ipython'), A1-A11 fallback fixes, "
+            "--rescue-code, GuardedStream thinking gzip loop monitor, and 4-path post-attempt train_check + ranked_answers."
+        ),
+        num_attempts=2,
+        max_turns=40,
+        total_token_budget=80000,
+        soft_token_target=40000,
+        turn_think_cap=64000,
+        attempt_prompt_styles=("lean2sub", "lean2sub"),
+        attempt_include_task_summary=(False, False),
+        use_arc_helpers=False,
+        auto_check_on_solve=False,
+        use_falsification_protocol=False,
+        use_equivariance_audit=False,
+        use_native_xml_tools=True,
+        use_two_stage_think_nudge=False,
+        use_evolutionary_two_wave=False,
+        use_transcript_compaction=False,
+        use_havu_b32_harness=True,
+    ),
+    "havu_b32_bo4": Pilot2HypothesisConfig(
+        exp_id="havu_b32_bo4",
+        title="Havu Candidate B32 Harness (Multi-Test + Auto-Repair + Token-Exact + 80k/40k Gentle + 64k Uninterrupted + 4-Path Train-Check, N=4)",
+        hypothesis_summary=(
+            "Controlled N=4 scaling of Havu's Candidate B32 harness (ARC_MULTI_TEST=1, ARC_MULTI_BUDGET=0.5, "
+            "ARC_AUTO_REPAIR=1, --token-exact, 80k/40k gentle, 64k uninterrupted per-turn max_tokens, isolated "
+            "LocalExecutor, A1-A11 fixes, --rescue-code, GuardedStream loop guard, 4-path train_check + ranked_answers) "
+            "for apples-to-apples comparison against e031_deepseek_teaching_bo4 (N=4)."
+        ),
+        num_attempts=4,
+        max_turns=40,
+        total_token_budget=80000,
+        soft_token_target=40000,
+        turn_think_cap=64000,
+        attempt_prompt_styles=("lean2sub", "lean2sub", "lean2sub", "lean2sub"),
+        attempt_include_task_summary=(False, False, False, False),
+        use_arc_helpers=False,
+        auto_check_on_solve=False,
+        use_falsification_protocol=False,
+        use_equivariance_audit=False,
+        use_native_xml_tools=True,
+        use_two_stage_think_nudge=False,
+        use_evolutionary_two_wave=False,
+        use_transcript_compaction=False,
+        use_havu_b32_harness=True,
     ),
 }
 
@@ -914,6 +969,10 @@ def build_wave2_evolutionary_seed(
     wave2_attempt_idx: int,
 ) -> str:
   """Build an evolutionary repair or counterfactual falsification seed from Wave 1 (Attempts 0 & 1)."""
+  is_e031 = any(getattr(sb, "use_e031_ipython_mode", False) for sb in wave1_sandboxes)
+  submit_tool_str = (
+      "`submit_answer` with `solve(test_input)`" if is_e031 else "`submit_program`"
+  )
   verified_sbs = [sb for sb in wave1_sandboxes if sb.first_tp_pred is not None]
   partial_sbs = [
       sb
@@ -937,14 +996,14 @@ def build_wave2_evolutionary_seed(
       code_snippet = code_snippet[:2400] + "\n# ... [truncated]"
     return (
         "[Wave 1 Evolutionary Program Repair Seed]\n"
-        f"An earlier attempt wrote a near-miss `def solve(grid):` achieving "
+        f"An earlier attempt wrote a near-miss rule achieving "
         f"{best_sb.best_partial_train_frac*100:.1f}% full-pair pass rate "
         f"({best_sb.best_partial_cell_acc*100:.1f}% mean cell accuracy) across the training examples.\n"
         f"Per-pair diagnostic diffs:\n{reports_str}\n"
         f"Near-miss candidate code from Wave 1:\n```python\n{code_snippet}\n```\n"
         "In Python, diagnose why this candidate failed on the remaining training pair(s) "
         "(or whether it used an overly narrow assumption), fix or rewrite `def solve(grid):` "
-        "so all training pairs pass 100%, and call `submit_program`."
+        f"so all training pairs pass 100%, and call {submit_tool_str}."
     )
 
   # If Wave 1 found at least one verified program, seed Wave 2 with a counterfactual anti-overfit audit note.
@@ -964,7 +1023,7 @@ def build_wave2_evolutionary_seed(
         "WARNING: Training-passing programs can still fail on `test_input` if they rely on a "
         "2- or 3-example coincidence (e.g. anchoring to row 0 instead of a marker, or assuming symmetry). "
         "Independently inspect `train` and `test_input` in Python, check all novel features of `test_input`, "
-        "and derive a clean general `def solve(grid):`."
+        f"derive a clean general `def solve(grid):`, and call {submit_tool_str}."
     )
 
   return ""
@@ -1192,6 +1251,39 @@ def select_top_two_predictions(
         sec_entry["min_gen_tokens"] = min(sec_entry["min_gen_tokens"], int(sec_toks))
         sec_entry["min_turn"] = min(sec_entry["min_turn"], int(sec_turn))
         sec_entry["min_attempt_idx"] = min(sec_entry["min_attempt_idx"], att.attempt_idx)
+
+      # Also register any distinct partial/fallback grid from this attempt at Tier 1/2
+      # so `attempt_2` is never a wasted duplicate of `attempt_1` if an alternative hypothesis exists.
+      ver_key = sandbox_verifier.grid_to_canonical_key(att.verified_grid)
+      if (
+          att.partial_grid is not None
+          and sandbox_verifier.grid_to_canonical_key(att.partial_grid) != ver_key
+      ):
+        p_entry = _ensure_entry(att.partial_grid)
+        p_entry["tier"] = min(p_entry["tier"], 1)
+        p_entry["total_attempts"].add(att.attempt_idx)
+        p_entry["best_train_frac"] = max(
+            p_entry["best_train_frac"], float(att.partial_train_frac)
+        )
+        p_entry["best_cell_acc"] = max(
+            p_entry["best_cell_acc"], float(att.partial_cell_acc)
+        )
+        p_entry["min_gen_tokens"] = min(
+            p_entry["min_gen_tokens"],
+            int(att.partial_gen_tokens or att.total_gen_tokens),
+        )
+        p_entry["min_attempt_idx"] = min(p_entry["min_attempt_idx"], att.attempt_idx)
+      if (
+          att.fallback_grid is not None
+          and sandbox_verifier.grid_to_canonical_key(att.fallback_grid) != ver_key
+      ):
+        f_entry = _ensure_entry(att.fallback_grid)
+        f_entry["total_attempts"].add(att.attempt_idx)
+        f_entry["min_gen_tokens"] = min(
+            f_entry["min_gen_tokens"],
+            int(att.fallback_gen_tokens or att.total_gen_tokens),
+        )
+        f_entry["min_attempt_idx"] = min(f_entry["min_attempt_idx"], att.attempt_idx)
 
     elif att.partial_grid is not None:
       entry = _ensure_entry(att.partial_grid)
