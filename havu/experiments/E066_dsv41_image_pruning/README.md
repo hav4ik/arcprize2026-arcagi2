@@ -215,6 +215,14 @@ attempts each) measure the wrong model. Do not use them.
 
 ## Final ARC-AGI-2 results (2026-10-29, 120 eval tasks x 2, ARC Prize scoring, `scripts/compare_evals.py`)
 
+> **2026-10-30: every image result in E066 ran with a serving bug (E068).** The fork sets `is_mm_prefix_lm =
+> vision_n_layers > 0`, so the language model attended bidirectionally over image spans; DeepSeek's reference is
+> causal. Fixed with `--hf-overrides '{"is_mm_prefix_lm": false}' --disable-chunked-mm-input`; on the full model the
+> grid-reading probe rises from 7.5% to 18.3% exact (API 25.8%; `experiments/E068_selfhost_image_gap`). The image rows
+> below, the image dev-NLL screens and the image half of the calibration (expert statistics and GPTQ activations)
+> are affected; text rows, text calibration and the Engram census are not. Re-check: `scripts/fix_c1_chain.sh`
+> (fixed-path replays, keep-set shift vs candidate 1) and `scripts/run_c1xc_local.sh` (candidate 1 image re-eval).
+
 | model | harness | pass@1 | pass@2 | output tok/attempt | tool-call error rate |
 |---|---|---|---|---|---|
 | candidate 1 (new E128, 2-bit) | text | 75.1 | 85.8 | 38.9K | 14.4% |

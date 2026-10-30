@@ -1,5 +1,17 @@
 # Candidate E066-IMG (2026-10-29): image harness + E72-152 on Manh's server
 
+> **Before any image submission (2026-10-30, from E068):** the fork attends bidirectionally over image spans.
+> - **Cause:** `is_mm_prefix_lm = vision_n_layers > 0` in `vllm/transformers_utils/configs/deepseek_v41.py:66`. DeepSeek's reference is causal.
+> - **Effect:** on the full model, causal raised exact grid transcription from 7.5% to 18.3% (API: 25.8%).
+> - **Fix:** add `--hf-overrides '{"is_mm_prefix_lm": false}' --disable-chunked-mm-input` to the server.
+> - **Checks** (the missing "multimodal-bidirectional" log line proves nothing once `--disable-chunked-mm-input` is passed, because vLLM prints it only when it has to force that flag):
+>   - (a) the server's "non-default args" line contains `'hf_overrides': {'is_mm_prefix_lm': False}`;
+>   - (b) in the server venv, `vllm.transformers_utils.config.get_config(model, trust_remote_code=True, hf_overrides_kw={"is_mm_prefix_lm": False}).is_mm_prefix_lm is False`;
+>   - (c) strongest, behavioural: E068's perception probe on a few <=36-cell grids transcribes exactly about 2 in 3 with the fix, about 1 in 3 with the bug.
+> - **Likely explains part of** the ~5-point image loss we measured on the self-hosted stack.
+> - **Text-only E128 runs (V12, B32-M, our V1) are unaffected:** V12's server log has no such line.
+> - Details: experiments/E068_selfhost_image_gap/README.md.
+
 What ships tonight, if the user picks it. The serving side is Manh's code and config (source of truth). The harness
 side is ours. The only serving-side addition is our patch that lets his vLLM load per-layer expert counts.
 

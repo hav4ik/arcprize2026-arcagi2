@@ -1,0 +1,425 @@
+<meta name="dash-one-writer">
+<style>
+  .arc { font-family: var(--font-anthropic-sans); color: var(--color-fg); display: flex; flex-direction: column; gap: var(--cds-gap-lg); }
+  .arc h1 { font-family: var(--font-anthropic-serif); font-weight: 400; font-size: var(--cds-font-size-title); margin: 0; text-wrap: balance; }
+  .arc h2 { font-size: var(--cds-font-size-heading); font-weight: var(--cds-font-weight-medium); margin: 0; }
+  .arc-take { margin: var(--cds-gap-xs) 0 0; color: var(--color-fg-muted); max-width: 70ch; }
+  .arc-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: var(--cds-gap-md); }
+  .arc-card { background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-lg); min-width: 0; }
+  .arc-tile-label { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); letter-spacing: .02em; }
+  .arc-tile-value { font-family: var(--font-anthropic-serif); font-weight: 400; font-size: var(--cds-font-size-title); font-variant-numeric: tabular-nums; display: block; margin-top: var(--cds-gap-xs); }
+  .arc-tile-note { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); margin-top: var(--cds-gap-xs); }
+  .arc .is-warn { color: var(--color-warn); }
+  .arc .is-bad { color: var(--color-bad); }
+  .arc .is-ok { color: var(--color-ok); }
+  .arc-note { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); margin: var(--cds-gap-xs) 0 var(--cds-gap-md); }
+  .arc-grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr)); gap: var(--cds-gap-md); }
+  .arc-chart { position: relative; min-height: 260px; }
+  .arc-empty { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); margin: 0; }
+  .arc-scroll { overflow-x: auto; }
+  .arc table { border-collapse: collapse; width: 100%; font-size: var(--cds-font-size-caption); font-variant-numeric: tabular-nums; }
+  .arc th { text-align: left; font-weight: var(--cds-font-weight-medium); color: var(--color-fg-muted); padding: var(--cds-pad-xs) var(--cds-pad-sm); border-bottom: 1px solid var(--color-border-line); white-space: nowrap; }
+  .arc td { padding: var(--cds-pad-xs) var(--cds-pad-sm); border-bottom: 1px solid var(--color-border-line); vertical-align: top; }
+  .arc td.num { text-align: right; white-space: nowrap; }
+  .arc td.wrap { min-width: 16rem; }
+  .arc-sub { display: block; max-width: 15rem; white-space: normal; color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+  .arc-pill { display: inline-block; padding: 0 var(--cds-pad-sm); border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+  .arc-legend { display: flex; flex-wrap: wrap; gap: var(--cds-gap-sm) var(--cds-gap-md); font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); margin-bottom: var(--cds-gap-xs); }
+  .arc-legend i { display: inline-block; width: .7rem; height: .7rem; border-radius: 2px; margin-right: .35rem; vertical-align: -1px; }
+  .arc-tip { position: absolute; pointer-events: none; background: var(--cds-surface-popover); border: 1px solid var(--cds-border); border-radius: var(--cds-radius); box-shadow: var(--cds-shadow-popover); padding: var(--cds-pad-xs) var(--cds-pad-sm); font-size: var(--cds-font-size-caption); white-space: nowrap; }
+  .arc-tip .t { color: var(--cds-text-secondary); }
+  .arc [data-dash-source-state=empty] { color: transparent; }
+  .arc [data-dash-source-state=refreshing] { opacity: .5; transition: opacity var(--cds-dur-slow); }
+</style>
+
+<div class="arc">
+  <header>
+    <h1>ARC-AGI-2 submissions tracker</h1>
+    <p class="arc-take">Two 12-hour replicas test the last two Kaggle submissions on 4×L4 pods (240 tasks, rerun mode), with host RAM and GPU memory tracked against Kaggle's limits. The question: why did B32-M drop to 46.5, and is Manh's submission safe?</p>
+  </header>
+
+  <section class="arc-tiles" aria-label="Headline figures">
+    <div class="arc-card">
+      <div class="arc-tile-label">Replicas running now</div>
+      <b class="arc-tile-value dash-skeleton" data-draw="t_live" data-source="health" data-field="live">—</b>
+      <div class="arc-tile-note">12-hour Kaggle clock each</div>
+    </div>
+    <div class="arc-card">
+      <div class="arc-tile-label">Lowest host RAM headroom (GiB)</div>
+      <b class="arc-tile-value dash-skeleton" data-draw="t_ram" data-source="health" data-field="ram_headroom_min">—</b>
+      <div class="arc-tile-note">Under Kaggle's 173 GiB limit, Kaggle-equivalent</div>
+    </div>
+    <div class="arc-card">
+      <div class="arc-tile-label">Lowest spare room under PyTorch's cap (GiB)</div>
+      <b class="arc-tile-value dash-skeleton" data-draw="t_vram" data-source="health" data-field="cap_spare_min">—</b>
+      <div class="arc-tile-note">Lowest GPU, across running replicas; OOM risk below 0.26</div>
+    </div>
+    <div class="arc-card">
+      <div class="arc-tile-label">Best leaderboard score</div>
+      <b class="arc-tile-value dash-skeleton" data-draw="t_best" data-source="best" data-field="lb">—</b>
+      <div class="arc-tile-note" data-draw="t_bestname" data-source="best" data-field="name">—</div>
+    </div>
+  </section>
+
+  <section class="arc-card" id="runs">
+    <h2>Replica runs</h2>
+    <p class="arc-note">Each run is an exact Kaggle notebook on a Runpod 4×L4 pod. Kaggle-equivalent RAM is the container's own memory (cgroup anon + shmem) + 7 GiB (Kaggle measured ~7 GiB above pods for the same notebook). GPU and throughput columns come from the latest 10-minute point of each server log.</p>
+    <div class="arc-scroll">
+      <table data-source="runs" data-row-key="run">
+        <thead><tr>
+          <th data-field="run">Run</th><th data-field="pod">Pod</th><th data-field="status">Status</th>
+          <th data-field="elapsed_h">Hours</th><th data-field="first_done">First attempts</th>
+          <th data-field="first_correct">Correct</th><th data-field="deaths">Deaths</th><th data-field="restarts">Restarts</th>
+          <th data-field="errored">Errored</th><th data-field="ram_kaggle_eq_gib">RAM, Kaggle-eq (GiB)</th>
+          <th data-field="vram_free_min_gib">Free VRAM min (GiB)</th><th data-field="cap_spare_gib">Spare under cap (GiB)</th>
+          <th data-field="tps_recent">Gen tok/s, last 30 min</th><th data-field="tps_mean">Gen tok/s, run mean</th>
+          <th data-field="updated_utc">Updated (UTC)</th>
+        </tr></thead>
+        <tbody data-draw="runs_body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="arc-card" id="events">
+    <h2>Events</h2>
+    <p class="arc-note">Newest first. Hours are on each run's own clock, since its solver started.</p>
+    <div class="arc-scroll">
+      <table data-source="events" data-row-key="utc">
+        <thead><tr><th data-field="utc">UTC</th><th data-field="run">Run</th><th data-field="kaggle_h">Hour</th><th data-field="event">Event</th></tr></thead>
+        <tbody data-draw="events_body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="memory">
+    <h2>Memory over time</h2>
+    <p class="arc-note">Hours since the solver started. Dashed lines are Kaggle's limit and our alert levels. Shaded bands mark server outages (OOM hang, engine death, restart); GPU lines read 0 while no server runs. The B32 reference (the 68.89 submission's 10-27 pod replica) starts at 1.5 h because its detailed memory sampler started then; its GPU line is nvidia-smi free on B32's own vLLM, which reserves its memory at startup and logs no allocator cap, so it stays flat by design.</p>
+    <div class="arc-grid2">
+      <div class="arc-card">
+        <h2>Host RAM, Kaggle-equivalent (GiB)</h2>
+        <p class="arc-note">Over 173 GiB, Kaggle's kernel kills processes: sandboxes first, then a vLLM worker.</p>
+        <p class="arc-empty" data-empty-for="ram">No Kaggle-equivalent RAM samples yet: the two new replicas' samplers fill this.</p>
+        <div class="arc-chart" data-draw="ramchart" data-source="mem outages"></div>
+      </div>
+      <div class="arc-card">
+        <h2>Free GPU memory, lowest GPU (GiB)</h2>
+        <p class="arc-note">Lowest GPU, as vLLM reports it. B32-M's replica holds 0.35 GiB per GPU to match Kaggle's tighter headroom.</p>
+        <p class="arc-empty" data-empty-for="vram">No GPU memory samples yet.</p>
+        <div class="arc-chart" data-draw="vramchart" data-source="mem outages"></div>
+      </div>
+      <div class="arc-card">
+        <h2>Spare room under PyTorch's cap, lowest GPU (GiB)</h2>
+        <p class="arc-note">Cap minus peak allocated. It shrinks as long prompts arrive; near 0 a prefill runs out of GPU memory, the suspected B32-M failure.</p>
+        <p class="arc-empty" data-empty-for="cap">No allocator samples yet.</p>
+        <div class="arc-chart" data-draw="capchart" data-source="mem outages"></div>
+      </div>
+      <div class="arc-card">
+        <h2>Unreserved room under the cap, lowest GPU (GiB)</h2>
+        <p class="arc-note">Cap minus reserved: the real margin. B32-M's replica hit its OOM when this reached ~0.03 GiB, while spare room over the peak still read 0.40.</p>
+        <p class="arc-empty" data-empty-for="capres">No samples yet.</p>
+        <div class="arc-chart" data-draw="capreschart" data-source="mem outages"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="accuracy">
+    <h2>Accuracy over time</h2>
+    <p class="arc-note">Scored against the replica workload's solutions after each finished attempt. Score so far is the ARC task score over all 240 tasks, counting unanswered tasks as 0 and taking the best of the attempts finished so far. It is the score the run would get if it stopped at that hour.</p>
+    <div class="arc-grid2">
+      <div class="arc-card">
+        <h2>Score so far (ARC task score, %)</h2>
+        <p class="arc-note">Rises as tasks get answered; a flat stretch is an outage or long attempts still running.</p>
+        <p class="arc-empty" data-empty-for="score">No finished attempts yet.</p>
+        <div class="arc-chart" data-draw="scorechart" data-source="acc outages"></div>
+      </div>
+      <div class="arc-card">
+        <h2>Tasks with an answer (of 240)</h2>
+        <p class="arc-note">A task counts once any attempt (or a kept session answer) has a prediction.</p>
+        <p class="arc-empty" data-empty-for="answered">No finished attempts yet.</p>
+        <div class="arc-chart" data-draw="answeredchart" data-source="acc outages"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="throughput">
+    <h2>Throughput over time</h2>
+    <p class="arc-note">10-minute means of per-minute server metrics (0 while the server hangs or restarts), by hours since the solver started. Shaded bands mark outages. The B32 reference's swings are real: the KV gate admits a batch, contexts grow until KV is full and requests get preempted, attempts finish, and the gate admits again. Once the KV cache is ~85% full, the solver admits no new attempts, so fewer requests run and total tokens/s falls while each stream gets faster.</p>
+    <div class="arc-grid2">
+      <div class="arc-card">
+        <h2>Generated tokens per second</h2>
+        <p class="arc-note">Whole server, all four GPUs. B32 on its own stack averaged 386 tok/s over 12 h (468 in its first hour).</p>
+        <p class="arc-empty" data-empty-for="tps">No throughput samples yet.</p>
+        <div class="arc-chart" data-draw="tpschart" data-source="tps outages"></div>
+      </div>
+      <div class="arc-card">
+        <h2>Requests running</h2>
+        <p class="arc-note">Requests the server is decoding. Below the solver's worker count, the KV gate or long tool calls are holding attempts back.</p>
+        <p class="arc-empty" data-empty-for="running">No throughput samples yet.</p>
+        <div class="arc-chart" data-draw="runningchart" data-source="tps outages"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="arc-card" id="submissions">
+    <h2>Submissions compared</h2>
+    <p class="arc-note">Leaderboard (LB) is Kaggle's public score; replica is our pod run of the same notebook. VRAM free and RAM headroom are per-GPU and host margins at load (Kaggle or audit estimates).</p>
+    <div class="arc-scroll">
+      <table data-source="submissions" data-row-key="id">
+        <thead><tr>
+          <th data-field="id">Submission</th><th data-field="date">Date</th><th data-field="lb">LB</th><th data-field="replica">Replica</th>
+          <th data-field="stack">vLLM</th><th data-field="dcp">DCP</th><th data-field="util">GPU util</th><th data-field="workers">Workers</th>
+          <th data-field="recovery">Recovery</th><th data-field="vram_free_gib">VRAM free (GiB)</th><th data-field="ram_headroom_gib">RAM headroom (GiB)</th>
+          <th data-field="status">Status</th><th data-field="note">Note</th>
+        </tr></thead>
+        <tbody data-draw="subs_body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="arc-card" id="findings">
+    <h2>Findings from audits and tests</h2>
+    <p class="arc-note">High = can cost a large share of the score; ok = checked and fine.</p>
+    <div class="arc-scroll">
+      <table data-source="findings" data-row-key="id">
+        <thead><tr>
+          <th data-field="id">ID</th><th data-field="area">Area</th><th data-field="severity">Severity</th>
+          <th data-field="finding">Finding</th><th data-field="status">Status</th>
+        </tr></thead>
+        <tbody data-draw="findings_body"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<script>
+  const KAGGLE_RAM_LIMIT = 173, RAM_WARN = 155, RAM_ALERT = 165, VRAM_WARN = 1.0, VRAM_ALERT = 0.5, CAP_ALERT = 0.26, CAP_WARN = 0.75;
+  const f1 = d3.format(',.1f'), f2 = d3.format('.2f'), fInt = d3.format(',');
+  const isNum = (v) => v !== null && v !== undefined && v !== '' && !isNaN(+v);
+  const show = (v, f) => (isNum(v) ? f(+v) : '—');
+
+  dash.calc('health', {
+    inputs: ['runs'],
+    title: 'Running replicas: health',
+    description: 'Count of running replicas, the lowest host RAM headroom under 173 GiB, the lowest free VRAM and the lowest spare room under the PyTorch allocator cap among them.',
+    fn: (runs) => {
+      const live = runs.filter((r) => String(r.status).startsWith('running'));
+      const nums = (k) => live.map((r) => r[k]).filter((v) => v !== null && v !== '' && !isNaN(+v)).map(Number);
+      const ram = nums('ram_kaggle_eq_gib'), vram = nums('vram_free_min_gib'), cap = nums('cap_spare_gib');
+      return [{live: live.length, ram_headroom_min: ram.length ? 173 - Math.max(...ram) : null,
+               vram_free_min: vram.length ? Math.min(...vram) : null, cap_spare_min: cap.length ? Math.min(...cap) : null}];
+    },
+  });
+  dash.calc('best', {
+    inputs: ['submissions'],
+    title: 'Best leaderboard score',
+    description: 'The scored submission with the highest public leaderboard score.',
+    fn: (submissions) => {
+      const s = submissions.filter((x) => x.lb !== null && x.lb !== '' && !isNaN(+x.lb)).sort((a, b) => b.lb - a.lb);
+      return s.length ? [{lb: +s[0].lb, name: s[0].name}] : [];
+    },
+  });
+
+  const tile = (name, src, field, fmt, tone) => dash.draw(name, (el) => {
+    const d = dash.data(src);
+    const row = d.status === 'ok' ? d.data[0] : null;
+    const v = row ? row[field] : null;
+    el.textContent = isNum(v) || (v && typeof v === 'string') ? fmt(v) : '—';
+    el.classList.toggle('dash-skeleton', d.status === 'loading');
+    el.classList.remove('is-ok', 'is-warn', 'is-bad');
+    const t = tone && isNum(v) ? tone(+v) : '';
+    if (t) el.classList.add(t);
+  });
+  tile('t_live', 'health', 'live', (v) => fInt(+v));
+  tile('t_ram', 'health', 'ram_headroom_min', (v) => f1(+v),
+       (v) => (v < KAGGLE_RAM_LIMIT - RAM_ALERT ? 'is-bad' : v < KAGGLE_RAM_LIMIT - RAM_WARN ? 'is-warn' : 'is-ok'));
+  tile('t_vram', 'health', 'cap_spare_min', (v) => f2(+v),
+       (v) => (v < CAP_ALERT ? 'is-bad' : v < CAP_WARN ? 'is-warn' : 'is-ok'));
+  tile('t_best', 'best', 'lb', (v) => f2(+v));
+  tile('t_bestname', 'best', 'name', String);
+
+  const cell = (tr, text, cls) => { const td = document.createElement('td'); td.textContent = text; if (cls) td.className = cls; tr.append(td); return td; };
+  const pill = (td, tone) => { const s = document.createElement('span'); s.className = 'arc-pill ' + tone; s.textContent = td.textContent; td.replaceChildren(s); };
+
+  dash.draw('runs_body', (tb) => {
+    const d = dash.data('runs');
+    tb.replaceChildren();
+    if (d.status !== 'ok') return;
+    for (const r of d.data) {
+      const tr = document.createElement('tr');
+      cell(tr, r.run); cell(tr, r.pod);
+      // Short state in the pill, the detail in brackets underneath, so the table stays narrow.
+      const status = String(r.status || ''), cut = status.indexOf(' (');
+      const st = cell(tr, cut > 0 ? status.slice(0, cut) : status);
+      pill(st, status.startsWith('running') ? 'is-ok' : status.startsWith('waiting') ? 'is-warn' : '');
+      if (cut > 0) { const sub = document.createElement('span'); sub.className = 'arc-sub'; sub.textContent = status.slice(cut + 2).replace(/\)$/, ''); st.append(sub); }
+      cell(tr, show(r.elapsed_h, f1), 'num'); cell(tr, show(r.first_done, fInt), 'num'); cell(tr, show(r.first_correct, fInt), 'num');
+      cell(tr, show(r.deaths, fInt), 'num'); cell(tr, show(r.restarts, fInt), 'num');
+      const er = cell(tr, show(r.errored, fInt), 'num'); if (+r.errored > 0) er.classList.add('is-warn');
+      const ram = cell(tr, show(r.ram_kaggle_eq_gib, f1), 'num');
+      if (isNum(r.ram_kaggle_eq_gib)) ram.classList.add(+r.ram_kaggle_eq_gib >= RAM_ALERT ? 'is-bad' : +r.ram_kaggle_eq_gib >= RAM_WARN ? 'is-warn' : 'is-ok');
+      const vr = cell(tr, show(r.vram_free_min_gib, f2), 'num');
+      if (isNum(r.vram_free_min_gib)) vr.classList.add(+r.vram_free_min_gib < VRAM_ALERT ? 'is-bad' : +r.vram_free_min_gib < VRAM_WARN ? 'is-warn' : 'is-ok');
+      const cs = cell(tr, show(r.cap_spare_gib, f2), 'num');
+      if (isNum(r.cap_spare_gib)) cs.classList.add(+r.cap_spare_gib < CAP_ALERT ? 'is-bad' : +r.cap_spare_gib < CAP_WARN ? 'is-warn' : 'is-ok');
+      cell(tr, show(r.tps_recent, fInt), 'num'); cell(tr, show(r.tps_mean, fInt), 'num');
+      cell(tr, r.updated_utc || '—');
+      tb.append(tr);
+    }
+  });
+
+  dash.draw('subs_body', (tb) => {
+    const d = dash.data('submissions');
+    tb.replaceChildren();
+    if (d.status !== 'ok') return;
+    for (const s of d.data) {
+      const tr = document.createElement('tr');
+      cell(tr, s.id); cell(tr, s.date);
+      const lb = cell(tr, show(s.lb, f2), 'num'); if (isNum(s.lb) && +s.lb < 50) lb.classList.add('is-bad');
+      cell(tr, show(s.replica, f1), 'num'); cell(tr, s.stack); cell(tr, s.dcp);
+      cell(tr, show(s.util, (v) => d3.format('.3~f')(v)), 'num'); cell(tr, show(s.workers, fInt), 'num');
+      cell(tr, s.recovery, 'wrap'); cell(tr, show(s.vram_free_gib, f1), 'num'); cell(tr, show(s.ram_headroom_gib, f1), 'num');
+      cell(tr, s.status); cell(tr, s.note, 'wrap');
+      tb.append(tr);
+    }
+  });
+
+  dash.draw('findings_body', (tb) => {
+    const d = dash.data('findings');
+    tb.replaceChildren();
+    if (d.status !== 'ok') return;
+    const tone = {high: 'is-bad', medium: 'is-warn', ok: 'is-ok'};
+    for (const f of d.data) {
+      const tr = document.createElement('tr');
+      cell(tr, f.id); cell(tr, f.area);
+      pill(cell(tr, f.severity), tone[f.severity] || '');
+      cell(tr, f.finding, 'wrap'); cell(tr, f.status, 'wrap');
+      tb.append(tr);
+    }
+  });
+
+  // One colour per run in every chart: live replicas first, then stopped ones, then anything new.
+  const RUN_ORDER = ['Manh V12 replica', 'B32-M V3 replica', 'Ours V1 replica (stopped)', 'C1 image run 3 (stopped)'];
+  const runColor = (run) => {
+    let i = RUN_ORDER.indexOf(run);
+    if (i < 0) { RUN_ORDER.push(run); i = RUN_ORDER.length - 1; }
+    return dash.colors[i % dash.colors.length];
+  };
+  function lineChart(el, field, opts) {
+    const d = dash.data(opts.src || 'mem');
+    el.replaceChildren();
+    const empties = document.querySelectorAll(`[data-empty-for="${opts.key}"]`);
+    if (d.status !== 'ok') { empties.forEach((e) => { e.hidden = true; }); return; }
+    const rows = d.data.filter((r) => isNum(r[field]) && isNum(r.t_h)).map((r) => ({run: r.run, t: +r.t_h, v: +r[field]}));
+    empties.forEach((e) => { e.hidden = rows.length > 0; });
+    if (!rows.length) return;
+    const series = d3.groups(rows, (r) => r.run).map(([run, pts]) => ({run, pts: pts.sort((a, b) => a.t - b.t)}))
+      .sort((a, b) => RUN_ORDER.indexOf(a.run) - RUN_ORDER.indexOf(b.run));
+    const legend = document.createElement('div');
+    legend.className = 'arc-legend';
+    series.forEach((s) => { const span = document.createElement('span'); const sw = document.createElement('i'); sw.style.background = runColor(s.run); span.append(sw, document.createTextNode(s.run)); legend.append(span); });
+    el.append(legend);
+    const W = Math.max(280, el.clientWidth || 600), H = 220, m = {t: 10, r: 14, b: 26, l: 40};
+    const x = d3.scaleLinear([0, Math.max(12, d3.max(rows, (r) => r.t))], [m.l, W - m.r]);
+    const vals = rows.map((r) => r.v).concat(opts.limits.map((l) => l.v));
+    const y = d3.scaleLinear([opts.yMin(d3.min(vals)), opts.yMax(d3.max(vals))], [H - m.b, m.t]).nice();
+    const svg = d3.select(el).append('svg').attr('width', '100%').attr('viewBox', `0 0 ${W} ${H}`).attr('role', 'img');
+    svg.append('g').attr('transform', `translate(0,${H - m.b})`).call(d3.axisBottom(x).ticks(6).tickFormat((v) => v + ' h'))
+      .attr('font-size', null).attr('font-family', null)
+      .call((g) => g.selectAll('text').attr('fill', 'var(--color-fg-muted)').style('font-size', 'var(--cds-font-size-caption)'))
+      .call((g) => g.selectAll('line,path').attr('stroke', 'var(--cds-chart-axis)'));
+    svg.append('g').attr('transform', `translate(${m.l},0)`).call(d3.axisLeft(y).ticks(5).tickSize(-(W - m.l - m.r)).tickFormat(opts.fmt))
+      .attr('font-size', null).attr('font-family', null)
+      .call((g) => g.select('.domain').remove())
+      .call((g) => g.selectAll('line').attr('stroke', 'var(--cds-chart-grid)'))
+      .call((g) => g.selectAll('text').attr('fill', 'var(--color-fg-muted)').style('font-size', 'var(--cds-font-size-caption)'));
+    const od = dash.data('outages');
+    const outs = od && od.status === 'ok' ? od.data.filter((o) => isNum(o.start_h) && series.some((s) => s.run === o.run)) : [];
+    for (const o of outs) {
+      // an open outage (the final OOM: no server since) is drawn as a narrow column like the others
+      const endH = isNum(o.end_h) ? +o.end_h : +o.start_h + 0.14;
+      const x0 = x(+o.start_h), x1 = Math.max(x(endH), x0 + 3);
+      svg.append('rect').attr('x', x0).attr('y', m.t).attr('width', x1 - x0).attr('height', H - m.b - m.t)
+        .attr('fill', runColor(o.run)).attr('opacity', 0.14);
+      svg.append('text').attr('x', x0 + 2).attr('y', m.t + 10).attr('fill', 'var(--color-fg-muted)')
+        .style('font-size', 'var(--cds-font-size-caption)').text(/gone|final/i.test(o.kind || '') ? 'final OOM' : 'outage');
+    }
+    for (const l of opts.limits) {
+      const yy = y(l.v);
+      if (yy < m.t || yy > H - m.b) continue;
+      svg.append('line').attr('x1', m.l).attr('x2', W - m.r).attr('y1', yy).attr('y2', yy)
+        .attr('stroke', l.critical ? 'var(--cds-chart-status-critical)' : 'var(--cds-chart-reference)').attr('stroke-dasharray', '4 3');
+      svg.append('text').attr('x', W - m.r - 2).attr('y', yy - 3).attr('text-anchor', 'end').attr('fill', 'var(--color-fg-muted)')
+        .style('font-size', 'var(--cds-font-size-caption)').text(l.label);
+    }
+    const line = d3.line().x((p) => x(p.t)).y((p) => y(p.v));
+    series.forEach((s, i) => {
+      const c = runColor(s.run);
+      svg.append('path').attr('d', line(s.pts)).attr('fill', 'none').attr('stroke', c).attr('stroke-width', 2)
+        .attr('stroke-linecap', 'round').attr('stroke-linejoin', 'round');
+      svg.append('g').selectAll('circle').data(s.pts).join('circle').attr('cx', (p) => x(p.t)).attr('cy', (p) => y(p.v)).attr('r', 2.5).attr('fill', c);
+    });
+    const tip = document.createElement('div');
+    tip.className = 'arc-tip'; tip.hidden = true; el.append(tip);
+    const flat = series.flatMap((s, i) => s.pts.map((p) => ({...p, i})));
+    const dl = d3.Delaunay.from(flat, (p) => x(p.t), (p) => y(p.v));
+    svg.on('pointermove', (ev) => {
+      const [mx, my] = d3.pointer(ev);
+      const p = flat[dl.find(mx, my)];
+      if (!p) return;
+      tip.replaceChildren();
+      const t = document.createElement('div'); t.className = 't'; t.textContent = `${f1(p.t)} h`;
+      const v = document.createElement('div'); const sw = document.createElement('i');
+      sw.style.cssText = `display:inline-block;width:.6rem;height:.6rem;border-radius:2px;margin-right:.35rem;background:${runColor(p.run)}`;
+      v.append(sw, document.createTextNode(`${p.run}: ${opts.fmt(p.v)} ${opts.unit || 'GiB'}`));
+      tip.append(t, v); tip.hidden = false;
+      const box = el.getBoundingClientRect(), sx = box.width / W;
+      const left = Math.min(Math.max(0, x(p.t) * sx + 8), box.width - tip.offsetWidth - 4);
+      tip.style.left = left + 'px'; tip.style.top = (legend.offsetHeight + y(p.v) * sx - 8) + 'px';
+    }).on('pointerleave', () => { tip.hidden = true; });
+  }
+
+  dash.draw('ramchart', (el) => lineChart(el, 'ram_kaggle_eq_gib', {
+    key: 'ram', fmt: (v) => d3.format(',.0f')(v), yMin: (v) => Math.min(v, 120), yMax: (v) => Math.max(v, 180),
+    limits: [{v: KAGGLE_RAM_LIMIT, label: 'Kaggle limit 173', critical: true}, {v: RAM_ALERT, label: 'alert 165'}, {v: RAM_WARN, label: 'warn 155'}],
+  }));
+  dash.draw('vramchart', (el) => lineChart(el, 'vram_free_min_gib', {
+    key: 'vram', fmt: (v) => f2(v), yMin: () => 0, yMax: (v) => Math.max(v, 2.6),
+    limits: [{v: VRAM_WARN, label: 'warn 1.0'}, {v: VRAM_ALERT, label: 'alert 0.5', critical: true}],
+  }));
+  dash.draw('capchart', (el) => lineChart(el, 'cap_minus_peak_gib', {
+    key: 'cap', fmt: (v) => f2(v), yMin: () => 0, yMax: (v) => Math.max(v, 2.2),
+    limits: [{v: CAP_ALERT, label: 'OOM risk 0.26', critical: true}],
+  }));
+  dash.draw('tpschart', (el) => lineChart(el, 'gen_tok_s', {
+    key: 'tps', src: 'tps', unit: 'tok/s', fmt: (v) => d3.format(',.0f')(v), yMin: () => 0, yMax: (v) => Math.max(v, 800),
+    limits: [{v: 386, label: 'B32 12 h mean 386'}],
+  }));
+  dash.draw('runningchart', (el) => lineChart(el, 'running', {
+    key: 'running', src: 'tps', unit: 'running', fmt: (v) => d3.format(',.0f')(v), yMin: () => 0, yMax: (v) => Math.max(v, 80),
+    limits: [],
+  }));
+  dash.draw('events_body', (tb) => {
+    const d = dash.data('events');
+    tb.replaceChildren();
+    if (d.status !== 'ok') return;
+    const tone = {warn: 'is-warn', bad: 'is-bad', ok: 'is-ok'};
+    for (const e of d.data) {
+      const tr = document.createElement('tr');
+      cell(tr, e.utc); cell(tr, e.run); cell(tr, show(e.kaggle_h, f2), 'num');
+      const ev = cell(tr, e.event, 'wrap'); if (tone[e.kind]) ev.classList.add(tone[e.kind]);
+      tb.append(tr);
+    }
+  });
+  dash.draw('capreschart', (el) => lineChart(el, 'cap_minus_reserved_gib', {
+    key: 'capres', fmt: (v) => f2(v), yMin: () => 0, yMax: (v) => Math.max(v, 1.6),
+    limits: [{v: 0.15, label: 'alert 0.15'}, {v: 0.05, label: 'OOM risk 0.05', critical: true}],
+  }));
+  dash.draw('scorechart', (el) => lineChart(el, 'score_so_far', {
+    key: 'score', src: 'acc', unit: '%', fmt: (v) => d3.format('.1f')(v), yMin: () => 0, yMax: (v) => Math.max(v, 80),
+    limits: [{v: 68.89, label: 'B32 LB 68.89'}, {v: 46.5, label: 'B32-M LB 46.5', critical: true}],
+  }));
+  dash.draw('answeredchart', (el) => lineChart(el, 'tasks_answered', {
+    key: 'answered', src: 'acc', unit: 'tasks', fmt: (v) => d3.format(',.0f')(v), yMin: () => 0, yMax: (v) => Math.max(v, 240),
+    limits: [{v: 240, label: 'all 240'}],
+  }));
+</script>

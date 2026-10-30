@@ -247,3 +247,23 @@ Whole run after the first 10 min of serving: mean 646 gen tok/s, mean running 47
   | 8.0-8.5 | 604 | 42.1 |
 
   Whole run after 10 min: 582 tok/s at 38.7 running.
+
+### Reports 10-11 (10:27, 10:57 UTC; 8.6-9.1 h of solving; `report_1056.txt`)
+**Verdict: stable; margins flat for 6 h; no events.**
+- **Accuracy:**
+
+  | Kaggle h | score so far | tasks answered | first attempts | second attempts |
+  |---|---|---|---|---|
+  | 8.58 | 80.2 | 235 | 74.8% | 96/144 = 66.7% |
+  | 9.09 | 80.6 | 235 | 74.8% | 122/176 = 69.3% |
+
+- **VRAM:** cap - reserved 1.13 / 1.11 / 1.10 / 1.08 GiB, flat since 04:50. 0 retries, 0 OOMs.
+- **RAM:** Kaggle-eq (cgroup) 134.3 GiB, flat.
+- **Throughput:**
+
+  | window (h) | gen tok/s | running |
+  |---|---|---|
+  | 8.5-9.0 | 595 | 42.0 |
+  | 9.0-9.5 | 559 | 38.2 |
+
+  Whole run after 10 min: 582 tok/s at 38.9 running. Host restore ~0 since 8.5 h.

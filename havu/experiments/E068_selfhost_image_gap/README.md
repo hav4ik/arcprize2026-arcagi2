@@ -4,7 +4,7 @@
 might be the prompting problem?" (E066: candidate 1 image 69.7 vs text 75.1 pass@1; the full model self-hosted with
 images 72.4 on 221/240 attempts vs the API's 81.1.)
 
-## Summary (as of 10:30 UTC; the `causal`, `vitdp` and `noprefix` arms are still running)
+## Summary (as of 11:00 UTC; `vitdp` still running)
 1. **It is not the prompt.** Text and tokens are byte-identical to the API's, earlier reasoning stays in the prompt,
    and self-hosted text is as good as the API's. The loss is specific to images, and both self-hosted models show it.
 2. **It is perception.** Shown one rendered grid with no text, the self-hosted full model reads it much worse than the
@@ -14,8 +14,13 @@ images 72.4 on 221/240 attempts vs the API's 81.1.)
 3. **Not the sampler** (temperature 0.6 / top_p 0.95 reads the same as 1.0 / 1.0), **not FP8 KV** (the stack only runs
    DeepSeek's native mixed FP8/FP4 KV format), not the Engram image mask, not the router image bias, not the vision
    preprocessing or ViT/aligner math.
-4. **Lead suspect: the fork attends bidirectionally over image spans in the language model; DeepSeek's reference is
-   causal.** Being tested now (`causal` arm).
+4. **Main cause found: the fork attends bidirectionally over image spans in the language model; DeepSeek's reference
+   is causal.** One server flag fixes it (`--hf-overrides '{"is_mm_prefix_lm": false}' --disable-chunked-mm-input`):
+   probe exact 7.5% -> 18.3% (API 25.8%), small grids now match the API, and the images make the API's reasoning
+   markedly more predictable. Every self-hosted image result so far (E066 candidates, full_ref) ran with the bug.
+5. **A smaller residual gap remains on larger grids** (exact -7.5 [-15.0, -0.8] vs the API, all of it on grids with
+   more than 36 cells). Not the indexer precision (the reference also uses FP4) and not leftover widening (every
+   widening path is gated on the flag).
 
 ## Paired re-analysis of E066's result files (no new runs; ARC Prize weighting per task-attempt)
 On the 221 task-attempts the self-hosted full-model image run (`e066_full_ref`) finished:
@@ -92,12 +97,16 @@ experts=None engram=None`). Raw files: `results/box/`.
 | API | 76.7 | 34.2 | 69.2 | 66.7 | 25.8 | 63 / 30 / 7 / 3 | 98.3 | 28 | 8.8k |
 | `ref` (E066 settings) | 60.8 | 14.2 | 56.7 | 40.8 | 7.5 | 30 / 0 / 0 / 0 | 90.0 | 47 | 10.2k |
 | `ref_t06` (temperature 0.6, top_p 0.95) | 63.3 | 13.3 | 58.3 | 47.5 | 7.5 | | 92.3 | | 9.2k |
-| `causal` | pending | | | | | | | | |
-| `vitdp` | pending | | | | | | | | |
-| `noprefix` | pending | | | | | | | | |
+| `causal` (causal image attention) | 67.5 | 25.8 | 60.8 | 51.7 | 18.3 | 67 / 7 / 0 / 0 | 98.4 | 39 | 9.4k |
+| `vitdp` (`causal` + vision tower unsharded) | pending | | | | | | | | |
 
 `ref` − API: size −20.0 [−29.2, −11.7], colours −12.5 [−24.2, −0.8], corners −25.8 [−37.5, −13.3], exact −18.3
-[−26.7, −10.0]. Within each run, sample 0 and sample 1 score alike (`ref` exact 8.3 / 6.7, API 23.3 / 28.3).
+[−26.7, −10.0]. `ref_t06` − API: the same (exact −18.3 [−26.7, −10.8]). `causal` − API: size −8.3 [−15.0, −1.7],
+colours −8.3 [−18.3, +1.7], corners −15.0 [−24.2, −5.8], exact −7.5 [−15.0, −0.8]; on the 54 calls `causal` finished
+first, API / `ref` / `causal` exact 48.1 / 16.7 / 40.7%. Within each run, sample 0 and sample 1 score alike (`ref`
+exact 8.3 / 6.7, API 23.3 / 28.3): a second identical request (which can reuse the first one's cached image prefix) is
+not worse, so prefix-cache reuse is not a suspect and `noprefix` was dropped. Conditional on answering (not hitting
+the 16k cap), exact is API 33.7%, `causal` 27.1%, `ref` 12.3%.
 
 **Image-ablation NLL (32 API image rollouts, 348k generated tokens, per token):**
 
@@ -105,9 +114,14 @@ experts=None engram=None`). Raw files: `results/box/`.
 |---|---|---|
 | `ref_real` | 0.7521 | 0.6462 |
 | `ref_grey` | 0.7560 | 0.6641 |
-| `causal_real` / `causal_grey` | pending | |
+| `causal_real` | 0.7489 | 0.6335 |
+| `causal_grey` | 0.7552 | 0.6616 |
 
 `ref`: grey − real +0.0095 [+0.0066, +0.0127] on all generated tokens, +0.0235 [+0.0150, +0.0320] on the first turn.
+`causal`: grey − real +0.0160 [+0.0111, +0.0217] and +0.0410 [+0.0296, +0.0527], i.e. ~1.7x the image information.
+`causal_real` − `ref_real` −0.0081 [−0.0115, −0.0052] (first turn −0.0200 [−0.0265, −0.0135]), while
+`causal_grey` − `ref_grey` is only −0.0015 [−0.0025, −0.0006] (first turn −0.0025, n.s.): the attention change matters
+only when the images carry content.
 The self-hosted vision path carries information, since the images make the API's reasoning more predictable. There is
 no API number to compare against (the API returns no prompt logprobs), so this cannot show how much is lost; the probe
 can.
@@ -118,7 +132,7 @@ accepts only DeepSeek V4.1's native mixed FP8/FP4 KV format (`fp8_ds_mla`, `deep
 own cache layout. The planned `kvauto` arm was therefore a duplicate of `ref`; that server ran `ref_t06` instead. The
 Lightning Indexer cache is MXFP4 ("Using MXFP4 indexer cache"); irrelevant for the probe's ~1-2k-token prompts.
 
-## Lead suspect: bidirectional attention over image spans
+## Cause: bidirectional attention over image spans
 - **The fork:** its config class sets `is_mm_prefix_lm = vision_n_layers > 0`
   (`transformers_utils/configs/deepseek_v41.py:66`; the comment: "The vision variant needs the mm-prefix plumbing
   (atomic image-span prefill + sparse-SWA window widening)"). Every attention path then lets image tokens attend to
@@ -132,13 +146,20 @@ Lightning Indexer cache is MXFP4 ("Using MXFP4 indexer cache"); irrelevant for t
   must lie inside the first (start_pos 0) chunk" assert serves the embedding merge, not attention.
 - If the model was trained causal (as the reference runs it), every image token's hidden states on the fork are ones
   it never saw in training: degraded, not destroyed, perception, as measured.
-- **Test, arm `causal`:** ref + `--hf-overrides '{"is_mm_prefix_lm": false}' --disable-chunked-mm-input` (keeps the
-  atomic image-span prefill). vLLM applies `--hf-overrides` with `config.update()` after the config class is built
+- **Fix, arm `causal`:** ref + `--hf-overrides '{"is_mm_prefix_lm": false}' --disable-chunked-mm-input` (keeps the
+  atomic image-span prefill). Every widening path is gated on the flag: `sparse_swa.py` 449-450 and 501, the V2
+  runner's `compute_mm_prefix_ranges` (`v1/worker/gpu/model_states/default.py` 213-216), the FlashInfer sparse /
+  FlashMLA backends; the remaining `max_image_tokens` use in `deepseek_v4_1/attention.py` 458 is for CED prefill only. vLLM applies `--hf-overrides` with `config.update()` after the config class is built
   (`transformers_utils/config.py:819`), so the override replaces the constructor's value. The missing "Forcing
   --disable_chunked_mm_input" warning is not proof: vLLM prints it only when chunked mm input is not already
   disabled, and this arm disables it explicitly.
 - Relevance: Manh's server (the Kaggle image candidate, `kaggle/dsv41_tools/CANDIDATE_E066_IMG.md`) is a build of the
-  same fork; check its `is_mm_prefix_lm` before any image submission. dsv4-infer owns that harness and server config.
+  same fork; check its `is_mm_prefix_lm` before any image submission (a server log with "multimodal-bidirectional"
+  runs the buggy path). dsv4-infer (owns that harness and server config) and dsv4-pruning (E066) were told at 11:00
+  UTC. E066's image-harness numbers (candidate 1 image −5.4 vs text, E72-152 image, image dev-NLL screening) were all
+  measured with the bug and are worth re-measuring with the flag.
+- Indexer precision is not a suspect: the reference also quantizes the Lightning Indexer's queries and keys to FP4
+  (`fp4_act_quant` in `Indexer.forward`); the fork's "MXFP4 indexer cache" matches.
 
 ## Operations log (for the next box run)
 - Box: Vast 58332344, 4x RTX PRO 6000 Blackwell WS, $5.74/h, traffic $0.0052/GB (the 510 GB download cost ~$2.7).
@@ -159,6 +180,8 @@ Lightning Indexer cache is MXFP4 ("Using MXFP4 indexer cache"); irrelevant for t
 - Box time used: ~3 h by the end of the planned arms (~$17 plus ~$3 traffic). API spend: the probe, $0.64.
 
 ## Status
-Running on node 5 (chain 3): `causal` (probe + NLL real/grey), then `vitdp`, then `noprefix`. Plan agreed with the user:
-if `causal` brings the probe within ~3 pp of the API, stop before `vitdp`, copy the results and destroy the box;
-otherwise run both.
+`causal` closed ~60% of the probe gap, not all, so `vitdp` (`causal` + `--mm-encoder-tp-mode data`) runs as agreed;
+`noprefix` dropped (see above). Then copy the results, stop the E068 servers and hand the box back to dsv4-pruning (not destroyed: at 10:56 UTC the user approved two E066 follow-ups on it, an expert-usage check with the fix and candidate 1's image re-eval; dsv4-pruning destroys the box after those). The full checkpoint stays at `/workspace/dsv4/DeepSeek-V4.1-Flash-1017`. Results and filtered server
+logs (`results/box/runs/`) are already copied.
+Open: the residual gap on larger grids; an ARC eval of the image harness with the fix (self-hosted full model and
+candidate 1), which decides whether images help on Kaggle.
