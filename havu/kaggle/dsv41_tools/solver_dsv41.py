@@ -160,7 +160,10 @@ CONN_ERRORS = ("Connection", "ConnectError", "RemoteProtocolError", "ReadError",
                "EngineCore encountered an issue", "EngineDeadError",
                # S27 (pod kill test 2026-10-29): Manh's vLLM answers a dying engine's in-flight requests with a plain
                # OpenAI-style 500 before its API server exits; counted as a try it cost every in-flight attempt 1 of 2
-               "The server had an error while processing your request")
+               "The server had an error while processing your request",
+               # pod 3, 2026-10-29: the OpenAI client reports httpx's ReadTimeout (above) as "APITimeoutError: Request
+               # timed out."; a turn that waited > 900 s in a full server queue cost its last try
+               "APITimeoutError", "Request timed out")
 TASK_LIMIT = env_num("ARC_TASK_LIMIT", 0, int)
 TASK_IDS = [t for t in E("ARC_TASK_IDS", "").split(",") if t]  # smoke tests: these tasks instead of the first N
 # E046 (opt-in): one attempt per task for tasks with several test inputs (all test inputs in one rollout, the answer

@@ -18,7 +18,7 @@ We SIGKILLed one TP worker with 63 requests running, under a restart supervisor.
 
 ## The three changes
 
-1. That 500 is in `CONN_ERRORS`: a free re-queue, like `EngineDeadError`.
+1. That 500 is in `CONN_ERRORS`: a free re-queue, like `EngineDeadError`. So is the OpenAI client's `APITimeoutError` ("Request timed out."), which is httpx's ReadTimeout, already meant to be free, under another name; pod 3 lost an attempt to it after a turn waited > 900 s in a full queue (commit 2).
 2. `ARC_CONN_TRIES` defaults to **12** when `ARC_EXTERNAL_SERVER_STATUS` is set (4 otherwise). Each restart costs every
    in-flight job at least one connection re-queue.
 3. `start_external()` waits while the status is not `up`. A restarted server can answer `/v1/models` on the same port
