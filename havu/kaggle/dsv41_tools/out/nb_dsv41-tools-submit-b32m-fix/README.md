@@ -81,3 +81,17 @@ at the max.
   - Hand projection from /proc/meminfo: ~154 GiB, ~19 GiB headroom.
   - Builder fix for future builds: without cgroup v2 stats the guard warns and skips. Kaggle (v2) is unchanged.
 - **The CV replica** of this notebook (rerun mode, x2t) started at 23:44 UTC on pod 2, with a TP-worker kill ~30 min in.
+
+## Open items from the overnight runs (for the next build; Kaggle V1 unchanged)
+
+- **Read timeouts cost a try.** A turn that waits > 900 s in a full vLLM queue fails as `APITimeoutError: Request timed
+  out.` That is httpx's ReadTimeout, which B32 meant to re-queue for free, under the OpenAI client's name.
+  - Pod 3 lost an attempt to it: KV 0.89-0.93, 3-6 waiting.
+  - The pinned solver is now `a9983f4c`, with that string in CONN_ERRORS. The same fix is in Manh's branch
+    `havu-s27-graceful-recovery` (`f2b03775d`).
+- **VRAM creep.** nvidia-smi free memory per GPU falls ~0.11 GiB per 30 min under load (pod 3 at util 0.90:
+  2.06 -> 1.68 GiB over 1 h 46 min; pod 2 saw ~0.13 at 0.94).
+  - If it is linear, it reaches 0 around hour 9.6 of a run.
+  - It is likely the torch caching allocator's reserved pool growing toward its cap, not live allocations, but that is
+    not proven. Pod 2's replica logs allocated vs reserved hourly.
+  - If it ends in an OOM, the supervisor restarts the server while >= 60 min remain before stop-new.

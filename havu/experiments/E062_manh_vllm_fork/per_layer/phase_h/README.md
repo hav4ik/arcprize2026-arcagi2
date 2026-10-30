@@ -293,9 +293,47 @@ Per worker, RssAnon minus Engram is ~15.2 GiB on every rank. That is the 12 GiB/
 - **Pod inputs:**
   - **Model:** E128, the Kaggle model chankhavu/dsv41-flash-1017-arc-tool-e128-2bit/PyTorch/default/1 (136 files, 131.09 GB), downloaded sequentially per file (`dl_kaggle_files.py`) to /root/models/e128. E72-152 was deleted first to make room (it is on HF).
     - Kaggle serves ~30-40 MB/s per 1.15 GB file, so ~25-29 MB/s overall: about 80 min.
+  - **E128 download:** DL_DONE ok=136 failed=0 in 4,128 s (~32 MB/s).
+    - sha256 of all 136 files matches the manifest embedded in the notebook's cell 1b (`verify_manifest.py`: VERIFY_OK).
+    - The dataset's `e043_manifest.json` is the pruning manifest, not a hash list.
   - **vllm-wheels v11** (listing through every page: 1,669 entries, 9.17 GB):
     - 293 of its 294 top-level wheels equal v10's by name and size. The vllm wheel changes from gf506afa210 to **g8cf0c0664b** (295,627,100 B); torch is unchanged.
     - The tree also holds 1,374 files (122 MB) in 4 nested source dirs: dion-0.1.0, liger_kernel-0.8.5, quack-kernels-0.6.5, sonic-moe-0.1.2.post1. These were also missing from the earlier v10 mapping. Manh's cell 3 copies them to /dev/shm, but no cell installs from them: cell 4 installs `/kaggle/working/quack-kernels`, which does not exist on Kaggle either. 1,374 sequential per-file downloads would take ~45 min, so they stay out.
   - **arc2-2026-src:** v22. The coordinator says any version works, because v6's cell 2m does not use --supervise.
   - **Unchanged:** cu13-install v2, dsv41-tools-kit v5 (same as the latest), unsloth-main v15.
 - **Tree:** `scripts/make_kaggle_tree.sh` now takes KT_MODEL_SLUG, KT_MODEL_DIR, KT_SRC_DIR and KT_WHEELS_DIR.
+- **v11 tree on the pod:** kagglehub resolved v11 for the new vllm wheel (sha256 5039fd7680a4) and .gitattributes. The other 293 wheels are hardlinks of the v10 set, and the nested source dirs are left out (see above).
+
+### Commit smoke f1_commit (23:36 UTC, bec71fb1e3f1): every check passes except the host RAM check, which fails on the pod's cgroup v1
+
+| cells | end |
+|---|---|
+| 0-9 | +3 s |
+| Manh's cell 4 | +44 s |
+| 2 (env) | +54 s |
+| 2m | +294 s |
+| 2s | +294 s |
+| 2b | +328 s |
+| 3 | +378 s |
+| 3s | +380 s |
+| 4 | +381 s |
+| verdict | +381 s, **raised** |
+
+- **Verdict:** `B32-M SMOKE FAILED: ['host RAM check: ValueError: max() iterable argument is empty']`.
+  - The pod runs cgroup v1: no /sys/fs/cgroup/memory.max or memory.stat. So every smoke_env sample has `stat: {}` and `memory.max: null`, and 4b's projection gets an empty list.
+  - Kaggle uses cgroup v2 (173 GiB), so the check computes there. But it fails closed wherever cgroup v2 is missing.
+  - The same formula from /proc/meminfo: peak anon 129.1 GiB (2b's sample) + Shmem 8.7 + 4 + 0.2 x 62 = ~154 GiB, ~19 GiB under 173.
+- **Settings:** "E046 settings: ARC_WORKERS 64, ARC_MULTI_TEST 1, ARC_MULTI_BUDGET 0.5, ARC_CONTEXT_LIMIT 163840, ARC_KV_ADMIT_MAX 0.85, …".
+- **0b:** "E046 CHECK OK", with solver_dsv41.py 1ea2b25d, run_deepseek_tools 882c817f, train_check 8fe36175, auto_repair 2292369c / 571f47eb. The kit unpacked with sha256 ok. **No cell 2r**; vLLM is the v11 wheel, unpatched.
+- **2m:** server up after 240 s. **KV 1,617,253 tokens at util 0.90** (E128).
+  - GPU free 2.46-2.51 GiB per rank after load; 2.01-2.07 GiB under the smoke (reserved 19.38, peak allocated 18.94 GiB). 0 OOMs.
+  - Model loading 14.33 GiB, 44.7 s per rank.
+- **2s:** "E066 SUPERVISOR: watching pid 156480 (max 2 restarts, stall 1500s, status …/e066_supervisor.json)".
+- **2b:** SANDBOX CHECK OK.
+- **2c:** contract `fail: []`.
+- **Cell 3:** 4 attempts on 2 tasks / 3 pairs, all submitted with train_pass, correct on every pair against the public training solutions. It ended at +0.10 h, right after the 2 tasks.
+- **3s:** "E066 supervisor stopped: {'restarts': 0, …}".
+- **3w:** contract thread finished.
+- **Cell 4:** submission.json valid; "Manh's server stopped".
+- **4b:** supervisor status `{"state": "up", "pid": 156480, "up_s": 240}`; model files 136, none missing; "E066 light smoke: 4 attempt records, 4 with an answer, 0 correct"; INPUT INTEGRITY OK (sha256 of every model file).
+- **Files:** `runs/nb_f1_commit_bec71fb1/`.

@@ -353,3 +353,30 @@ The supervisor itself (cell 2s) behaved as designed: death detected in < 1 s of 
 - GPU memory per worker process (nvidia-smi compute apps, the same on all 4 GPUs): 20,438 MiB from server up to 22:20, 20,478 MiB at 22:30, 20,580 MiB at 22:50.
   - That is +142 MiB in 45 min, in steps. Board used went from 20,477-20,531 to 20,619-20,673 MiB, and free from 2,036-2,090 to 1,894-1,948 MiB.
   - The rate is ~0.09 GiB per 30 min; pod 2 sees ~0.13.
+
+**23:57 (2.15 h elapsed):**
+- Stability: supervisor "up", start 1. No deaths beyond the kill; the r1 server.log has 0 tracebacks, 400s or 500s.
+- **Second lost attempt: f95b36dd.0#0.**
+  - It is one of the 64 that used a try at the kill (`retry ... APIError ...` at 22:06:49, then `re-queue ... Connection error` at 22:09:31).
+  - At 23:03:04 it ended as `[49] f95b36dd.0#0 pred=no stop=error turns=8 out=20811 ... 3212.1s`, error `TurnError: APITimeoutError: Request timed out.`
+  - The harness streams, and the solver's client uses `httpx.Timeout(7200, connect=30, read=900)`, so turn 8 got no chunk for 900 s.
+  - Turn 7 had completed; the trace (`traces/f95b36dd_p0_a0_r2.json.gz`) ends with the session-answer fallbacks, none accepted.
+  - The likely cause is a > 15 min wait in vLLM's waiting queue: KV 0.89-0.93, 3-6 waiting, 0 preemptions.
+  - `APITimeoutError` ("Request timed out.") is not in `CONN_ERRORS` (only "ReadTimeout" is), so a timeout costs a try even without a server death.
+- Throughput: KV-bound from ~60 min, at 395-536 gen/s with running 30-48 and KV 0.88-0.93. CPU-restored was 37-42% of prompt tokens in the 23:18-23:38 windows. 0 preemptions.
+- Progress: 79 first attempts done, 60 correct; 109 of 344 pairs answered; 48 running; 351 queued.
+- Host: AnonPages 137.6 GiB; RSS of all processes 136.7 GiB; MemAvailable 339 GiB. The peak is still 139.1 GiB.
+- GPU memory per worker process:
+
+  | UTC | MiB |
+  |---|---|
+  | 22:10 | 20,438 |
+  | 23:00 | 20,620 |
+  | 23:10 | 20,700 |
+  | 23:20 | 20,740 |
+  | 23:40 | 20,760 |
+  | 23:50 | 20,780 |
+  | 23:56 | 20,820 |
+
+  - That is +382 MiB in 1 h 46 min (~0.11 GiB per 30 min, in 20-100 MiB steps). Free per GPU is 1,654-1,708 MiB.
+  - Extrapolated linearly, the headroom runs out near 9.6 h elapsed, before the 11.5 h hard stop.
