@@ -32,7 +32,28 @@ whole run. Nothing is killed deliberately in this run.
     Also ALERT on: any CUDA OOM, allocator retry, engine death, supervisor restart, or stop=error attempt.
   - **Hourly:** `scripts/v12_report.py` (trend table in 30-min buckets, errors, accuracy, split table). `scripts/v12_wait.sh` copies the data to `manh_v12/data/` at each report.
 
-## Results
+## Final result (run ended 12:01:33 UTC, NOTEBOOK_DONE ok at +36,629 s = 10.17 h)
+- **Kaggle score (task-weighted) 80.83; per pair 277/344 = 80.52%.**
+  - Scored directly from the notebook's `submission.json` against evalx2t_s2026_solutions; `replica_report.py` gives the same.
+  - **On Kaggle's clock: 80.83** (pessimistic 80.62, optimistic 80.83), cluster-bootstrap sd 3.1. Report: `replica_report.md`.
+  - attempt_1 only: 75.62; attempt_2 adds +5.21.
+- **Coverage:** all 240 jobs finished both attempts, the last at 10.17 h. The force deadline was not reached and no attempt was cut by a deadline. 338 of 344 pairs have an answer; 6 rows stay at the fallback.
+- **Per-attempt accuracy** (finished attempts, per pair): attempt 0 72.1%, attempt 1 70.9%; train_pass True 83.4%.
+- **Stability:** 0 engine deaths, 0 supervisor restarts (start 0 ran 36,576 s; the supervisor stopped cleanly in cell 4), 0 errored attempts, 0 APITimeoutError or HTTP 500, 0 allocator retries, 0 OOMs.
+- **Memory over the whole run** (609 samples with the server up, 01:56-12:01):
+
+  | measure | extreme | limit / reference |
+  |---|---|---|
+  | host RAM, Kaggle-eq (cgroup rss + shmem + 7) | 133.3-135.1 GiB (meminfo form max 148.0) | 173.0 GiB, so >= 38 GiB headroom |
+  | VRAM cap - reserved (primary) | min 1.08 GiB (TP3), flat from 04:50 to the end | 0 |
+  | VRAM cap - peak | min 1.58 GiB | 0.26 alert |
+  | nvidia-smi free | min 1.32 GiB | board-level |
+  | sandboxes RSS | max 3.4 GiB | |
+
+- **Throughput:** 735-741 tok/s with 56-63 running in the first hour. Then KV-bound at 31-47 running, 510-630 tok/s (the solver's KV gate at 0.85, plus a server capacity queue at 1.5-2.5 h). Whole-run mean after the first 10 min: 561 tok/s at 37.2 running, including the idle tail after 9.5 h.
+- **Data** (`data/`): executed notebook with every cell output (`nbruns/m12_rerun/nb.ipynb`, `nb_outputs.txt`), timeline, solver/server/supervisor logs, attempts, metrics, traces, submission.json, `samp.jsonl` / `samp.alerts`, `gpumem.log`, `ram.tsv`, `tps.tsv`, `status.json`, `workload.txt`.
+
+## Results (as the run went)
 - **Start:**
   - Install cells finished at +43 s.
   - Server up at +297 s: his supervisor, start 0; `supervisor.json` reads `{"state": "up", "up_s": 245.2, "max_restarts": 3}`.

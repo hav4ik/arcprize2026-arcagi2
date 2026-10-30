@@ -4,7 +4,7 @@
 might be the prompting problem?" (E066: candidate 1 image 69.7 vs text 75.1 pass@1; the full model self-hosted with
 images 72.4 on 221/240 attempts vs the API's 81.1.)
 
-## Summary (as of 11:00 UTC; `vitdp` still running)
+## Summary (2026-10-30, 11:30 UTC; box runs done)
 1. **It is not the prompt.** Text and tokens are byte-identical to the API's, earlier reasoning stays in the prompt,
    and self-hosted text is as good as the API's. The loss is specific to images, and both self-hosted models show it.
 2. **It is perception.** Shown one rendered grid with no text, the self-hosted full model reads it much worse than the
@@ -21,6 +21,11 @@ images 72.4 on 221/240 attempts vs the API's 81.1.)
 5. **A smaller residual gap remains on larger grids** (exact -7.5 [-15.0, -0.8] vs the API, all of it on grids with
    more than 36 cells). Not the indexer precision (the reference also uses FP4) and not leftover widening (every
    widening path is gated on the flag).
+6. **The vision tower's TP split is not the cause of the size/exact gap:** replicating it per GPU (`vitdp`, run on the
+   bidirectional path; it was meant to run on top of `causal` but `box_run.sh` defines it on top of `ref`) leaves
+   exact and size unchanged (+0.8 / +0.8 vs `ref`). It did raise the answered rate (60.8 -> 75.8%) and colour-set
+   accuracy (+15.0 [+5.8, +24.2]) to the API's level, so the sharded ViT's numerics may cost something; `causal` +
+   unsharded ViT is untested.
 
 ## Paired re-analysis of E066's result files (no new runs; ARC Prize weighting per task-attempt)
 On the 221 task-attempts the self-hosted full-model image run (`e066_full_ref`) finished:
@@ -98,8 +103,10 @@ experts=None engram=None`). Raw files: `results/box/`.
 | `ref` (E066 settings) | 60.8 | 14.2 | 56.7 | 40.8 | 7.5 | 30 / 0 / 0 / 0 | 90.0 | 47 | 10.2k |
 | `ref_t06` (temperature 0.6, top_p 0.95) | 63.3 | 13.3 | 58.3 | 47.5 | 7.5 | | 92.3 | | 9.2k |
 | `causal` (causal image attention) | 67.5 | 25.8 | 60.8 | 51.7 | 18.3 | 67 / 7 / 0 / 0 | 98.4 | 39 | 9.4k |
-| `vitdp` (`causal` + vision tower unsharded) | pending | | | | | | | | |
+| `vitdp` (`ref` + vision tower unsharded; bidirectional, NOT on top of `causal`) | 75.8 | 15.0 | 71.7 | 47.5 | 8.3 | 33 / 0 / 0 / 0 | 90.7 | | 9.6k |
 
+`vitdp` − `ref`: size +0.8 [−3.3, +5.0], colours +15.0 [+5.8, +24.2], corners +6.7 [−2.5, +15.8], exact +0.8
+[+0.0, +2.5]; `vitdp` − API: size −19.2, exact −17.5, colours +2.5.
 `ref` − API: size −20.0 [−29.2, −11.7], colours −12.5 [−24.2, −0.8], corners −25.8 [−37.5, −13.3], exact −18.3
 [−26.7, −10.0]. `ref_t06` − API: the same (exact −18.3 [−26.7, −10.8]). `causal` − API: size −8.3 [−15.0, −1.7],
 colours −8.3 [−18.3, +1.7], corners −15.0 [−24.2, −5.8], exact −7.5 [−15.0, −0.8]; on the 54 calls `causal` finished
@@ -180,8 +187,12 @@ Lightning Indexer cache is MXFP4 ("Using MXFP4 indexer cache"); irrelevant for t
 - Box time used: ~3 h by the end of the planned arms (~$17 plus ~$3 traffic). API spend: the probe, $0.64.
 
 ## Status
-`causal` closed ~60% of the probe gap, not all, so `vitdp` (`causal` + `--mm-encoder-tp-mode data`) runs as agreed;
-`noprefix` dropped (see above). Then copy the results, stop the E068 servers and hand the box back to dsv4-pruning (not destroyed: at 10:56 UTC the user approved two E066 follow-ups on it, an expert-usage check with the fix and candidate 1's image re-eval; dsv4-pruning destroys the box after those). The full checkpoint stays at `/workspace/dsv4/DeepSeek-V4.1-Flash-1017`. Results and filtered server
-logs (`results/box/runs/`) are already copied.
-Open: the residual gap on larger grids; an ARC eval of the image harness with the fix (self-hosted full model and
-candidate 1), which decides whether images help on Kaggle.
+Done on the box (11:24 UTC): `ref`, `ref_t06`, `causal`, `vitdp`; `kvauto` impossible (see above), `noprefix` dropped
+(sample 0 vs 1 shows no prefix-cache effect). Results and filtered server logs are in `results/box/` and
+`results/box/runs/`. Node 5 went back to dsv4-pruning at 11:26 UTC with the full checkpoint in place (not destroyed:
+at 10:56 UTC the user approved two E066 follow-ups on it, an expert-usage check with the fix and candidate 1's
+image-harness re-eval; dsv4-pruning destroys the box after those).
+Open:
+- an ARC eval of the image harness with the fix (self-hosted full model and candidate 1), which decides whether
+  images help on Kaggle (candidate 1's re-eval is dsv4-pruning's);
+- the residual gap on larger grids; next cheap test: `causal` + `--mm-encoder-tp-mode data` (~35 min).

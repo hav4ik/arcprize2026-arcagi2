@@ -2,7 +2,9 @@
 # E066 follow-up to E068 (the fork attends bidirectionally over image spans; DeepSeek's reference is causal; user
 # 2026-10-30: "Expert check + C1 image re-eval"). On node 5 (Vast 58332344), after model-serving frees the GPUs:
 #  1. full model, VISION=1, E068's fix: --hf-overrides '{"is_mm_prefix_lm": false}' --disable-chunked-mm-input
-#  2. E066's calibration replays with the observer: image (374 rollouts / 12.0M tokens, seed 1) and text (12M, seed 1)
+#  2. E066's calibration replays with the observer, same selections: image (12M tokens, seed 1, minus the 7 preflight
+#     rollouts = 374 rollouts / 12,005,133 tokens; data/e066/e066_pre_manifest.jsonl rebuilt from the preflight's
+#     shard0 / 200k / seed 7) and text (12M, seed 1). Relative --tok paths as in E066 (the exclude keys use them).
 #  3. aggregate, select E128 with candidate 1's class weights, compare with candidate 1's keep set (keep_shift.py)
 #  4. swapped >= SHIFT_MAX experts per layer on average: stop with DECISION_NEEDED, full model still up (a re-prune
 #     starts with gptq_candidate.sh dump on it); else stop it and serve candidate 1 with the fix (serve_eval.sh c1xc)
@@ -17,6 +19,7 @@ E=$D/data/e066
 log() { echo "$(date -u +%H:%M:%S) $*"; }
 mkdir -p /dev/shm/e043 obs logs
 echo '{"engram_keep": null, "expert_keep": null, "observe": null}' > $CTRL
+if [ "${SKIP_SERVE:-0}" != 1 ]; then  # SKIP_SERVE=1: imgF already up from an earlier start
 VISION=1 GPUS=0,1,2,3 TP=4 PORT=18001 CTRL=$CTRL MODEL=$D/DeepSeek-V4.1-Flash-1017 bash $S43/serve.sh imgF \
   --limit-mm-per-prompt '{"image": 64}' --hf-overrides '{"is_mm_prefix_lm": false}' --disable-chunked-mm-input
 for i in $(seq 1 120); do
@@ -25,15 +28,16 @@ for i in $(seq 1 120); do
   sleep 15
 done
 curl -s -m 5 http://127.0.0.1:18001/v1/models | grep -q dsv41 || { log "SERVE_FAILED imgF"; tail -20 runs/imgF/server.log; exit 1; }
+fi
 grep -q "'hf_overrides': {'is_mm_prefix_lm': False}" runs/imgF/server.log || { log "FIX_NOT_APPLIED imgF"; exit 1; }
 log "READY imgF | $(grep 'ctrl loaded' runs/imgF/server.log | tail -1 | cut -c1-120)"
 rm -rf obs/e066f_img obs/e066f_txt
-$D/tvenv/bin/python $S/replay_mm.py --tok $E/tok_img_calib_s/shard* --parquet $E/e065_image.parquet --tokens 15000000 \
-  --seed 1 --server http://127.0.0.1:18001 --ctrl $CTRL --obs-dir $D/obs/e066f_img --engram-keep $G \
-  > logs/replay_img_fixed.log 2>&1
+$D/tvenv/bin/python $S/replay_mm.py --tok data/e066/tok_img_calib_s/shard* --parquet $E/e065_image.parquet \
+  --tokens 12000000 --seed 1 --exclude $E/e066_pre_manifest.jsonl --server http://127.0.0.1:18001 --ctrl $CTRL \
+  --obs-dir $D/obs/e066f_img --engram-keep $G > logs/replay_img_fixed.log 2>&1
 log "image replay: $(tail -1 logs/replay_img_fixed.log)"
-grep -q '"rollouts": 374' logs/replay_img_fixed.log || { log "IMAGE_REPLAY_DIFFERS (E066: 374 rollouts)"; exit 1; }
-$D/tvenv/bin/python $S43/replay_reap.py --tok $E/tok_txt_calib_sub --tokens 12000000 --seed 1 \
+grep -q '"rollouts": 374, "tokens": 12005133' logs/replay_img_fixed.log || { log "IMAGE_REPLAY_DIFFERS (E066: 374 / 12005133)"; exit 1; }
+$D/tvenv/bin/python $S43/replay_reap.py --tok data/e066/tok_txt_calib_sub --tokens 12000000 --seed 1 \
   --server http://127.0.0.1:18001 --ctrl $CTRL --obs-dir $D/obs/e066f_txt --engram-keep $G > logs/replay_txt_fixed.log 2>&1
 log "text replay: $(tail -1 logs/replay_txt_fixed.log)"
 for p in "img_causal obs/e066f_img" "txt obs/e066f_txt"; do
