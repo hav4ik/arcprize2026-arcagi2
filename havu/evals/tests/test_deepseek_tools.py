@@ -674,6 +674,60 @@ class TextImageContentTest(unittest.TestCase):
         self.assertEqual(deepseek_tokens([[0] * 16] * 11), 189)       # measured
 
 
+class E070ImageLayoutTest(unittest.TestCase):
+    """E070 --image-layout pair|sheet (Manh's --vision-layout): several grids per image, tile-aligned, test alone."""
+
+    TRAIN = [{"input": [[1, 2], [3, 4]], "output": [[4]]}, {"input": [[0] * 30] * 30, "output": [[5] * 13] * 13}]
+
+    def images(self, parts):
+        import base64, io
+        from PIL import Image
+        return [Image.open(io.BytesIO(base64.b64decode(p["image_url"]["url"].split(",")[1])))
+                for p in parts if p["type"] == "image_url"]
+
+    def test_pair_and_sheet_parts(self):
+        from run_deepseek_tools import layout_image_content
+        pair = layout_image_content("PROMPT", self.TRAIN, [[[7, 7, 7]]], "pair")
+        self.assertTrue(pair[0]["text"].startswith("PROMPT") and "input on the left" in pair[0]["text"])
+        labels = [p["text"].strip() for p in pair[1:] if p["type"] == "text"]
+        self.assertEqual(labels, ["Example 0, input (left) 2x2 -> output (right) 1x1:",
+                                  "Example 1, input (left) 30x30 -> output (right) 13x13:", "Test input (1x3):"])
+        sheet = layout_image_content("PROMPT", self.TRAIN, [[[7, 7, 7]], [[1]]], "sheet")
+        labels = [p["text"].strip() for p in sheet[1:] if p["type"] == "text"]
+        self.assertEqual(labels, ["Training sheet, one example per row, input (left) -> output (right) "
+                                  "(row 0: example 0, 2x2 -> 1x1; row 1: example 1, 30x30 -> 13x13):",
+                                  "Test input 0 (1x3):", "Test input 1 (1x1):"])
+        for img in self.images(pair) + self.images(sheet):  # whole tiles, within the API's no-rescale range
+            w, h = img.size
+            self.assertEqual((w % 42, h % 42), (0, 0))
+            self.assertTrue(169 <= (w // 42) * (h // 42) <= 1024)
+
+    def test_cells_and_pages(self):
+        from arc_harness.grid_image import render_rows, rows_cell, sheet_pages
+        self.assertEqual(rows_cell([[[[0] * 13] * 13]]), 42)                    # 169 tiles at one tile per cell
+        self.assertEqual(rows_cell([[[[0] * 30] * 30, [[0] * 30] * 30]]), 28)   # 62x30 cells > 1024 tiles at 42
+        self.assertEqual(rows_cell([[[[0] * 30] * 30] * 3] * 3), 14)            # 94x94 cells = 32x32 tiles at 14
+        self.assertIsNone(rows_cell([[[[0] * 30] * 30] * 4] * 4))               # 124x124 cells: no fit even at 14
+        big = ([[0] * 30] * 30, [[1] * 30] * 30)
+        pages = sheet_pages([big] * 5)
+        self.assertEqual([s for s, _ in pages], [0, 4])                         # 4 big pairs fit at 14 px, then split
+        self.assertEqual(sum(len(p) for _, p in pages), 5)
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(render_rows([[[[1]], [[2]]]], rows_cell([[[[1]], [[2]]]]))))
+        cell = rows_cell([[[[1]], [[2]]]])
+        self.assertEqual(img.getpixel((0, 0)), (0, 116, 217))                   # input cell (blue)
+        self.assertEqual(img.getpixel((cell + 1, 0)), (255, 255, 255))          # the white gap
+        self.assertEqual(img.getpixel((3 * cell, 0)), (255, 65, 54))            # output cell (red), 2 gap cells later
+
+    def test_option_default_and_config(self):
+        from run_deepseek_tools import V6_DEFAULTS, harness_version
+        ok = parser().parse_args(["--grid-format", "text+image", "--image-cell", "0", "--image-layout", "pair"])
+        self.assertEqual((ok.image_layout, V6_DEFAULTS["image_layout"]), ("pair", "grid"))  # recorded when not grid
+        self.assertEqual(parser().parse_args([]).image_layout, "grid")
+        self.assertEqual(harness_version(ok), "persistent-v6")
+
+
 class E064VisionTests(unittest.TestCase):
     """E064 --show-tool / --check-image / --image-note: grids drawn as images inside tool results."""
 

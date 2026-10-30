@@ -41,7 +41,13 @@ def main():
     out = Path(a.out)
     bb, ic, tx = load(a.both_bidir), load(a.img_causal), load(a.txt)
     ib = {k: bb[k] - tx[k] for k in bb}  # E066's image replay alone (bidirectional path)
-    assert (ib["N"] >= 0).all() and (ib["pos"] >= 0).all(), "text stats exceed the combined stats: not the same text"
+    # the text stream must be E066's own (positions per class equal); per-expert counts differ by run-to-run routing
+    # noise between servers, so rare experts can go slightly negative: clip them and report how many
+    assert (ib["pos"] == ic["pos"]).all(), f"text positions differ from E066's: {ib['pos']} vs image {ic['pos']}"
+    neg = {"entries": int((ib["N"] < 0).sum()), "selections": int(-ib["N"][ib["N"] < 0].sum()),
+           "share_of_selections": float(-ib["N"][ib["N"] < 0].sum() / max(1, ib["N"][ib["N"] > 0].sum()))}
+    for k in ("N", "A", "W"):
+        ib[k] = np.maximum(ib[k], 0)
     np.savez(out.parent / "stats_img_bidir.npz", **ib)
     bc = {k: ic[k] + tx[k] for k in ic}
     np.savez(out.parent / "stats_both_causal.npz", **bc)
@@ -52,6 +58,7 @@ def main():
         "positions": {"img_bidir": dict(zip(CLASSES, ib["pos"].tolist())), "img_causal": dict(zip(CLASSES, ic["pos"].tolist())),
                       "txt": dict(zip(CLASSES, tx["pos"].tolist()))},
         "same_image_stream": bool((ib["pos"] == ic["pos"]).all()),
+        "img_bidir_clipped": neg,
         "overlap_new_vs_c1": {"mean": round(float(ov.mean()), 2), "min": int(ov.min()),
                               "swapped_mean": round(float(128 - ov.mean()), 2),
                               "layers_swapped_ge4": [int(i) for i in np.flatnonzero(128 - ov >= 4)],

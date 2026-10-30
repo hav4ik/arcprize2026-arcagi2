@@ -76,6 +76,86 @@ def data_uri(grid, cell=32):
     return "data:image/png;base64," + base64.b64encode(render(grid, cell)).decode()
 
 
+# E070 (Manh's --vision-layout): several grids in one image. Rows of grids, left to right with GAP white cells between
+# grids and between rows, on white (not an ARC colour); the image is padded with white to whole DeepSeek tiles so the
+# API never rescales it. Cell sides stay aligned to DeepSeek's geometry: 42*k px (k x k tiles per cell, smallest k
+# reaching 169 tiles) when one tile per cell fits in 1,024 tiles, else 28 or 14 px (one ViT patch).
+ROW_GAP = 2
+SUB_TILE_CELLS = (28, 14)
+
+
+def rows_cells(rows):
+    """(width, height) in cells of an image of `rows` (lists of grids)."""
+    w = max(sum(len(g[0]) for g in row) + ROW_GAP * (len(row) - 1) for row in rows)
+    h = sum(max(len(g) for g in row) for row in rows) + ROW_GAP * (len(rows) - 1)
+    return w, h
+
+
+def _tiles(px):
+    return -(-px // DS_TILE)
+
+
+def rows_cell(rows):
+    """Pixels per cell for the multi-grid image of `rows`, or None if it cannot fit in DS_MAX_TILES tiles."""
+    w, h = rows_cells(rows)
+    k = 1
+    while w * h * k * k < DS_MIN_TILES:
+        k += 1
+    if w * h * k * k <= DS_MAX_TILES:
+        return DS_TILE * k
+    for cell in SUB_TILE_CELLS:
+        tw, th = _tiles(w * cell), _tiles(h * cell)
+        if DS_MIN_TILES <= tw * th <= DS_MAX_TILES:
+            return cell
+    return None
+
+
+def render_rows(rows, cell):
+    """PNG bytes of `rows` drawn at `cell` px per cell, padded to whole 42-px tiles."""
+    w, h = rows_cells(rows)
+    img = Image.new("RGB", (_tiles(w * cell) * DS_TILE, _tiles(h * cell) * DS_TILE), (255, 255, 255))
+    y = 0
+    for row in rows:
+        x = 0
+        for g in row:
+            gh, gw = len(g), len(g[0])
+            small = Image.new("RGB", (gw, gh))
+            small.putdata([PALETTE[v] for r in g for v in r])
+            img.paste(small.resize((gw * cell, gh * cell), Image.NEAREST), (x * cell, y * cell))
+            x += gw + ROW_GAP
+        y += max(len(g) for g in row) + ROW_GAP
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def rows_data_uri(rows, cell):
+    return "data:image/png;base64," + base64.b64encode(render_rows(rows, cell)).decode()
+
+
+def rows_tokens(rows, cell):
+    """Prompt tokens DeepSeek charges for the image of `rows` at `cell` px (see deepseek_tokens)."""
+    w, h = rows_cells(rows)
+    tw, th = _tiles(w * cell), _tiles(h * cell)
+    return tw * th + th + 2
+
+
+def sheet_pages(pairs):
+    """Training pairs (input, output) packed greedily, in order, into as few sheet images as fit DeepSeek's tile cap;
+    returns a list of (first_index, [pairs]). A pair that fits nowhere alone raises ValueError."""
+    pages, cur, start = [], [], 0
+    for i, p in enumerate(pairs):
+        if cur and rows_cell([[a, b] for a, b in cur + [p]]) is None:
+            pages.append((start, cur))
+            cur, start = [], i
+        if rows_cell([[p[0], p[1]]]) is None:
+            raise ValueError(f"training pair {i} does not fit in {DS_MAX_TILES} tiles even at {SUB_TILE_CELLS[-1]} px")
+        cur.append(p)
+    if cur:
+        pages.append((start, cur))
+    return pages
+
+
 def visual_tokens(grid, cell=32, patch=16, merge=2):
     """LLM visual tokens for an unresized image of `grid` (excluding the vision start/end markers)."""
     h, w = len(grid) * cell, len(grid[0]) * cell

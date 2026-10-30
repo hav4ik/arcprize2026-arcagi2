@@ -37,7 +37,8 @@ from test_b32m import manh_stub  # noqa: E402
 SCRATCH = Path(tempfile.mkdtemp(prefix="input_scans_"))
 # frozen, sha256-pinned copies of submitted candidates (B32 77fe80a3, B32.1, V6, the unused E064 variant): left
 # byte-identical; their only input scan sits behind ARC_MODEL_DIR, which every notebook's solver cell passes
-FROZEN = ("pinned_candb", "pinned_candb1", "pinned_mtf_v6", "pinned_manh")
+FROZEN = ("pinned_candb", "pinned_candb1", "pinned_mtf_v6", "pinned_manh",
+          "pinned_v12img")  # V12 + images: V12's solver 11bfaaaa + the image switch (its lookup unchanged)
 # built outputs, downloaded runs, review copies, tests, vendored vLLM sources, data
 SKIP_DIRS = {"out", "runs", "reviews", "tests", "tests_mtf_v6", "vllm_overlay_src", "datasets", "__pycache__"} | set(FROZEN)
 MANH_PULL = Path("/tmp/claude-1000/-home-vu-Workspace-ARC-AGI-2/81e68821-e1f4-4b05-bad6-9a606f77ad54/scratchpad/"
@@ -246,6 +247,8 @@ class Built(unittest.TestCase):
                                 ("img_manh_load", ["--text", "--commit", "load"])):
                 run([D / "build_img_manh.py", "--manh-nb", TI.MANH_V4, "--out", SCRATCH / name] + extra)
                 cls.add(name, SCRATCH / name)
+        run([D / "build_v12_img.py", "--out", SCRATCH / "v12_img"])  # V12 + images (Manh's V12 as pulled)
+        cls.add("v12_img", SCRATCH / "v12_img")
         if (MANH_PULL / "kernel-metadata.json").exists():
             run([D / "build_manh_stack.py", "--manh-nb", MANH_PULL, "--out", SCRATCH / "manh_stack"])
             cls.add("manh_stack", SCRATCH / "manh_stack")
@@ -258,7 +261,7 @@ class Built(unittest.TestCase):
 
     def test_every_builder_was_built(self):
         want = {"nb_submit", "nb_smoke", "nb_bench", "nb_evalbench-w48", "nb_evalbench-w64", "frozen", "frozen_smoke",
-                "b32m", "b32m_load", "img", "img_load", "img_ext"}
+                "b32m", "b32m_load", "img", "img_load", "img_ext", "v12_img"}
         self.assertLessEqual(want, set(self.built))
 
     def test_no_code_cell_scans_the_input_root(self):

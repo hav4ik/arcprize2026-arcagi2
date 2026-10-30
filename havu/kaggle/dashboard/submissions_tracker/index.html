@@ -28,6 +28,15 @@
   .arc-legend i { display: inline-block; width: .7rem; height: .7rem; border-radius: 2px; margin-right: .35rem; vertical-align: -1px; }
   .arc-tip { position: absolute; pointer-events: none; background: var(--cds-surface-popover); border: 1px solid var(--cds-border); border-radius: var(--cds-radius); box-shadow: var(--cds-shadow-popover); padding: var(--cds-pad-xs) var(--cds-pad-sm); font-size: var(--cds-font-size-caption); white-space: nowrap; }
   .arc-tip .t { color: var(--cds-text-secondary); }
+  .arc-picker { display: flex; flex-direction: column; gap: var(--cds-gap-sm); }
+  .arc-picker-bar { display: flex; flex-wrap: wrap; gap: var(--cds-gap-sm); align-items: center; }
+  .arc-btn { font: inherit; font-size: var(--cds-font-size-caption); color: var(--color-fg); background: transparent; border: 1px solid var(--color-border-line); border-radius: 999px; padding: .3rem .8rem; min-height: 2.25rem; cursor: pointer; display: inline-flex; align-items: center; gap: .45rem; text-align: left; }
+  .arc-btn i { width: .75rem; height: .75rem; border-radius: 2px; border: 2px solid var(--run, currentColor); box-sizing: border-box; flex: none; }
+  .arc-btn[aria-pressed=true] { border-color: var(--run, var(--color-fg)); background: color-mix(in srgb, var(--run, var(--color-fg)) 16%, transparent); }
+  .arc-btn[aria-pressed=true] i { background: var(--run, currentColor); }
+  .arc-btn[aria-pressed=false] { color: var(--color-fg-muted); }
+  .arc-btn:focus-visible { outline: 2px solid var(--color-fg); outline-offset: 2px; }
+  .arc-sep { width: 1px; align-self: stretch; background: var(--color-border-line); }
   .arc [data-dash-source-state=empty] { color: transparent; }
   .arc [data-dash-source-state=refreshing] { opacity: .5; transition: opacity var(--cds-dur-slow); }
 </style>
@@ -35,8 +44,19 @@
 <div class="arc">
   <header>
     <h1>ARC-AGI-2 submissions tracker</h1>
-    <p class="arc-take">Two 12-hour replicas test the last two Kaggle submissions on 4×L4 pods (240 tasks, rerun mode), with host RAM and GPU memory tracked against Kaggle's limits. The question: why did B32-M drop to 46.5, and is Manh's submission safe?</p>
+    <p class="arc-take">12-hour replicas of our Kaggle notebooks on 4×L4 pods (240 tasks, rerun mode), with host RAM and GPU memory tracked against Kaggle's limits. Manh's V12 is the gold standard: 80.83 with no OOMs, deaths or retries. B32-M's 46.5 came from repeated GPU OOMs. V1 is dropped: its fault tests showed that a crash costs ~40 min of solving and a hang ~78 min.</p>
   </header>
+
+  <section class="arc-card arc-picker" id="picker" aria-label="Runs shown">
+    <div class="arc-tile-label">Runs shown in every chart and table below</div>
+    <div class="arc-picker-bar">
+      <button type="button" class="arc-btn" data-pick="all" aria-pressed="false">All</button>
+      <button type="button" class="arc-btn" data-pick="default" aria-pressed="true">Default</button>
+      <span class="arc-sep" aria-hidden="true"></span>
+      <div class="arc-picker-bar" data-draw="run_buttons" data-source="runs"></div>
+    </div>
+    <div class="arc-tile-note">Default is the live run, Manh V12 (the gold standard) and the B32 reference. Tap a run to add or remove it.</div>
+  </section>
 
   <section class="arc-tiles" aria-label="Headline figures">
     <div class="arc-card">
@@ -86,7 +106,7 @@
     <div class="arc-scroll">
       <table data-source="events" data-row-key="utc">
         <thead><tr><th data-field="utc">UTC</th><th data-field="run">Run</th><th data-field="kaggle_h">Hour</th><th data-field="event">Event</th></tr></thead>
-        <tbody data-draw="events_body"></tbody>
+        <tbody data-draw="events_body" data-source="runs"></tbody>
       </table>
     </div>
   </section>
@@ -99,25 +119,25 @@
         <h2>Host RAM, Kaggle-equivalent (GiB)</h2>
         <p class="arc-note">Over 173 GiB, Kaggle's kernel kills processes: sandboxes first, then a vLLM worker.</p>
         <p class="arc-empty" data-empty-for="ram">No Kaggle-equivalent RAM samples yet: the two new replicas' samplers fill this.</p>
-        <div class="arc-chart" data-draw="ramchart" data-source="mem outages"></div>
+        <div class="arc-chart" data-draw="ramchart" data-source="mem outages runs"></div>
       </div>
       <div class="arc-card">
         <h2>Free GPU memory, lowest GPU (GiB)</h2>
         <p class="arc-note">Lowest GPU, as vLLM reports it. B32-M's replica holds 0.35 GiB per GPU to match Kaggle's tighter headroom.</p>
         <p class="arc-empty" data-empty-for="vram">No GPU memory samples yet.</p>
-        <div class="arc-chart" data-draw="vramchart" data-source="mem outages"></div>
+        <div class="arc-chart" data-draw="vramchart" data-source="mem outages runs"></div>
       </div>
       <div class="arc-card">
         <h2>Spare room under PyTorch's cap, lowest GPU (GiB)</h2>
         <p class="arc-note">Cap minus peak allocated. It shrinks as long prompts arrive; near 0 a prefill runs out of GPU memory, the suspected B32-M failure.</p>
         <p class="arc-empty" data-empty-for="cap">No allocator samples yet.</p>
-        <div class="arc-chart" data-draw="capchart" data-source="mem outages"></div>
+        <div class="arc-chart" data-draw="capchart" data-source="mem outages runs"></div>
       </div>
       <div class="arc-card">
         <h2>Unreserved room under the cap, lowest GPU (GiB)</h2>
         <p class="arc-note">Cap minus reserved: the real margin. B32-M's replica hit its OOM when this reached ~0.03 GiB, while spare room over the peak still read 0.40.</p>
         <p class="arc-empty" data-empty-for="capres">No samples yet.</p>
-        <div class="arc-chart" data-draw="capreschart" data-source="mem outages"></div>
+        <div class="arc-chart" data-draw="capreschart" data-source="mem outages runs"></div>
       </div>
     </div>
   </section>
@@ -130,13 +150,13 @@
         <h2>Score so far (ARC task score, %)</h2>
         <p class="arc-note">Rises as tasks get answered; a flat stretch is an outage or long attempts still running.</p>
         <p class="arc-empty" data-empty-for="score">No finished attempts yet.</p>
-        <div class="arc-chart" data-draw="scorechart" data-source="acc outages"></div>
+        <div class="arc-chart" data-draw="scorechart" data-source="acc outages runs"></div>
       </div>
       <div class="arc-card">
         <h2>Tasks with an answer (of 240)</h2>
         <p class="arc-note">A task counts once any attempt (or a kept session answer) has a prediction.</p>
         <p class="arc-empty" data-empty-for="answered">No finished attempts yet.</p>
-        <div class="arc-chart" data-draw="answeredchart" data-source="acc outages"></div>
+        <div class="arc-chart" data-draw="answeredchart" data-source="acc outages runs"></div>
       </div>
     </div>
   </section>
@@ -149,13 +169,13 @@
         <h2>Generated tokens per second</h2>
         <p class="arc-note">Whole server, all four GPUs. B32 on its own stack averaged 386 tok/s over 12 h (468 in its first hour).</p>
         <p class="arc-empty" data-empty-for="tps">No throughput samples yet.</p>
-        <div class="arc-chart" data-draw="tpschart" data-source="tps outages"></div>
+        <div class="arc-chart" data-draw="tpschart" data-source="tps outages runs"></div>
       </div>
       <div class="arc-card">
         <h2>Requests running</h2>
         <p class="arc-note">Requests the server is decoding. Below the solver's worker count, the KV gate or long tool calls are holding attempts back.</p>
         <p class="arc-empty" data-empty-for="running">No throughput samples yet.</p>
-        <div class="arc-chart" data-draw="runningchart" data-source="tps outages"></div>
+        <div class="arc-chart" data-draw="runningchart" data-source="tps outages runs"></div>
       </div>
     </div>
   </section>
@@ -192,7 +212,7 @@
 </div>
 
 <script>
-  const KAGGLE_RAM_LIMIT = 173, RAM_WARN = 155, RAM_ALERT = 165, VRAM_WARN = 1.0, VRAM_ALERT = 0.5, CAP_ALERT = 0.26, CAP_WARN = 0.75;
+  const V12_GOLD = 80.83, KAGGLE_RAM_LIMIT = 173, RAM_WARN = 155, RAM_ALERT = 165, VRAM_WARN = 1.0, VRAM_ALERT = 0.5, CAP_ALERT = 0.26, CAP_WARN = 0.75;
   const f1 = d3.format(',.1f'), f2 = d3.format('.2f'), fInt = d3.format(',');
   const isNum = (v) => v !== null && v !== undefined && v !== '' && !isNaN(+v);
   const show = (v, f) => (isNum(v) ? f(+v) : '—');
@@ -245,6 +265,7 @@
     tb.replaceChildren();
     if (d.status !== 'ok') return;
     for (const r of d.data) {
+      if (!isShown(r.run)) continue;
       const tr = document.createElement('tr');
       cell(tr, r.run); cell(tr, r.pod);
       // Short state in the pill, the detail in brackets underneath, so the table stays narrow.
@@ -298,7 +319,16 @@
   });
 
   // One colour per run in every chart: live replicas first, then stopped ones, then anything new.
-  const RUN_ORDER = ['Manh V12 replica', 'B32-M V3 replica', 'Ours V1 replica (stopped)', 'C1 image run 3 (stopped)'];
+  const RUN_ORDER = ['Manh V12 replica', 'B32-M V3 replica', 'Ours V1 qualification', 'SFT 025ep on V12', 'V12 + images FINAL', 'V12 + images (causal) r0', 'Ours V1 replica (stopped)', 'C1 image run 3 (stopped)', 'B32 replica (LB 68.89), 10-27'];
+  // Which runs are shown: the `runs` filter (a list), or the default when it is not set.
+  const allRuns = () => { const d = dash.data('runs'); return d.status === 'ok' ? d.data.map((r) => r.run) : []; };
+  const defaultRuns = () => {
+    const d = dash.data('runs');
+    return d.status === 'ok' ? d.data.filter((r) => String(r.status).startsWith('running') || r.run === 'Manh V12 replica' || String(r.run).startsWith('B32 replica')).map((r) => r.run) : [];
+  };
+  const pickedList = () => { const p = dash.params().runs; const l = Array.isArray(p) ? p : (typeof p === 'string' && p ? [p] : []); return l.length ? l : null; };
+  const selected = () => new Set(pickedList() || defaultRuns());
+  const isShown = (run) => { const known = allRuns(); return !run || !known.includes(run) || selected().has(run); };
   const runColor = (run) => {
     let i = RUN_ORDER.indexOf(run);
     if (i < 0) { RUN_ORDER.push(run); i = RUN_ORDER.length - 1; }
@@ -309,7 +339,7 @@
     el.replaceChildren();
     const empties = document.querySelectorAll(`[data-empty-for="${opts.key}"]`);
     if (d.status !== 'ok') { empties.forEach((e) => { e.hidden = true; }); return; }
-    const rows = d.data.filter((r) => isNum(r[field]) && isNum(r.t_h)).map((r) => ({run: r.run, t: +r.t_h, v: +r[field]}));
+    const rows = d.data.filter((r) => isNum(r[field]) && isNum(r.t_h) && isShown(r.run)).map((r) => ({run: r.run, t: +r.t_h, v: +r[field]}));
     empties.forEach((e) => { e.hidden = rows.length > 0; });
     if (!rows.length) return;
     const series = d3.groups(rows, (r) => r.run).map(([run, pts]) => ({run, pts: pts.sort((a, b) => a.t - b.t)}))
@@ -404,6 +434,7 @@
     if (d.status !== 'ok') return;
     const tone = {warn: 'is-warn', bad: 'is-bad', ok: 'is-ok'};
     for (const e of d.data) {
+      if (!isShown(e.run)) continue;
       const tr = document.createElement('tr');
       cell(tr, e.utc); cell(tr, e.run); cell(tr, show(e.kaggle_h, f2), 'num');
       const ev = cell(tr, e.event, 'wrap'); if (tone[e.kind]) ev.classList.add(tone[e.kind]);
@@ -414,9 +445,40 @@
     key: 'capres', fmt: (v) => f2(v), yMin: () => 0, yMax: (v) => Math.max(v, 1.6),
     limits: [{v: 0.15, label: 'alert 0.15'}, {v: 0.05, label: 'OOM risk 0.05', critical: true}],
   }));
+  dash.draw('run_buttons', (el) => {
+    const d = dash.data('runs');
+    el.replaceChildren();
+    if (d.status !== 'ok') return;
+    const sel = selected();
+    for (const r of d.data) {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'arc-btn'; b.dataset.run = r.run;
+      b.setAttribute('aria-pressed', sel.has(r.run) ? 'true' : 'false');
+      b.style.setProperty('--run', runColor(r.run));
+      const sw = document.createElement('i');
+      b.append(sw, document.createTextNode(r.run));
+      el.append(b);
+    }
+    const everything = allRuns().every((r) => sel.has(r));
+    document.querySelectorAll('#picker [data-pick]').forEach((b) => {
+      b.setAttribute('aria-pressed', String(b.dataset.pick === 'all' ? everything && !!pickedList() : !pickedList()));
+    });
+  });
+  const picker = document.getElementById('picker');
+  if (picker) picker.addEventListener('click', (ev) => {
+    const b = ev.target.closest('button');
+    if (!b) return;
+    if (b.dataset.pick === 'all') dash.setParams({runs: allRuns()});
+    else if (b.dataset.pick === 'default') dash.setParams({runs: null});
+    else if (b.dataset.run) {
+      const sel = selected();
+      if (sel.has(b.dataset.run)) sel.delete(b.dataset.run); else sel.add(b.dataset.run);
+      if (sel.size) dash.setParams({runs: allRuns().filter((r) => sel.has(r))});
+    }
+  });
   dash.draw('scorechart', (el) => lineChart(el, 'score_so_far', {
     key: 'score', src: 'acc', unit: '%', fmt: (v) => d3.format('.1f')(v), yMin: () => 0, yMax: (v) => Math.max(v, 80),
-    limits: [{v: 68.89, label: 'B32 LB 68.89'}, {v: 46.5, label: 'B32-M LB 46.5', critical: true}],
+    limits: [{v: V12_GOLD, label: 'V12 replica 80.83 (gold standard)'}, {v: 68.89, label: 'B32 LB 68.89'}, {v: 46.5, label: 'B32-M LB 46.5', critical: true}],
   }));
   dash.draw('answeredchart', (el) => lineChart(el, 'tasks_answered', {
     key: 'answered', src: 'acc', unit: 'tasks', fmt: (v) => d3.format(',.0f')(v), yMin: () => 0, yMax: (v) => Math.max(v, 240),

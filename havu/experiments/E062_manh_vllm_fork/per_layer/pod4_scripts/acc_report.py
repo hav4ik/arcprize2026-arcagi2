@@ -14,7 +14,18 @@ if not pts:
 last = pts[-1]
 print(f"score so far {last['score_so_far']:.2f} / 100 over 240 tasks; tasks answered {last['tasks_answered']}/240; "
       f"first-attempt acc {last['first_attempt_acc']}% (at Kaggle {last['t_h']:.2f} h)")
-at = lambda h: ([p for p in pts if p["t_h"] <= h] or [{"score_so_far": 0.0, "tasks_answered": 0, "first_attempt_acc": None, "t_h": 0}])[-1]
+import os, tempfile
+LINES = [l for l in open(f"{D}/attempts.jsonl") if l.strip()]
+def at(h):
+    """exact state at Kaggle h: the tool on the attempts finished by h (its last point)"""
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+        f.writelines(l for l in LINES if float(json.loads(l).get("t_end_h") or 0) <= h)
+    try:
+        q = json.loads(subprocess.run([sys.executable, TOOL, "pod4", f.name, SOL], capture_output=True, text=True,
+                                      check=True).stdout)
+    finally:
+        os.unlink(f.name)
+    return q[-1] if q else {"score_so_far": 0.0, "tasks_answered": 0, "first_attempt_acc": None, "t_h": 0}
 print("| Kaggle h (end) | score so far | tasks answered | first-attempt acc % |")
 print("|---|---|---|---|")
 for h in range(1, int(last["t_h"]) + 2):

@@ -31,16 +31,20 @@ curl -s -m 5 http://127.0.0.1:18001/v1/models | grep -q dsv41 || { log "SERVE_FA
 fi
 grep -q "'hf_overrides': {'is_mm_prefix_lm': False}" runs/imgF/server.log || { log "FIX_NOT_APPLIED imgF"; exit 1; }
 log "READY imgF | $(grep 'ctrl loaded' runs/imgF/server.log | tail -1 | cut -c1-120)"
-rm -rf obs/e066f_img obs/e066f_txt
+rm -rf obs/e066f_txt
+if [ "${SKIP_IMG:-0}" != 1 ]; then  # SKIP_IMG=1: obs/e066f_img and stats_img_causal.npz already complete
+rm -rf obs/e066f_img
 $D/tvenv/bin/python $S/replay_mm.py --tok data/e066/tok_img_calib_s/shard* --parquet $E/e065_image.parquet \
   --tokens 12000000 --seed 1 --exclude $E/e066_pre_manifest.jsonl --server http://127.0.0.1:18001 --ctrl $CTRL \
   --obs-dir $D/obs/e066f_img --engram-keep $G > logs/replay_img_fixed.log 2>&1
 log "image replay: $(tail -1 logs/replay_img_fixed.log)"
 grep -q '"rollouts": 374, "tokens": 12005133' logs/replay_img_fixed.log || { log "IMAGE_REPLAY_DIFFERS (E066: 374 / 12005133)"; exit 1; }
+fi
 $D/tvenv/bin/python $S43/replay_reap.py --tok data/e066/tok_txt_calib_sub --tokens 12000000 --seed 1 \
   --server http://127.0.0.1:18001 --ctrl $CTRL --obs-dir $D/obs/e066f_txt --engram-keep $G > logs/replay_txt_fixed.log 2>&1
 log "text replay: $(tail -1 logs/replay_txt_fixed.log)"
-for p in "img_causal obs/e066f_img" "txt obs/e066f_txt"; do
+AGG=("txt obs/e066f_txt"); [ "${SKIP_IMG:-0}" != 1 ] && AGG=("img_causal obs/e066f_img" "txt obs/e066f_txt")
+for p in "${AGG[@]}"; do
   set -- $p
   $D/tvenv/bin/python $S/class_stats.py aggregate --obs $2 --out $E/stats_$1.npz > logs/agg_$1.log 2>&1 \
     || { log "AGG_FAILED $1"; tail -3 logs/agg_$1.log; exit 1; }

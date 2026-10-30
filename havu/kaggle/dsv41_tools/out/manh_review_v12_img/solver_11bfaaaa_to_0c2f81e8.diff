@@ -1,0 +1,230 @@
+--- solver_dsv41.py 11bfaaaa (V12)
++++ solver_dsv41.py 0c2f81e8 (V12 + images, recovery A+B)
+@@ -52,6 +52,7 @@
+ import threading
+ import time
+ import traceback
++import urllib.error
+ import urllib.parse
+ import urllib.request
+ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+@@ -158,12 +159,30 @@
+                # E055: a dying engine answers in-flight requests with these before the port closes; without them every
+                # server death used up one ARC_JOB_TRIES of each in-flight job (43 jobs lost after two deaths)
+                "EngineCore encountered an issue", "EngineDeadError")
++# R1 (V12 + images, 2026-10-30): server-side failures cost no tries and no burst of re-queues into a dead server.
++# SERVER_ERRORS = CONN_ERRORS + a dying engine's HTTP 500s (B32-M lost attempts to them) + the client's timeout (V1's
++# hang test burned 33 tries on them). Such an error re-queues the attempt for free at most once per server start (and
++# CONN_TRIES times in all; past that, the attempt's normal tries) and holds it until the server is up again: its
++# supervisor's status says up with a newer start (or the solver restarted its own server), or the same start answers
++# /health with 200 (vLLM answers 503 once its engine is dead, while /v1/models still lists the model; /v1/models only
++# when there is no /health). Polled with backoff 1, 2, 4, 8, 16, 30 s, and only while an attempt is held: nothing of
++# this runs while nothing fails.
++SERVER_ERRORS = CONN_ERRORS + ("Error code: 500", "Internal Server Error", "APITimeoutError", "Request timed out")
++HOLD_MAX_S = 30.0
+ TASK_LIMIT = env_num("ARC_TASK_LIMIT", 0, int)
+ TASK_IDS = [t for t in E("ARC_TASK_IDS", "").split(",") if t]  # smoke tests: these tasks instead of the first N
+ # E046 (opt-in): one attempt per task for tasks with several test inputs (all test inputs in one rollout, the answer
+ # is a list of grids). On Flash-1017 it ties per-pair attempts (pass@2 82.6% vs 85.9%) at -41% tokens per task.
+ MULTI_TEST = E("ARC_MULTI_TEST", "0") == "1"
+ CONTEXT_LIMIT = env_arg("ARC_CONTEXT_LIMIT", int, 1)  # E046 --context-limit: the server's max-model-len (163840)
++# E066 (opt-in): the E058 image harness for checkpoints with the vision tower, one token-aligned image per grid next
++# to the JSON prompt (harness --grid-format text+image --image-cell 0). Images need the chat path (token ids carry no
++# pixels), so --token-exact is dropped (--context-limit applies there too: chat_context_cap), and the server keeps
++# its vision encoder (no --language-model-only).
++GRID_FORMAT = E("ARC_GRID_FORMAT", "json")
++if GRID_FORMAT not in ("json", "text+image"):
++    raise SystemExit(f"ARC_GRID_FORMAT must be json or text+image, not {GRID_FORMAT!r}")
++IMAGES = GRID_FORMAT == "text+image"
+ MULTI_BUDGET = env_arg("ARC_MULTI_BUDGET", float, 0)  # E046 --multi-budget f: (1 + f (n - 1)) x budget and turns
+ # I5 (opt-in): the harness's --auto-repair (retry a run_python cell once with an identifier typo fixed). Needs
+ # evals/auto_repair.py + auto_repair_names.json in the kit's repo/evals (not in the V5 kit): without them it is off.
+@@ -331,7 +350,7 @@
+ 
+ 
+ def server_cmd():
+-    return [VLLM, "serve", STATE["model"], "--served-model-name", "dsv41", "--host", "127.0.0.1", "--port", str(PORT),
++    cmd = [VLLM, "serve", STATE["model"], "--served-model-name", "dsv41", "--host", "127.0.0.1", "--port", str(PORT),
+             "--trust-remote-code", "--tensor-parallel-size", "4", "--distributed-executor-backend", "mp",
+             "--kv-cache-dtype", "fp8", "--block-size", "128", "--max-model-len", MAX_MODEL_LEN,
+             "--max-num-seqs", MAX_NUM_SEQS, "--max-num-batched-tokens", "2048",
+@@ -340,6 +359,9 @@
+             "--tokenizer-mode", "deepseek_v41", "--language-model-only", "--reasoning-parser", "deepseek_v41",
+             "--tool-call-parser", "deepseek_v41", "--enable-auto-tool-choice", "--enable-prompt-tokens-details",
+             "--compilation-config", '{"cudagraph_mode":"FULL"}'] + [str(x) for x in SERVER_EXTRA_ARGS]
++    if IMAGES:  # E066: keep the vision encoder
++        cmd.remove("--language-model-only")
++    return cmd
+ 
+ 
+ def server_alive():
+@@ -397,6 +419,44 @@
+         return {}
+ 
+ 
++def server_start():
++    """R1: the server start an error happened on: (the supervisor's start, the solver's restarts, up), up = the status
++    said up (or there is no status)."""
++    status = external_status()
++    return status.get("start"), STATE["restarts"], status.get("state") in (None, "up")
++
++
++def server_answers():
++    """R1: True if the server's engine answers: /health 200, or /v1/models listing dsv41 when there is no /health.
++    Never raises."""
++    try:
++        with urllib.request.urlopen(URL + "/health", timeout=5) as r:
++            return r.status == 200
++    except urllib.error.HTTPError as exc:
++        if exc.code != 404:
++            return False
++    except Exception:
++        return False
++    try:
++        with urllib.request.urlopen(URL + "/v1/models", timeout=5) as r:
++            return "dsv41" in [m.get("id") for m in json.loads(r.read())["data"]]
++    except Exception:
++        return False
++
++
++def server_back(since, status, answers):
++    """R1: True once the server is up again after an error on `since` (server_start()): the supervisor says up with a
++    newer start (or with any start when it was not up at the error), the solver restarted its own server, or the same
++    start answers (answers(): one probe per poll, only when needed)."""
++    if not STATE["server_ok"]:
++        return False
++    if status.get("state") == "up" and (status.get("start") != since[0] or not since[2]):
++        return True
++    if STATE["restarts"] != since[1]:
++        return True
++    return status.get("state") in (None, "up") and answers()
++
++
+ class ExternalServer:
+     """S25: stands in for the process of an external server: poll() is None while its port accepts a TCP connection
+     (checked at most every EXTERNAL_PROBE_S), then 1 for good, as for a server process that exited. A refused
+@@ -754,7 +814,9 @@
+             return {"train_pass": None, "train_frac": None, "train_trace": "skipped_deadline"}
+         return orig_tc(*a, **kw)
+     h.train_check = train_check
+-    return h.parser().parse_args(HARNESS + (["--multi-test"] if MULTI_TEST else [])
++    harness = ([x for x in HARNESS if x != "--token-exact"] + ["--grid-format", "text+image", "--image-cell", "0"]
++               if IMAGES else HARNESS)
++    return h.parser().parse_args(harness + (["--multi-test"] if MULTI_TEST else [])
+                                  + (["--auto-repair"] if AUTO_REPAIR else [])
+                                  + (["--multi-budget", MULTI_BUDGET] if MULTI_TEST and MULTI_BUDGET else [])
+                                  + (["--context-limit", CONTEXT_LIMIT] if CONTEXT_LIMIT else [])
+@@ -853,6 +915,11 @@
+ METRIC_KEYS = ("generation_tokens_total", "prefix_cache_hits_total", "prefix_cache_queries_total",
+                "kv_cache_usage_perc", "num_requests_running", "num_requests_waiting", "num_preemptions_total",
+                "external_prefix_cache_hits_total")
++# images: vLLM's multimodal processor-cache counters (vllm:mm_cache_queries / _hits: images re-sent on later turns
++# served from the cache instead of re-processed); not read in text mode
++MM_KEYS = ("mm_cache_queries_total", "mm_cache_hits_total")
++if IMAGES:
++    METRIC_KEYS += MM_KEYS
+ METRICS_EVERY_S = float(E("ARC_METRICS_EVERY_S", "300"))
+ 
+ 
+@@ -939,6 +1006,9 @@
+           "srv_waiting": cur.get("num_requests_waiting"), "preemptions": cur.get("num_preemptions_total")}
+     if "external_prefix_cache_hits_total" in cur:
+         tp["host_tok_s"] = round(host / dt, 1)
++    if IMAGES and "mm_cache_queries_total" in cur:  # images: MM processor-cache hit rate over the window
++        mq = d("mm_cache_queries_total")
++        tp["mm_queries"], tp["mm_hit"] = round(mq), (round(d("mm_cache_hits_total") / mq, 3) if mq > 0 else None)
+     return tp
+ 
+ 
+@@ -960,6 +1030,7 @@
+                     f"{tp['uncached_tok_s']} tok/s, KV {tp['kv']}, running {tp['srv_running']}, waiting "
+                     f"{tp['srv_waiting']}, preemptions {tp['preemptions']}"
+                     + (f", host restored {tp['host_tok_s']} tok/s" if "host_tok_s" in tp else "")
++                    + (f", MM cache hits {tp['mm_hit']} of {tp['mm_queries']} images" if "mm_queries" in tp else "")
+                     + f" (last {tp['window_s']} s); {done} attempts done")
+         st["server"] = STATE.get("last_tp")
+         atomic_json(LOG / "status.json", st)
+@@ -1032,6 +1103,8 @@
+              for p in range(1 if MULTI_TEST else len(tasks[t]["test"]))]
+     running, done, errors = {}, 0, 0
+     conn_retries = {}  # (task, pair, attempt) -> re-queues after server-side connection errors
++    held, free_starts = [], {}  # R1: [(job, server_start())] waiting for the server; key -> starts that re-queued it
++    hold = {"next": 0.0, "wait": 1.0}
+     rates = []  # completion tokens per wall second of finished, uncut attempts
+     STATE["phase"] = "attempts"
+     pool = ThreadPoolExecutor(WORKERS)
+@@ -1056,9 +1129,20 @@
+                         STATE["restarts"] += 1
+                         stop_server()
+                         start_server()
++                        hold["next"] = 0.0  # R1: check the held attempts at once
+                     elif not running:
+                         log("server down and no restart left; finishing with what we have")
+                         break
++                if held and time.time() >= hold["next"]:  # R1: only while attempts are held
++                    sup, probe = external_status(), []  # (not `status`: that is the status() function)
++                    answers = lambda: probe[0] if probe else (probe.append(server_answers()) or probe[0])  # noqa: E731
++                    back = [h for h in held if server_back(h[1], sup, answers)]
++                    if back:
++                        queue[0:0] = [h[0] for h in back]
++                        held = [h for h in held if h not in back]
++                        log(f"server up again: {len(back)} held attempts re-queued, {len(held)} still held")
++                    hold["wait"] = min(2 * hold["wait"], HOLD_MAX_S)
++                    hold["next"] = time.time() + hold["wait"]
+                 # Launch.
+                 rate = sorted(rates)[len(rates) // 2] if len(rates) >= 5 else None
+                 if rate is not None and queue and (FORCE_AT_S - elapsed()) * rate < MIN_ATTEMPT_TOKENS:
+@@ -1074,11 +1158,13 @@
+                     t, p, a, tries = queue.pop(pick(queue))
+                     running[pool.submit(run_attempt, args, tasks[t], t, p, a)] = (t, p, a, tries)
+                 if not running:
+-                    if not queue or elapsed() >= STOP_NEW_S or STATE["forced"] or STATE.get("admission_closed"):
++                    if ((not queue and not held) or elapsed() >= STOP_NEW_S or STATE["forced"]
++                            or STATE.get("admission_closed")):
+                         break
+-                    time.sleep(5)
++                    time.sleep(min(5.0, max(0.2, hold["next"] - time.time())) if held else 5)
+                     continue
+-                finished, _ = wait(list(running), timeout=10, return_when=FIRST_COMPLETED)
++                finished, _ = wait(list(running), timeout=min(10.0, max(0.2, hold["next"] - time.time())) if held else 10,
++                                   return_when=FIRST_COMPLETED)
+                 for fut in finished:
+                     t, p, a, tries = running.pop(fut)
+                     try:
+@@ -1091,19 +1177,29 @@
+                         with open(LOG / "attempts.jsonl", "a") as f:
+                             f.write(json.dumps({k: v for k, v in rec.items() if k != "content"}) + "\n")
+                         key = (t, p, a)
+-                        requeue = None
++                        requeue, start = None, None
+                         if rec.get("error") and not STATE["forced"]:
+-                            if any(c in rec["error"] for c in CONN_ERRORS) and conn_retries.get(key, 0) < CONN_TRIES:
+-                                # Lost to the server (died, restarting, or dropped the stream): re-queue without using
+-                                # a try.
++                            if any(c in rec["error"] for c in SERVER_ERRORS) and conn_retries.get(key, 0) < CONN_TRIES:
++                                start = server_start()
++                                if start[:2] in free_starts.get(key, ()):
++                                    start = None  # R1: its free re-queue on this server start is used
++                            if start is not None:
++                                # Lost to the server (died, restarting, 500, hang, or dropped the stream): re-queue
++                                # without using a try, held until the server is up again (R1)
+                                 conn_retries[key] = conn_retries.get(key, 0) + 1
+-                                requeue = ((t, p, a, tries),
+-                                           f"re-queue {t}.{p}#{a} after a server-side error ({conn_retries[key]})")
++                                free_starts.setdefault(key, set()).add(start[:2])
++                                requeue = ((t, p, a, tries), f"hold {t}.{p}#{a} after a server-side error "
++                                                             f"({conn_retries[key]}) until the server is up again")
+                             elif tries + 1 < JOB_TRIES:
+                                 requeue = (t, p, a, tries + 1), f"retry {t}.{p}#{a}"
+                         if requeue:
+                             errors += 1
+-                            queue.insert(0, requeue[0])
++                            if start is not None:
++                                if not held:
++                                    hold.update(next=time.time() + 1.0, wait=1.0)
++                                held.append((requeue[0], start))
++                            else:
++                                queue.insert(0, requeue[0])
+                             # S6 / A4: the harness read the session's answer before the error ended the attempt;
+                             # it counts until the re-run brings a grid
+                             harvested = rec.get("pred") is not None and "task_id" in rec

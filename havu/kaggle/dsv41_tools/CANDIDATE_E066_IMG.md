@@ -4,6 +4,7 @@
 > - **Cause:** `is_mm_prefix_lm = vision_n_layers > 0` in `vllm/transformers_utils/configs/deepseek_v41.py:66`. DeepSeek's reference is causal.
 > - **Effect:** on the full model, causal raised exact grid transcription from 7.5% to 18.3% (API: 25.8%).
 > - **Fix:** add `--hf-overrides '{"is_mm_prefix_lm": false}' --disable-chunked-mm-input` to the server.
+> - **Which builds have the bug (source check, 2026-10-30):** the git sources of Manh's wheels v10 (f506afa210), v11 (8cf0c0664b) and g22df163d2d, and of our `dynamic-count-moe` branch, all contain upstream PR #57152 ("Restore causal image SWA for DeepSeek V4.1", commit 9f9e1dac26), and none sets `is_mm_prefix_lm` in `configs/deepseek_v41.py`; `sparse_swa.py` widens the image window only for the V4 config class. B32-M's wheel (5e1bccd07c) lacks #57152. The `is_mm_prefix_lm` gating is in the E043 wheel (dsv4-pruning). An installed wheel can still differ from its git commit, so run checks (b)-(c) in the server's own venv before any image submission.
 > - **Checks** (the missing "multimodal-bidirectional" log line proves nothing once `--disable-chunked-mm-input` is passed, because vLLM prints it only when it has to force that flag):
 >   - (a) the server's "non-default args" line contains `'hf_overrides': {'is_mm_prefix_lm': False}`;
 >   - (b) in the server venv, `vllm.transformers_utils.config.get_config(model, trust_remote_code=True, hf_overrides_kw={"is_mm_prefix_lm": False}).is_mm_prefix_lm is False`;

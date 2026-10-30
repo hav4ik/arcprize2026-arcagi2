@@ -4,7 +4,7 @@
 might be the prompting problem?" (E066: candidate 1 image 69.7 vs text 75.1 pass@1; the full model self-hosted with
 images 72.4 on 221/240 attempts vs the API's 81.1.)
 
-## Summary (2026-10-30, 11:30 UTC; box runs done)
+## Summary (2026-10-30; box runs done at 11:24 UTC)
 1. **It is not the prompt.** Text and tokens are byte-identical to the API's, earlier reasoning stays in the prompt,
    and self-hosted text is as good as the API's. The loss is specific to images, and both self-hosted models show it.
 2. **It is perception.** Shown one rendered grid with no text, the self-hosted full model reads it much worse than the
@@ -26,6 +26,8 @@ images 72.4 on 221/240 attempts vs the API's 81.1.)
    exact and size unchanged (+0.8 / +0.8 vs `ref`). It did raise the answered rate (60.8 -> 75.8%) and colour-set
    accuracy (+15.0 [+5.8, +24.2]) to the API's level, so the sharded ViT's numerics may cost something; `causal` +
    unsharded ViT is untested.
+7. **The same bug was fixed upstream** in vLLM PR #57152 (merged 2026-09-16) for upstream's later code; on the E043
+   fork the override is equivalent (port: `patches/apply_pr57152_port.py`).
 
 ## Paired re-analysis of E066's result files (no new runs; ARC Prize weighting per task-attempt)
 On the 221 task-attempts the self-hosted full-model image run (`e066_full_ref`) finished:
@@ -101,9 +103,9 @@ experts=None engram=None`). Raw files: `results/box/`.
 |---|---|---|---|---|---|---|---|---|---|
 | API | 76.7 | 34.2 | 69.2 | 66.7 | 25.8 | 63 / 30 / 7 / 3 | 98.3 | 28 | 8.8k |
 | `ref` (E066 settings) | 60.8 | 14.2 | 56.7 | 40.8 | 7.5 | 30 / 0 / 0 / 0 | 90.0 | 47 | 10.2k |
-| `ref_t06` (temperature 0.6, top_p 0.95) | 63.3 | 13.3 | 58.3 | 47.5 | 7.5 | | 92.3 | | 9.2k |
+| `ref_t06` (temperature 0.6, top_p 0.95) | 63.3 | 13.3 | 58.3 | 47.5 | 7.5 | 30 / 0 / 0 / 0 | 92.3 | 44 | 9.2k |
 | `causal` (causal image attention) | 67.5 | 25.8 | 60.8 | 51.7 | 18.3 | 67 / 7 / 0 / 0 | 98.4 | 39 | 9.4k |
-| `vitdp` (`ref` + vision tower unsharded; bidirectional, NOT on top of `causal`) | 75.8 | 15.0 | 71.7 | 47.5 | 8.3 | 33 / 0 / 0 / 0 | 90.7 | | 9.6k |
+| `vitdp` (`ref` + vision tower unsharded; bidirectional, NOT on top of `causal`) | 75.8 | 15.0 | 71.7 | 47.5 | 8.3 | 33 / 0 / 0 / 0 | 90.7 | 29 | 9.6k |
 
 `vitdp` − `ref`: size +0.8 [−3.3, +5.0], colours +15.0 [+5.8, +24.2], corners +6.7 [−2.5, +15.8], exact +0.8
 [+0.0, +2.5]; `vitdp` − API: size −19.2, exact −17.5, colours +2.5.
@@ -156,7 +158,8 @@ Lightning Indexer cache is MXFP4 ("Using MXFP4 indexer cache"); irrelevant for t
 - **Fix, arm `causal`:** ref + `--hf-overrides '{"is_mm_prefix_lm": false}' --disable-chunked-mm-input` (keeps the
   atomic image-span prefill). Every widening path is gated on the flag: `sparse_swa.py` 449-450 and 501, the V2
   runner's `compute_mm_prefix_ranges` (`v1/worker/gpu/model_states/default.py` 213-216), the FlashInfer sparse /
-  FlashMLA backends; the remaining `max_image_tokens` use in `deepseek_v4_1/attention.py` 458 is for CED prefill only. vLLM applies `--hf-overrides` with `config.update()` after the config class is built
+  FlashMLA backends; the remaining `max_image_tokens` use in `deepseek_v4_1/attention.py` 458 is for CED prefill
+  only. vLLM applies `--hf-overrides` with `config.update()` after the config class is built
   (`transformers_utils/config.py:819`), so the override replaces the constructor's value. The missing "Forcing
   --disable_chunked_mm_input" warning is not proof: vLLM prints it only when chunked mm input is not already
   disabled, and this arm disables it explicitly.
@@ -165,13 +168,21 @@ Lightning Indexer cache is MXFP4 ("Using MXFP4 indexer cache"); irrelevant for t
   runs the buggy path). dsv4-infer (owns that harness and server config) and dsv4-pruning (E066) were told at 11:00
   UTC. E066's image-harness numbers (candidate 1 image −5.4 vs text, E72-152 image, image dev-NLL screening) were all
   measured with the bug and are worth re-measuring with the flag.
+- **Upstream fix:** vLLM PR #57152, "[Bugfix][Model] Restore causal image SWA for DeepSeek V4.1" (merged 2026-09-16,
+  merge commit 9f9e1dac), fixes the same bug against upstream's later layout (`models/deepseek_v41/`, in-kernel
+  `prefill_left_visible`/`right_visible` widening also gated on `vision_n_layers`). It does not apply to the E043
+  fork as is. On the fork the flag is the only gate, so `--hf-overrides '{"is_mm_prefix_lm": false}'` gives the
+  PR's causal window (dsv4-pruning checked it at runtime too). `patches/apply_pr57152_port.py` is the PR's config
+  hunk plus `max_image_tokens = 0`, for the fork's site-packages (tested on copies; not applied anywhere). Manh's
+  newer fork (the Kaggle image server) may carry upstream-style paths, where the override alone may not be enough.
 - Indexer precision is not a suspect: the reference also quantizes the Lightning Indexer's queries and keys to FP4
   (`fp4_act_quant` in `Indexer.forward`); the fork's "MXFP4 indexer cache" matches.
 
 ## Operations log (for the next box run)
 - Box: Vast 58332344, 4x RTX PRO 6000 Blackwell WS, $5.74/h, traffic $0.0052/GB (the 510 GB download cost ~$2.7).
-  Handed over by dsv4-pruning at ~08:30 UTC with the user's approval; to be destroyed after the run (user: "kill the
-  rtx6000 nodes after finishing").
+  Handed over by dsv4-pruning at ~08:30 UTC with the user's approval; handed back at 11:26 UTC with the checkpoint
+  in place for two user-approved E066 follow-ups (dsv4-pruning destroys it afterwards; user rule: "kill the rtx6000
+  nodes after finishing").
 - Download: `hf download deepseek-ai/DeepSeek-V4.1-Flash-1017` with the read-only HF key (passed on stdin, never on
   the command line): 08:36-09:02, 26 min, ~165 MB/s for the first 10 min, then ~400 MB/s (E066's box: 12.5 min).
 - Server start: ~9 min to the first answer (checkpoint load 20-30 s, then compile, CUDA graphs, FlashInfer autotune);
@@ -184,7 +195,25 @@ Lightning Indexer cache is MXFP4 ("Using MXFP4 indexer cache"); irrelevant for t
 - Do not find processes by name with a pattern that also appears in the ssh command itself: an `awk '/[p]robe.../'`
   over `ps` matched the remote shell running the command (its heredoc held the same text) and killed it. Use pids
   (`pgrep -P <parent>`) and upload scripts as files instead of heredocs.
-- Box time used: ~3 h by the end of the planned arms (~$17 plus ~$3 traffic). API spend: the probe, $0.64.
+- Box time used: 08:30-11:26 UTC, ~3 h (~$17 plus ~$2.7 traffic). API spend: the probe, $0.64.
+
+## Lessons
+- **Compare the serving code with the model's reference implementation before suspecting numerics.** The bug was a
+  semantic choice in the fork (bidirectional image spans, borrowed from DeepSeek V4 Vision-Exp), visible in one config
+  line; the earlier audit compared vision preprocessing and the ViT but not the language model's attention masks.
+- **A task-free perception probe is the fast, sensitive check for any vision-path change** (~30 min self-hosted,
+  $0.64 on the API): it separated perception from reasoning, and its per-size breakdown showed the fix's residual.
+  Image-ablation NLL (real vs grey) shows whether images carry information, but not how much is lost without an API
+  reference.
+- **Read the arm's code path before planning it:** `--kv-cache-dtype auto` silently maps to fp8 on this fork, so the
+  planned BF16-KV arm was a duplicate; the server log line "Using DeepSeek V4.1's native mixed KV cache format" and
+  `_resolve_dsv41_kv_cache_dtype` showed it.
+- **Check each arm's exact flags against the plan:** `vitdp` was described as "on top of `causal`" but `box_run.sh`
+  defined it on top of `ref`; it still answered its question (the ViT split), but not the combined one.
+- **A missing warning is not evidence:** vLLM's "multimodal-bidirectional" warning disappears once
+  `--disable-chunked-mm-input` is explicit. Verify flags from the "non-default args" line or a config assertion.
+- **ARC accuracy of the fix is not measured yet** for the full model; candidate 1's re-eval (dsv4-pruning,
+  `evals/results/..._e066_c1f_img.jsonl`) was at 222/240 attempts at 16:40 UTC.
 
 ## Status
 Done on the box (11:24 UTC): `ref`, `ref_t06`, `causal`, `vitdp`; `kvauto` impossible (see above), `noprefix` dropped

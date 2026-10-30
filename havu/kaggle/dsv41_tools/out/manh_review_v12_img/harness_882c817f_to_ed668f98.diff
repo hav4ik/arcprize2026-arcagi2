@@ -1,0 +1,156 @@
+--- run_deepseek_tools.py 882c817f (V12)
++++ run_deepseek_tools.py ed668f98 (V12 + images)
+@@ -22,7 +22,7 @@
+ from run_deepseek_arc2 import api_key
+ from run_deepseek_arcprize import TASKS, build_prompt, parse
+ from arc_harness.arcprize import TEMPLATE as ARC_TEMPLATE
+-from arc_harness.grid_image import build_image_prompt
++from arc_harness.grid_image import aligned_cell, build_image_prompt, data_uri
+ from sandbox_client import SandboxSession, check_health, tool_output
+ from task_summary import task_summary
+ from train_check import ranked_answers, train_check
+@@ -720,6 +720,40 @@
+ 
+ 
+ CONTEXT_MIN_ROOM = 1024
++# --context-limit on the chat path (no prompt ids to count): per-message template allowance, tokens assumed per image
++# part (DeepSeek's API caps an image at 1,024 tiles = <= 1,058 tokens, Qwen's at ~2,500 + 2), a margin for the
++# re-rendered last assistant turn, and turn 1's allowance for template text around the tool schemas. On E066's 240
++# image traces (3,075 turns, DeepSeek-V4.1 template) the bound was never below the real prompt: slack >= 290 tokens on
++# turns >= 2 (median 528), >= 11.6k on turn 1 without the template allowance.
++CHAT_MESSAGE_TOKENS, CHAT_IMAGE_TOKENS, CHAT_CONTEXT_MARGIN, CHAT_TEMPLATE_TOKENS = 32, 2600, 256, 2048
++
++
++def message_token_bound(message):
++    """Upper bound on a chat message's prompt tokens: one per UTF-8 byte of its text (byte-level BPE never needs more),
++    CHAT_IMAGE_TOKENS per image part, plus CHAT_MESSAGE_TOKENS for the template."""
++    n = CHAT_MESSAGE_TOKENS + len((message.get("reasoning_content") or "").encode())
++    content = message.get("content")
++    for part in content if isinstance(content, list) else [{"type": "text", "text": content or ""}]:
++        n += CHAT_IMAGE_TOKENS if part.get("type") == "image_url" else len((part.get("text") or "").encode())
++    return n + sum(len(json.dumps(c).encode()) for c in message.get("tool_calls") or [])
++
++
++def chat_context_cap(args, max_tokens, messages, ctx):
++    """--context-limit on the chat path (--grid-format image / text+image, or a final / no-think turn under
++    --token-exact). The chat API returns no prompt ids, so the next prompt is bounded by the last turn's exact usage
++    (`ctx` = (prompt + completion tokens, len(messages) after its assistant message)) plus message_token_bound of every
++    message appended since; turn 1 (ctx None) by message_token_bound of all messages plus the tool schemas and
++    CHAT_TEMPLATE_TOKENS. Like the token-exact path: max_tokens is capped to the room left, and less than
++    CONTEXT_MIN_ROOM raises ContextFull."""
++    limit = getattr(args, "context_limit", 0)
++    if not limit:
++        return max_tokens
++    used, n = ctx if ctx is not None else (len(json.dumps(tools_for(args)).encode()) + CHAT_TEMPLATE_TOKENS, 0)
++    bound = used + sum(message_token_bound(m) for m in messages[n:]) + CHAT_CONTEXT_MARGIN
++    room = limit - bound - 16
++    if room < CONTEXT_MIN_ROOM:
++        raise ContextFull(f"prompt <= {bound} tokens (chat bound), limit {limit}")
++    return min(max_tokens, room)
+ 
+ 
+ class TurnError(RuntimeError):
+@@ -1335,6 +1369,27 @@
+     return bool(kinds) and (true_lines >= n_train or ("one" in kinds and true_lines >= 1))
+ 
+ 
++IMAGE_NOTE = ("\n\nThe images below show the SAME training examples and test input(s) as the JSON above, in the same "
++              "order; they are not additional examples. Each image is one grid, drawn as flat coloured squares "
++              "without lines (0 black, 1 blue, 2 red, 3 green, 4 yellow, 5 grey, 6 magenta, 7 orange, 8 light blue, "
++              "9 maroon). Use them to see shapes and layout; the JSON grids specify the exact cells.")
++
++
++def text_image_content(prompt, train, test_inputs, cell=0, align="deepseek", note=IMAGE_NOTE):
++    """E058 --grid-format text+image: chat content parts = the full text prompt, a note, then one labelled image per
++    grid (training inputs and outputs, then test inputs). cell 0 = grid_image.aligned_cell(align): each cell exactly
++    k x k model tiles (DeepSeek 42 px, Qwen 32 px), never rescaled by the API; otherwise a fixed cell size in pixels."""
++    def image(label, g):
++        return [{"type": "text", "text": f"\n{label} ({len(g)}x{len(g[0])}):"},
++                {"type": "image_url", "image_url": {"url": data_uri(g, cell or aligned_cell(g, align))}}]
++    parts = [{"type": "text", "text": prompt + note}]
++    for i, pair in enumerate(train):  # numbered from 0, like the text prompt's --Example 0--
++        parts += image(f"Example {i} input", pair["input"]) + image(f"Example {i} output", pair["output"])
++    for j, g in enumerate(test_inputs, 1):
++        parts += image("Test input" if len(test_inputs) == 1 else f"Test input {j - 1}", g)
++    return parts
++
++
+ def build_prompt_multi(train, test_inputs):
+     """E046 --multi-test: the ARC Prize prompt with every test input of the task, numbered."""
+     tests = "\n\n".join(f"--Test input {i}--\n\n{json.dumps(g)}" for i, g in enumerate(test_inputs))
+@@ -1477,6 +1532,9 @@
+         prompt += ALT_NOTES[args.alt_answer]
+     if prior:  # E047 --prior-mode
+         prompt += prior_note(args.prior_mode, prior["preds"], prior["train_pass"], prior.get("program"))
++    if getattr(args, "grid_format", "json") == "text+image":  # E058: JSON prompt unchanged, plus one image per grid
++        prompt = text_image_content(prompt, task["train"], test_inputs if multi else [test_input], args.image_cell,
++                                    getattr(args, "image_align", "deepseek"))
+     messages = [{"role": "user", "content": prompt}]
+     if getattr(args, "effort_header", ""):
+         messages.insert(0, {"role": "system", "content": EFFORT_HEADERS[args.effort_header]})
+@@ -1497,6 +1555,7 @@
+     tok = ({"ids": None, "n": 0, "prev_len": 0, "prev_sampled": [], "resync": False, "turns": 0, "breaks": 0,
+             "rerenders": 0, "resyncs": 0, "parse_fallbacks": 0}
+            if getattr(args, "token_exact", False) and getattr(args, "base_url", None) else None)
++    ctx = None  # --context-limit on the chat path: (last turn's prompt + completion tokens, len(messages) after it)
+     events, error, content, t0 = [], None, "", time.monotonic()
+     session_final = getattr(args, "final_mode", "turn") == "session"
+     source = None  # where the single scored grid came from
+@@ -1554,6 +1613,8 @@
+                     mult = peak_multiplier() if auto_price else args.price_multiplier
+                     try:
+                         think = args.think_turns < 0 or index < args.think_turns
++                        if tok is None:  # E058 images: the chat path (turn_token_exact caps its own)
++                            cap = chat_context_cap(args, cap, messages, ctx)
+                         msg, usage, finish = turn(client, args, messages, cap, final, think, tok)
+                     except ContextFull as exc:
+                         n_turns -= 1
+@@ -1569,6 +1630,7 @@
+                         raise
+                     add_cost(cost, usage, args.model, mult)
+                     messages.append(msg)
++                    ctx = ((usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0), len(messages))
+                     add_usage(total, usage)
+                     events.append({"turn": n_turns, "usage": usage, "finish_reason": finish,
+                                    "max_tokens": cap, "final": final})
+@@ -1974,11 +2036,13 @@
+                          "attempt 0 nor 1 passes the train check (not part of the config, so files resume)")
+     ap.add_argument("--turns-note", type=int, default=0,
+                     help="E029: append a 'N turns left, submit now' note to tool output when N or fewer turns remain (0=off)")
+-    ap.add_argument("--grid-format", default="json", choices=["json", "image"],
++    ap.add_argument("--grid-format", default="json", choices=["json", "image", "text+image"],
+                     help="E033: image = every grid in the prompt is a PNG (ARC palette, --image-cell px per cell, no grid "
+-                         "lines) instead of JSON; needs a vision model behind --base-url")
++                         "lines) instead of JSON; needs a vision model behind --base-url. E058: text+image = the JSON "
++                         "prompt unchanged plus one labelled image per grid (works with the DeepSeek API)")
+     ap.add_argument("--image-cell", type=int, default=32,
+-                    help="E033: pixels per grid cell (Qwen3.8: 32 = one LLM visual token per cell, 16 = one ViT patch)")
++                    help="E033: pixels per grid cell (Qwen3.8: 32 = one LLM visual token per cell, 16 = one ViT patch); "
++                         "E058 text+image: 0 = DeepSeek-aligned per grid (grid_image.deepseek_cell)")
+     ap.add_argument("--openrouter-provider", default="",
+                     help="E037: run through OpenRouter pinned to this provider (no fallbacks); --model is then an "
+                          "OpenRouter id such as deepseek/deepseek-v4.1-flash-1017; cost comes from OpenRouter usage")
+@@ -1994,9 +2058,10 @@
+                          "the session has test_inputs, and the answer is a list of grids (one record per pair; the "
+                          "attempt's usage is on pair 0, the other pairs carry multi_share)")
+     ap.add_argument("--context-limit", type=int, default=0,
+-                    help="E046 (--token-exact): the server's max-model-len; each turn's max_tokens is capped to the room "
+-                         "left, and an attempt with less than 1024 tokens of room ends like an output-budget stop "
+-                         "(session-answer fallback) instead of a context-length error")
++                    help="E046: the server's max-model-len; each turn's max_tokens is capped to the room left, and an "
++                         "attempt with less than 1024 tokens of room ends like an output-budget stop (session-answer "
++                         "fallback) instead of a context-length error. Exact on the --token-exact path; on the chat "
++                         "path (images) the prompt is bounded from the last turn's usage (chat_context_cap)")
+     ap.add_argument("--multi-budget", type=float, default=0.0,
+                     help="E046: with --multi-test, scale a multi-input task's output budget, soft budget and turn cap "
+                          "by 1 + f x (n - 1)")
+@@ -2046,6 +2111,9 @@
+         ap.error("--extra-attempt-if-no-train-pass needs --attempts 2 and --train-check")
+     if args.grid_format == "image" and not args.base_url:
+         ap.error("--grid-format image needs a vision model behind --base-url")
++    if args.token_exact and args.grid_format != "json":
++        ap.error("--token-exact has no image path (token ids carry no pixels): image runs use the chat path, with "
++                 "--context-limit for a self-hosted server")
+     if args.cap_nudge and (args.final_mode != "session" or not args.answer_tool):
+         ap.error("--cap-nudge needs --final-mode session and --answer-tool")
+     if args.fallback_solve and args.final_mode != "session":

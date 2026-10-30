@@ -22,7 +22,7 @@ from openai import OpenAI
 from run_deepseek_arc2 import api_key
 from run_deepseek_arcprize import TASKS, build_prompt, parse
 from arc_harness.arcprize import TEMPLATE as ARC_TEMPLATE
-from arc_harness.grid_image import aligned_cell, build_image_prompt, data_uri
+from arc_harness.grid_image import aligned_cell, build_image_prompt, data_uri, rows_cell, rows_data_uri, sheet_pages
 from sandbox_client import SandboxSession, check_health, tool_output
 from task_summary import task_summary
 from train_check import ranked_answers, train_check
@@ -96,7 +96,7 @@ V6_DEFAULTS = {"turns_note": 0, "fallback_solve": False, "cap_nudge": False, "ef
                "image_cell": 32, "image_align": "deepseek", "openrouter_provider": "", "or_reasoning": "", "multi_test": False,
                "multi_budget": 0.0, "multi_prompt": "note", "context_limit": 0,
                "prior_mode": "", "alt_answer": "", "show_tool": False, "check_image": False, "image_note": "",
-               "image_in": "tool"}
+               "image_in": "tool", "image_layout": "grid"}
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 V6_PROMPTS = {"lean2code"}
 HELPERS_SRC = (Path(__file__).resolve().parent / "arc_helpers.py").read_text()
@@ -1470,6 +1470,58 @@ IMAGE_NOTES = {"": IMAGE_NOTE,  # E064 --image-note strict: images can mislead (
                                        "connect, sizes or positions), confirm it in code on the JSON grids.")}
 
 
+# E070 --image-layout (Manh's --vision-layout): training examples drawn several grids per image.
+LAYOUT_NOTES = {
+    "pair": ("\n\nThe images below show the SAME training examples and test input(s) as the JSON above, in the same "
+             "order; they are not additional examples. Each training image is one example: its input on the left and "
+             "its output on the right, separated by white space (white is not a grid colour). Each test input is shown "
+             "alone. Grids are drawn as flat coloured squares without lines (0 black, 1 blue, 2 red, 3 green, 4 "
+             "yellow, 5 grey, 6 magenta, 7 orange, 8 light blue, 9 maroon). Use them to see shapes and layout; the "
+             "JSON grids specify the exact cells."),
+    "sheet": ("\n\nThe images below show the SAME training examples and test input(s) as the JSON above, in the same "
+              "order; they are not additional examples. The training sheet shows the examples one per row, from top to "
+              "bottom: each row is that example's input on the left and its output on the right, separated by white "
+              "space (white is not a grid colour; rows are separated by white space too). Each test input is shown "
+              "alone. Grids are drawn as flat coloured squares without lines (0 black, 1 blue, 2 red, 3 green, 4 "
+              "yellow, 5 grey, 6 magenta, 7 orange, 8 light blue, 9 maroon). Use them to see shapes and layout; the "
+              "JSON grids specify the exact cells."),
+}
+
+
+def _size(g):
+    return f"{len(g)}x{len(g[0])}"
+
+
+def layout_image_content(prompt, train, test_inputs, layout, cell=0, align="deepseek"):
+    """E070 --image-layout pair|sheet with --grid-format text+image: the full text prompt, the layout's note, then
+    `pair` one image per training example (input | output), or `sheet` all examples in one image, one per row (split
+    into pages only past DeepSeek's 1,024-tile cap); test inputs one image each, as in the grid layout. Cells:
+    grid_image.rows_cell (42*k px, else 28 / 14 px), images padded to whole 42-px tiles."""
+    parts = [{"type": "text", "text": prompt + LAYOUT_NOTES[layout]}]
+
+    def add(label, rows):
+        c = rows_cell(rows)
+        if c is None:
+            raise ValueError(f"{label}: too large for one image")
+        parts.extend([{"type": "text", "text": f"\n{label}:"}, {"type": "image_url", "image_url": {"url": rows_data_uri(rows, c)}}])
+
+    if layout == "pair":
+        for i, p in enumerate(train):
+            add(f"Example {i}, input (left) {_size(p['input'])} -> output (right) {_size(p['output'])}",
+                [[p["input"], p["output"]]])
+    else:
+        pages = sheet_pages([(p["input"], p["output"]) for p in train])
+        for n, (start, page) in enumerate(pages):
+            rows = "; ".join(f"row {r}: example {start + r}, {_size(a)} -> {_size(b)}" for r, (a, b) in enumerate(page))
+            head = "Training sheet" if len(pages) == 1 else f"Training sheet {n + 1} of {len(pages)}"
+            add(f"{head}, one example per row, input (left) -> output (right) ({rows})", [[a, b] for a, b in page])
+    for j, g in enumerate(test_inputs, 1):
+        label = "Test input" if len(test_inputs) == 1 else f"Test input {j - 1}"
+        parts.extend([{"type": "text", "text": f"\n{label} ({_size(g)}):"},
+                      {"type": "image_url", "image_url": {"url": data_uri(g, cell or aligned_cell(g, align))}}])
+    return parts
+
+
 def text_image_content(prompt, train, test_inputs, cell=0, align="deepseek", note=IMAGE_NOTE):
     """E058 --grid-format text+image: chat content parts = the full text prompt, a note, then one labelled image per
     grid (training inputs and outputs, then test inputs). cell 0 = grid_image.aligned_cell(align): each cell exactly
@@ -1627,7 +1679,10 @@ def solve(client, args, task, test_input, session_factory=SandboxSession, test_i
         prompt += ALT_NOTES[args.alt_answer]
     if prior:  # E047 --prior-mode
         prompt += prior_note(args.prior_mode, prior["preds"], prior["train_pass"], prior.get("program"))
-    if getattr(args, "grid_format", "json") == "text+image":  # E058: JSON prompt unchanged, plus one image per grid
+    if getattr(args, "grid_format", "json") == "text+image" and getattr(args, "image_layout", "grid") != "grid":
+        prompt = layout_image_content(prompt, task["train"], test_inputs if multi else [test_input], args.image_layout,
+                                      args.image_cell, getattr(args, "image_align", "deepseek"))  # E070
+    elif getattr(args, "grid_format", "json") == "text+image":  # E058: JSON prompt unchanged, plus one image per grid
         prompt = text_image_content(prompt, task["train"], test_inputs if multi else [test_input], args.image_cell,
                                     getattr(args, "image_align", "deepseek"),
                                     IMAGE_NOTES[getattr(args, "image_note", "")])
@@ -2171,6 +2226,11 @@ def parser():
     ap.add_argument("--image-cell", type=int, default=32,
                     help="E033: pixels per grid cell (Qwen3.8: 32 = one LLM visual token per cell, 16 = one ViT patch); "
                          "E058 text+image: 0 = DeepSeek-aligned per grid (grid_image.deepseek_cell)")
+    ap.add_argument("--image-layout", default="grid", choices=["grid", "pair", "sheet"],
+                    help="E070 with --grid-format text+image (Manh's --vision-layout): grid = one image per grid (E058); "
+                         "pair = one image per training example, input left of output; sheet = all training examples in "
+                         "one image, one per row (pages past 1,024 DeepSeek tiles). Test inputs stay one image each. "
+                         "DeepSeek tile geometry only")
     ap.add_argument("--image-align", default="deepseek", choices=["deepseek", "qwen"],
                     help="E058 text+image with --image-cell 0: tile geometry to align cells to (deepseek 42 px, "
                          "169-1024 tiles; qwen = Qwen3.8 Flash on Alibaba, 32 px, 64-2500 tiles)")
@@ -2264,6 +2324,9 @@ def main():
         ap.error("--show-tool / --check-image need grid mode without --token-exact (images in tool results)")
     if args.check_image and not args.answer_tool:
         ap.error("--check-image needs --answer-tool")
+    if args.image_layout != "grid" and (args.grid_format != "text+image" or args.image_align != "deepseek"
+                                        or args.image_note):
+        ap.error("--image-layout pair|sheet needs --grid-format text+image, --image-align deepseek, no --image-note")
     if args.image_note and args.grid_format != "text+image":
         ap.error("--image-note needs --grid-format text+image")
     if args.cap_nudge and (args.final_mode != "session" or not args.answer_tool):

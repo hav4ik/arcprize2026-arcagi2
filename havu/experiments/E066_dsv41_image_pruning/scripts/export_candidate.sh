@@ -10,7 +10,7 @@
 set -euo pipefail
 D=/workspace/dsv4
 S43=$D/repo/experiments/E043_dsv41_real_pruning/scripts
-E=$D/export/engram64_tool_chunked
+E=${ENGRAM_SRC:-$D/export/engram64_tool_chunked}  # ENGRAM_SRC: an export that already holds the same chunked table
 SCHEMA='{"quant_method": "humming", "weight_dtype": "uint2", "weight_scale_dtype": "bfloat16", "group_size": 128, "has_zero_point": true}'
 case $1 in
   engram)
