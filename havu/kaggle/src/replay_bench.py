@@ -52,7 +52,7 @@ def left():
 
 
 def load_data():
-    p = S.find_one(f"{S.INPUT}/**/agentic_replay.json.gz") or S.find_one(f"{S.INPUT}/**/agentic_replay.json")
+    p = S.find_input("agentic_replay.json.gz") or S.find_input("agentic_replay.json")  # fixed depths (no recursive scan)
     if not p:  # Kaggle stores uploaded .gz files decompressed
         raise FileNotFoundError("agentic_replay.json(.gz) not attached")
     return json.load(gzip.open(p, "rt") if p.endswith(".gz") else open(p))

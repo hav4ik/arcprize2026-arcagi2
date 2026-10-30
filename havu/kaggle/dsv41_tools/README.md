@@ -51,3 +51,14 @@ Unit tests (no GPU; the V5 Kaggle kit `kaggle_kit_v5/` with the live solver and 
 them): `.venv/bin/python -m unittest discover -s kaggle/dsv41_tools/tests` (solver, notebook cells 00 / 0b, E042
 tooling) and `evals/tests/test_dsv41_harness.py` (the harness's Kaggle paths). Open and fixed gaps of the next
 candidate: `next_candidate_fixes.md`.
+
+Input lookup (rule from Manh, 2026-10-30): notebook, cell and solver code never scans `/kaggle/input` (or
+`ARC_INPUT_ROOT`) recursively. With his datasets attached, one `**` glob, `rglob` or `os.walk` there walks thousands of
+files, about 5 min per call. Cell 0 defines `find_input(name, *exact)` and `find_inputs` (`input_paths.HELPER`). They
+look at the exact candidates first, then the attached sources' mount dirs (`INPUT_ROOTS`), then fixed depths only:
+`datasets/<owner>/<slug>[/<dir>]`, `competitions/<slug>`, `notebooks/<owner>/<slug>[/<dir>]`,
+`models/<owner>/<model>/<framework>/<variation>/<version>`, and up to two levels for older mounts and the pods. Every
+builder ends with `input_paths.finish(nb, meta)`, which sets `INPUT_ROOTS` from kernel-metadata.json, rewrites the old
+lookups in the Version 5 and Manh notebooks it starts from, and fails the build if any code cell still scans the input
+root. The solvers use `ARC_MODEL_DIR` (every solver cell sets it) and otherwise `find_model_dir()` at fixed depths.
+`tests/test_input_scans.py` checks the live code under `kaggle/` and every builder's notebook.

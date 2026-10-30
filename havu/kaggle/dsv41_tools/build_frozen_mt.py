@@ -15,10 +15,15 @@ import gzip
 import hashlib
 import io
 import json
+import sys
 import tarfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:  # tests load this file by path
+    sys.path.insert(0, str(HERE))
+import input_paths as IP  # noqa: E402
+
 ROOT = HERE.parents[1]
 V5 = HERE / "out/nb_submit_v4"  # submit Version 5's notebook (v3's cells + the v4 settings cell)
 KIT_TGZ = HERE / "kaggle_kit_v5/dsv41_kit.tgz"  # the kit dataset as Kaggle mounts it (Version 5's inputs)
@@ -569,11 +574,13 @@ def main():
                                "source": SANDBOX_CELL.read_text().splitlines(keepends=True)})
     out = a.out or HERE / f"out/nb_{a.slug}"
     out.mkdir(parents=True, exist_ok=True)
-    json.dump(nb, open(out / f"{a.slug}.ipynb", "w"), indent=1, ensure_ascii=False)
     meta.update(id=f"chankhavu/{a.slug}", title=a.slug, code_file=f"{a.slug}.ipynb")
     if a.pins_dataset:
         meta["dataset_sources"] = list(meta["dataset_sources"]) + [f"chankhavu/{a.pins_dataset}"]
     meta.pop("id_no", None)
+    # Version 5's cells 0 and 2 found inputs with recursive scans: bounded lookups (input_paths.py), checked
+    IP.finish(nb, meta)
+    json.dump(nb, open(out / f"{a.slug}.ipynb", "w"), indent=1, ensure_ascii=False)
     json.dump(meta, open(out / "kernel-metadata.json", "w"), indent=1)
     print(out, {k: meta[k] for k in ("dataset_sources", "model_sources", "kernel_sources", "is_private")},
           {f: h[:8] for f, h in sha.items()})

@@ -62,6 +62,10 @@ def vfree(r):
     vals = [g["free_mib"] / 1024 for g in r.get("gpus", []) if g["used_mib"] > 4000]
     return min(vals) if vals else None
 print("\nslopes over the last %.1f h (per hour) and time to limit at that slope:" % ((w[-1]["t"] - w[0]["t"]) / 3600))
+for k_ in ("TP0", "TP1", "TP2", "TP3"):
+    s_ = series(lambda r: (r.get("alloc_cap") or {}).get(k_, {}).get("cap_minus_reserved_now")); kk = fit(s_)
+    if s_ and kk is not None:
+        print(f"  PRIMARY {k_} cap - reserved: now {s_[-1][1]:.2f} GiB, slope {kk:+.3f}/h" + (f"; reaches 0 in ~{s_[-1][1] / -kk:.1f} h" if kk < 0 else "; not decreasing"))
 for name, f, limit, down in (("Kaggle-eq RAM GiB", lambda r: r.get("kaggle_eq_gib"), 173.0, False),
                              ("worst cap - peak GiB", lambda r: worst(r, "cap_minus_peak"), 0.26, True),
                              ("worst cap - reserved GiB", lambda r: worst(r, "cap_minus_reserved_now"), 0.0, True),

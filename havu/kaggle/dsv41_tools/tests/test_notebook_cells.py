@@ -39,6 +39,15 @@ def sha(p):
 PIN_SHA = {f: sha(src) for f, src in FILES.items()}
 
 
+def cell0_lookup(ns):
+    """Cell 0's bounded input lookup (input_paths.HELPER: find_one / find_input / find_inputs) defined in a cell
+    namespace that has INPUT, as cells 0b and 1b find it on Kaggle."""
+    import glob as _glob
+    ns["glob"] = _glob
+    exec(compile(B.IP.HELPER, "cell0_lookup", "exec"), ns)
+    return ns
+
+
 def run_cells(rerun, extra_env=None, mode="submit", break_kit=None, cell0b=CELL0B):
     kit = Path(tempfile.mkdtemp(prefix="kit_", dir=C.SCRATCH)) / "kit"
     shutil.copytree(C.V3, kit)
@@ -389,9 +398,8 @@ class PinsDataset(unittest.TestCase):
         ns, out, err = {}, io.StringIO(), None
         with patch.dict(os.environ, env, clear=True), redirect_stdout(out):
             exec(compile(B.settings_cell(A_NEXT), "cell00", "exec"), ns)
-            import glob as _glob
-            ns.update(KIT=str(kit), MODE="submit", RERUN=rerun, INPUT=str(self.root / "input"),
-                      find_one=lambda p: (sorted(_glob.glob(p, recursive=True)) or [None])[0])
+            ns.update(KIT=str(kit), MODE="submit", RERUN=rerun, INPUT=str(self.root / "input"))
+            cell0_lookup(ns)
             try:
                 exec(compile(cell or self.cell, "cell0b", "exec"), ns)
             except RuntimeError as exc:
@@ -531,9 +539,8 @@ class InputIntegrity(unittest.TestCase):
 
     def run_cell(self, corrupt=False):
         root, inp, work, model, manifest = self.setup_tree(corrupt)
-        import glob as _glob
-        ns = {"T0": time.time(), "INPUT": str(inp), "WORK": str(work), "KIT": "/kit", "MODEL_SRC": str(model),
-              "MODE": "smoke", "RERUN": False, "find_one": lambda p: (sorted(_glob.glob(p, recursive=True)) or [None])[0]}
+        ns = cell0_lookup({"T0": time.time(), "INPUT": str(inp), "WORK": str(work), "KIT": "/kit",
+                           "MODEL_SRC": str(model), "MODE": "smoke", "RERUN": False})
         with redirect_stdout(io.StringIO()):
             exec(compile(B.integrity_cell(manifest), "cell1b", "exec"), ns)
         for _ in range(100):
@@ -567,7 +574,7 @@ class InputIntegrity(unittest.TestCase):
         with redirect_stdout(out):
             exec(compile(B.integrity_cell(self.setup_tree()[4]), "cell1b", "exec"),
                  {"T0": time.time(), "INPUT": "/x", "WORK": "/x", "KIT": "", "MODEL_SRC": "", "MODE": "submit",
-                  "RERUN": True, "find_one": lambda p: None})
+                  "RERUN": True, "find_input": lambda *a: None})
         self.assertEqual(out.getvalue(), "")
 
 

@@ -50,6 +50,7 @@ import sys
 from pathlib import Path
 
 import build_frozen_mt as B
+import input_paths as IP
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -321,7 +322,9 @@ def main():
         if a.load_test:  # the eval challenges file of the competition data, 80 typical tasks
             tasks = (f'os.environ["B32M_LOAD_TEST"] = "1"\n'
                      f'    import glob as _lg\n'
-                     f'    _lf = sorted(_lg.glob("/kaggle/input/**/arc-agi_evaluation_challenges.json", recursive=True))\n'
+                     # cell 00 runs before cell 0's find_input: fixed depths, never a recursive scan
+                     f'    _lf = sorted({{_p for _d in {IP.PRE_CELL0_DIRS}\n'
+                     f'                  for _p in _lg.glob(f"/kaggle/input/{{_d}}arc-agi_evaluation_challenges.json")}})\n'
                      f'    if _lf:\n'
                      f'        os.environ.setdefault("ARC_CHALLENGES", _lf[0])\n'
                      f'        os.environ.setdefault("ARC_TASK_IDS", "{LOAD_EVAL_TASKS}")\n'
@@ -333,7 +336,6 @@ def main():
         cells = external_server(cells, manh_nb, a)
     nb["cells"] = cells
     out.mkdir(parents=True, exist_ok=True)
-    json.dump(nb, open(out / f"{a.slug}.ipynb", "w"), indent=1, ensure_ascii=False)
     meta["dataset_sources"] = [d for d in meta["dataset_sources"] if d == "chankhavu/dsv41-tools-kit"] + [
         d for d in a.manh_datasets.split(",") if d]
     meta["kernel_sources"] = []  # B32's fork wheel kernel is not used
@@ -346,6 +348,8 @@ def main():
     meta.update(id=f"chankhavu/{a.slug}", title=a.slug, code_file=f"{a.slug}.ipynb", is_private=True,
                 enable_gpu=True, enable_internet=False, machine_shape="NvidiaL4")
     assert "arc-prize-2026-arc-agi-2" in meta["competition_sources"], "4xL4 needs the competition attached"
+    IP.finish(nb, meta)  # cell 0's INPUT_ROOTS from these sources; no cell scans the input root
+    json.dump(nb, open(out / f"{a.slug}.ipynb", "w"), indent=1, ensure_ascii=False)
     json.dump(meta, open(out / "kernel-metadata.json", "w"), indent=1)
     print(out, len(nb["cells"]), "cells;", {k: meta[k] for k in ("id", "dataset_sources", "kernel_sources",
                                                                  "model_sources", "docker_image_pinning_type")},

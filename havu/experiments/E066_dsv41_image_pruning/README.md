@@ -247,9 +247,58 @@ Paired differences (95% bootstrap CI over tasks):
   - Candidate 1's tool errors are identifier typos at the old E128 rate, growing with attempt length (5.8% -> 17%).
   - E72-152 tends to submit the first rule that fits the training pairs without checking test-only features.
 
+## Engram A/B on B32's model (2026-10-30, Vast 58332344, 4x RTX PRO 6000; `scripts/b32_engram_ab.sh`, `b32_engram_fp8next.sh`)
+
+User's question: does MXFP4 Engram cost ARC accuracy on the model and harness we know best? Setup:
+- Model: B32's tool E128 2-bit (HF `chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-E128-2bit`), text only.
+- Harness: B32's pinned harness and flags, tool code in the local executor on the box (`scripts/b32_local_eval.py`).
+- Server: the fork at TP4, fp8 KV, prefix caching.
+- Runs: 120 eval tasks x 2 attempts per arm, each arm alone on the box. Only the Engram table differs: the shipped FP8
+  (`export/b32_e128`) or the same rows rounded to MXFP4 (`export/b32_fp4`; served weights checked to hold 16 distinct
+  FP8 bytes, the E2M1 grid, vs 254 in FP8).
+- Scoring: locally with the **Kaggle** solutions file (`scripts/score_b32_engram.py`). The GitHub copy used by the
+  harness `correct` field differs on 4a21e3da, f560132c, b6f77b65.
+
+| Engram (same box, 120 tasks) | pass@1 | pass@2 | attempt 0 | attempt 1 | tasks fully solved (pass@2) | output tok/attempt |
+|---|---|---|---|---|---|---|
+| FP8 (shipped) | 69.9 | 81.4 | 69.7 | 70.1 | 95 | 41.4K |
+| MXFP4 | 69.8 | 78.9 | 67.6 | 71.9 | 91 | 41.4K |
+
+- Paired MXFP4 - FP8 (95% bootstrap CI over tasks): pass@1 -0.1 [-4.9, +4.6], better/worse 19/19; pass@2 -2.5
+  [-8.8, +3.8], 9/12. **No measurable effect.** A pass@2 loss of up to ~5 points can't be excluded.
+- The 48 GiB rows + MXFP4 arm was postponed (user); its table is built and on HF (below).
+- Mixed baselines misled: before the control ran, MXFP4 looked -9.5 vs E052 arm A (CI excluding zero) and -4.7 vs a
+  combined FP8 baseline. All of that was setup difference. Compare Engram variants on the same box only.
+- **E052's 76.5 is not reproduced here:** same model and harness, FP8 Engram, attempt 0: 69.7 here vs 76.5 in E052 arm A
+  (V6-era stack, 4090s). E046 run 7 (Kaggle key) has 70.0. The cause is open: the stack, or E052 being a high draw
+  (one run each, CIs ~+/-5).
+  - Against the stack explanation (model-serving): the full model's text run on this same wheel matched the API
+    (85.7 vs 82.7 on 136 attempts).
+- MXFP4 needs vLLM PR 61530 (+ the row_map patch) to save host RAM; until then it only proves the format is safe.
+- Engram tables backed up: HF dataset `chankhavu/dsv41-flash1017-e066-engram-tables` (private): `b32_tool64_mxfp4/`
+  and `b32_tool48_mxfp4/`, verified.
+- **Further Engram pruning** (`scripts/engram_subset.py`; rows ranked by the training census only):
+  - Coverage check on B32's own eval traces (`scripts/engram_evalcheck.py`, measurement only, nothing selected).
+    92.2% of eval Engram lookups fall in the 64 GiB table (training census: 94.3%).
+  - Lookups kept by smaller budgets, training vs eval:
+
+    | budget | training | eval | eval, generated tokens |
+    |---|---|---|---|
+    | 56 GiB | 99.92% | 98.59% | 98.00% |
+    | 48 GiB | 99.44% | 97.00% | 95.71% |
+    | 40 GiB | 98.50% | 95.11% | 93.01% |
+    | 32 GiB | 97.18% | 93.03% | 90.02% |
+
+  - The training census understates the loss on unseen tasks by 2-4x.
+  - Rows never seen in the training census (26.9M, 10%) still serve 1.1% of eval lookups.
+  - Advice: 56 GiB at most without an ARC A/B, 48 GiB only after one, nothing below 40 GiB.
+- Node 5 handed to model-serving for the image-harness research (user, 2026-10-30 08:10 UTC); results and logs in
+  `results/b32_engram/`.
+
 ## Status
 - 2026-10-28: CPU prep done (data, tokens, census, scripts, tests). No box yet; no API spend.
 - 2026-10-29: box up, replays done, candidate 1 picked; candidate 1 GPTQ capture and the layer sweep running.
 - 2026-10-29 afternoon: final candidates fixed (above); boxes 2 and 3 destroyed; the C1 eval was found unmasked and
   re-planned; the box 1 chain and the local evals are running.
 - 2026-10-29/30 night: all four evals finished; both boxes destroyed (logs in `results/box1`, `results/box4`).
+- 2026-10-30: Engram A/B on B32's model done: MXFP4 = FP8 on ARC (pass@1 -0.1, pass@2 -2.5, CIs include zero); node 5 handed to model-serving.

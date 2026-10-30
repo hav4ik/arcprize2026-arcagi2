@@ -35,7 +35,7 @@ def left():
 
 
 def wheel_dir_sglang():
-    p = S.find_one("/kaggle/input/**/sglang-0.5.20-*.whl")
+    p = S.find_input("sglang-0.5.20-*.whl", root="/kaggle/input")  # fixed depths, never a recursive scan
     if not p:
         raise FileNotFoundError("sglang wheel source not attached")
     return os.path.dirname(p)
@@ -143,7 +143,7 @@ async def bench_cfg(name, radix, steps, mdir, tasks, prefixes):
 
 async def main_async():
     tasks = json.load(open(S.comp_file("arc-agi_evaluation_challenges.json")))
-    prefixes = json.load(open(S.find_one("/kaggle/input/**/bench_prefixes.json")))
+    prefixes = json.load(open(S.find_input("bench_prefixes.json", root="/kaggle/input")))
     mdir = S.model_dir()
     await bench_cfg("radix_on", True, [
         ("decode_16x40k", dict(n_seqs=16, gen_tokens=1000)),

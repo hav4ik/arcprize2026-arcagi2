@@ -231,26 +231,53 @@ def valid_grid(grid):
 
 # ---------------------------------------------------------------- paths
 
+# Inputs are found at exact paths and fixed depths only, never by a recursive scan of INPUT: with large datasets
+# attached, one scan walks thousands of files (~5 min per call on Kaggle). Kaggle mounts datasets/<owner>/<slug>,
+# competitions/<slug>, notebooks/<owner>/<slug> (kernel outputs) and models/<owner>/<model>/<framework>/<variation>/
+# <version>; older mounts and the local tests use <slug>/ at the top.
+INPUT_DEPTHS = ("", "*", "*/*", "datasets/*/*", "datasets/*/*/*", "notebooks/*/*", "notebooks/*/*/*", "models/*/*/*/*/*")
+
+
 def find_one(pattern):
-    hits = sorted(glob.glob(pattern, recursive=True))
+    hits = sorted(glob.glob(pattern))
     return hits[0] if hits else None
 
 
+def find_input(name, *exact, root=None):
+    """The first input file or dir called `name` (glob characters allowed): the `exact` patterns first, then
+    <root>/<d>/name for the fixed depths d of INPUT_DEPTHS (root: INPUT)."""
+    root = root or INPUT
+    for pat in list(exact) + [f"{root}/{d}/{name}" if d else f"{root}/{name}" for d in INPUT_DEPTHS]:
+        p = find_one(pat)
+        if p:
+            return p
+    return None
+
+
+def find_below(roots, name, depth=3):
+    """The first `name` at most `depth` dirs below one of `roots` (glob patterns, in order; shallowest first): a model
+    mount holds <framework>/<variation>/<version>/."""
+    for r in roots:
+        for k in range(depth + 1):
+            p = find_one("/".join([r] + ["*"] * k + [name]))
+            if p:
+                return p
+    return None
+
+
 def comp_file(name):
-    return (find_one(f"{INPUT}/competitions/arc-prize-2026-arc-agi-2/{name}")
-            or find_one(f"{INPUT}/arc-prize-2026-arc-agi-2/{name}")
-            or find_one(f"{INPUT}/**/{name}"))
+    return find_input(name, f"{INPUT}/competitions/arc-prize-2026-arc-agi-2/{name}",
+                      f"{INPUT}/arc-prize-2026-arc-agi-2/{name}")
 
 
 def official_model_dir():
     """The official Qwen3.8-27B-FP8 mirror (mikedan7/qwen3-8-27b-fp8-official), mounted by Kaggle at
     /kaggle/input/models/mikedan7/qwen3-8-27b-fp8-official/pytorch/hf-fp8/1 (framework lower-cased)."""
-    for pat in [f"{INPUT}/models/mikedan7/qwen3-8-27b-fp8-official/**/config.json",
-                f"{INPUT}/qwen3-8-27b-fp8-official/**/config.json",
-                f"{INPUT}/**/qwen3-8-27b-fp8*/**/config.json"]:
-        p = find_one(pat)
-        if p:
-            return os.path.dirname(p)
+    p = find_below([f"{INPUT}/models/mikedan7/qwen3-8-27b-fp8-official", f"{INPUT}/qwen3-8-27b-fp8-official",
+                    f"{INPUT}/models/*/qwen3-8-27b-fp8*", f"{INPUT}/datasets/*/qwen3-8-27b-fp8*",
+                    f"{INPUT}/qwen3-8-27b-fp8*"], "config.json")
+    if p:
+        return os.path.dirname(p)
     raise FileNotFoundError("model dir")
 
 
@@ -260,10 +287,9 @@ def source_dir(source, need="config.json"):
     if os.path.isdir(source):
         return source
     owner, _, slug = source.strip("/").partition("/")
-    for pat in [f"{INPUT}/models/{owner}/{slug}/**/{need}", f"{INPUT}/{slug}/**/{need}"]:
-        p = find_one(pat)
-        if p:
-            return os.path.dirname(p)
+    p = find_below([f"{INPUT}/models/{owner}/{slug}", f"{INPUT}/{slug}"], need)
+    if p:
+        return os.path.dirname(p)
     raise FileNotFoundError(f"model {source!r} not attached (no {need} under {INPUT})")
 
 
@@ -321,7 +347,7 @@ def tokenizer_dir():
 def wheel_dir():
     """Our own wheel sources (attached as kernel sources): SGLang 0.5.20 cu130 or the user's vLLM 0.23.0 cu128."""
     pat = "sglang-0.5.20-*.whl" if SERVER == "sglang" else "vllm-0.23.0*.whl"
-    p = find_one(f"{INPUT}/notebooks/chankhavu/**/{pat}") or find_one(f"{INPUT}/**/{pat}")
+    p = find_below([f"{INPUT}/notebooks/chankhavu/*"], pat, depth=2) or find_input(pat)
     if not p:
         raise FileNotFoundError(f"wheel source for {SERVER}")
     return os.path.dirname(p)
@@ -447,7 +473,7 @@ def sglang_jit_env(env):
     """SGLang JIT kernel cache: a writable dir, seeded from a pre-built cache attached as input if there is one."""
     import shutil
     jit = os.environ.get("ARC_SGL_JIT_DIR", "/tmp/sglang_jit")
-    seed = find_one(f"{INPUT}/**/sglang_jit_cache/sm89") if os.path.isdir(INPUT) else None
+    seed = find_input("sglang_jit_cache/sm89") if os.path.isdir(INPUT) else None
     if seed and not os.path.exists(os.path.join(jit, "sm89")):
         shutil.copytree(seed, os.path.join(jit, "sm89"), symlinks=True)
         log("sglang JIT cache seeded from", seed)
@@ -1665,8 +1691,8 @@ def main():
             tasks = json.load(open(comp_file("arc-agi_evaluation_challenges.json")))
             solutions = json.load(open(comp_file("arc-agi_evaluation_solutions.json")))
         else:
-            tasks = json.load(open(find_one(f"{INPUT}/**/arc-agi_local_challenges.json")))
-            solutions = json.load(open(find_one(f"{INPUT}/**/arc-agi_local_solutions.json")))
+            tasks = json.load(open(find_input("arc-agi_local_challenges.json")))
+            solutions = json.load(open(find_input("arc-agi_local_solutions.json")))
         if LOCAL_TASKS:
             tasks = {t: tasks[t] for t in LOCAL_TASKS.split(",") if t in tasks}
         force_at = hard_stop = None  # set once the server is ready

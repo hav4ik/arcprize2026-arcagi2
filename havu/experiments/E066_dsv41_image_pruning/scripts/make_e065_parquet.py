@@ -25,13 +25,14 @@ PFX = "tools_persistent_grid_lean2sub_deepseek-flash_low_"
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", nargs="+", required=True)
+    ap.add_argument("--prefix", default=PFX, help="result-file prefix (self-hosted runs: ..._dsv41_low_)")
     ap.add_argument("--results", default="/home/vu/Workspace/ARC-AGI-2/evals/results")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     rows = []
     for run in a.runs:
         latest = {}
-        for line in open(f"{a.results}/{PFX}{run}.jsonl"):
+        for line in open(f"{a.results}/{a.prefix}{run}.jsonl"):
             r = json.loads(line)
             if "error" not in r:
                 latest[(r["task_id"], r["pair"], r["attempt"])] = r

@@ -147,3 +147,114 @@ The OOM came earlier than the auditor's 3.1-4.4 h band.
   - `gpumem.log` sync: the remote grep loop ended on a no-match in server_restart1.log, so ssh returned 1 and the file was never renamed. The loop now ends in `; true`.
   - New `data/tps.tsv`: one row per minute from /metrics deltas, with 0 / 0 / 0 and an empty kv_pct while the server is down.
   - `status.json` counters are now cumulative over all server logs, with a floor file so they never go down.
+
+**Kaggle 2.5 h (06:01 UTC): one blow-up (OOM 05:37 -> serving 05:45:41); cycle 2 is serving normally** (446-503 gen tok/s, running 79-80, waiting 0).
+- New server: cap - peak 0.61 / 0.59 / 0.55 / 0.55 and cap - reserved 0.17 / 0.15 / 0.11 / 0.11. Peak 19.82 and reserved 20.26 are flat after the warm-up; 0 retries.
+- **Lesson from cycle 1: the OOM came at cap - peak 0.40, not 0.26; the binding margin is cap - reserved.**
+  - With expandable segments, reserved crept 20.26 -> 20.34 on TP2/3 (cap 20.37, so 0.03 left) over ~1.8 h, and then a 32 MiB all_gather buffer failed.
+  - At cycle 1's ~0.045 GiB/h, the new server's 0.11 lasts ~2 h: the next OOM is expected ~07:20-07:50 UTC (Kaggle ~3.8-4.3 h).
+- **Restart cost (cycle 1):**
+  - hang 303 s + 32 s to relaunch + 160 s load;
+  - then ~7 min of slow re-prefill (19-41 gen tok/s at 05:46-05:52) while the 80 retried attempts resubmitted;
+  - about 15 min of serving lost, plus the progress of the 80 in-flight attempts.
+- Accuracy: 63 first attempts, 53 fully correct; 104 of 344 pairs answered (including kept session answers).
+- Counters: ooms 2, deaths 1, restarts 1, errored 81, retries_max 41.
+- Watcher fix: the cap-peak drop alert now compares only samples of the current server after its warm-up (it had fired twice on the restart's ~0.4 GiB warm-up step).
+
+**Kaggle 3.0 h (06:31 UTC): cycle 2 is retracing cycle 1 about 15-20 min faster; next OOM expected ~07:15-07:25 UTC (Kaggle ~3.75-3.9 h).**
+
+TP2 (the tightest rank, = TP3) by server age; peak / reserved / retries:
+
+| server age | cycle 1 | cycle 2 |
+|---|---|---|
+| 0 (up) | 03:45 19.42 / 19.71 / 0 | 05:45 19.42 / 19.71 / 0 |
+| ~10 min | 03:55 19.82 / 20.26 / 0 | 05:55 19.82 / 20.26 / 0 |
+| ~40 min | 04:25 19.86 / 20.30 / 0 | 06:25 19.87 / 20.28 / 3 |
+| ~60 min | 04:45 19.87 / 20.30 / 1 | 06:30 retries 3, cap - reserved 0.05 |
+| ~80-110 min | 05:05-05:35 19.93 -> 19.97 / 20.34-20.36 -> 20.22 / 11 -> 41 | |
+| 112 min | 05:37 OOM (TP2 + TP3) | |
+
+- The predictor is peak + the unreleasable split (0.26) against the cap (20.37). At the OOM, PyTorch had 20.06 allocated + 0.26 split + the 32 MiB request, about the cap.
+  - Cycle 2 at 06:25: 19.87 + 0.26 = 20.13, so 0.24 GiB is left, and cycle 1 needed ~0.20 more to OOM.
+- Reserved is not monotone: allocator retries flush the cache (20.36 -> 20.22 in cycle 1).
+- Host: Kaggle-eq 147.3 GiB, flat; one engine.
+- Health: no new errors since the restart; 393-511 gen tok/s, running 80, waiting 0.
+- Accuracy: 67 first attempts, 57 fully correct; 109 of 344 pairs answered.
+
+**Kaggle 3.0-3.5 h (06:31-07:01 UTC): cycle 2 at the edge, no OOM yet.**
+- 06:39: cap - reserved 0.03 on TP2/3, the cycle-1 OOM level; peak step to cap - peak 0.46.
+- 06:42: retry storm, retries 3 / 10 / 11 / 11 -> 8 / 17 / 22 / 22; cap - peak 0.43 on TP2/3 (peak 19.94).
+- 06:43-07:01: a plateau. Peak 19.94, reserved 20.36 (cap - reserved 0.01), split 0.26, free 0.51, retries 27 on TP2/3, 0 OOMs. The retries flush the cache and keep it alive. Cycle 1 OOMed 3-12 min after the same peak.
+- Serving: 400-491 gen tok/s, running 79-80, waiting 0. Kaggle-eq 147.5 GiB.
+- Accuracy: 76 first attempts, 63 fully correct; 119 of 344 pairs.
+
+**Kaggle 4.0 h (07:31 UTC): cycle 2 has been at the edge for ~50 min, held up by retry storms; no OOM yet at 1.77 h of server age** (cycle 1 died at 1.87 h).
+
+TP2 (= TP3), cycle 2:
+
+| UTC (age) | peak | reserved | cap - reserved | retries |
+|---|---|---|---|---|
+| 05:55 (0.2 h) | 19.82 | 20.26 | 0.11 | 0 |
+| 06:25 (0.7 h) | 19.87 | 20.28 | 0.09 | 3 |
+| 06:45 (1.0 h) | 19.94 | 20.34 | 0.03 | 25 |
+| 07:15 (1.5 h) | 19.94 | 20.36 | 0.01 | 32 |
+| 07:31 (1.77 h) | 19.96 | 20.22 | 0.15 | 75 |
+
+- Retries are accelerating (TP2/3 27 -> 75 in 30 min; TP1 61, TP0 38). Each one flushes the cache, so reserved swings 20.22-20.40; TP0 is at 20.40 of its 20.43 cap.
+- cap - peak 0.47 / 0.45 / 0.41 / 0.41 (peak 19.96 vs cycle 1's logged 19.97 before its OOM).
+- Serving: 459 gen tok/s mean over the hour (387-511), running 79-80, waiting 0. 0 new errors.
+- Host: Kaggle-eq 147.7 GiB (+0.4 GiB/h); shmem 125.1; one engine.
+- Accuracy: 87 first attempts, 73 fully correct; 131 of 344 pairs answered.
+
+### Second OOM (TP2 + TP3) at Kaggle 4.02 h (07:32:01 UTC), 1.77 h into cycle 2
+- `server_restart1.log`, TP3 pid 86567, the same all_gather -> torch.empty path: `torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 MiB. GPU 3 has a total capacity of 22.04 GiB of which 515.94 MiB is free. Process 66985 has 350.00 MiB memory in use. Including non-PyTorch memory, this process has 21.05 GiB memory in use. 20.37 GiB allowed; Of the allocated memory 20.11 GiB is allocated by PyTorch, with 126.00 MiB allocated in private pools (e.g., CUDA Graphs), and 265.63 MiB is reserved by PyTorch but ...`
+- TP2 logged the same; 2 lines each.
+- Just before (07:31): peak 19.96 on every rank; reserved 20.22 (TP2/3) / 20.40 (TP0); retries 75 / 75 / 61 / 38; gen 471-527 tok/s until 07:32:01, then 0.
+- At the failure: 20.11 GiB allocated + 0.27 unreleasable reached the 20.37 cap. Cycle 1 failed at 20.06 allocated.
+- Logs preserved in `/root/e066/b32mv3/preserved/073259/`.
+- The attempts still in flight that already used a try at the cycle-1 death have none left and will be finalized as errors at this death.
+- **07:37:03:** `EngineDeadError` (server_restart1.log), 302 s after the OOM.
+- **07:37:00-07:37:15:** the 80 in-flight attempts got the HTTP 500.
+  - **56 were finalized as `stop=error`.** These were retried at the cycle-1 death, and their last try is now used. They had been running since 05:45 (1.85 h), e.g. `[89] 25acf30e.0#0 pred=no stop=error turns=8 out=7088 ... 6678.7s`.
+  - The other 24 were retried once.
+- **07:37:15:** `server died (code 0)`.
+- **07:37:40:** `server start (restart 2)`, log `server_restart2.log`. Host Kaggle-eq was back to 9.5 GiB before the relaunch.
+- Counters: 248 attempt records, 160 with error; deaths 2, restarts 2 (the solver allows 3), OOM events 2.
+- Logs preserved in `/root/e066/b32mv3/preserved/073259/` and `/073758/`.
+- **07:40:15:** `server up after 155s` (restart 2); KV 3,196,704, the same caps (20.43 / 20.41 / 20.37 / 20.37). 1 free re-queue at up.
+  - **Outage 2, OOM to serving: 8 min 14 s.** Cycle 3 started.
+  - At the cycle-1/2 rate, the next OOM comes ~09:25 UTC (Kaggle ~5.9 h), and there is 1 restart left after it.
+
+**Kaggle 4.5 h (08:01 UTC): two blow-ups (05:37 and 07:32). Cycle 3 is serving normally and tightening ~10 min ahead of cycle 2; next OOM expected ~09:10-09:25 UTC (Kaggle ~5.7-5.9 h).**
+- Recovery after restart 2 took 12 min (07:40 up -> 07:52 at 80 running / 0 waiting): all 80 attempts restarted on a cold prefix cache (hit 4.5%) and were prefilled at 1,000-2,300 prompt tok/s. After restart 1 it took ~7 min.
+- 08:01, TP2/3: peak 19.86, reserved 20.30, cap - reserved 0.07, 0 retries. cap - peak 0.57 / 0.55 / 0.51 / 0.51; cycle 2 at the same age had 0.55 on TP2/3.
+- Serving: 401-458 gen tok/s, running 80, waiting 0. Kaggle-eq 147.1 GiB.
+- Losses: 2 deaths, 2 restarts (1 left); 56 attempts finalized as errors; 162 error records.
+- Accuracy: 88 first attempts, 74 fully correct; 141 of 344 pairs answered.
+- Fix: the 5-min dashboard sync now runs before any watcher exit. It had been skipped when the watcher exited at a report mark.
+
+**Kaggle 5.0 h (08:31 UTC): two blow-ups; cycle 3 at the edge (cap - reserved 0.03 on TP2/3 since 08:24). Next OOM likely ~09:10-09:30 UTC; one restart left after it.**
+
+| cycle | server up | first retry (age) | cap - reserved 0.03 (age) | OOM (age) |
+|---|---|---|---|---|
+| 1 | 03:45 | 04:46 (1.0 h) | ~05:31 (1.8 h) | 05:37 (1.87 h) |
+| 2 | 05:45 | 06:22 (0.6 h) | 06:39 (0.9 h) | 07:32 (1.77 h) |
+| 3 | 07:40 | 08:20 (0.67 h) | 08:24 (0.73 h) | - |
+
+- Gen tok/s by Kaggle hour: h0 408, h1 446, h2 352, h3 459, h4 294. The dips are the two outages; 36 min in total below 50 tok/s.
+- Restart cost per cycle: ~5 min hang + ~30 s + ~2.6 min load, then 7-12 min of cold re-prefill, so about 15-20 min of serving. In-flight attempts are retried once and lost at the next death (56 at death 2).
+- Accuracy: 98 first attempts, 84 fully correct; 152 of 344 pairs answered; 162 error records.
+- Projection:
+  - An OOM ~09:20 uses the last restart (3 of 3).
+  - The next one (~11:15 UTC, Kaggle ~7.7 h) leaves no server for the last ~4 h.
+  - On Kaggle each reload is 19-30 min, so the same cycle there loses ~1 h of serving per OOM.
+
+**Accuracy trend (coordinator's method, `dashboard/tools/acc_series.py`; helper `pod3_scripts/b32mv3/acc_report.py`):** the ARC task score so far over all 240 tasks (per task, the fraction of test pairs right by any finished attempt; unanswered = 0), plus the tasks answered and the first-attempt accuracy (fully correct / first attempts with an answer, including kept session answers).
+- At Kaggle 5.23 h: **score 40.4**, 120 of 240 tasks answered, first-attempt accuracy 74.6%.
+- Score at the end of each Kaggle hour (tasks answered):
+
+  | h1 | h2 | h3 | h4 | h5 | h6 so far |
+  |---|---|---|---|---|---|
+  | 6.2 (19) | 21.9 (62) | 25.0 (77) | 32.1 (95) | 37.3 (111) | 40.4 (120) |
+
+  The slow steps (h3 +3.1, h5 +5.2) are the hours of the two outages.

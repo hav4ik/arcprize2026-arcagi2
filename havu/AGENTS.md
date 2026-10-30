@@ -183,6 +183,10 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
   - **Rejected:** 4-bit weights (INT4/AWQ) lose tool accuracy; pipeline parallelism is slower on decode; MTP2 + TurboQuant KV produces broken text on vLLM 0.31.
   - **Also rejected (2026-10-17):** MTP2 on vLLM 0.31 (accuracy tie, slower on real tool traffic: 0.31 reuses less prefix cache) and tuned FP8 GEMM configs (faster on the decode bench, slower on a real-traffic probe, unresolved; v4d not pushed).
   - **Transcript compaction (opt-in, off by default):** `AgentConfig.compact_at/compact_keep/compact_tool_chars`, solver `ARC_COMPACT_AT/ARC_COMPACT_KEEP/ARC_COMPACT_TOOL_CHARS`. It empties earlier turns' thinking and cuts old tool outputs once per +50% transcript growth. Tests: `evals/tests/test_qwen_tools.py` `CompactTest`.
+- **Never scan `/kaggle/input` recursively in notebook, cell or solver code** (rule from Manh, 2026-10-30).
+  - Banned: `glob("…/**/…", recursive=True)`, `find_one(f"{INPUT}/**/x")`, `Path("/kaggle/input").rglob(...)` and `os.walk`.
+  - Why: with his cu13 debs and vLLM wheel datasets attached, each such call walks thousands of files and costs ~5 min of the 12 h budget.
+  - Instead: use exact mount paths built from kernel-metadata (`/kaggle/input/datasets/<owner>/<slug>/…`, `/kaggle/input/models/<owner>/<model>/<framework>/<variation>/<version>/…`, `/kaggle/input/competitions/<slug>/…`), or at most fixed-depth globs (`{INPUT}/*/name`).
 - **Never kill processes by name on this host.** `pkill -f` patterns such as `sglang` or `vllm` also match other agents'
   eval runs and the SGLang gateway (E021 incident, 2026-10-12: a test of the Kaggle emergency writer killed E020's runs).
   In `kaggle/`, the emergency writer, the notebook guard cell and `kill_server` use name patterns **only on Kaggle**

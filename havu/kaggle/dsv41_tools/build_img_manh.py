@@ -12,7 +12,8 @@ attaching through ARC_EXTERNAL_SERVER. On top, only what the E066 image candidat
   expert-count whitelist in dsv4_topk.py; for his g5e1bccd07c wheel also the Engram row chunks) instead of his
   row-chunk-only cell (a newer wheel of his already has row chunks);
 - cell 2c: the API contract check also requires parsed chat tool calls and an accepted image;
-- metadata: our slug and the E066 Kaggle Model; his datasets and docker image.
+- metadata: our slug and the E066 Kaggle Model; his datasets and docker image;
+- every cell: our cells' recursive input lookups (cells 0, 1b, 2, the load test) become bounded ones (input_paths.py).
 Usage: build_img_manh.py --manh-nb DIR --model-source owner/model/framework/instance/version [--slug S] [--out DIR]
 Nothing is pushed.
 """
@@ -24,6 +25,7 @@ import re
 from pathlib import Path
 
 import build_frozen_mt as B
+import input_paths as IP
 
 HERE = Path(__file__).resolve().parent
 P = HERE / "pinned_img"
@@ -426,7 +428,6 @@ def main():
     nb["cells"] = cells
     out = a.out or HERE / f"out/nb_{a.slug}"
     out.mkdir(parents=True, exist_ok=True)
-    json.dump(nb, open(out / f"{a.slug}.ipynb", "w"), indent=1, ensure_ascii=False)
     meta.update(id=f"chankhavu/{a.slug}", title=a.slug, code_file=f"{a.slug}.ipynb", is_private=True,
                 model_sources=[a.model_source] if a.model_source else meta["model_sources"])
     meta.pop("id_no", None)
@@ -441,6 +442,10 @@ def main():
         meta.pop("docker_image", None)
         meta["docker_image_pinning_type"] = "latest"
     assert "arc-prize-2026-arc-agi-2" in meta["competition_sources"], "4xL4 needs the competition attached"
+    # our cells as copied into his notebook (cells 0, 1b, 2 and the load test in 00) found inputs with recursive scans:
+    # bounded lookups, cell 0's INPUT_ROOTS from these sources, and no cell left that scans the input root
+    IP.finish(nb, meta)
+    json.dump(nb, open(out / f"{a.slug}.ipynb", "w"), indent=1, ensure_ascii=False)
     json.dump(meta, open(out / "kernel-metadata.json", "w"), indent=1)
     print(out, len(cells), "cells;", {f: h[:8] for f, h in sha.items()},
           {k: meta.get(k) for k in ("id", "model_sources", "dataset_sources", "docker_image_pinning_type")})

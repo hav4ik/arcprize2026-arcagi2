@@ -3,8 +3,8 @@
 # offline wheel set against its SHA256SUMS when it ships one; and every file of the model (136 files, 131 GB) by size
 # and sha256 against the manifest made before upload. The model is hashed once the server is up, so it does not slow
 # the load. Results go to /kaggle/working/smoke_integrity.json; the report cell prints them and fails the commit run on
-# any mismatch. The competition rerun skips this cell. Uses cell 0's T0, INPUT, WORK, KIT, MODEL_SRC, MODE, RERUN and
-# find_one.
+# any mismatch. The competition rerun skips this cell. Uses cell 0's T0, WORK, KIT, MODEL_SRC, MODE, RERUN and
+# find_input (bounded lookups, never a recursive scan of the input root).
 import hashlib
 import json
 import os
@@ -35,14 +35,14 @@ def integrity_sha256(path):
 def integrity_worker(state, model_dir, threads=8, wait_s=1800):
     try:
         state["competition"] = {}
-        comp_files = sorted({p for p in (find_one(f"{INPUT}/**/arc-agi_test_challenges.json"),) if p})
+        comp_files = sorted({p for p in (find_input("arc-agi_test_challenges.json"),) if p})
         comp_dir = os.path.dirname(comp_files[0]) if comp_files else None
         for name in sorted(os.listdir(comp_dir)) if comp_dir else []:
             if name.endswith(".json"):
                 with open(os.path.join(comp_dir, name)) as f:
                     state["competition"][name] = len(json.load(f))
         state["kit"] = "sha256-checked by cell 0 (MANIFEST.json)" if KIT else "MISSING"
-        wheel = find_one(f"{INPUT}/**/vllm-0.28.1rc1*.whl")
+        wheel = find_input("vllm-0.28.1rc1*.whl")
         wdir = os.path.dirname(wheel) if wheel else None
         sums = os.path.join(wdir, "SHA256SUMS") if wdir else None
         if sums and os.path.exists(sums):

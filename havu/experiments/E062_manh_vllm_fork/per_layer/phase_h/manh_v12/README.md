@@ -173,3 +173,56 @@ Whole run after the first 10 min of serving: mean 646 gen tok/s, mean running 47
 - Events: none.
 - Accuracy: 182 first attempts, 127 correct (69.8%). Stops: 167 submitted, 11 output_budget, 3 max_turns, 1 context.
 - Load: 4.0-4.5 h at 531 tok/s, 31 running, KV 0.88.
+
+### Primary VRAM margin is cap - reserved (coordinator, 06:10 UTC, after pod 3's OOM)
+- Pod 3 (B32-M) OOMed on a 32 MiB all-gather buffer with reserved 0.03 GiB below the cap (expandable segments), while cap - peak still read 0.40. **So cap - reserved, not cap - peak, is the danger signal.** My earlier "benign without retries" note was wrong.
+- V12 at 06:10: cap - reserved 1.13 / 1.11 / 1.10 / 1.08 GiB (TP0-3); 2 h slope -0.016 GiB/h; ETA to 0 ~67-70 h; flat since 04:50.
+- The sampler alerts at cap - reserved < 0.30 (EARLY) / 0.15 (ALERT) / 0.05 (CRIT), and on the first allocator retry. The reports lead with cap - reserved per rank, its slope and ETA.
+
+### Report 5 (06:56 UTC; 5 h of solving; `report_0656.txt`)
+**Verdict: stable; every memory margin flat for 2 h.**
+- **VRAM:** cap - reserved TP0-3 = 1.13 / 1.11 / 1.10 / 1.08 GiB, slope 0.000/h over 2 h (last change ~04:50). cap - peak 1.58-1.63. 0 retries, 0 OOMs.
+- **RAM:** Kaggle-eq (cgroup) 134.2 GiB, -0.14 GiB/h.
+- **Events:** none.
+- **Accuracy:** 225 first attempts, 162 correct (72.0%). Stops: 206 submitted, 15 output_budget, 3 max_turns, 1 context.
+- **Throughput:**
+
+  | window (h) | gen tok/s | running |
+  |---|---|---|
+  | 4.0-4.5 | 511 | 32.6 |
+  | 4.5-5.0 | 619 | 43.8 |
+  | 5.0-5.5 | 586 | 36.5 |
+
+  Whole run after 10 min: 586 tok/s at 39.5 running.
+
+### Report 6 (07:57 UTC; 6 h of solving; `report_0756.txt`)
+**Verdict: stable; margins flat for 3 h.**
+- **VRAM:** cap - reserved 1.13 / 1.11 / 1.10 / 1.08 GiB, slope 0.000/h, unchanged since 04:50. 0 retries, 0 OOMs.
+- **RAM:** Kaggle-eq (cgroup) 134.2 GiB, flat.
+- **Events:** none.
+- **Progress:** all 240 tasks finished their first attempt by Kaggle 6.0 h: 171 correct (71.3%, scored on pair 0 per task). Stops: 220 submitted, 16 output_budget, 3 max_turns, 1 context. Second attempts are running (262 attempt records).
+- **Load:** 5.5-6.0 h: 506-629 tok/s, 29-42 running, KV 0.84-0.90; host restore up to 94% of prompt tokens in some windows.
+
+### Report 7 (08:57 UTC; 7 h of solving; `report_0856.txt`)
+**Verdict: stable; memory margins flat for 4 h; no events.**
+- **Accuracy trend** (`scripts/acc_report.py`, the dashboard's acc_series method: best of the finished attempts, all test pairs, all 240 tasks, unanswered = 0):
+  - ARC score so far 75.6 at Kaggle 7.04 h; 233 tasks answered.
+  - First attempts 166/222 = 74.8%; second attempts 24/53 = 45.3%.
+
+  | by Kaggle h | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+  |---|---|---|---|---|---|---|---|
+  | score so far | 18.1 | 29.8 | 40.4 | 53.3 | 68.3 | 74.0 | 75.6 |
+  | tasks answered | 50 | 87 | 126 | 164 | 206 | 224 | 233 |
+
+  Earlier reports counted first-attempt records scored on pair 0 (e.g. 171/240 at 6 h); from here on, this metric.
+- **VRAM:** cap - reserved 1.13 / 1.11 / 1.10 / 1.08 GiB, flat since 04:50. 0 retries, 0 OOMs.
+- **Sampler bug fixed at 08:57:** the startup cap lines had scrolled out of the 3 MB log tail, so `alloc_cap` (and its alerts) was empty for 24 samples, the last ones ~08:33-08:56. Caps are now read from the log head once per log. In that window reserved stayed <= 20.07 GiB per rank (cap - reserved >= 1.08) with 0 retries, so nothing was missed.
+- **RAM:** Kaggle-eq (cgroup) 134.7 GiB, +0.09 GiB/h.
+- **Throughput:**
+
+  | window (h) | gen tok/s | running |
+  |---|---|---|
+  | 6.5-7.0 | 555 | 37.6 |
+  | 7.0-7.5 | 736 | 54.4 |
+
+  The 7.0-7.5 h window is higher because second attempts start short, so the KV gate admits more. Whole run after 10 min: 578 tok/s at 38.1 running.

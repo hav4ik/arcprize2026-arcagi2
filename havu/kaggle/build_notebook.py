@@ -141,7 +141,8 @@ def _valid(g):
     return (isinstance(g, list) and 1 <= len(g) <= 30 and all(isinstance(r, list) and 1 <= len(r) <= 30 for r in g)
             and len({len(r) for r in g}) == 1 and all(type(v) is int and 0 <= v <= 9 for r in g for v in r))
 test_path = (glob.glob('/kaggle/input/competitions/arc-prize-2026-arc-agi-2/arc-agi_test_challenges.json')
-             or glob.glob('/kaggle/input/**/arc-agi_test_challenges.json', recursive=True))[0]
+             or sorted(p for d in ('', '*/', '*/*/', 'datasets/*/*/')  # fixed depths, never a recursive scan
+                       for p in glob.glob(f'/kaggle/input/{d}arc-agi_test_challenges.json')))[0]
 tasks = json.load(open(test_path))
 try:
     sub = json.load(open('/kaggle/working/submission.json'))

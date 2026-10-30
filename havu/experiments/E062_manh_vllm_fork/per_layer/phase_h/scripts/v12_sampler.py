@@ -12,6 +12,7 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 GM = re.compile(r"Worker_TP(\d).*?GPU memory: ([\d.]+) GiB allocated \(peak ([\d.]+) GiB\), ([\d.]+) GiB reserved.*?, ([\d.]+) GiB free, (\d+) allocator retries, (\d+) OOMs")
 CAP = re.compile(r"Worker_TP(\d).*?Capped the PyTorch allocator at ([\d.]+) GiB \(([\d.]+) GiB reserved\)")
 cap_alerted = set()
+CAPS_BY_LOG = {}
 MEMK = ("MemTotal", "MemAvailable", "AnonPages", "Shmem", "Cached", "Mlocked", "PageTables", "AnonHugePages")
 def alert(level, msg):
     with open(OUT + ".alerts", "a") as f:
@@ -143,13 +144,26 @@ while True:
         for mm in GM.finditer(txt):
             vr[mm.group(1)] = [float(x) for x in mm.groups()[1:]]
         rec["vllm_gpu_mem"] = {f"TP{k}": {"alloc": v[0], "peak": v[1], "reserved": v[2], "free": v[3], "retries": int(v[4]), "ooms": int(v[5])} for k, v in sorted(vr.items())}
-        caps = {mm.group(1): (float(mm.group(2)), float(mm.group(3))) for mm in CAP.finditer(txt)}
+        # the startup "Capped the PyTorch allocator" lines sit at the head of the log, out of the 3 MB tail once the
+        # log grows: read them from the head, once per server log (cached)
+        if logs and logs[-1] not in CAPS_BY_LOG:
+            with open(logs[-1], "rb") as fh:
+                head = ANSI.sub("", fh.read(20_000_000).decode(errors="replace"))
+            cc = {mm.group(1): (float(mm.group(2)), float(mm.group(3))) for mm in CAP.finditer(head)}
+            if len(cc) == 4:
+                CAPS_BY_LOG[logs[-1]] = cc
+        caps = CAPS_BY_LOG.get(logs[-1], {}) if logs else {}
         rec["alloc_cap"] = {}
         for k, (cx, cy) in sorted(caps.items()):
             v = vr.get(k)
             rec["alloc_cap"][f"TP{k}"] = {"cap": cx, "reserved_at_cap": cy, "cap_minus_reserved0": round(cx - cy, 3),
                                          "cap_minus_peak": round(cx - v[1], 3) if v else None,
                                          "cap_minus_reserved_now": round(cx - v[2], 3) if v else None}
+            if v:  # cap - RESERVED is the real margin (pod 3 OOM, 2026-10-30): alert at 0.30 / 0.15 / 0.05 GiB
+                for lvl_, thr in (("EARLY", 0.30), ("ALERT", 0.15), ("CRIT", 0.05)):
+                    if cx - v[2] < thr and (logs[-1], k, thr) not in cap_alerted:
+                        alert(lvl_, f"TP{k}: cap - reserved = {cx - v[2]:.2f} GiB < {thr} (cap {cx}, reserved {v[2]}, peak {v[1]}, retries {int(v[4])})")
+                        cap_alerted.add((logs[-1], k, thr))
             if v and cx - v[1] < 0.26 and (logs[-1], k) not in cap_alerted:
                 alert("ALERT", f"TP{k}: cap - peak allocated = {cx - v[1]:.2f} GiB < 0.26 (cap {cx}, peak {v[1]}, reserved {v[2]}, retries {int(v[4])})")
                 cap_alerted.add((logs[-1], k))

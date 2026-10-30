@@ -2,6 +2,7 @@
 """Build the DeepSeek-V4.1 tool-solver kit dataset and its Kaggle submission notebook (E042 RW / E043 tool models).
 
     .venv/bin/python kaggle/dsv41_tools/build.py            # -> kaggle/dsv41_tools/out/{kit,nb,local_run.py}
+    [--no-model] [--out DIR]                                 # --out: write there instead of out/ (tests)
 
 - out/kit/ (Kaggle dataset chankhavu/dsv41-tools-kit): an exact snapshot of the harness files the solver imports
   (evals/run_deepseek_tools.py and its imports, the ARC Prize prompt), solver_dsv41.py, stage_model.py, the vLLM
@@ -21,6 +22,8 @@ import json
 import os
 import shutil
 from pathlib import Path
+
+import input_paths as IP
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -51,10 +54,7 @@ RERUN = bool(os.environ.get("KAGGLE_IS_COMPETITION_RERUN"))
 COMMIT_MODE = os.environ.get("ARC_COMMIT_MODE", "fallback")
 MODE = "submit" if RERUN else os.environ.get("ARC_MODE", COMMIT_MODE)
 
-def find_one(pattern):
-    hits = sorted(glob.glob(pattern, recursive=True))
-    return hits[0] if hits else None
-
+__INPUT_HELPER__
 # Every cache and HOME under SCRATCH (defensive). The read-only failures of 2026-10-24 (smoke v2, bench v1: uv
 # "Read-only file system" in /root/.cache/uv) came with the 131 GB staging copy to /tmp; without the copy, both the
 # setdefault variant (submit v3 / bench v2) and this forced variant (submit v4 / bench v3) installed fine.
@@ -69,7 +69,7 @@ for _k, _v in (("UV_CACHE_DIR", f"{_C}/uv"), ("XDG_CACHE_HOME", _C), ("VLLM_CACH
     os.environ[_k] = _v
     os.makedirs(_v, exist_ok=True)
 os.environ.pop("UV_NO_CACHE", None)
-CHALLENGES = os.environ.get("ARC_CHALLENGES") or find_one(f"{INPUT}/**/arc-agi_test_challenges.json")
+CHALLENGES = os.environ.get("ARC_CHALLENGES") or find_input("arc-agi_test_challenges.json")
 os.environ["ARC_CHALLENGES"] = CHALLENGES
 _tasks = json.load(open(CHALLENGES))
 _fb = {t: [{"attempt_1": x["input"], "attempt_2": x["input"]} for x in v["test"]] for t, v in _tasks.items()}
@@ -82,7 +82,7 @@ KIT = os.environ.get("ARC_KIT")
 if not KIT:
     try:
         import hashlib, tarfile
-        _tgz = find_one(f"{INPUT}/**/dsv41_kit.tgz")
+        _tgz = find_input("dsv41_kit.tgz")
         KIT = f"{SCRATCH}/kit"
         with tarfile.open(_tgz) as tf:
             tf.extractall(KIT)
@@ -93,9 +93,9 @@ if not KIT:
     except Exception as exc:  # without the kit nothing else can run: keep the fallback submission
         print("kit unavailable, fallback only:", type(exc).__name__, exc, flush=True)
         MODE = "fallback"
-MODEL_SRC = os.environ.get("ARC_MODEL_SRC") or (os.path.dirname(find_one(f"{INPUT}/**/e043_manifest.json") or "") or None)
+MODEL_SRC = os.environ.get("ARC_MODEL_SRC") or (os.path.dirname(find_input("e043_manifest.json") or "") or None)
 print("kit", KIT, "| model", MODEL_SRC, flush=True)
-'''
+'''.replace("__INPUT_HELPER__\n", IP.HELPER)
 
 CELL_STAGE = r'''
 # Cell 1: stage the checkpoint to local disk in the background (stage_model.py), while vLLM installs.
@@ -134,7 +134,7 @@ if MODE != "fallback" and not os.environ.get("ARC_SKIP_INSTALL"):
     if os.path.exists(real + "/libcuda.so"):
         os.environ["LD_LIBRARY_PATH"] = real + ":" + os.environ.get("LD_LIBRARY_PATH", "")
         os.environ["LD_PRELOAD"] = real + "/libcuda.so"
-    WHEELS = os.path.dirname(find_one(f"{INPUT}/**/vllm-0.28.1rc1*.whl"))
+    WHEELS = os.path.dirname(find_input("vllm-0.28.1rc1*.whl"))
     t = time.time()
     _uvc = os.environ["UV_CACHE_DIR"]
     _ienv = dict(os.environ, HOME=SUB_HOME, UV_CACHE_DIR=_uvc, TMPDIR=f"{SCRATCH}/tmp")
@@ -284,9 +284,10 @@ for _k, _v in (("ARC_COMMIT_MODE", "smoke"), ("ARC_TASK_LIMIT", "40"), ("ARC_STO
 '''
 # Eval-set bench: the competition's own evaluation file (120 ARC-AGI-2 tasks, 172 pairs, with solutions), all tasks,
 # W workers, ~2.5 h (stop-new 2 h, force 2 h 20, hard 2 h 30, kill 2 h 40): realistic TPS and accuracy on Kaggle.
+# It runs before cell 0 (no INPUT or find_input yet): fixed depths under /kaggle/input, never a recursive scan.
 EVALBENCH_ENV = r'''
 import glob, os
-_hits = lambda p: sorted(glob.glob(f"/kaggle/input/**/{p}", recursive=True))
+_hits = lambda p: sorted({x for d in ("", "*/", "*/*/", "datasets/*/*/") for x in glob.glob(f"/kaggle/input/{d}{p}")})
 for _k, _v in (("ARC_COMMIT_MODE", "smoke"), ("ARC_TASK_LIMIT", "0"), ("ARC_WORKERS", "__W__"),
                ("ARC_CHALLENGES", (_hits("arc-agi_evaluation_challenges.json") or [""])[0]),
                ("ARC_SOLUTIONS", (_hits("arc-agi_evaluation_solutions.json") or [""])[0]),
@@ -341,16 +342,19 @@ def build_notebook(variant="submit", with_model=True):
     cells_src = (pre[variant] if variant in pre else [EVALBENCH_ENV.replace("__W__", variant.split("w")[-1])]) + CELLS
     cells = [{"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [],
               "source": c.strip("\n").splitlines(keepends=True)} for c in cells_src]
-    (nb / f"{slug}.ipynb").write_text(json.dumps({
-        "cells": cells, "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-                                     "language_info": {"name": "python"}}, "nbformat": 4, "nbformat_minor": 5}, indent=1))
-    (nb / "kernel-metadata.json").write_text(json.dumps({
+    meta = {
         "id": f"{USER}/{slug}", "title": slug, "code_file": f"{slug}.ipynb", "language": "python",
         "kernel_type": "notebook", "is_private": True, "enable_gpu": True, "enable_tpu": False,
         "enable_internet": False, "dataset_sources": [f"{USER}/{KIT_SLUG}"], "kernel_sources": [WHEELS_KERNEL],
         "competition_sources": [COMPETITION], "model_sources": MODEL_SOURCES if with_model else [],
         "docker_image": DOCKER,
-        "docker_image_pinning_type": "original", "machine_shape": "NvidiaL4"}, indent=1))
+        "docker_image_pinning_type": "original", "machine_shape": "NvidiaL4"}
+    # cell 0 looks in the attached sources' mount dirs first; no cell scans the input root (input_paths.py)
+    nbd = IP.finish({"cells": cells, "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python",
+                                                                 "name": "python3"}, "language_info": {"name": "python"}},
+                     "nbformat": 4, "nbformat_minor": 5}, meta)
+    (nb / f"{slug}.ipynb").write_text(json.dumps(nbd, indent=1))
+    (nb / "kernel-metadata.json").write_text(json.dumps(meta, indent=1))
     (OUT / "local_run.py").write_text(
         '"""The notebook cells as one script, for the Runpod pods (ARC_* environment variables set the paths)."""\n'
         + "\n".join(c.strip("\n") + "\n" for c in CELLS))
@@ -358,7 +362,10 @@ def build_notebook(variant="submit", with_model=True):
 
 def main():
     import sys
+    global OUT
     with_model = "--no-model" not in sys.argv
+    if "--out" in sys.argv:  # e.g. a temp dir for the tests (default: out/)
+        OUT = Path(sys.argv[sys.argv.index("--out") + 1]).resolve()
     manifest = build_kit()
     build_notebook("submit", with_model)
     build_notebook("smoke", with_model)

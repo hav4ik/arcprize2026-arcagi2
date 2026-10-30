@@ -19,6 +19,7 @@ import json
 import tarfile
 from pathlib import Path
 
+import input_paths as IP
 from build_frozen_mt import KIT_TGZ, PINS_MTIME, check_imports
 
 HERE = Path(__file__).resolve().parent
@@ -96,12 +97,13 @@ def main():
     nb["cells"] = cells + [code(m1)] + [code(p.read_text()) for p in CELLS[1:]]
     out = a.out or HERE / f"out/nb_{a.slug}"
     out.mkdir(parents=True, exist_ok=True)
-    json.dump(nb, open(out / f"{a.slug}.ipynb", "w"), indent=1, ensure_ascii=False)
     for k in ("id_no",):
         meta.pop(k, None)
     meta.update(id=f"{a.owner}/{a.slug}", title=a.slug, code_file=f"{a.slug}.ipynb", is_private=True,
                 enable_gpu=True, enable_internet=False, machine_shape="NvidiaL4")
     assert "arc-prize-2026-arc-agi-2" in meta["competition_sources"], "4xL4 needs the competition attached"
+    IP.finish(nb, meta)  # no cell scans the input root (input_paths.py)
+    json.dump(nb, open(out / f"{a.slug}.ipynb", "w"), indent=1, ensure_ascii=False)
     json.dump(meta, open(out / "kernel-metadata.json", "w"), indent=1)
     (out / "KIT_SHA256.json").write_text(json.dumps({"tgz": hashlib.sha256(tgz).hexdigest(), "files": sha}, indent=1))
     print(out, f"{len(cells)} of Manh's cells + 4 ours; kit {len(tgz) / 1e3:.0f} kB, {len(sha)} files;",

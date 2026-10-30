@@ -3,7 +3,8 @@
 # `vllm` wrapper (the kernel's Python -m vllm.entrypoints.cli.main, as his dsv41_vllm.py launches it). Then: an
 # import check (no working vLLM -> fallback submission, as in B32), the environment record (versions, his wheel and
 # dataset versions, sha256 of the files his weight loading runs: b32m_env.json) and B32's tool-python check.
-# Defines what cells 2b, 3 and 5 use: V, PY, BASE_ENV, TOOL_PY, sh().
+# Defines what cells 2b, 3 and 5 use: V, PY, BASE_ENV, TOOL_PY, sh(). Uses cell 0's find_inputs (no recursive scan of
+# the input root: his wheels are looked up in the two dirs his cell 3 installs from, and at fixed depths).
 import hashlib, importlib.metadata as _md, platform, shutil
 V = f"{SCRATCH}/b32m"; PY = sys.executable
 MANH_VERSIONS = json.loads(r"""__VERSIONS__""")  # recorded by build_b32m.py (dataset versions, wheel names)
@@ -40,8 +41,9 @@ if MODE != "fallback":
             except Exception:
                 _pk[_p] = None
         ENV_RECORD["packages"] = _pk
-        ENV_RECORD["vllm_wheels_in_inputs"] = sorted(os.path.basename(p) for p in
-                                                     glob.glob(f"{INPUT}/**/vllm-*.whl", recursive=True))
+        ENV_RECORD["vllm_wheels_in_inputs"] = sorted(os.path.basename(p) for p in find_inputs(
+            "vllm-*.whl", f"{INPUT}/datasets/*/vllm-wheels/wheels/wheels/vllm-*.whl",
+            f"{INPUT}/vllm-wheels/wheels/wheels/vllm-*.whl"))
         # the files his weight loading of E128 runs (Kaggle Model copy): the DeepSeek-V4.1 model package (GPTQ
         # experts, Engram tables, quant config), the model loader, Humming's MoE / linear methods
         _vroot = os.path.dirname(_md.distribution("vllm").locate_file("vllm/__init__.py"))

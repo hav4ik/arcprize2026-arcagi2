@@ -5,7 +5,7 @@
 # and settings.
 # Commit run ("Save & Run All"): any failure RAISES, so the commit errors and the log shows "E046 CHECK FAILED".
 # Competition rerun: the same failure restores the kit's v3 files and runs per pair at 36 workers (a scored submission
-# beats an error); the rerun path never raises (S10). Uses cell 0's KIT, MODE, RERUN, INPUT and find_one.
+# beats an error); the rerun path never raises (S10). Uses cell 0's KIT, MODE, RERUN and find_input.
 import hashlib
 import json
 import os
@@ -84,7 +84,7 @@ if MODE != "fallback":
     _pins_state, _pins_why = {"backups": {}, "extracted": False}, ""
     try:
         assert KIT, "kit not unpacked"
-        _pins_archive = find_one(f"{INPUT}/**/{PINS['archive']}")
+        _pins_archive = find_input(PINS["archive"])  # bounded lookup (cell 0), never a recursive scan
         assert _pins_archive, f"{PINS['archive']} is not attached (dataset {PINS['dataset']})"
         assert pins_sha256(_pins_archive) == PINS["archive_sha"], f"{_pins_archive} is not the build's archive"
         pins_install(KIT, _pins_archive, PINS, _pins_state)

@@ -926,6 +926,18 @@ def status(tasks, queue, running, done, errors):
         pass
 
 
+def find_model_dir(root="/kaggle/input"):
+    """The attached model's dir when ARC_MODEL_DIR is unset (every notebook's cell 3 sets it): the first
+    e043_manifest.json at the fixed depths Kaggle and the pods mount a model (Kaggle:
+    models/<owner>/<model>/<framework>/<variation>/<version>/), never a recursive scan of the input root (with large
+    datasets attached, one walks thousands of files: ~5 min on Kaggle)."""
+    for d in ("", "*/", "*/*/", "datasets/*/*/", "models/*/*/*/*/*/"):
+        hits = sorted(Path(root).glob(f"{d}e043_manifest.json"))
+        if hits:
+            return str(hits[0].parent)
+    return ""
+
+
 def main():
     try:
         import resource
@@ -959,8 +971,7 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
-    model = E("ARC_MODEL_DIR") or next((str(p.parent) for p in sorted(Path("/kaggle/input").rglob("e043_manifest.json"))),
-                                       "")
+    model = E("ARC_MODEL_DIR") or find_model_dir()
     if not model or not (Path(model) / "config.json").exists():
         log(f"no model dir found ({model!r}); keeping the fallback submission")
         return

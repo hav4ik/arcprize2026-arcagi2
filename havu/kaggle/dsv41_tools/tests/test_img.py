@@ -270,17 +270,25 @@ class ManhBase(unittest.TestCase):
     def test_only_our_cells_change(self):
         his = set(self.his)
         ours = [c.splitlines()[0][:14] for c in self.cells if c not in his]
-        self.assertEqual(ours, ["# E066 image c", "# Cell 0b (E04", "# Cell 1b (smo", "# Cell 2r (E06", "# Cell 2m (B32",
-                                "# Cell 2s (E06", "# Cell 2c (B32", "# Cell 3: the ", "# Cell 3s (E06", "# Cell 3w (E06",
-                                "# Cell 4b (B32"])
+        # cells 0 and 2 (B32-M env), our code in his notebook: only their input lookups change (input_paths.py)
+        self.assertEqual(ours, ["# E066 image c", "# Cell 0: cloc", "# Cell 0b (E04", "# Cell 1b (smo", "# Cell 2r (E06",
+                                "# Cell 2 (B32-", "# Cell 2m (B32", "# Cell 2s (E06", "# Cell 2c (B32", "# Cell 3: the ",
+                                "# Cell 3s (E06", "# Cell 3w (E06", "# Cell 4b (B32"])
+        sys.path.insert(0, str(D))
+        import input_paths as IP
+        for prefix in ("# Cell 0: clock", "# Cell 2 (B32-M)"):
+            mine = next(c for c in self.cells if c.startswith(prefix))
+            theirs = next(c for c in self.his if c.startswith(prefix))
+            self.assertEqual(mine, IP.with_roots(IP.rewrite(theirs), IP.input_roots(self.meta)), prefix)
+            self.assertTrue(IP.input_scans(theirs) and not IP.input_scans(mine), prefix)
         w = next(i for i, c in enumerate(self.cells) if c.startswith("# Cell 3w (E066"))
         self.assertTrue(self.cells[w - 1].startswith("# Cell 3s (E066)"))
         self.assertTrue(self.cells[w + 1].startswith("# Cell 4: final check"))
         # every other cell is his, in his order
         self.assertEqual([c for c in self.cells if c in his], [c for c in self.his if c.splitlines()[0][:14] not in
-                                                               ("# B32-M + MANH", "# Cell 0b (E04", "# Cell 1b (smo",
-                                                                "# Cell 2m (B32", "# Cell 2c (B32", "# Cell 3: the ",
-                                                                "# Cell 4b (B32")])
+                                                               ("# B32-M + MANH", "# Cell 0: cloc", "# Cell 0b (E04",
+                                                                "# Cell 1b (smo", "# Cell 2 (B32-", "# Cell 2m (B32",
+                                                                "# Cell 2c (B32", "# Cell 3: the ", "# Cell 4b (B32")])
         i = next(i for i, c in enumerate(self.cells) if c.startswith("# Cell 2r (E066"))
         self.assertTrue(self.cells[i - 1].startswith("# Manh's cell 5"))
         self.assertTrue(self.cells[i + 1].startswith("# Cell 2 (B32-M)"))

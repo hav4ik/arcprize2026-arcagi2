@@ -21,7 +21,8 @@ _C = [p for p in ("/kaggle/input/arc-prize-2026-arc-agi-2/arc-agi_test_challenge
                   "/kaggle/input/competitions/arc-prize-2026-arc-agi-2/arc-agi_test_challenges.json") if os.path.exists(p)]
 if not _C:
     import glob
-    _C = sorted(glob.glob("/kaggle/input/**/arc-agi_test_challenges.json", recursive=True))
+    _C = sorted({p for d in ("", "*/", "*/*/", "datasets/*/*/")  # fixed depths, never a recursive scan
+                 for p in glob.glob(f"/kaggle/input/{d}arc-agi_test_challenges.json")})
 CHALLENGES = os.environ.get("ARC_CHALLENGES") or _C[0]
 _tasks = json.load(open(CHALLENGES))
 _fb = {t: [{"attempt_1": x["input"], "attempt_2": x["input"]} for x in v["test"]] for t, v in _tasks.items()}

@@ -4,7 +4,7 @@ its newest sample is > 240 s old, turns the sampler's 5 s mode on (fast.flag) on
 after the first allocator retry, and EXITS printing ALERT lines (plus a 5-min timeline and, for engine events, the
 matching server-log lines; the server logs are copied to /root/e066/b32mv3/preserved/<UTC>/) on:
 the first allocator retry, a retry storm (>= +10 within 10 min; the running count is in every 30-min report), an OOM, an engine-death pattern, a server death or restart; cap - peak below
-0.40 / 0.30 / 0.26 GiB or a drop > 0.1 GiB within 30 min; Kaggle-eq > 155 GiB or rising > 2 GiB/h; any errored attempt,
+0.40 / 0.30 / 0.26 GiB or a drop > 0.1 GiB within 30 min; cap - reserved below 0.08 / 0.05 GiB; Kaggle-eq > 155 GiB or rising > 2 GiB/h; any errored attempt,
 APITimeoutError or HTTP 500; gen tok/s at 0 for > 3 min with requests running; waiting > 30; a server ERROR /
 Traceback line; the notebook ending. Also exits with REPORT30 / REPORT60 at the 30-min / hourly marks of the Kaggle
 clock (T0 03:30:40 UTC). Every 5 min it also refreshes the dashboard files (export_dash.sh). Alerts already reported are kept in watch2_state.json, so a restarted watcher does not repeat them.
@@ -60,7 +60,7 @@ def finish(lines, engine=False):
     sys.exit(0)
 
 
-def dash_sync():
+def dash_sync():  # runs before any alert / report exit, so exits never delay the 5-min cadence
     """Dashboard files every 5 min (export_dash.sh: gpumem.log, ram.tsv, status.json with the automatic verdict)."""
     r = subprocess.run([f"{S}/export_dash.sh"], capture_output=True, text=True, timeout=600)
     open(f"{S}/dash_sync.log", "a").write(time.strftime("%H:%M:%S ", time.gmtime()) + (r.stdout.strip().splitlines() or ["?"])[-1] + "\n")
@@ -122,9 +122,14 @@ while True:
         win = [cap_peak(h) for h in hist if h["t"] >= max(s["t"] - 1800, rep.get("up_t", 0) + 600) and cap_peak(h) is not None]
         if win and max(win) - cp > 0.1 and s["t"] - rep.get("drop_t", 0) > 1800 and not warm:
             al.append(f"ALERT cap-peak dropped {max(win) - cp:.2f} GiB within 30 min (now {cp:.2f})"); rep["drop_t"] = s["t"]
+    cr = [r["cap"] - r["reserved"] for r in s["ranks"].values() if "cap" in r and "reserved" in r]
+    if cr:  # cycle 1 OOMed at cap - reserved 0.03 GiB (the binding margin with expandable segments)
+        for lv in (0.08, 0.05):
+            if min(cr) < lv and rep.get("cr_level", 9) > lv:
+                al.append(f"ALERT cap-reserved {min(cr):.2f} GiB below {lv:.2f} (" + ", ".join(f"TP{k} {r['cap'] - r['reserved']:.2f}" for k, r in sorted(s['ranks'].items()) if 'reserved' in r) + ")"); rep["cr_level"] = lv
     if s["keq"] > 155 and rep.get("keq155") is None:
         al.append(f"ALERT Kaggle-eq {s['keq']} GiB > 155"); rep["keq155"] = 1
-    old = [h for h in hist if h["t"] <= s["t"] - 1800]
+    old = [h for h in hist if h["t"] <= s["t"] - 1800 and h["t"] >= rep.get("up_t", 0) + 600]  # same server, after warm-up
     if old and s["t"] - rep.get("slope_t", 0) > 3600:
         sl = (s["keq"] - old[-1]["keq"]) / ((s["t"] - old[-1]["t"]) / 3600)
         if sl > 2:
@@ -137,15 +142,15 @@ while True:
         al.append(f"ALERT waiting {sc[-1]['num_requests_waiting']} > 30"); rep["wait_t"] = s["t"]
     if s["nb_end"] or not s["papermill"]:
         al.append(f"ALERT notebook ended (nb_end {s['nb_end']}, papermill procs {s['papermill']})")
-    if any(a.startswith("ALERT") for a in al):
-        finish(al, eng)
-    if time.time() >= mark:
-        finish([("REPORT60" if round((mark - T0) / 1800) % 2 == 0 else "REPORT30") + f" due (Kaggle {(mark - T0) / 3600:.1f} h)"] + al)
     if time.time() >= next_sync:
         try:
             dash_sync()
         except Exception as exc:
             open(f"{S}/dash_sync.log", "a").write(f"sync failed: {exc}\n")
         next_sync = time.time() + 300
+    if any(a.startswith("ALERT") for a in al):
+        finish(al, eng)
+    if time.time() >= mark:
+        finish([("REPORT60" if round((mark - T0) / 1800) % 2 == 0 else "REPORT30") + f" due (Kaggle {(mark - T0) / 3600:.1f} h)"] + al)
     save()
     time.sleep(max(5, 60 - (time.time() - s["t"])))
