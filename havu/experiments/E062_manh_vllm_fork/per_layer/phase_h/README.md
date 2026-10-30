@@ -337,3 +337,45 @@ Per worker, RssAnon minus Engram is ~15.2 GiB on every rank. That is the 12 GiB/
 - **Cell 4:** submission.json valid; "Manh's server stopped".
 - **4b:** supervisor status `{"state": "up", "pid": 156480, "up_s": 240}`; model files 136, none missing; "E066 light smoke: 4 attempt records, 4 with an answer, 0 correct"; INPUT INTEGRITY OK (sha256 of every model file).
 - **Files:** `runs/nb_f1_commit_bec71fb1/`.
+
+### CV replica r1_rerun (bec71fb1e3f1, rerun mode, x2t; notebook from 23:44:11 UTC, solver from 23:49:07)
+- **Solver:** "attempting 240 tasks, 344 pairs; deadlines: stop-new 10.83h, force 11.17h, hard stop 11.50h".
+  - Env has ARC_EXTERNAL_SERVER, ARC_EXTERNAL_SERVER_LOG, **ARC_EXTERNAL_SERVER_STATUS** (= dsv41_logs/e066_supervisor.json) and ARC_CONN_TRIES=12.
+- **Server:** KV 1,617,253 tokens. Server up 240 s after cell 2m started.
+- **Pod-only accommodation:** after the install cells (+46 s) the 20 GB uv cache in /tmp/dsv41/cache/uv was deleted to keep disk headroom (34 GB free). Nothing reads it afterwards.
+- **Watchers:**
+  - `scripts/r1_watch.py` on the pod: read-only, 60 s. It writes a summary every 10 min to `watch.log`, and FLAG lines to `watch.flags` for VRAM free < 1 GiB, allocator retries or OOMs, server deaths, stop=error, Tracebacks, a supervisor not up for > 5 min, and the notebook's end.
+  - `scripts/p2_report.sh <run> <pool>` for the hourly report.
+
+#### Checkpoint 00:08 (19 min of solving)
+- gen 751-798 tok/s; KV 0.59; 64 running / 0 waiting.
+- 14 first attempts, 9 correct. 0 errors, 0 gate holds.
+- Host used 154 GiB.
+- VRAM per rank: 18.62 GiB allocated (peak 18.94), 19.39 reserved, 2.01-2.06 free, 0 retries, 0 OOMs.
+
+#### TP-worker kill test (00:19:38, 30 min into solving, 63 running): PASS (`runs/r1_rerun_bec71fb1/killtest.log`)
+
+| t after the kill | event |
+|---|---|
+| 0 | SIGKILL of exactly `VLLM::Worker_TP2` (pid 165301) |
+| +2 s | its GPU (GPU 1: --gpu-ids 0,2,1,3) freed; host anon 129.8 → 96.2 GiB |
+| +11 s (00:19:49) | API server pid 164585 exited. Supervisor status `{"start": 1, "state": "restarting", "error": "server pid 164585 exited"}`. Solver: `server died (code 1)`, then 65 x `re-queue <task> after a server-side error (1): TurnError: APIError: The server had an error while processing your request.` (64 of them; 1 x `InternalServerError: Error code: 500 …`; 2 with "its session answer is kept"), then `external server … (wait 1)` |
+| +17 s | old process group gone, all GPUs at 0 MiB; host anon 11.7 GiB |
+| +42 s | relaunch (new output root `dsv41_logs/r1/server/`) |
+| +116 s (00:21:34) | solver: `server up after 105s (external, start 1); GPU KV cache size: 1,617,253 tokens`. Supervisor `{"start": 1, "state": "up", "pid": 170790, "up_s": 95}` |
+| +8 min | 64 running, 0 waiting, 857 gen tok/s |
+
+- **Host RAM never held two engines:** anon 12 GiB in the gap, 126.6 GiB once the new engine was up. Peak `free` used in the window: 153 GiB, vs 154 before the kill.
+- **No attempt finalized as an error:** 0 `stop=error` in solver.log.
+  - attempts.jsonl holds 65 per-try records with stop_reason "error", one per re-queued job. They are re-run; their final records are checked in the hourly reports.
+- **VRAM after the restart:** identical to before (2.01-2.06 GiB free, reserved 19.39, 0 retries / OOMs).
+- The supervisor's own "E066 SUPERVISOR: … restart 1/2" lines are in the kernel cell output and appear in nb.ipynb when the run ends.
+
+#### Checkpoint ~1 h of solving (00:50 UTC; `runs/r1_rerun_bec71fb1/report_0050.txt`)
+- **Attempts:** 41 first attempts finalized, 34 correct (82.9%), all submitted, 0 finalized as error.
+  - Of the kill test's 65 re-queued jobs, 14 had already finished normally.
+  - No other errored attempts, and no APITimeoutError.
+- **Throughput:** gen 720-806 tok/s. KV 0.80 at 54-59 min; 64 running, 0 waiting. 1 KV gate hold (0.798).
+- **VRAM, per rank (allocated / peak / reserved / free, GiB):** 18.62 / 18.94 / 19.39 / 2.01-2.06 at 00:08, then 18.62 / 19.00 / 19.43 / 1.97-2.02 at 00:48. 0 retries, 0 OOMs.
+  - Allocated is flat; reserved grows with the peak, which is cache growth, not a leak.
+- **Host:** used 151-153 GiB (peak 154). Disk 33 GB free.

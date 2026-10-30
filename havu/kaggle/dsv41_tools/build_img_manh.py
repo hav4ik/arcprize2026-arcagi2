@@ -349,11 +349,11 @@ def main():
 
     # cell 1b: commit-run input integrity against the E066 export's manifest (his cell checks E128's)
     q = find(cells, "# Cell 1b ")
-    if a.text:  # his cell 1b already checks the E128 model's manifest; only the names-and-sizes pass is added
+    if a.text and a.model_manifest is None:  # his cell 1b checks the E128 model's manifest; add the size pass only
         ic = src(cells[q])
         if "len(json.load(f))f\n" in ic:  # his v7 typo (a SyntaxError: the cell, and so the run, would fail)
             ic = replace_once(ic, "len(json.load(f))f\n", "len(json.load(f))\n")
-    else:
+    else:  # image builds, or --text with another model (e.g. C1): 1b checks that model's manifest
         ic = B.integrity_cell(a.model_manifest)
         man = json.load(open(a.model_manifest))
         ic = re.sub(r"every file of the model \(\d+ files, \d+ GB\)",

@@ -213,8 +213,43 @@ attempts each) measure the wrong model. Do not use them.
     - MXFP6 1.2% at 6.25 bits.
   - Recommendation: MXFP4 with best-of-two scales. Same storage and decoder as the PR, 64 -> ~34 GiB.
 
+## Final ARC-AGI-2 results (2026-10-29, 120 eval tasks x 2, ARC Prize scoring, `scripts/compare_evals.py`)
+
+| model | harness | pass@1 | pass@2 | output tok/attempt | tool-call error rate |
+|---|---|---|---|---|---|
+| candidate 1 (new E128, 2-bit) | text | 75.1 | 85.8 | 38.9K | 14.4% |
+| candidate 1 (new E128, 2-bit) | image | 69.7 | 80.0 | 37.5K | 15.4% |
+| E72-152 (per-layer 72-152, avg 120, 2-bit) | text | 69.0 | 79.6 | 35.9K | 7.3% |
+| E72-152 | image | 69.0 | 78.3 | 36.9K | 9.3% |
+| old tool E128 2-bit (B32's model; E046 run 7, 10-25) | text | 73.7 | 84.6 | 40.8K | 15.1% |
+| full model, API | text | 77.6 | 88.6 | 29.6K | 2.7% |
+| full model, API (E058) | image | 81.1 | 90.7 | 27.0K | 3.6% |
+| full model, self-hosted (221/240 finished) | image | 72.4 | 82.8 | 24.4K | 5.2% |
+
+Paired differences (95% bootstrap CI over tasks):
+- Candidate 1 text vs B32 text: pass@1 +1.5 [-3.1, +6.0], pass@2 +1.2 [-3.8, +6.2]. A tie, slightly ahead.
+- Candidate 1 text vs the full model's API text run: -2.5 / -2.8 (CIs include zero).
+- Candidate 1 vs E72-152 on text: +6.2 [+0.6, +11.7] / +6.2 [+0.4, +12.1].
+- **Candidate 1 image vs its own text run: -5.4 [-10.6, -0.4] / -5.8 [-11.2, -0.8].** Images hurt the pruned model on the
+  self-hosted stack.
+- The full model self-hosted (image) vs the API (image): -4.4 [-9.3, +0.2] on the same tasks.
+  - Ruled out as the cause: prompt text (byte-identical) and prompt tokens including image tokens (identical to the
+    API on every task), image preprocessing (the fork's `load_image` is a line-for-line port of DeepSeek's reference),
+    and sampling (temperature 1.0 / top_p 1.0, the model card values).
+  - Untested suspects: FP8 KV cache on long image prompts, kernel numerics, the API's thinking-mode sampling.
+- Decisions:
+  - E72-152 retired: below B32 on both harnesses, and below its own better dev NLL.
+  - Candidate 1 on the text harness is the next-submission option: B32's setup with the model swapped.
+  - The image harness is on hold until the self-hosted image gap is explained.
+- Kaggle: candidate 1 is a private Model `arazzd/deepseek-v41-flash-1017-arc-tool-img-e128-2bit/pyTorch/default/1`
+  (137 files, 132.06 GB, verified, shared with chankhavu). Tonight's submission (user) was B32-M.
+- Trace reviews (`trace_review/report_*.md`): no mechanical damage in either candidate.
+  - Candidate 1's tool errors are identifier typos at the old E128 rate, growing with attempt length (5.8% -> 17%).
+  - E72-152 tends to submit the first rule that fits the training pairs without checking test-only features.
+
 ## Status
 - 2026-10-28: CPU prep done (data, tokens, census, scripts, tests). No box yet; no API spend.
 - 2026-10-29: box up, replays done, candidate 1 picked; candidate 1 GPTQ capture and the layer sweep running.
 - 2026-10-29 afternoon: final candidates fixed (above); boxes 2 and 3 destroyed; the C1 eval was found unmasked and
   re-planned; the box 1 chain and the local evals are running.
+- 2026-10-29/30 night: all four evals finished; both boxes destroyed (logs in `results/box1`, `results/box4`).

@@ -17,7 +17,7 @@ def ok(r):  # as first_correct.py: multi-test records carry the list of all test
 pairs = {}
 for r in recs:
     k = (r["task_id"], int(r.get("pair", 0))); pairs.setdefault(k, []).append(r)
-a0 = [r for r in recs if r.get("attempt") == 0]
+a0 = [r for r in recs if r.get("attempt") == 0 and not r.get("error")]  # finalized first attempts (per-try error records are re-queues)
 print(f"attempt records {len(recs)}, correct {sum(map(ok, recs))} ({sum(map(ok, recs)) / max(1, len(recs)):.3f}); "
       f"with pred {sum(r.get('pred') is not None for r in recs)}; stops {dict(stops)}")
 print(f"first attempts {len(a0)}, correct {sum(map(ok, a0))} ({sum(map(ok, a0)) / max(1, len(a0)):.3f}); "
