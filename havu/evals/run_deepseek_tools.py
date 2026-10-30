@@ -912,6 +912,8 @@ def turn(client, args, messages, max_tokens, final=False, think=True, tok=None):
 
 # E043 --token-exact: DeepSeek-V4.1 completion format (the model's encoding/encoding.py, V4.1 DSML).
 DS_EOS, DS_THINK_END, DSML = "<｜end▁of▁sentence｜>", "</think>", "｜DSML｜"
+DS_IMAGE = "<｜deepseek_image｜>"  # V4.1's image placeholder; the server expands each one to the image's token span
+_IMAGE_IDS = {}  # server root -> DS_IMAGE's token id
 DS_CALLS_START, DS_CALLS_END = f"\n\n<{DSML} calls", f"</{DSML} calls>"
 DS_INVOKE, DS_INVOKE_END = f"<{DSML} invoke", f"</{DSML} invoke"
 DS_PARAM, DS_PARAM_END = f"<{DSML} parameter", f"/{DSML} parameter"
@@ -1021,6 +1023,66 @@ def parse_ds_completion(text):
         return (*_parse_ds_lenient(text), False)
 
 
+def generate_with_images(client, root, args, body, ids, urls, max_tokens):
+    """E043 --token-exact with E058 images (--grid-format text+image on a vision server). /v1/completions takes token
+    ids but no pixels, so every image span in `ids` would run, silently, on the placeholder's text embedding. vLLM's
+    /inference/v1/generate (server flag --enable-scale-out) takes the ids with one placeholder per image plus the images
+    as content parts, and expands them back to the image spans; its first chunk echoes the prompt it ran, which must
+    be `ids`. The sampling parameters are the ones /v1/completions/render derives from the same request. Yields the
+    stream's events."""
+    import httpx
+
+    def post(path, payload):
+        r = httpx.post(f"{root}{path}", json=payload, timeout=600)
+        if r.status_code == 403:
+            raise RuntimeError(f"{path}: HTTP 403; --token-exact with images needs vLLM --enable-scale-out")
+        r.raise_for_status()
+        return r.json()
+
+    if root not in _IMAGE_IDS:
+        t = post("/tokenize", {"model": args.model, "prompt": DS_IMAGE, "add_special_tokens": False})["tokens"]
+        if len(t) != 1:
+            raise RuntimeError(f"{DS_IMAGE} is {len(t)} tokens, not one")
+        _IMAGE_IDS[root] = t[0]
+    image = _IMAGE_IDS[root]
+    # one placeholder per span; text_image_content puts a label before every image, so two spans never touch
+    prompt = [t for i, t in enumerate(ids) if t != image or not i or ids[i - 1] != image]
+    if prompt.count(image) != len(urls):
+        raise RuntimeError(f"{prompt.count(image)} image spans in the prompt for {len(urls)} images")
+    request = {k: v for k, v in body.items() if k != "cache_salt"}
+    (rendered,) = post("/v1/completions/render", {**request, "model": args.model, "prompt": prompt[:1],
+                                                  "max_tokens": max_tokens, "skip_special_tokens": False,
+                                                  "spaces_between_special_tokens": False})
+    sampling = {"max_tokens": max_tokens, **rendered["sampling_params"]}  # /render leaves out SamplingParams defaults
+    payload = {"model": args.model, "token_ids": prompt, "sampling_params": sampling,
+               "content_parts": [{"type": "image_url", "url": u} for u in urls], "stream": True,
+               "stream_options": {"include_usage": True}, "return_token_ids": True, "output_mode": "text"}
+    if body.get("cache_salt") is not None:
+        payload["cache_salt"] = body["cache_salt"]
+    with httpx.stream("POST", f"{root}/inference/v1/generate", json=payload, timeout=client.timeout) as r:
+        if r.status_code != 200:
+            raise RuntimeError(f"/inference/v1/generate: HTTP {r.status_code} {r.read()[:500].decode(errors='replace')}"
+                               + ("; start vLLM with --enable-scale-out" if r.status_code == 403 else ""))
+        echoed = False
+        for line in r.iter_lines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                return
+            event = json.loads(data)
+            if event.get("error") or event.get("object") == "error":
+                raise RuntimeError(f"/inference/v1/generate: {event.get('error') or event.get('message')}")
+            if event.get("choices") and not echoed:
+                ran = event.get("prompt_token_ids")
+                if ran != ids:
+                    raise RuntimeError(f"the server expanded the images to another prompt ({len(ran or [])} ids, "
+                                       f"rendered {len(ids)})")
+                echoed = True
+            yield event
+    raise RuntimeError("/inference/v1/generate: stream ended without [DONE]")
+
+
 def turn_token_exact(client, args, messages, max_tokens, tok):
     """E043 --token-exact (--base-url only): continue the attempt's exact token history instead of letting the server
     re-render earlier assistant turns. Re-tokenizing sampled text does not always give back the sampled ids (the
@@ -1032,7 +1094,7 @@ def turn_token_exact(client, args, messages, max_tokens, tok):
     instead of the sampled ids when this turn was not canonical, was cut by max_tokens, or the harness rewrote it
     (rescue / tool-name fix: tok["resync"]), so the model never sees malformed history the chat path would have shown
     cleanly. If the render is not prefix-stable (e.g. a new user message drops earlier reasoning), the turn uses the
-    full render too."""
+    full render too. With images in the messages the turn goes to /inference/v1/generate (generate_with_images)."""
     import httpx
     root = str(client.base_url).rstrip("/").removesuffix("/v1")
     body = dict(json.loads(args.extra_body or "{}"))
@@ -1066,19 +1128,31 @@ def turn_token_exact(client, args, messages, max_tokens, tok):
         if room < CONTEXT_MIN_ROOM:
             raise ContextFull(f"prompt {len(ids)} tokens, limit {limit}")
         max_tokens = min(max_tokens, room)
+    urls = [p["image_url"]["url"] for m in messages if isinstance(m.get("content"), list) for p in m["content"]
+            if p.get("type") == "image_url"]
     text, sampled, usage, finish, failure, stream = [], [], None, None, None, None
     try:
-        stream = client.completions.create(
-            model=args.model, prompt=ids, max_tokens=max_tokens, stream=True, stream_options={"include_usage": True},
-            extra_body={**body, "return_token_ids": True, "skip_special_tokens": False,
-                        "spaces_between_special_tokens": False})
-        for chunk in stream:
-            if chunk.usage is not None:
-                usage = chunk.usage.model_dump()
-            for ch in chunk.choices or []:
-                text.append(ch.text or "")
-                sampled += (ch.model_extra or {}).get("token_ids") or []
-                finish = ch.finish_reason or finish
+        if urls:
+            stream = generate_with_images(client, root, args, body, ids, urls, max_tokens)
+            for event in stream:
+                usage = event.get("usage") or usage
+                for ch in event.get("choices") or []:
+                    text.append(ch.get("text") or "")
+                    sampled += ch.get("token_ids") or []
+                    finish = ch.get("finish_reason") or finish
+        else:
+            stream = client.completions.create(
+                model=args.model, prompt=ids, max_tokens=max_tokens, stream=True,
+                stream_options={"include_usage": True},
+                extra_body={**body, "return_token_ids": True, "skip_special_tokens": False,
+                            "spaces_between_special_tokens": False})
+            for chunk in stream:
+                if chunk.usage is not None:
+                    usage = chunk.usage.model_dump()
+                for ch in chunk.choices or []:
+                    text.append(ch.text or "")
+                    sampled += (ch.model_extra or {}).get("token_ids") or []
+                    finish = ch.finish_reason or finish
     except Exception as exc:
         failure = f"{type(exc).__name__}: {exc}"
     finally:
