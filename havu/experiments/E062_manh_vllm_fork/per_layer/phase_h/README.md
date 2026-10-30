@@ -379,3 +379,32 @@ Per worker, RssAnon minus Engram is ~15.2 GiB on every rank. That is the 12 GiB/
 - **VRAM, per rank (allocated / peak / reserved / free, GiB):** 18.62 / 18.94 / 19.39 / 2.01-2.06 at 00:08, then 18.62 / 19.00 / 19.43 / 1.97-2.02 at 00:48. 0 retries, 0 OOMs.
   - Allocated is flat; reserved grows with the peak, which is cache growth, not a leak.
 - **Host:** used 151-153 GiB (peak 154). Disk 33 GB free.
+
+#### Status at 01:28 UTC: everything copied, because Runpod credit runs out at ~01:40
+- **Run time:** 1.74 h of the notebook, 1.65 h of the solver. Copied to `runs/r1_rerun_bec71fb1/`:
+  - attempts.jsonl, solver.log, status.json, metrics.jsonl, the supervisor status file;
+  - server.log + launch.json of start 0 (`dsv41_logs/server/`) and start 1 (`dsv41_logs/r1/server/`);
+  - traces, submission.json;
+  - nbruns/r1_rerun: timeline, run_nb.log, mem.log, mem_probe, watch.log / watch.flags, killtest.log.
+  - Not copied: the executed notebook with outputs. nbclient writes nb.ipynb only when the run ends, so the cell outputs, including cell 2s's "E066 SUPERVISOR" lines, are not on disk yet. The supervisor's status-file transitions are in killtest.log and watch.log.
+- **Accuracy:** 69 first attempts finalized, **62 correct (89.9%)**, all `submitted`, 0 finalized as error.
+  - Of the 65 per-try error records from the kill test (all re-queued), 37 jobs had finished normally by 01:28; the rest were re-running.
+  - No other errored attempts; no APITimeoutError.
+- **Deaths / restarts:** 1 death and 1 restart, both the planned TP2 kill at 00:19:38. Back up at 00:21:34 (116 s outage). No other deaths, Tracebacks or flags.
+- **Load:**
+  - KV reached 0.88-0.90 from ~65 min.
+  - Running fell 64 → 32-35, with 5-7 waiting at the server, as contexts grew to ~45k per stream.
+  - The CPU KV offload is now in use: 18-55% of prompt tokens restored from host, recompute 1.5-1.8%.
+  - gen/s fell 800 → 561.
+  - Gate holds logged (0.85 limit).
+- **VRAM, vLLM per rank (allocated / peak / reserved / free, GiB):**
+
+  | UTC | allocated | peak | reserved | free |
+  |---|---|---|---|---|
+  | 00:08 | 18.62 | 18.94 | 19.39 | 2.01-2.06 |
+  | 00:48 | 18.62 | 19.00 | 19.43 | 1.97-2.02 |
+  | 00:58 | 18.62 | 19.07 | 19.60 | 1.80-1.85 |
+  | 01:18 | 18.62 | 19.10 | 19.62 | 1.78-1.83 |
+
+  0 allocator retries, 0 OOMs. **Allocated is flat; the creep is reserved (cache growth with the peak), not a leak.** Free falls ~0.1 GiB per 30 min, as on pod 3.
+- **Host RAM:** used 151-156 GiB (peak 156), process RSS 131.5 GiB, flat. Disk 33 GB free.

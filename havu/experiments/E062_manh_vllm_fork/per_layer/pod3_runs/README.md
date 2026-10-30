@@ -380,3 +380,60 @@ The supervisor itself (cell 2s) behaved as designed: death detected in < 1 s of 
 
   - That is +382 MiB in 1 h 46 min (~0.11 GiB per 30 min, in 20-100 MiB steps). Free per GPU is 1,654-1,708 MiB.
   - Extrapolated linearly, the headroom runs out near 9.6 h elapsed, before the 11.5 h hard stop.
+
+**00:56 (3.13 h elapsed):**
+- Stability: supervisor "up", start 1. No deaths beyond the kill and no new error records; r1 server.log has 0 tracebacks, 400s or 500s.
+- Throughput, 00:08-00:48: 436-521 gen/s with running 35-43, 94-97% GPU prefix hits, KV 0.89-0.90.
+- 00:48-00:58: 364 gen/s with running/waiting 54/18, GPU hit 62% / CPU-restored 25.5% / recompute 12%, KV 0.92. 0 preemptions throughout.
+- Progress: 117 first attempts done, 86 correct; 174 of 344 pairs answered; 56 running; 299 queued.
+- Host: AnonPages 138.7 GiB (peak 140.2 GiB at 00:45); RSS of all processes 137.5 GiB; MemAvailable 338 GiB.
+- GPU memory per worker process: 20,820 (00:00), 20,860 (00:10), 20,880 (00:30), 20,900 MiB (00:40-00:56).
+  - +80 MiB in this hour vs +200 in the previous one; +462 MiB since the restart.
+  - Free per GPU: 1,574-1,628 MiB.
+
+## Final status (01:23 UTC, Runpod credit running out, so the pods are expected to stop at ~01:40)
+The pod is not stopped or deleted by us; the user decides. Run 3 was still running at the copy.
+
+**Run 3 at 3.57 h elapsed:**
+- Stability: one server death, the deliberate TP3 kill at 22:06:37, restarted by cell 2s in 174 s; supervisor "up", start 1.
+  - No other deaths. The r1 server.log has 0 tracebacks, 400s or 500s.
+  - The 130 error records all come from the kill (64 x APIError 500, 64 x Connection error, 1 x InternalServerError 500), plus 1 x APITimeoutError.
+  - Net: 2 attempts lost (f4c952f2.0#0 and f95b36dd.0#0) and 64 tries spent at the kill (see the kill-test section for the solver fix).
+- Progress: 144 attempts done, 198 of 344 pairs answered, 37 running, 299 queued.
+- Last 328 s: 482 gen/s, KV 0.90, 31 running / 6 waiting, 5.8k tok/s restored from the CPU offload, 0 preemptions.
+- Host RAM: AnonPages 134-140 GiB through the run (peak 140.2 GiB at 00:45); the old and new engines never coexisted during the restart.
+- GPU memory per worker process (the same on all 4 GPUs):
+
+  | UTC | MiB | event |
+  |---|---|---|
+  | 22:00 | 20,438 | first engine |
+  | 22:10 | 20,438 | new engine after the restart |
+  | 23:00 | 20,620 | |
+  | 00:00 | 20,820 | |
+  | 01:00 | 20,900 | |
+
+  - +462 MiB in 3 h, slowing from +200 MiB/h to +80 MiB/h. Free per GPU at 00:56: 1,574-1,628 MiB.
+- **Paired first-attempt accuracy vs the C1 eval on the E043 stack** (`paired_c1.py`, 194 common pairs, 142 x2t tasks): no deficit, unlike run 2's interim trend.
+
+  | pairs | n | run 3 | eval a0 | run-only | eval-only | p |
+  |---|---|---|---|---|---|---|
+  | originals | 100 | 75.0% | 73.0% | 11 | 9 | 0.82 |
+  | copies | 94 | 72.3% | 71.3% | 13 | 12 | 1.0 |
+  | all | 194 | 73.7% | 72.2% | 24 | 21 | 0.77 |
+
+  - Run 3 uses context 131,072, 64 workers / 64 seqs and util 0.90, against run 2's 163,840, 80 / 80 and 0.94.
+  - So the decode paths at >= 8 concurrent decodes show no accuracy cost here.
+
+**Copied data in this directory (secret scan: 436 files, 0 hits):**
+- `run3_data/dsv41_logs/`: run 3's working dir
+  - attempts.jsonl, solver.log, status.json, metrics.jsonl, e066_supervisor.json, traces/;
+  - the start-0 server log in `server/`, the relaunch in `r1/server/`.
+- `run3_data/pod_r3/`: the restart-test scripts and logs
+  - `kill_tp.log`, `stop_run2.log`, `setup.log`;
+  - `sampler.jsonl` (5 s RAM / VRAM / process samples), `mem.log`, `metrics_scrape.txt`;
+  - `run.log` (papermill + supervisor lines), and `nb_run3.ipynb` / `nb_run3_out.ipynb` (the executed notebook).
+- `run2_data/working/`: run 2's dsv41_logs (attempts, solver.log, traces), Manh's server dir with its server.log, and the json records.
+- `run2_data/nbrun/`: run 2's run.log, mem.log, memprobe.jsonl, metrics_scrape.txt, `nb_c1.ipynb`, `nb_c1_out.ipynb` and `run2_attempts_final.jsonl`.
+- `run1_data/`: the c1_dcp4 status and the pod's copy of `dcp4_slow_load`.
+
+The repo's `.gitignore` skips `*.log`, so the GitHub sync leaves out server.log, solver.log, run.log and mem.log unless they are renamed.
