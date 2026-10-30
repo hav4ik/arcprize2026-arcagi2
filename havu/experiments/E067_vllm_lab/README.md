@@ -29,13 +29,26 @@ spending a pod day or a Kaggle slot on it.
 | Reliability kit + qualification protocol: notebook runner, sampler, watcher, report, GPU hold, fault injection | built, unit-tested | [`kaggle/reliability/README.md`](../../kaggle/reliability/README.md) |
 | Safety edits proposed for Manh's notebook (tries, step timeout, util, wheel pin) | done | [`kaggle/dsv41_tools/MANH_SAFETY_EDITS.md`](../../kaggle/dsv41_tools/MANH_SAFETY_EDITS.md) |
 | All-reduce lab: NCCL settings, host all-reduce prototypes, TP1/TP2 decode over PCIe without P2P (vLLM 0.20, 2x 3090) | done | [note](../../notes/2026-10-30_vllm_lab_comm.md), [scripts + results](comm/), logs on HF `comm/results/` |
-| KV pressure lab: multi-turn agentic load, admission gate, preemption and head-of-line counters | **running** | [kvcache/](kvcache/) |
+| KV pressure lab: multi-turn agentic load, admission gate, preemption and head-of-line counters | done (stopped early to protect the local GPUs; projected-context gate, max-num-seqs and gate+offload runs not done) | [note](../../notes/2026-10-30_vllm_lab_kvcache.md), [scripts + small logs](kvcache/), raw runs on HF `kvcache/runs/` |
 | Illegal-memory-access risk: are V12 and B32-M exposed to the CUDA IMA Manh hit on Kaggle at 120 concurrent requests? (code reading + issue search) | done; pod repro not run | [note](../../notes/2026-10-30_illegal_memory_access_risk.md) |
-| Replica vs benchmark pass@1 | **pending** | `notes/2026-10-30_replica_vs_benchmark_pass1.md` (not yet written) |
+| Replica vs benchmark pass@1 (paired on the same tasks) | done for the first hours: V12 −2.5 [−8.1, +3.2], B32-M −2.4 [−9.0, +3.4]; rerun at the end | [note](../../notes/2026-10-30_replica_vs_benchmark_pass1.md), [script](../E062_manh_vllm_fork/per_layer/scripts/replica_vs_bench.py) |
 | 12 h rerun-mode replica of Manh's V12 notebook (pod 2) | **running** | [E062 phase_h/manh_v12](../E062_manh_vllm_fork/per_layer/phase_h/manh_v12/) |
-| 12 h rerun-mode replica of B32-M V3 with Kaggle-like VRAM (pod 3) | **running** | [E062 pod3_runs/b32m_v3](../E062_manh_vllm_fork/per_layer/pod3_runs/b32m_v3/) |
+| 12 h rerun-mode replica of B32-M V3 with Kaggle-like VRAM (pod 3) | **running**; CUDA OOM at 2.11 h, restart 1 at 2.25 h | [E062 pod3_runs/b32m_v3](../E062_manh_vllm_fork/per_layer/pod3_runs/b32m_v3/), [OOM modes](../../notes/2026-10-30_b32m_oom_modes.md), [restart sim](../E062_manh_vllm_fork/per_layer/scripts/oom_restart_sim.py) |
 
 ## Key findings so far
+
+### KV pressure under agentic multi-turn load (local lab, Qwen2.5-0.5B, vLLM 0.20)
+- **A cliff, not a slope:** when the live attempts' total context goes from 0.9x to 1.8x the KV pool, real prefix hits fall
+  0.68 → 0.04, turns/min 131 → 79, and TTFT 0.1 s → 11 s. It doesn't recover while the load lasts.
+- **The cause is admission plus eviction, not preemption.** Between turns an attempt's context exists only as evictable cache,
+  which gets reused before the next turn. Strict FCFS blocks the head of the queue in 97% of scheduler steps.
+- **CPU offload helps only if the CPU tier holds the whole working set:** 12 GiB brought total hits back to 0.90 (2.3x
+  throughput); 4 GiB thrashed. GPU hits around 3% are normal with offload.
+- **Gates on server signals (KV use, hit rate) over-admit, then stay collapsed.** A fixed concurrency cap beat both (1.5x
+  throughput, 20x lower TTFT p90). Gate on the solver's own projected context instead (not yet tested).
+- **Measurement trap:** vLLM's `prefix_cache_hits/queries` counters overstate queries 5-35x under pressure. Use
+  `prompt_tokens_by_source_total`. `serve_replay_bench.py`'s server-side hit rate uses the inflated counter and needs
+  this fix.
 
 ### Memory: how the KV pool is sized and why the margin runs out
 Sources: [memory lab](../../notes/2026-10-30_vllm_lab_memory.md),
@@ -289,4 +302,4 @@ public). Code, small tables and notes stay in git.
 | `comm/results/*.log` (0.3 MB, 25 files) | the all-reduce lab's console logs, with `NCCL_DEBUG=INFO`; git skips `*.log`, so they live only here (the `.json` results are in git) | `comm/scripts/`; hostname, LAN and docker IPs redacted |
 | `replay/b32m_x2t.tokens.json.gz` (4.4 MB) + `tools.json`, `prepare.json` | the replay bench's prepared token cache for b32m_x2t | `evals/serve_replay_bench.py --prepare-only --local-render`; download in [replay/README.md](replay/README.md) |
 
-When the kvcache lab finishes, its raw runs over ~1 MB go to the same dataset, with a pointer here.
+| `kvcache/runs/` | the KV pressure lab's raw runs (per-request and per-window logs, server logs) | `kvcache/loadgen.py` and run scripts; see [kvcache/](kvcache/) |

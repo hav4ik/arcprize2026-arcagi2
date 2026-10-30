@@ -108,14 +108,19 @@ while True:
     for key, label in (("died", "server died"), ("starts", "server starts")):
         if s[key] > rep.get(key, {"died": 0, "starts": 1}[key]):
             al.append(f"ALERT {label}: {s[key]} (logs {s['logs']})"); rep[key] = s[key]; eng = True
-    if s["att_err"] > rep.get("att_err", 0):
+    if s["ups"] > rep.get("ups", 1):
+        al.append(f"ALERT server up again: {s['ups']} 'server up after' lines (logs {s['logs']})"); rep["ups"] = s["ups"]; rep["up_t"] = s["t"]
+    warm = s["t"] - rep.get("up_t", 0) < 900  # the first 15 min after a server up: warm-up and the re-submit burst are expected
+    if s["att_err"] > rep.get("att_err", 0) and (rep.get("att_err", 0) == 0 or s["t"] - rep.get("att_t", 0) > 600):  # first, then every 10 min
+        rep["att_t"] = s["t"]
         al.append(f"ALERT errored attempt records {s['att_err']} (was {rep.get('att_err', 0)}), timeouts {s['att_timeout']}"); rep["att_err"] = s["att_err"]
     if cp is not None:
         for lv in (0.40, 0.30, 0.26):
             if cp < lv and rep.get("cp_level", 9) > lv:
                 al.append(f"ALERT cap-peak {cp:.2f} GiB below {lv:.2f} (min over ranks)"); rep["cp_level"] = lv
-        win = [cap_peak(h) for h in hist if h["t"] >= s["t"] - 1800 and cap_peak(h) is not None]
-        if win and max(win) - cp > 0.1 and s["t"] - rep.get("drop_t", 0) > 1800:
+        # the same server only, after its 10-min warm-up (the warm-up step itself is ~0.4 GiB)
+        win = [cap_peak(h) for h in hist if h["t"] >= max(s["t"] - 1800, rep.get("up_t", 0) + 600) and cap_peak(h) is not None]
+        if win and max(win) - cp > 0.1 and s["t"] - rep.get("drop_t", 0) > 1800 and not warm:
             al.append(f"ALERT cap-peak dropped {max(win) - cp:.2f} GiB within 30 min (now {cp:.2f})"); rep["drop_t"] = s["t"]
     if s["keq"] > 155 and rep.get("keq155") is None:
         al.append(f"ALERT Kaggle-eq {s['keq']} GiB > 155"); rep["keq155"] = 1
@@ -128,7 +133,7 @@ while True:
     if len(sc) >= 4 and sc[-1]["generation_tokens_total"] == sc[-4]["generation_tokens_total"] and sc[-1].get("num_requests_running", 0) > 0 \
             and sc[-1]["t"] - sc[-4]["t"] >= 170 and s["t"] - rep.get("stall_t", 0) > 900:
         al.append(f"ALERT gen tok/s 0 for {sc[-1]['t'] - sc[-4]['t']} s with {sc[-1]['num_requests_running']} running"); rep["stall_t"] = s["t"]
-    if sc and sc[-1].get("num_requests_waiting", 0) > 30 and s["t"] - rep.get("wait_t", 0) > 1800:
+    if sc and sc[-1].get("num_requests_waiting", 0) > 30 and s["t"] - rep.get("wait_t", 0) > 1800 and not warm:
         al.append(f"ALERT waiting {sc[-1]['num_requests_waiting']} > 30"); rep["wait_t"] = s["t"]
     if s["nb_end"] or not s["papermill"]:
         al.append(f"ALERT notebook ended (nb_end {s['nb_end']}, papermill procs {s['papermill']})")

@@ -82,6 +82,24 @@ EW = {"cap_lt1": set(), "keq150": False, "keq_rate_t": 0, "wait30_t": 0, "gen0_t
 hist_cap = []  # (t, worst cap - peak)
 hist_keq = []  # (t, kaggle-eq)
 ENG = re.compile(r"Avg generation throughput: ([\d.]+) tokens/s, Running: (\d+) reqs, Waiting: (\d+) reqs")
+import urllib.request
+TPS = {"t": None, "gen": None}
+T_NB = os.path.getmtime(f"{R}/notebook.sha256") if os.path.exists(f"{R}/notebook.sha256") else time.time()
+def tps_row(t):
+    """One /metrics row per sample: gen tok/s from the generation_tokens_total delta; 0/0/0/empty when down."""
+    try:
+        txt_ = urllib.request.urlopen("http://127.0.0.1:18084/metrics", timeout=5).read().decode()
+        val = lambda name: sum(float(l.rsplit(" ", 1)[1]) for l in txt_.splitlines() if l.startswith(name + "{"))
+        gen, run_, wait_, kv_ = val("vllm:generation_tokens_total"), val("vllm:num_requests_running"), val("vllm:num_requests_waiting"), val("vllm:kv_cache_usage_perc")
+        rate = (gen - TPS["gen"]) / (t - TPS["t"]) if TPS["gen"] is not None and gen >= TPS["gen"] and t > TPS["t"] else 0.0
+        TPS.update(t=t, gen=gen)
+        row = f"{rate:.1f}\t{int(run_)}\t{int(wait_)}\t{kv_ * 100:.1f}"
+    except Exception:
+        TPS.update(t=None, gen=None); row = "0\t0\t0\t"
+    new = not os.path.exists(OUT + ".tps.tsv")
+    with open(OUT + ".tps.tsv", "a") as f:
+        if new: f.write("utc\tkaggle_h\tgen_tok_s\trunning\twaiting\tkv_pct\n")
+        f.write(f"{time.strftime('%H:%M:%S', time.gmtime(t))}\t{(t - T_NB) / 3600:.3f}\t{row}\n")
 def nb_alive():
     try:
         pid = int(open(f"{R}/run_nb.pid").read().strip()); os.kill(pid, 0); return True
@@ -154,6 +172,7 @@ while True:
             last_start = st["start"]
         # --- early warnings (coordinator, 04:30) ---
         open(OUT + ".heartbeat", "w").write(f"{t:.0f} {rec['utc']}\n")
+        tps_row(t)
         wc = [v["cap_minus_peak"] for v in rec.get("alloc_cap", {}).values() if v.get("cap_minus_peak") is not None]
         if wc:
             w_ = min(wc); hist_cap.append((t, w_)); hist_cap[:] = [x for x in hist_cap if x[0] >= t - 1800]

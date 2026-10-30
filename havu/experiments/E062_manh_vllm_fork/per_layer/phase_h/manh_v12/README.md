@@ -149,3 +149,27 @@ Whole run after the first 10 min of serving: mean 646 gen tok/s, mean running 47
 - **Accuracy:** 138 first attempts, 97 correct (70.3%). Stops: 128 submitted, 6 output_budget, 3 max_turns, 1 context.
   - Accuracy falls as the long, hard attempts finish later.
 - **Throughput:** 3.0-3.5 h: 620 tok/s at 41 running. Whole-run mean after 10 min: 621 tok/s at 44.7 running.
+
+### Correction (05:59 UTC): throughput table and tps.tsv
+- `v12_tput.py` and the tps backfill missed every Engine line carrying "KV fetch: …, …," before "GPU KV cache usage". That was a regex miss; both are fixed.
+- Corrected values:
+
+  | clock (h) | gen tok/s | running | server waiting |
+  |---|---|---|---|
+  | 0.5-1.0 | 729 | 55.9 | 2.0 |
+  | 1.0-1.5 | 554 | 32.3 | 4.7 |
+  | 1.5-2.0 | 565 | 40.2 | 6.9 (max 29) |
+  | 2.0-2.5 | 540 | 32.1 | 10.6 (max 18) |
+
+  Whole run after the first 10 min: 589 tok/s at 39.6 running.
+- KV-fetch entries (waiting to start + in progress + completed waiting) average <= 0.9, so the server's waiting queue in 1.5-2.5 h was capacity (KV full), not CPU-restore fetches.
+- The conclusion stands: KV capacity limits concurrency, through the solver's gate and, in 1.5-2.5 h, the server's capacity queue.
+- `data/tps.tsv` now uses ISO utc. The only zero rows are 01:52-01:55 (server loading).
+
+### Report 4 (05:56 UTC; 4 h of solving; `report_0556.txt`)
+**Verdict: stable; VRAM growth has flattened.**
+- Worst cap - peak 1.58 GiB, unchanged since 04:50: slope over 2 h -0.04 GiB/h, ~34 h to 0.26. Peak 19.57 and reserved 20.07, both flat. 0 retries, 0 OOMs.
+- RAM: Kaggle-eq (cgroup) 133.9 GiB, flat. TP-worker RSS 127.8; sandboxes 1.7-3.2 GiB.
+- Events: none.
+- Accuracy: 182 first attempts, 127 correct (69.8%). Stops: 167 submitted, 11 output_budget, 3 max_turns, 1 context.
+- Load: 4.0-4.5 h at 531 tok/s, 31 running, KV 0.88.

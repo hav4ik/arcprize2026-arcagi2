@@ -104,6 +104,7 @@ class State:
         self.inflight = 0
         self.gate_blocked = 0
         self.kv_usage = 0.0
+        self.ctx = {}  # worker id -> current context tokens of its active attempt
         self.hit_recent = 1.0  # (local + external cached) / prompt tokens over the last ~10 s
         self.hist = []
         self.stop = False
@@ -114,7 +115,7 @@ async def sampler(session, args, st, fout):
     while not st.stop:
         t = time.time()
         rec = {"t": round(t - st.t0, 3), "active": st.active_attempts, "inflight": st.inflight,
-               "gate_blocked": st.gate_blocked}
+               "gate_blocked": st.gate_blocked, "ctx_sum": sum(st.ctx.values())}
         try:
             async with session.get(args.url + "/metrics", timeout=aiohttp.ClientTimeout(total=5)) as r:
                 m = parse_metrics(await r.text())
@@ -186,11 +187,18 @@ async def worker(wid, session, args, st, fout, sys_ids):
     while not st.stop and time.time() - st.t0 < args.duration:
         # admission gate for NEW attempts
         t_gate = time.time()
-        if args.gate_kv < 1.0 or args.gate_hit > 0.0:
+        def ctx_full():
+            # projected working set: each active attempt counts max(current context, expected final context)
+            if args.gate_ctx <= 0:
+                return False
+            proj = sum(max(c, args.gate_ctx_est) for c in st.ctx.values())
+            return proj + args.gate_ctx_est > args.gate_ctx
+
+        if args.gate_kv < 1.0 or args.gate_hit > 0.0 or args.gate_ctx > 0:
             st.gate_blocked += 1
             while (not st.stop and time.time() - st.t0 < args.duration
                    and st.active_attempts >= args.gate_min
-                   and (st.kv_usage >= args.gate_kv or st.hit_recent < args.gate_hit)):
+                   and (st.kv_usage >= args.gate_kv or st.hit_recent < args.gate_hit or ctx_full())):
                 await asyncio.sleep(0.25)
             st.gate_blocked -= 1
             if st.stop or time.time() - st.t0 >= args.duration:
@@ -201,6 +209,7 @@ async def worker(wid, session, args, st, fout, sys_ids):
         attempt_idx += 1
         n_turns = rng.randint(args.turns_min, args.turns_max)
         ids = list(sys_ids) + nrng.integers(100, 150000, args.init_tokens - len(sys_ids)).tolist()
+        st.ctx[wid] = len(ids)
         t_att = time.time()
         turns_done = 0
         try:
@@ -232,11 +241,13 @@ async def worker(wid, session, args, st, fout, sys_ids):
                 turns_done += 1
                 tool = rng.randint(args.tool_min, args.tool_max)
                 ids = ids + out_ids + nrng.integers(100, 150000, tool).tolist()
+                st.ctx[wid] = len(ids)
                 if time.time() - st.t0 >= args.duration:
                     break
                 await asyncio.sleep(rng.uniform(args.think_min, args.think_max))
         finally:
             st.active_attempts -= 1
+            st.ctx.pop(wid, None)
         fout.write(json.dumps({"aid": aid, "w": wid, "attempt_done": turns_done == n_turns,
                                "turns_done": turns_done, "n_turns": n_turns,
                                "dur": round(time.time() - t_att, 2), "final_ctx": len(ids)}) + "\n")
@@ -285,6 +296,9 @@ def main():
     ap.add_argument("--gate-kv", type=float, default=1.0, help="admit new attempts only if KV usage < this")
     ap.add_argument("--gate-hit", type=float, default=0.0,
                     help="admit new attempts only if the recent cached fraction of prompt tokens >= this")
+    ap.add_argument("--gate-ctx", type=int, default=0,
+                    help="admit a new attempt only if sum(max(ctx, est)) over active attempts + est <= this (tokens)")
+    ap.add_argument("--gate-ctx-est", type=int, default=22000, help="expected final context of an attempt")
     ap.add_argument("--gate-min", type=int, default=4, help="always allow this many active attempts")
     ap.add_argument("--request-timeout", type=float, default=3600)
     ap.add_argument("--sample-interval", type=float, default=1.0)

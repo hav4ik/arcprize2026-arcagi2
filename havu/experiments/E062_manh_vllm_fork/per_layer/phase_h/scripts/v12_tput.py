@@ -2,7 +2,7 @@
 plus the solver's KV-gate lines and metrics.jsonl (host-restore share). Usage: v12_tput.py <dsv41_logs> <t0 epoch (notebook start)>"""
 import calendar, glob, json, os, re, sys, time
 L, T0 = sys.argv[1], float(sys.argv[2]); ANSI = re.compile(r"\x1b\[[0-9;]*m")
-E = re.compile(r"(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d) \[loggers.py:\d+\] Engine 000: Avg prompt throughput: ([\d.]+) tokens/s, Avg generation throughput: ([\d.]+) tokens/s, Running: (\d+) reqs, Waiting: (\d+) reqs, GPU KV cache usage: ([\d.]+)%, Prefix cache hit rate: ([\d.]+)%(?:, External prefix cache hit rate: ([\d.]+)%)?")
+E = re.compile(r"(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d) \[loggers.py:\d+\] Engine 000: Avg prompt throughput: ([\d.]+) tokens/s, Avg generation throughput: ([\d.]+) tokens/s, Running: (\d+) reqs, Waiting: (\d+) reqs, .*?GPU KV cache usage: ([\d.]+)%, Prefix cache hit rate: ([\d.]+)%(?:, External prefix cache hit rate: ([\d.]+)%)?")
 yr = time.gmtime(T0).tm_year; rows = []
 for f in glob.glob(f"{L}/**/server.log", recursive=True):
     for l in open(f, errors="replace"):

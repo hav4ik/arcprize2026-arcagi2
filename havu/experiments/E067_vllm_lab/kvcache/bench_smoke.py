@@ -21,9 +21,14 @@ def main():
     args[args.index("--max-model-len") + 1] = "131072"
     i = args.index("--scheduler-cls")
     del args[i:i + 2]  # plain upstream scheduler for the bench smoke
+    # Qwen2.5-0.5B has max_position_embeddings 32768; the b32m traces reach 125k (p90). Try 1 used
+    # VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 and the engine died with a CUDA device-side assert once a sequence passed
+    # 32k positions. YaRN x4 (Qwen2.5's documented long-context setting) makes 131072 legitimate.
+    args += ["--hf-overrides", '{"rope_scaling": {"rope_type": "yarn", "factor": 4.0, '
+             '"original_max_position_embeddings": 32768}}']
     logp = os.path.join(OUT, "server.log")
     log = open(logp, "w")
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="1", HF_HUB_OFFLINE="1", VLLM_ALLOW_LONG_MAX_MODEL_LEN="1")
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="1", HF_HUB_OFFLINE="1")
     cmd = ["flock", rs.LOCK, rs.VLLM, "serve", rs.MODEL] + args
     print("[bench_smoke] start", " ".join(cmd), flush=True)
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)

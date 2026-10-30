@@ -22,7 +22,7 @@ Two selection effects, and what controls each:
 
 Usage:
   replica_vs_bench.py REPLICA [REPLICA ...] --bench [LABEL=]FILE_OR_DIR [--bench ...] --idmap IDMAP
-      [--cut H] [--at-n N,N] [--boot 10000] [--losses N] [--json OUT]
+      [--cut H] [--at-n N,N] [--prefix-m M,M] [--boot 10000] [--losses N] [--json OUT]
 REPLICA: a run dir (attempts.jsonl in it, dsv41_logs/, out/dsv41_logs/, data/ or data/dsv41_logs/) or the file;
 LABEL=PATH names it. Benchmark files: solver attempts.jsonl (one record per task, Kaggle eval set) or harness results
 (evals/results/*.jsonl, per-pair records with config.challenges).
@@ -200,6 +200,12 @@ def load_replica(path, ch, sol, idmap, cut=None):
     return rows, errored
 
 
+def queue_order(ch, universe):
+    """The solver's first-attempt queue: tasks by prompt size (train JSON + largest test input), stable in file order."""
+    size = {t: len(json.dumps(ch[t]["train"])) + max(len(json.dumps(y["input"])) for y in ch[t]["test"]) for t in universe}
+    return sorted(universe, key=lambda t: size[t])
+
+
 def score(right, qs=None):
     qs = sorted(right) if qs is None else qs
     if not qs:
@@ -290,7 +296,7 @@ def stop_counts(rows):
     return ", ".join(f"{k} {v}" for k, v in c.most_common())
 
 
-def report(label, path, ch, sol, idmap, bench, cut, reps, n_losses, at_n=()):
+def report(label, path, ch, sol, idmap, bench, cut, reps, n_losses, at_n=(), prefix_m=()):
     rep, errored = load_replica(path, ch, sol, idmap, cut)
     if not rep:
         print(f"\n## {label}: no finished first attempts")
@@ -336,6 +342,36 @@ def report(label, path, ch, sol, idmap, bench, cut, reps, n_losses, at_n=()):
         out["progress"].append(dict(s, first_n=n, t_end_h=order[n - 1]["t_end_h"]))
         ci = "" if s["ci"][0] is None else f" [{s['ci'][0]:+.1f}, {s['ci'][1]:+.1f}]"
         print(f"| {n} | {order[n - 1]['t_end_h']:.2f} | {s['replica']:.1f} | {s['bench']:.1f} | {s['diff']:+.1f}{ci} |")
+
+    # queue order: the solver starts first attempts smallest task first, whatever their outcome, so a queue prefix whose
+    # first attempts have all finished carries no attempt-level selection (only task-level, which the pairing removes)
+    universe = [t for t in ch if any(r["kind"] == "copy" for r in rep.values()) or idmap[t]["kind"] == "orig"]
+    qpos = {t: i for i, t in enumerate(queue_order(ch, universe))}
+    at_pos = sorted(qpos, key=qpos.get)
+    m_full = 0
+    while m_full < len(at_pos) and at_pos[m_full] in rep:
+        m_full += 1
+    by_pos = {qpos[i["task"]]: i for i in items}
+    print(f"\n### Queue order (first attempts start smallest task first; {len(qpos)} tasks)\n")
+    print(f"Complete queue prefix: the first {m_full} tasks in queue order have all finished.\n")
+    print("| queue positions | finished / tasks | replica | bench, same tasks | diff [95% CI] | complete? |")
+    print("|---|---|---|---|---|---|")
+    out["queue"] = {"complete_prefix": m_full, "bins": [], "prefixes": []}
+    rows = [(f"prefix 0-{m_full - 1}", 0, m_full)] if m_full else []
+    rows += [(f"prefix 0-{min(m, len(qpos)) - 1}", 0, min(m, len(qpos))) for m in prefix_m if m != m_full]
+    rows += [(f"{lo}-{min(lo + 40, len(qpos)) - 1}", lo, min(lo + 40, len(qpos))) for lo in range(0, len(qpos), 40)]
+    for name, lo, hi in rows:
+        sel = [by_pos[p] for p in range(lo, hi) if p in by_pos]
+        s = summarise(sel, reps)
+        fin = sum(1 for p in range(lo, hi) if at_pos[p] in rep)
+        rec = dict(s or {}, name=name, lo=lo, hi=hi, finished=fin)
+        out["queue"]["prefixes" if name.startswith("prefix") else "bins"].append(rec)
+        if not s:
+            print(f"| {name} | {fin} / {hi - lo} | - | - | - | {'yes' if fin == hi - lo else 'no'} |")
+            continue
+        ci = "" if s["ci"][0] is None else f" [{s['ci'][0]:+.1f}, {s['ci'][1]:+.1f}]"
+        print(f"| {name} | {fin} / {hi - lo} | {s['replica']:.1f} | {s['bench']:.1f} | {s['diff']:+.1f}{ci} | "
+              f"{'yes' if fin == hi - lo else 'no'} |")
 
     # time profile: by hour of finish, and cumulative cuts
     print("\n### Time profile (ARC task score; hour = t_end_h of the replica's first attempt)\n")
@@ -424,6 +460,7 @@ def main():
     ap.add_argument("--boot", type=int, default=10000)
     ap.add_argument("--losses", type=int, default=40, help="rows in the loss table")
     ap.add_argument("--at-n", default="", help="extra N values for the progress profile, comma-separated")
+    ap.add_argument("--prefix-m", default="", help="extra queue-prefix sizes M (first M tasks in queue order)")
     ap.add_argument("--json", help="write the numbers here")
     a = ap.parse_args()
     idp = Path(a.idmap)
@@ -449,7 +486,7 @@ def main():
     for arg in a.replicas:
         lab, path = labelled(arg)
         res.append(report(lab, path, ch, sol, idmap, bench, a.cut, a.boot, a.losses,
-                          [int(x) for x in a.at_n.split(",") if x]))
+                          [int(x) for x in a.at_n.split(",") if x], [int(x) for x in a.prefix_m.split(",") if x]))
     if a.json:
         Path(a.json).write_text(json.dumps(res, indent=1, default=str))
 

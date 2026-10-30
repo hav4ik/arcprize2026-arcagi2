@@ -121,3 +121,29 @@ Dashboard data in `data/`, refreshed every 30 min by `export_dash.sh`:
 - Host: Kaggle-eq 149.4 -> 149.8 GiB (+0.5 GiB/h); shmem flat at 125.0 GiB.
 - Health: 0 errors, timeouts, HTTP 500 or deaths.
 - Accuracy: 62 first attempts, 52 fully correct; 82 of 344 pairs.
+
+### CUDA OOM on TP3 at Kaggle 2.11 h (05:37:24 UTC)
+The OOM came earlier than the auditor's 3.1-4.4 h band.
+- `server.log` line 7437 (TP3 pid 68334, multiproc_executor.py:1189; execute_model -> all_gather -> torch.empty): `torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 MiB. GPU 3 has a total capacity of 22.04 GiB of which 537.94 MiB is free. Process 66985 has 350.00 MiB memory in use. Including non-PyTorch memory, this process has 21.03 GiB memory in use. 20.37 GiB allowed; Of the allocated memory 20.06 GiB is allocated by PyTorch, ...`
+  - The cap (20.37 GiB on TP3) was hit, not the device: 538 MiB was still free.
+  - Process 66985 is the 350 MiB hold (the Kaggle-like non-PyTorch memory).
+- Before it: cap - peak on TP2/3 0.42 (05:32), then 0.40 (05:33:37); retries 37 -> 41 (TP2/3); 446-495 gen tok/s with 80 running.
+- 05:37:29: 198 gen tok/s. **05:37:39 on: 0 gen and 0 prompt tokens/s with 80 requests "running".** The engine hangs, as the auditor predicted for a non-output rank.
+- Server logs copied to `/root/e066/b32mv3/preserved/053753/`.
+- No intervention: B32's own restart path plays out.
+- **05:42:27:** `EngineDeadError: EngineCore encountered an issue` (server.log 47035), **303 s after the OOM**. Rank 0 waited out VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS (300 s).
+- **05:42:29:** all **80 in-flight attempts** logged `retry <task>.0#0: TurnError: APIError: The server had an error while processing your request.`
+  - On this V3 solver (77fe80a3) that is the HTTP 500 path, so each attempt used one of its 2 ARC_JOB_TRIES: 80 "retry" lines, 0 free re-queues, 0 attempts finalized as stop=error.
+  - A second death would finalize the attempts that are in flight again.
+  - Then `server died (code 0)`.
+- **05:43:01:** `server start (restart 1)`, 32 s after the death; log `server_restart1.log`. Before the relaunch, the host had freed everything: Kaggle-eq 8.3 GiB, shmem 0, /dev/shm 0, 0 engines; on the GPUs only the 350 MiB hold. Two engines never coexisted.
+- Logs preserved in `/root/e066/b32mv3/preserved/053753/` (OOM) and `/054231/` (death).
+- Correction: **TP2 and TP3 both OOMed at 05:37:24.** They are the two ranks with the lowest cap (20.37 GiB); each logged `torch.OutOfMemoryError` twice.
+- **05:45:41:** `server up after 160s` (restart 1), with KV 3,196,704 and the same caps (20.43 / 20.41 / 20.37 / 20.37, reserved 19.71). First GPU memory line: peak 19.42, 0 retries, free 1.16-1.22.
+  - **Outage from OOM to serving: 8 min 17 s** (hang 303 s, death to relaunch 32 s, load 160 s with hot page and compile caches; Kaggle's load would be slower).
+  - 1 free re-queue at server up (`ConnectError: Connection refused`).
+  - 0 attempts finalized as stop=error. 81 error records (80 APIError 500 + 1 ConnectError).
+- Dashboard fixes (coordinator):
+  - `gpumem.log` sync: the remote grep loop ended on a no-match in server_restart1.log, so ssh returned 1 and the file was never renamed. The loop now ends in `; true`.
+  - New `data/tps.tsv`: one row per minute from /metrics deltas, with 0 / 0 / 0 and an empty kv_pct while the server is down.
+  - `status.json` counters are now cumulative over all server logs, with a floor file so they never go down.

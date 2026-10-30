@@ -5,7 +5,9 @@
 # meminfo form).
 D=/home/vu/Workspace/ARC-AGI-2/experiments/E062_manh_vllm_fork/per_layer/phase_h/manh_v12/data; mkdir -p $D/nbruns/m12_rerun
 SSH="timeout 120 ssh -o BatchMode=yes -o ConnectTimeout=15 -p 18070 root@213.173.105.27"
-$SSH 'cd /root/kwork_m12_rerun/dsv41_logs && for f in server/server.log $(ls -d r[0-9]*/server/server.log 2>/dev/null | sort -V); do grep -aE "GPU memory:|Capped the PyTorch allocator|Avg generation throughput" $f; done' > $D/gpumem.log.tmp && mv $D/gpumem.log.tmp $D/gpumem.log
+# every start's server.log in start order: server/ (start 0), then his supervisor's server_restart{n}/ (or our r{n}/server/)
+$SSH 'cd /root/kwork_m12_rerun/dsv41_logs && for f in $(find . -name server.log | grep -v traces | awk "{n=0; if (match(\$0, /server_restart[0-9]+/)) n=substr(\$0, RSTART+14, RLENGTH-14); else if (match(\$0, /\\/r[0-9]+\\//)) n=substr(\$0, RSTART+2, RLENGTH-3); print n, \$0}" | sort -n | cut -d" " -f2); do grep -aE "GPU memory:|Capped the PyTorch allocator|Avg generation throughput" $f; done' > $D/gpumem.log.tmp && mv $D/gpumem.log.tmp $D/gpumem.log
+$SSH 'head -1 /root/nbruns/m12_rerun/samp.tps.tsv; cat /root/nbruns/m12_rerun/tps_backfill.tsv 2>/dev/null; tail -n +2 /root/nbruns/m12_rerun/samp.tps.tsv | sed -E "s/^([0-9]{2}:[0-9]{2}:[0-9]{2})\t/2026-10-30T\1Z\t/"' > $D/tps.tsv.tmp && mv $D/tps.tsv.tmp $D/tps.tsv
 mkdir -p $D/dsv41_logs
 $SSH 'cat /root/kwork_m12_rerun/dsv41_logs/attempts.jsonl' > $D/dsv41_logs/attempts.jsonl.tmp && mv $D/dsv41_logs/attempts.jsonl.tmp $D/dsv41_logs/attempts.jsonl
 $SSH 'cat /root/kwork_m12_rerun/dsv41_logs/solver.log' > $D/dsv41_logs/solver.log.tmp && mv $D/dsv41_logs/solver.log.tmp $D/dsv41_logs/solver.log
@@ -54,5 +56,11 @@ T0 = 1793325064.3
 st = {"utc": last["utc"], "kaggle_h": round((last["t"] - T0) / 3600, 2), "first_done": len(a0), "first_correct": sum(map(correct, a0)),
       "pairs_answered": len(answered), "errored": len(rs) - len(ok), "deaths": deaths, "restarts": restarts, "retries_max": retries,
       "ooms": ooms, "running": e.get("running"), "waiting": e.get("waiting"), "verdict": verdict}
+import os
+SF = "/root/nbruns/m12_rerun/status_state.json"
+prev = json.load(open(SF)) if os.path.exists(SF) else {}
+for k in ("first_done", "first_correct", "pairs_answered", "errored", "deaths", "restarts", "retries_max", "ooms"):
+    st[k] = max(st[k], prev.get(k, 0))
+json.dump({k: st[k] for k in ("first_done", "first_correct", "pairs_answered", "errored", "deaths", "restarts", "retries_max", "ooms")}, open(SF, "w"))
 print(json.dumps(st))
 PY' > $D/status.json.tmp && mv $D/status.json.tmp $D/status.json && cat $D/status.json

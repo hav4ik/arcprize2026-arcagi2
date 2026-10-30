@@ -60,6 +60,8 @@ SUITES = {
     "exp3": [R("e3_c64_gatekv70", concurrency=64, gate_kv=0.70, gate_min=4),
              R("e3_c64_gatehit80", concurrency=64, gate_hit=0.80, gate_min=4),
              R("e3_c64_gatekv50", concurrency=64, gate_kv=0.50, gate_min=4)],
+    # projected-working-set gate: 1.5 x the 195k pool / 22k expected final context ~ 13 attempts
+    "exp3c": [R("e3_c64_gatectx15", concurrency=64, gate_ctx=292_968, gate_ctx_est=22000, gate_min=4)],
     "exp3b": [R("e3_c64_gatehit80_off4", OFF(4), concurrency=64, gate_hit=0.80, gate_min=4)],
 }
 
