@@ -28,6 +28,15 @@ def sh(cmd, timeout=120):
         return f"ERR {type(exc).__name__}"
 
 
+def gce():
+    """E081b: zone / machine type from the GCE metadata server (link-local; may answer with internet off)."""
+    out = {}
+    for k in ("zone", "machine-type", "id"):
+        v = sh(f"curl -s -m 3 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/{k}", timeout=10)
+        out[k] = v.strip().split("/")[-1][:80] if v and not v.startswith("ERR") and "<" not in v else None
+    return out
+
+
 def identity():
     q = ("index,name,uuid,serial,pci.bus_id,driver_version,power.limit,power.max_limit,clocks.max.sm,"
          "pcie.link.gen.max,pcie.link.width.max,memory.total")
@@ -37,7 +46,7 @@ def identity():
     R["identity"] = {"hostname": socket.gethostname(), "cpu": cpu.group(1).strip() if cpu else None,
                      "nproc": os.cpu_count(), "mem_total_gb": round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9, 1),
                      "kernel": sh("uname -r").strip(), "gpus": rows, "topo": sh("nvidia-smi topo -m"),
-                     "boot_id": open("/proc/sys/kernel/random/boot_id").read().strip()}
+                     "boot_id": open("/proc/sys/kernel/random/boot_id").read().strip(), "gce": gce()}
     print(json.dumps({k: v for k, v in R["identity"].items() if k != "topo"}, indent=1))
     print(R["identity"]["topo"])
 
@@ -84,6 +93,8 @@ def read_range(path, nbytes, stop_at):
 ROOTS = ["/kaggle/input/models/chankhavu/dsv41-flash-1017-arc-tool-e128-2bit/pytorch/default/1",
          "/kaggle/input/datasets/nguyennguyen599/vllm-wheels",
          "/kaggle/input/datasets/nguyennguyen599/cu13-install"]
+if os.environ.get("E081_ROOTS"):  # E081b: explicit order, e.g. both E128 models alternating which is read first
+    ROOTS = os.environ["E081_ROOTS"].split(",")
 
 
 def mounts():

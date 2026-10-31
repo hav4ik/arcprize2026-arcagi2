@@ -56,3 +56,26 @@ are such machines, and how fast do our submission's mounted inputs read? Budget:
   different pool; one interactive session started here but its cell failed, so no interactive data point exists.
 - The reads are time-boxed samples (~17 GB of the model per run), not full stagings; cold means "first read in this
   session", which may still hit a Kaggle-side cache if another session read the same blocks shortly before.
+
+## E081b: does the causal image E128 mount read differently? (4 probes, 2026-10-31 21:14–21:32 UTC)
+User hypothesis: each Kaggle model/dataset lives in some region, compute is provisioned near it, and Manh's bad machine
+came from the region holding the newer model. Probes `chankhavu/e081-l4-probeb-01..04` attach **both**
+`chankhavu/dsv41-flash-1017-arc-tool-e128-2bit/PyTorch/default/1` (V12's text E128, 131.09 GB) and
+`arazzd/deepseek-v41-flash-1017-arc-tool-img-e128-causal/PyTorch/default/1` (132.06 GB, 137 files) and read both on the
+same machine within the same minute, alternating which is read first (`build.py N OUTDIR b`, `compare_b.py`). They also
+query the GCE metadata server for the zone. ~20 GPU-minutes (the rest of the 2 h budget).
+
+| probe | read first | text E128 single / 8-par MB/s | causal image E128 single / 8-par MB/s | host links | NCCL 516 KB best / worst µs |
+|---|---|---|---|---|---|
+| b-01 | image | 249 / 767 | 147 / 765 | 11.5 / 12.3 GB/s all GPUs | 150 / 229 |
+| b-02 | text | 171 / 747 | 255 / 777 | same | 150 / 227 |
+| b-03 | image | 246 / 717 | 133 / 706 | same | 150 / 227 |
+| b-04 | text | 150 / 957 | 274 / 959 | same | 150 / 228 |
+
+- **The two models read at the same speed on the same machine:** 8-parallel rates differ by at most 1.5% within each
+  probe (706–959 MB/s across machines). The only systematic difference is order: whichever model is read first gets the
+  lower single-stream number (133–171 vs 246–274 MB/s), a first-read warm-up, not a dataset effect.
+- **All 4 machines were healthy** (full host links, the usual NCCL shape), so 23 batch probes in total, no bad machine.
+- **The zone is not observable:** the metadata server does not answer inside Kaggle notebooks (zone, machine type and
+  instance id all empty), so the region hypothesis can't be tested directly from inside the notebook. Nothing here
+  supports it: the newer model's mount is as fast as the old one's, and the machines that mount it look identical.
