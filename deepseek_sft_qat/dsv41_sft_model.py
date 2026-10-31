@@ -26,8 +26,10 @@ Implements:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from concurrent import futures
 from dataclasses import dataclass
+import functools
 import io
 import json
 import math
@@ -137,6 +139,59 @@ def quantize_fp8_block32_torch(
     return w_fp8, scale_e8m0
 
 
+def _fake_quant_fp8_block32_nograd_eager(
+    w: torch.Tensor,
+    block_size: int = FP8_BLOCK_SIZE,
+    use_2d: bool = True,
+) -> torch.Tensor:
+    out_dim, in_dim = w.shape
+    b_in = in_dim // block_size
+    if use_2d:
+        b_out = out_dim // block_size
+        w_f32 = w.detach().to(torch.float32).view(b_out, block_size, b_in, block_size)
+        amax = w_f32.abs().amax(dim=(1, 3), keepdim=True)
+        _, scale_f32 = _fast_round_scale_e8m0(amax, FP8_MAX)
+        q_fp8 = (w_f32 / scale_f32).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+        return (q_fp8.to(torch.float32) * scale_f32).reshape(out_dim, in_dim).to(w.dtype)
+    w_f32 = w.detach().to(torch.float32).view(out_dim, b_in, block_size)
+    amax = w_f32.abs().amax(dim=-1, keepdim=True)
+    _, scale_f32 = _fast_round_scale_e8m0(amax, FP8_MAX)
+    q_fp8 = (w_f32 / scale_f32).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    return (q_fp8.to(torch.float32) * scale_f32).reshape(out_dim, in_dim).to(w.dtype)
+
+
+def _act_quant_fp8_nograd_eager(
+    x: torch.Tensor,
+    block_size: int = FP8_BLOCK_SIZE,
+) -> torch.Tensor:
+    orig_shape = x.shape
+    last_dim = orig_shape[-1]
+    x_f32 = x.detach().to(torch.float32).reshape(-1, last_dim // block_size, block_size)
+    amax = x_f32.abs().amax(dim=-1, keepdim=True)
+    _, scale_f32 = _fast_round_scale_e8m0(amax, FP8_MAX)
+    q_fp8 = (x_f32 / scale_f32).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    return (q_fp8.to(torch.float32) * scale_f32).reshape(orig_shape).to(x.dtype)
+
+
+_COMPILED_QAT_FNS: dict[str, Any] = {}
+_COMPILE_QAT_DISABLED = False
+
+
+def _get_compiled_qat_fn(name: str, fn: Any) -> Any:
+    global _COMPILE_QAT_DISABLED
+    if _COMPILE_QAT_DISABLED or os.environ.get("DSV41_COMPILE_QAT", "1") in ("0", "false", "False"):
+        return None
+    compiled = _COMPILED_QAT_FNS.get(name)
+    if compiled is None:
+        try:
+            compiled = torch.compile(fn, dynamic=True)
+            _COMPILED_QAT_FNS[name] = compiled
+        except Exception:  # pylint: disable=broad-exception-caught
+            _COMPILE_QAT_DISABLED = True
+            return None
+    return compiled
+
+
 def fake_quant_fp8_block32_ste(
     w: torch.Tensor,
     block_size: int = FP8_BLOCK_SIZE,
@@ -147,12 +202,18 @@ def fake_quant_fp8_block32_ste(
         return w
     use_2d = scale_2d and (w.shape[0] % block_size == 0)
     with torch.no_grad():
-        w_fp8, s_e8m0 = quantize_fp8_block32_torch(
-            w, block_size=block_size, scale_2d=use_2d
-        )
-        w_deq = dequantize_fp8_block32_torch(
-            w_fp8, s_e8m0, block_size=block_size, out_dtype=w.dtype
-        )
+        w_deq: torch.Tensor | None = None
+        if w.is_cuda:
+            c_fn = _get_compiled_qat_fn("fake_quant_fp8", _fake_quant_fp8_block32_nograd_eager)
+            if c_fn is not None:
+                try:
+                    w_deq = c_fn(w, block_size, use_2d)
+                except Exception:  # pylint: disable=broad-exception-caught
+                    global _COMPILE_QAT_DISABLED
+                    _COMPILE_QAT_DISABLED = True
+                    w_deq = None
+        if w_deq is None:
+            w_deq = _fake_quant_fp8_block32_nograd_eager(w, block_size, use_2d)
     if not torch.is_grad_enabled() or not w.requires_grad:
         return w_deq
     return w + (w_deq - w).detach()
@@ -168,11 +229,18 @@ def act_quant_fp8_ste(
     if last_dim == 0 or last_dim % block_size != 0:
         return x
     with torch.no_grad():
-        x_f32 = x.detach().to(torch.float32).reshape(-1, last_dim // block_size, block_size)
-        amax = x_f32.abs().amax(dim=-1, keepdim=True)
-        _, scale_f32 = _fast_round_scale_e8m0(amax, FP8_MAX)
-        q_fp8 = (x_f32 / scale_f32).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-        x_deq = (q_fp8.to(torch.float32) * scale_f32).reshape(orig_shape).to(x.dtype)
+        x_deq: torch.Tensor | None = None
+        if x.is_cuda:
+            c_fn = _get_compiled_qat_fn("act_quant_fp8", _act_quant_fp8_nograd_eager)
+            if c_fn is not None:
+                try:
+                    x_deq = c_fn(x, block_size)
+                except Exception:  # pylint: disable=broad-exception-caught
+                    global _COMPILE_QAT_DISABLED
+                    _COMPILE_QAT_DISABLED = True
+                    x_deq = None
+        if x_deq is None:
+            x_deq = _act_quant_fp8_nograd_eager(x, block_size)
     if not x.requires_grad:
         return x_deq
     return x + (x_deq - x).detach()
@@ -574,15 +642,23 @@ class NgramHashStateModule(nn.Module):
         self,
         input_ids: torch.Tensor,
         prefix_compressed: torch.Tensor | None = None,
+        token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Computes `[B, L, n_engram_layers, n_hash_cols]` int64 hash IDs for `input_ids [B, L]`.
 
         If `prefix_compressed` (`[B, P]` of compressed token IDs before `input_ids`) is given,
         uses the last `max_ngram_size - 1` tokens of `prefix_compressed` for seamless KV-cached decode.
+        `token_mask` (`[B, L]` bool, False inside image spans) marks positions that take no part
+        in any n-gram: they are cached as `DEAD`, so look-back stops at them (reference
+        `NgramHashState`).
         """
         batch, seqlen = input_ids.shape
         safe_ids = input_ids.clamp(0, self.token_map.numel() - 1)
         compressed = self.token_map[safe_ids]  # [B, L]
+        if token_mask is not None:
+            compressed = torch.where(
+                token_mask.to(torch.bool), compressed, torch.full_like(compressed, self.DEAD)
+            )
         if prefix_compressed is not None and prefix_compressed.size(1) > 0:
             full_comp = torch.cat([prefix_compressed, compressed], dim=1)
             start_pos = prefix_compressed.size(1)
@@ -671,6 +747,23 @@ class Dsv41E128Config:
     qat_trainable_expert_scales: bool = True
     qat_lock_gptq_codes: bool = False
     load_compact_engram: bool = True
+    # Vision tower (DeepSeek-V4.1 VL). `vision_n_layers == 0` disables the image path entirely;
+    # the released E128 image checkpoints carry `vision.*`, `aligner.*`, `image_{start,end,newline}`.
+    vision_n_layers: int = 0
+    vision_dim: int = 1024
+    vision_n_heads: int = 16
+    vision_inter_dim: int = 2816
+    vision_patch_size: int = 14
+    vision_rope_theta: float = 10000.0
+    vision_downsample_ratio: int = 3
+    vision_max_n_token: int = 1024
+    vision_min_pixels: int = 544 * 544
+    # Raw id of `<｜deepseek_image｜>`; every position of an image span carries it in `input_ids`.
+    image_token_id: int = 129264
+
+    @property
+    def vision_enabled(self) -> bool:
+        return self.vision_n_layers > 0
 
     @classmethod
     def from_json_dict(cls, raw: dict[str, Any]) -> Dsv41E128Config:
@@ -726,7 +819,34 @@ class Dsv41E128Config:
             engram_head_dim=int(tc.get("engram_head_dim", cls.engram_head_dim)),
             engram_pad_id=int(tc.get("engram_pad_id", tc.get("engram_pad_token_id", cls.engram_pad_id))),
             engram_compressed_vocab_size=int(tc.get("engram_compressed_vocab_size", cls.engram_compressed_vocab_size)),
+            **cls._vision_kwargs_from_json(raw),
         )
+
+    @classmethod
+    def _vision_kwargs_from_json(cls, raw: dict[str, Any]) -> dict[str, Any]:
+        """Vision-tower fields from `vision_config`, unless the checkpoint is marked text-only.
+
+        The E043 text-only export keeps a `vision_config` block in `config.json` but ships no
+        `vision.*` tensors (`e043_pruning.text_only == true`), so vision stays disabled for it.
+        """
+        pruning = raw.get("e043_pruning") or {}
+        vc = raw.get("vision_config") or {}
+        if not vc or bool(pruning.get("text_only", False)):
+            return {"vision_n_layers": 0}
+        tc = raw.get("text_config", raw)
+        # `inference/config.json` style keys first, then HF `vision_config` keys.
+        return {
+            "vision_n_layers": int(tc.get("vision_n_layers", vc.get("num_hidden_layers", 32))),
+            "vision_dim": int(tc.get("vision_dim", vc.get("hidden_size", cls.vision_dim))),
+            "vision_n_heads": int(tc.get("vision_n_heads", vc.get("num_attention_heads", cls.vision_n_heads))),
+            "vision_inter_dim": int(tc.get("vision_inter_dim", vc.get("intermediate_size", cls.vision_inter_dim))),
+            "vision_patch_size": int(tc.get("vision_patch_size", vc.get("patch_size", cls.vision_patch_size))),
+            "vision_rope_theta": float(tc.get("vision_rope_theta", vc.get("rope_theta", cls.vision_rope_theta))),
+            "vision_downsample_ratio": int(tc.get("vision_downsample_ratio", vc.get("downsample_ratio", cls.vision_downsample_ratio))),
+            "vision_max_n_token": int(tc.get("vision_max_n_token", vc.get("max_image_tokens", cls.vision_max_n_token))),
+            "vision_min_pixels": int(tc.get("vision_min_pixels", vc.get("min_pixels", cls.vision_min_pixels))),
+            "image_token_id": int(raw.get("image_token_id", tc.get("image_token_id", cls.image_token_id))),
+        }
 
     @classmethod
     def tiny_test_config(cls) -> Dsv41E128Config:
@@ -777,76 +897,93 @@ class _SymmetricAllReduce(torch.autograd.Function):
     """Performs an autograd-friendly symmetric SUM all_reduce without FutureWarnings."""
 
     @staticmethod
-    def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        ctx: Any, x: torch.Tensor, group: dist.ProcessGroup | None = None
+    ) -> torch.Tensor:
+        ctx.group = group
         out = x.contiguous().clone()
-        dist.all_reduce(out, op=dist.ReduceOp.SUM)
+        dist.all_reduce(out, op=dist.ReduceOp.SUM, group=group)
         return out
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
         g = grad_output.contiguous().clone()
-        dist.all_reduce(g, op=dist.ReduceOp.SUM)
-        return g
+        dist.all_reduce(g, op=dist.ReduceOp.SUM, group=ctx.group)
+        return g, None
 
 
 class _EPAllGather(torch.autograd.Function):
     """Gathers `[L_max, ...]` across all EP ranks into `[W, L_max, ...]`; backward is `reduce_scatter(SUM)`."""
 
     @staticmethod
-    def forward(ctx: Any, x: torch.Tensor) -> torch.Tensor:
-        world_size = dist.get_world_size()
+    def forward(
+        ctx: Any, x: torch.Tensor, group: dist.ProcessGroup | None = None
+    ) -> torch.Tensor:
+        ctx.group = group
+        world_size = dist.get_world_size(group)
         x_contig = x.contiguous()
         out = torch.empty(
             (world_size, *x_contig.shape),
             dtype=x_contig.dtype,
             device=x_contig.device,
         )
-        dist.all_gather_into_tensor(out, x_contig)
+        dist.all_gather_into_tensor(out, x_contig, group=group)
         return out
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        group = ctx.group
         g_contig = grad_output.contiguous()
         grad_in = torch.empty(
             g_contig.shape[1:],
             dtype=g_contig.dtype,
             device=g_contig.device,
         )
-        dist.reduce_scatter_tensor(grad_in, g_contig, op=dist.ReduceOp.SUM)
-        return grad_in
+        dist.reduce_scatter_tensor(
+            grad_in, g_contig, op=dist.ReduceOp.SUM, group=group
+        )
+        return grad_in, None
 
 
 class _EPReduceScatter(torch.autograd.Function):
     """Reduce-scatters `[W, L_max, D]` across all EP ranks into `[L_max, D]`; backward is `all_gather`."""
 
     @staticmethod
-    def forward(ctx: Any, y_all: torch.Tensor) -> torch.Tensor:
+    def forward(
+        ctx: Any, y_all: torch.Tensor, group: dist.ProcessGroup | None = None
+    ) -> torch.Tensor:
+        ctx.group = group
         y_contig = y_all.contiguous()
         out = torch.empty(
             y_contig.shape[1:],
             dtype=y_contig.dtype,
             device=y_contig.device,
         )
-        dist.reduce_scatter_tensor(out, y_contig, op=dist.ReduceOp.SUM)
+        dist.reduce_scatter_tensor(
+            out, y_contig, op=dist.ReduceOp.SUM, group=group
+        )
         return out
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
-        world_size = dist.get_world_size()
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        group = ctx.group
+        world_size = dist.get_world_size(group)
         g_contig = grad_output.contiguous()
         grad_all = torch.empty(
             (world_size, *g_contig.shape),
             dtype=g_contig.dtype,
             device=g_contig.device,
         )
-        dist.all_gather_into_tensor(grad_all, g_contig)
-        return grad_all
+        dist.all_gather_into_tensor(grad_all, g_contig, group=group)
+        return grad_all, None
 
 
-def _differentiable_all_reduce(x: torch.Tensor) -> torch.Tensor:
-    """Performs an autograd-friendly all_reduce across all distributed ranks."""
-    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        return _SymmetricAllReduce.apply(x)
+def _differentiable_all_reduce(
+    x: torch.Tensor, group: dist.ProcessGroup | None = None
+) -> torch.Tensor:
+    """Performs an autograd-friendly all_reduce across distributed EP ranks."""
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size(group) > 1:
+        return _SymmetricAllReduce.apply(x, group)
     return x
 
 
@@ -1066,7 +1203,12 @@ class DifferentiableCompressor(nn.Module):
         bsz, seqlen, _ = x.shape
         ratio = self.compress_ratio
         if ratio == 1:
-            x_in = act_quant_fp8_ste(x) if (self.enable_qat and not self.teacher_mode) else x
+            use_qat = (
+                self.enable_qat
+                and not self.teacher_mode
+                and self.wkv.weight.requires_grad
+            )
+            x_in = act_quant_fp8_ste(x) if use_qat else x
             return self.norm(self.wkv(x_in))
         if seqlen < ratio:
             return None
@@ -1154,7 +1296,11 @@ class DifferentiableIndexer(nn.Module):
         if comp_total == 0:
             return torch.empty(bsz, seqlen, 0, dtype=torch.int32, device=x.device)
 
-        use_qat = self.enable_qat and not self.teacher_mode
+        use_qat = (
+            self.enable_qat
+            and not self.teacher_mode
+            and self.wq_b.weight.requires_grad
+        )
         if self.owns_k and latent is not None and latent.size(1) > 0:
             prev_comp = shared_state.get("index_k")
             prev_comp_len = 0 if (prev_comp is None or start_pos == 0) else prev_comp.size(1)
@@ -1297,7 +1443,11 @@ class DifferentiableIndexer(nn.Module):
         rd = self.rope_head_dim
         if comp_total <= 0 or index_k is None:
             return torch.empty(bsz, 1, 0, dtype=torch.int32, device=x.device)
-        use_qat = self.enable_qat and not self.teacher_mode
+        use_qat = (
+            self.enable_qat
+            and not self.teacher_mode
+            and self.wq_b.weight.requires_grad
+        )
 
         qr_in = act_quant_fp8_ste(qr) if use_qat else qr
         q = self.wq_b(qr_in).unflatten(-1, (self.n_heads, self.index_head_dim))
@@ -1617,7 +1767,11 @@ class DifferentiableAttention(nn.Module):
         cos_tbl = cos_comp if ratio > 0 else cos_swa
         sin_tbl = sin_comp if ratio > 0 else sin_swa
         rd = self.rope_head_dim
-        use_qat = self.enable_qat and not self.teacher_mode
+        use_qat = (
+            self.enable_qat
+            and not self.teacher_mode
+            and self.wq_a.weight.requires_grad
+        )
 
         x_in = act_quant_fp8_ste(x) if use_qat else x
         qr = self.q_norm(self.wq_a(x_in))
@@ -1983,7 +2137,11 @@ class DifferentiableAttention(nn.Module):
         cos_tbl = cos_comp if ratio > 0 else cos_swa
         sin_tbl = sin_comp if ratio > 0 else sin_swa
         rd = self.rope_head_dim
-        use_qat = self.enable_qat and not self.teacher_mode
+        use_qat = (
+            self.enable_qat
+            and not self.teacher_mode
+            and self.wq_a.weight.requires_grad
+        )
         dev = x.device
         b_ar = torch.arange(bsz, device=dev)
 
@@ -2120,8 +2278,14 @@ def _compute_humming_master_and_quant_nograd(
     )
     w_scaled = (d_orig * s_cur.unsqueeze(-1)).flatten(1)
     has_lora = lora_A is not None and lora_B is not None
-    if has_lora:
-        delta = (lora_B.detach().float() @ lora_A.detach().float()) * scaling
+    if has_lora and lora_A is not None and lora_B is not None:
+        if lora_A.is_cuda:
+            delta = (
+                lora_B.detach().to(torch.bfloat16)
+                @ lora_A.detach().to(torch.bfloat16)
+            ).float() * scaling
+        else:
+            delta = (lora_B.detach().float() @ lora_A.detach().float()) * scaling
         w_master = w_scaled + delta
     else:
         w_master = w_scaled
@@ -2145,6 +2309,67 @@ def _compute_humming_master_and_quant_nograd(
     return d_orig, w_master, w_quant, q_u2.to(torch.uint8), s_bf16
 
 
+@torch.no_grad()
+def _compute_humming_quant_weight_bf16_nograd(
+    weight: torch.Tensor,
+    s_orig: torch.Tensor,
+    z_orig: torch.Tensor,
+    qat_scale: torch.Tensor | None,
+    lora_A: torch.Tensor | None,
+    lora_B: torch.Tensor | None,
+    scaling: float,
+    group: int,
+    lock_gptq_codes: bool = False,
+    d_orig_cached: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Single-buffer in-place computation of `w_quant` (`[N, K]`, `out_dtype`) under `no_grad`."""
+    z0 = z_orig.detach().float().unsqueeze(-1)
+    if d_orig_cached is not None and d_orig_cached.numel() > 0:
+        d_orig_src: torch.Tensor = d_orig_cached.detach()
+    else:
+        w_init_g = weight.detach().float().unflatten(1, (-1, group))
+        s0 = s_orig.detach().float().unsqueeze(-1)
+        d_orig_src = torch.where(
+            s0 > 0,
+            torch.round(w_init_g / s0.clamp_min(1e-12)),
+            torch.zeros_like(w_init_g),
+        ).clamp(-z0, 3.0 - z0)
+
+    s_bf16 = (
+        qat_scale.detach().to(torch.bfloat16)
+        if qat_scale is not None
+        else s_orig.detach()
+    )
+    s_q = s_bf16.float().unsqueeze(-1)
+    has_lora = lora_A is not None and lora_B is not None
+    if lock_gptq_codes and not has_lora:
+        return (d_orig_src.float().mul_(s_q)).flatten(1).to(out_dtype)
+
+    s_cur = (
+        qat_scale.detach().float().clamp_min(1e-7)
+        if qat_scale is not None
+        else s_orig.detach().float().clamp_min(1e-7)
+    )
+    buf_g = d_orig_src.float().mul_(s_cur.unsqueeze(-1))
+    buf = buf_g.flatten(1)
+    if has_lora and lora_A is not None and lora_B is not None:
+        if lora_A.is_cuda:
+            delta = (
+                lora_B.detach().to(torch.bfloat16)
+                @ lora_A.detach().to(torch.bfloat16)
+            ).float()
+        else:
+            delta = lora_B.detach().float() @ lora_A.detach().float()
+        buf.add_(delta, alpha=scaling)
+    buf_g = buf.unflatten(1, (-1, group))
+    s_q_safe = s_q.clamp_min(1e-12)
+    buf_g.div_(s_q_safe).add_(z0).round_().clamp_(0.0, 3.0)
+    buf_g = torch.where(s_q > 0, buf_g, z0)
+    buf_g.sub_(z0).mul_(s_q)
+    return buf_g.flatten(1).to(out_dtype)
+
+
 class _HummingQATLinearFn(torch.autograd.Function):
     """Zero-weight-storage STE autograd Function for 2-bit Humming QAT + FP32 LoRA + FP32 per-group scales."""
 
@@ -2163,7 +2388,7 @@ class _HummingQATLinearFn(torch.autograd.Function):
         group: int,
         lock_gptq_codes: bool,
     ) -> torch.Tensor:
-        _, _, w_quant, _, _ = _compute_humming_master_and_quant_nograd(
+        w_quant_bf16 = _compute_humming_quant_weight_bf16_nograd(
             weight=weight,
             s_orig=s_orig,
             z_orig=z_orig,
@@ -2174,14 +2399,18 @@ class _HummingQATLinearFn(torch.autograd.Function):
             group=group,
             lock_gptq_codes=lock_gptq_codes,
             d_orig_cached=d_orig_cached,
+            out_dtype=x_in.dtype,
         )
-        ctx.save_for_backward(
-            x_in, weight, s_orig, z_orig, d_orig_cached, qat_scale, lora_A, lora_B
-        )
+        ctx.save_for_backward(x_in, qat_scale, lora_A, lora_B)
+        ctx.w_quant_bf16 = w_quant_bf16
+        ctx.weight = weight
+        ctx.s_orig = s_orig
+        ctx.z_orig = z_orig
+        ctx.d_orig_cached = d_orig_cached
         ctx.scaling = scaling
         ctx.group = group
         ctx.lock_gptq_codes = lock_gptq_codes
-        return F.linear(x_in, w_quant.to(x_in.dtype))
+        return F.linear(x_in, w_quant_bf16)
 
     @staticmethod
     def backward(
@@ -2199,16 +2428,13 @@ class _HummingQATLinearFn(torch.autograd.Function):
         None,
         None,
     ]:
-        (
-            x_in,
-            weight,
-            s_orig,
-            z_orig,
-            d_orig_cached,
-            qat_scale,
-            lora_A,
-            lora_B,
-        ) = ctx.saved_tensors
+        x_in, qat_scale, lora_A, lora_B = ctx.saved_tensors
+        w_quant_bf16: torch.Tensor | None = getattr(ctx, "w_quant_bf16", None)
+        ctx.w_quant_bf16 = None
+        weight: torch.Tensor = ctx.weight
+        s_orig: torch.Tensor = ctx.s_orig
+        z_orig: torch.Tensor = ctx.z_orig
+        d_orig_cached: torch.Tensor = ctx.d_orig_cached
         scaling: float = ctx.scaling
         group: int = ctx.group
         lock_gptq_codes: bool = ctx.lock_gptq_codes
@@ -2224,26 +2450,33 @@ class _HummingQATLinearFn(torch.autograd.Function):
 
         grad_x: torch.Tensor | None = None
         if need_x:
-            d_orig, _, w_quant, _, _ = _compute_humming_master_and_quant_nograd(
-                weight=weight,
-                s_orig=s_orig,
-                z_orig=z_orig,
-                qat_scale=qat_scale,
-                lora_A=lora_A,
-                lora_B=lora_B,
-                scaling=scaling,
-                group=group,
-                lock_gptq_codes=lock_gptq_codes,
-                d_orig_cached=d_orig_cached,
-            )
-            grad_x = (go_2d.to(x_in.dtype) @ w_quant.to(x_in.dtype)).reshape(
-                orig_shape
-            )
-        else:
-            d_orig = (
-                d_orig_cached.detach().float()
-                if (d_orig_cached is not None and d_orig_cached.numel() > 0)
-                else _compute_humming_master_and_quant_nograd(
+            if w_quant_bf16 is None:
+                w_quant_bf16 = _compute_humming_quant_weight_bf16_nograd(
+                    weight=weight,
+                    s_orig=s_orig,
+                    z_orig=z_orig,
+                    qat_scale=qat_scale,
+                    lora_A=lora_A,
+                    lora_B=lora_B,
+                    scaling=scaling,
+                    group=group,
+                    lock_gptq_codes=lock_gptq_codes,
+                    d_orig_cached=d_orig_cached,
+                    out_dtype=x_in.dtype,
+                )
+            grad_x = (go_2d.to(x_in.dtype) @ w_quant_bf16).reshape(orig_shape)
+        del w_quant_bf16
+
+        use_cuda_tc = x_2d.is_cuda
+        x_bf = x_2d.to(torch.bfloat16) if use_cuda_tc else None
+        go_bf = go_2d.to(torch.bfloat16) if use_cuda_tc else None
+
+        grad_s: torch.Tensor | None = None
+        if need_s and qat_scale is not None:
+            if d_orig_cached is not None and d_orig_cached.numel() > 0:
+                d_orig_rel: torch.Tensor = d_orig_cached.detach()
+            else:
+                d_orig_rel = _compute_humming_master_and_quant_nograd(
                     weight=weight,
                     s_orig=s_orig,
                     z_orig=z_orig,
@@ -2254,12 +2487,11 @@ class _HummingQATLinearFn(torch.autograd.Function):
                     group=group,
                     lock_gptq_codes=lock_gptq_codes,
                 )[0]
-            )
-
-        grad_s: torch.Tensor | None = None
-        if need_s and qat_scale is not None:
-            grad_w = go_2d.float().T @ x_2d.float()
-            raw_grad_s = (grad_w.unflatten(1, (-1, group)) * d_orig).sum(dim=-1)
+            if use_cuda_tc and x_bf is not None and go_bf is not None:
+                grad_w = (go_bf.T @ x_bf).float()
+            else:
+                grad_w = go_2d.float().T @ x_2d.float()
+            raw_grad_s = (grad_w.unflatten(1, (-1, group)) * d_orig_rel).sum(dim=-1)
             grad_s = torch.where(
                 qat_scale.detach().float() >= 1e-7,
                 raw_grad_s,
@@ -2270,14 +2502,22 @@ class _HummingQATLinearFn(torch.autograd.Function):
         grad_a: torch.Tensor | None = None
         grad_b: torch.Tensor | None = None
         if (need_a or need_b) and lora_A is not None and lora_B is not None:
-            x_f = x_2d.float()
-            go_f = go_2d.float()
-            if need_b:
-                xa = x_f @ lora_A.detach().float().T
-                grad_b = ((go_f.T @ xa) * scaling).to(lora_B.dtype)
-            if need_a:
-                gob = go_f @ lora_B.detach().float()
-                grad_a = ((gob.T @ x_f) * scaling).to(lora_A.dtype)
+            if use_cuda_tc and x_bf is not None and go_bf is not None:
+                if need_b:
+                    xa = x_bf @ lora_A.detach().to(torch.bfloat16).T
+                    grad_b = ((go_bf.T @ xa).float() * scaling).to(lora_B.dtype)
+                if need_a:
+                    gob = go_bf @ lora_B.detach().to(torch.bfloat16)
+                    grad_a = ((gob.T @ x_bf).float() * scaling).to(lora_A.dtype)
+            else:
+                x_f = x_2d.float()
+                go_f = go_2d.float()
+                if need_b:
+                    xa = x_f @ lora_A.detach().float().T
+                    grad_b = ((go_f.T @ xa) * scaling).to(lora_B.dtype)
+                if need_a:
+                    gob = go_f @ lora_B.detach().float()
+                    grad_a = ((gob.T @ x_f) * scaling).to(lora_A.dtype)
 
         return (
             grad_x,
@@ -2466,32 +2706,79 @@ class LoRALinear(nn.Module):
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Exports `(q_packed, s_bf16, z_packed)` using locked `z_orig` when GPTQ state is present."""
+        q_packed, s_bf16, z_packed, _ = self.export_humming_2bit_with_stats()
+        return q_packed, s_bf16, z_packed
+
+    @torch.no_grad()
+    def export_humming_2bit_with_stats(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, int]]:
+        """`export_humming_2bit` plus on-disk delta counters vs the loaded GPTQ state.
+
+        Stats (`codes_total`, `codes_changed`, `scales_total`, `scales_changed`) count 2-bit codes
+        that differ from the original GPTQ codes and BF16 group scales that differ from `s_orig`
+        -- i.e. what a byte diff of the exported `gptq/` shard against the base would show.
+        """
         if self.has_gptq_state:
-            _, _, q_u2, s_bf16, z_u2 = self._compute_master_and_quant_weight()
+            self._ensure_gptq_state()
+            d_orig, _, _, q_u2, s_bf16 = _compute_humming_master_and_quant_nograd(
+                weight=self.weight,
+                s_orig=self.s_orig,
+                z_orig=self.z_orig,
+                qat_scale=self.qat_scale,
+                lora_A=self.lora_A if self.lora_r > 0 else None,
+                lora_B=self.lora_B if self.lora_r > 0 else None,
+                scaling=self.scaling,
+                group=self.group,
+                lock_gptq_codes=self.lock_gptq_codes,
+                d_orig_cached=self.d_orig,
+            )
+            z0 = self.z_orig.detach().float().unsqueeze(-1)
+            q_orig_u2 = (d_orig + z0).round().clamp(0.0, 3.0).to(torch.uint8)
+            stats = {
+                "codes_total": int(q_u2.numel()),
+                "codes_changed": int((q_u2 != q_orig_u2).sum().item()),
+                "scales_total": int(s_bf16.numel()),
+                "scales_changed": int((s_bf16 != self.s_orig).sum().item()),
+            }
             q_packed = pack_uint2_torch(q_u2.flatten(1))
-            z_packed = pack_uint2_torch(z_u2.T.contiguous()).T.contiguous()
-            return q_packed, s_bf16, z_packed
-        return quantize_uint2_humming_expert_tensor(
+            z_packed = pack_uint2_torch(self.z_orig.T.contiguous()).T.contiguous()
+            return q_packed, s_bf16, z_packed, stats
+        q_packed, s_bf16, z_packed = quantize_uint2_humming_expert_tensor(
             self.merged_weight(), group=self.group
         )
+        return q_packed, s_bf16, z_packed, {
+            "codes_total": int(self.weight.numel()),
+            "codes_changed": -1,
+            "scales_total": int(s_bf16.numel()),
+            "scales_changed": -1,
+        }
 
     def merged_weight(self) -> torch.Tensor:
         if self.enable_qat and self.has_gptq_state:
             _, w_quant, _, _, _ = self._compute_master_and_quant_weight()
             return w_quant.to(torch.bfloat16)
         if self.lora_r > 0 and self.lora_A is not None and self.lora_B is not None:
-            delta = (self.lora_B.float() @ self.lora_A.float()) * self.scaling
+            if self.lora_A.is_cuda:
+                delta = (
+                    self.lora_B.detach().to(torch.bfloat16)
+                    @ self.lora_A.detach().to(torch.bfloat16)
+                ).float() * self.scaling
+            else:
+                delta = (self.lora_B.float() @ self.lora_A.float()) * self.scaling
             return (self.weight.float() + delta).to(torch.bfloat16)
         return self.weight
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, prequant_input: bool = False
+    ) -> torch.Tensor:
         if self.teacher_mode:
             return F.linear(x, self.weight.to(x.dtype))
         if self.enable_qat:
             self._ensure_gptq_state()
-            x_in = act_quant_fp8_ste(x)
+            x_in = x if prequant_input else act_quant_fp8_ste(x)
             if not torch.is_grad_enabled():
-                _, _, w_quant, _, _ = _compute_humming_master_and_quant_nograd(
+                w_quant_bf16 = _compute_humming_quant_weight_bf16_nograd(
                     weight=self.weight,
                     s_orig=self.s_orig,
                     z_orig=self.z_orig,
@@ -2502,8 +2789,9 @@ class LoRALinear(nn.Module):
                     group=self.group,
                     lock_gptq_codes=self.lock_gptq_codes,
                     d_orig_cached=self.d_orig,
+                    out_dtype=x_in.dtype,
                 )
-                return F.linear(x_in, w_quant.to(x_in.dtype))
+                return F.linear(x_in, w_quant_bf16)
             return _HummingQATLinearFn.apply(
                 x_in,
                 self.weight,
@@ -2590,9 +2878,9 @@ class SwiGLUExpert(nn.Module):
     @torch.no_grad()
     def snapshot_teacher_weights(self) -> None:
         if self.trainable_dense:
-            self.w1_init = self.w1.weight.detach().to(device="cpu", dtype=torch.bfloat16).clone()
-            self.w2_init = self.w2.weight.detach().to(device="cpu", dtype=torch.bfloat16).clone()
-            self.w3_init = self.w3.weight.detach().to(device="cpu", dtype=torch.bfloat16).clone()
+            self.w1_init = self.w1.weight.detach().to(dtype=torch.bfloat16).clone()
+            self.w2_init = self.w2.weight.detach().to(dtype=torch.bfloat16).clone()
+            self.w3_init = self.w3.weight.detach().to(dtype=torch.bfloat16).clone()
 
     def forward(
         self,
@@ -2648,8 +2936,13 @@ class SwiGLUExpert(nn.Module):
                 act = act * weights.float()
             return F.linear(act.to(orig_dtype), self.w2.weight.to(orig_dtype))
 
-        gate = self.w1(x).float()
-        up = self.w3(x).float()
+        if self.enable_qat and not self.teacher_mode:
+            x_in = act_quant_fp8_ste(x)
+            gate = self.w1(x_in, prequant_input=True).float()
+            up = self.w3(x_in, prequant_input=True).float()
+        else:
+            gate = self.w1(x).float()
+            up = self.w3(x).float()
         if self.swiglu_limit > 0:
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
             gate = torch.clamp(gate, max=self.swiglu_limit)
@@ -2683,7 +2976,10 @@ class DifferentiableGate(nn.Module):
             persistent=True,
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, image_mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`x: [n, dim]`; `image_mask: [n]` bool selects the VL routing bias (`bias_vl`) per row."""
         scores = F.linear(x.float(), self.weight.float()) / self.gate_temp
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
@@ -2691,7 +2987,12 @@ class DifferentiableGate(nn.Module):
             scores = scores.sigmoid()
         else:
             scores = F.softplus(scores).clamp_min(1e-12).sqrt()
-        indices = (scores + self.bias).topk(self.topk, dim=-1).indices
+        bias = self.bias
+        if image_mask is not None and torch.any(image_mask):
+            bias = torch.where(
+                image_mask.to(torch.bool).unsqueeze(-1), self.bias_vl.float(), self.bias.float()
+            )
+        indices = (scores + bias).topk(self.topk, dim=-1).indices
         weights = scores.gather(1, indices)
         if self.norm_topk_prob and self.topk > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
@@ -2708,6 +3009,7 @@ class DifferentiableMoE(nn.Module):
         cfg: Dsv41E128Config,
         ep_rank: int = 0,
         ep_world_size: int = 1,
+        ep_group: dist.ProcessGroup | None = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -2715,6 +3017,7 @@ class DifferentiableMoE(nn.Module):
         self.n_routed_experts = cfg.n_routed_experts
         self.ep_rank = ep_rank
         self.ep_world_size = ep_world_size
+        self.ep_group = ep_group
         self.n_local_experts = cfg.n_routed_experts // ep_world_size
         self.experts_start_idx = ep_rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
@@ -2907,11 +3210,13 @@ class DifferentiableMoE(nn.Module):
             y = y.index_add(0, idx, out_e)
         return y
 
-    def _gate_forward(self, x_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _gate_forward(
+        self, x_flat: torch.Tensor, image_mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.gate.weight.requires_grad and not self.gate.bias.requires_grad:
             with torch.no_grad():
-                return self.gate(x_flat)
-        return self.gate(x_flat)
+                return self.gate(x_flat, image_mask)
+        return self.gate(x_flat, image_mask)
 
     def _moe_body_forward(
         self,
@@ -2941,35 +3246,43 @@ class DifferentiableMoE(nn.Module):
                 w_pad = weights
                 idx_pad = indices
 
-            x_all = _EPAllGather.apply(x_pad).view(-1, self.dim)
-            w_all = _EPAllGather.apply(w_pad).view(-1, weights.size(-1))
+            x_all = _EPAllGather.apply(x_pad, self.ep_group).view(-1, self.dim)
+            w_all = _EPAllGather.apply(w_pad, self.ep_group).view(-1, weights.size(-1))
             idx_all_buf = torch.empty(
                 (self.ep_world_size, *idx_pad.shape),
                 dtype=idx_pad.dtype,
                 device=idx_pad.device,
             )
-            dist.all_gather_into_tensor(idx_all_buf, idx_pad.contiguous())
+            dist.all_gather_into_tensor(
+                idx_all_buf, idx_pad.contiguous(), group=self.ep_group
+            )
             idx_all = idx_all_buf.view(-1, indices.size(-1))
 
             y_all = torch.zeros_like(x_all)
             ckpt_expert = bool(self.training and torch.is_grad_enabled())
+            expert_chunk = 16384
             for i in range(self.experts_start_idx, self.experts_end_idx):
-                mask = idx_all == i
-                if not torch.any(mask):
+                idx, top = torch.where(idx_all == i)
+                if idx.numel() == 0:
                     continue
-                idx, top = torch.where(mask)
                 expert = self.experts[i]
                 assert expert is not None
-                x_e = x_all[idx]
-                w_e = w_all[idx, top].unsqueeze(-1)
-                if ckpt_expert and x_e.size(0) >= 512:
-                    out_e = torch_ckpt(expert, x_e, w_e, use_reentrant=False)
-                else:
-                    out_e = expert(x_e, w_e)
-                y_all.index_add_(0, idx, out_e.to(y_all.dtype))
+                for s in range(0, int(idx.numel()), expert_chunk):
+                    idx_s = idx[s : s + expert_chunk]
+                    top_s = top[s : s + expert_chunk]
+                    x_e = x_all[idx_s]
+                    w_e = w_all[idx_s, top_s].unsqueeze(-1)
+                    if ckpt_expert and x_e.size(0) >= 512:
+                        out_e = torch_ckpt(expert, x_e, w_e, use_reentrant=False)
+                    else:
+                        out_e = expert(x_e, w_e)
+                    y_all.index_add_(0, idx_s, out_e.to(y_all.dtype))
 
+            if self.training and torch.is_grad_enabled() and x_all.requires_grad and not y_all.requires_grad:
+                y_all = y_all + x_all.sum() * 0.0
             y_pad = _EPReduceScatter.apply(
-                y_all.view(self.ep_world_size, l_max, self.dim)
+                y_all.view(self.ep_world_size, l_max, self.dim),
+                self.ep_group,
             )
             y = y_pad[:l_local].float()
         else:
@@ -2985,25 +3298,28 @@ class DifferentiableMoE(nn.Module):
                 self._clear_stacked_eval_weights()
                 y = torch.zeros_like(x_flat, dtype=torch.float32)
                 ckpt_expert = bool(self.training and torch.is_grad_enabled())
+                expert_chunk = 16384
                 for i in range(self.experts_start_idx, self.experts_end_idx):
-                    mask = indices == i
-                    if not torch.any(mask):
+                    idx, top = torch.where(indices == i)
+                    if idx.numel() == 0:
                         continue
-                    idx, top = torch.where(mask)
                     expert = self.experts[i]
                     assert expert is not None
-                    x_e = x_flat[idx]
-                    w_e = weights[idx, top].unsqueeze(-1)
-                    if ckpt_expert and x_e.size(0) >= 512:
-                        out_e = torch_ckpt(expert, x_e, w_e, use_reentrant=False)
-                    else:
-                        out_e = expert(x_e, w_e)
-                    y.index_add_(0, idx, out_e.float())
+                    for s in range(0, int(idx.numel()), expert_chunk):
+                        idx_s = idx[s : s + expert_chunk]
+                        top_s = top[s : s + expert_chunk]
+                        x_e = x_flat[idx_s]
+                        w_e = weights[idx_s, top_s].unsqueeze(-1)
+                        if ckpt_expert and x_e.size(0) >= 512:
+                            out_e = torch_ckpt(expert, x_e, w_e, use_reentrant=False)
+                        else:
+                            out_e = expert(x_e, w_e)
+                        y.index_add_(0, idx_s, out_e.float())
             if self.ep_world_size > 1:
                 if not self.training and not torch.is_grad_enabled():
-                    dist.all_reduce(y)
+                    dist.all_reduce(y, group=self.ep_group)
                 else:
-                    y = _differentiable_all_reduce(y)
+                    y = _differentiable_all_reduce(y, group=self.ep_group)
 
         if self.training and torch.is_grad_enabled():
             grad_anchor = torch.zeros((), dtype=torch.float32, device=x_flat.device)
@@ -3046,10 +3362,12 @@ class DifferentiableMoE(nn.Module):
         ep_l_max: int = 0,
         ep_replicated_input: bool = False,
         use_moe_ckpt: bool = False,
+        image_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         orig_shape = x.shape
         x_flat = x.view(-1, self.dim)
-        weights, indices = self._gate_forward(x_flat)
+        mask_flat = image_mask.reshape(-1) if image_mask is not None else None
+        weights, indices = self._gate_forward(x_flat, mask_flat)
         shared_prequant: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         if (
             self.shared_experts.trainable_dense
@@ -3138,6 +3456,7 @@ class CompactEngramModule(nn.Module):
         layer_id: int,
         ep_rank: int = 0,
         ep_world_size: int = 1,
+        ep_group: dist.ProcessGroup | None = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -3149,6 +3468,7 @@ class CompactEngramModule(nn.Module):
         self.n_hash_cols = (cfg.engram_max_ngram_size - 1) * cfg.engram_n_heads
         self.ep_rank = ep_rank
         self.ep_world_size = ep_world_size
+        self.ep_group = ep_group
         self.enable_qat = cfg.enable_qat
         self.teacher_mode = False
 
@@ -3259,7 +3579,7 @@ class CompactEngramModule(nn.Module):
 
         if ep_replicated_input:
             vals = self._lookup_local_slice(hash_ids)
-            dist.all_reduce(vals)
+            dist.all_reduce(vals, group=self.ep_group)
             return vals.flatten(-2)
 
         # DP+EP training mode (`ep_replicated_input=False`): each rank has its own sequence `hash_ids [B, S, 24]`.
@@ -3279,7 +3599,9 @@ class CompactEngramModule(nn.Module):
             dtype=h_pad.dtype,
             device=device,
         )
-        dist.all_gather_into_tensor(h_all, h_pad.contiguous())
+        dist.all_gather_into_tensor(
+            h_all, h_pad.contiguous(), group=self.ep_group
+        )
 
         c_start = self.head_start
         c_end = c_start + self.part_n_hash_cols
@@ -3296,7 +3618,7 @@ class CompactEngramModule(nn.Module):
             tc = t1 - t0
             send_part = self._lookup_local_slice(h_owned[:, t0:t1]).contiguous()  # [W, tc, 3, 256]
             recv_part = torch.empty_like(send_part)
-            dist.all_to_all_single(recv_part, send_part)
+            dist.all_to_all_single(recv_part, send_part, group=self.ep_group)
             if t0 < l_local:
                 valid_tc = min(tc, l_local - t0)
                 out_cols[:, t0 : t0 + valid_tc] = recv_part[:, :valid_tc]
@@ -3347,7 +3669,9 @@ class CompactEngramModule(nn.Module):
         hash_ids: torch.Tensor | None = None,
         ep_l_max: int = 0,
         ep_replicated_input: bool = True,
+        token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """`token_mask` (`[B, L]` bool, False inside image spans) zeroes the Engram delta there."""
         if (
             not self.has_compact_table
             or hash_ids is None
@@ -3367,13 +3691,16 @@ class CompactEngramModule(nn.Module):
                     ep_l_max=ep_l_max,
                     ep_replicated_input=ep_replicated_input,
                 )
-            return x + delta
-        return x + self._compute_delta(
-            x,
-            hash_ids,
-            ep_l_max=ep_l_max,
-            ep_replicated_input=ep_replicated_input,
-        )
+        else:
+            delta = self._compute_delta(
+                x,
+                hash_ids,
+                ep_l_max=ep_l_max,
+                ep_replicated_input=ep_replicated_input,
+            )
+        if token_mask is not None:
+            delta = delta.masked_fill(~token_mask.to(torch.bool)[:, :, None, None], 0)
+        return x + delta
 
 
 class DifferentiableBlock(nn.Module):
@@ -3385,6 +3712,7 @@ class DifferentiableBlock(nn.Module):
         cfg: Dsv41E128Config,
         ep_rank: int = 0,
         ep_world_size: int = 1,
+        ep_group: dist.ProcessGroup | None = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -3394,13 +3722,23 @@ class DifferentiableBlock(nn.Module):
         self.hc_eps = cfg.hc_eps
 
         self.engram = (
-            CompactEngramModule(cfg, layer_id, ep_rank=ep_rank, ep_world_size=ep_world_size)
+            CompactEngramModule(
+                cfg,
+                layer_id,
+                ep_rank=ep_rank,
+                ep_world_size=ep_world_size,
+                ep_group=ep_group,
+            )
             if layer_id in cfg.engram_layer_ids
             else None
         )
         self.attn = DifferentiableAttention(layer_id, cfg)
         self.ffn = DifferentiableMoE(
-            layer_id, cfg, ep_rank=ep_rank, ep_world_size=ep_world_size
+            layer_id,
+            cfg,
+            ep_rank=ep_rank,
+            ep_world_size=ep_world_size,
+            ep_group=ep_group,
         )
         self.attn_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.ffn_norm = RMSNorm(cfg.dim, cfg.norm_eps)
@@ -3485,13 +3823,16 @@ class DifferentiableBlock(nn.Module):
         ep_replicated_input: bool = False,
         layer_cache: dict[str, Any] | None = None,
         start_pos: int = 0,
+        image_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`image_mask`: `[B, S]` bool, True inside image spans (VL routing bias, no Engram)."""
         if self.engram is not None:
             x = self.engram(
                 x,
                 engram_hash_ids,
                 ep_l_max=ep_l_max,
                 ep_replicated_input=ep_replicated_input,
+                token_mask=None if image_mask is None else ~image_mask,
             )
 
         residual = x
@@ -3584,7 +3925,8 @@ class DifferentiableBlock(nn.Module):
             h_ffn,
             ep_l_max=ep_l_max,
             ep_replicated_input=ep_replicated_input,
-            use_moe_ckpt=bool(self.training and torch.is_grad_enabled()),
+            use_moe_ckpt=False,
+            image_mask=image_mask,
         )
         x = self.hc_post(h_ffn, residual, ffn_post, ffn_comb)
         return x, ffn_pre
@@ -3652,6 +3994,172 @@ class DifferentiableBlock(nn.Module):
         return x, ffn_pre
 
 
+# ==============================================================================
+# Vision tower (DeepSeek-V4.1 VL): exact port of `inference/vision.py`
+# ==============================================================================
+
+
+@functools.lru_cache(maxsize=16)
+def _vision_cos_sin_cpu(n_h: int, n_w: int, dim: int, theta: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """2-D RoPE tables `[n_h * n_w, 1, dim]` (reference `get_vision_cos_sin`)."""
+    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    hpos = torch.arange(n_h).unsqueeze(1).expand(n_h, n_w)
+    wpos = torch.arange(n_w).unsqueeze(0).expand(n_h, n_w)
+    freqs = torch.stack([hpos, wpos], dim=-1).reshape(-1, 2, 1).float() * inv_freq
+    freqs = freqs.flatten(1)
+    return freqs.cos().unsqueeze(1), freqs.sin().unsqueeze(1)
+
+
+def _vision_apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    dtype = x.dtype
+    x1, x2 = x.float().chunk(2, dim=-1)
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(dtype)
+
+
+class VisionRMSNorm(nn.Module):
+    """FP32 RMSNorm with `eps=1e-6` (reference `vision.RMSNorm`)."""
+
+    def __init__(self, dim: int, eps: float = 1e-6, dtype: torch.dtype = torch.float32):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim, dtype=dtype))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = x.dtype
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
+        return (self.weight.float() * xf).to(dtype)
+
+
+class _CastLinear(nn.Linear):
+    """`nn.Linear` whose parameters may be FP32 masters while the matmul runs in the input dtype."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # pylint: disable=arguments-renamed
+        w = self.weight.to(x.dtype)
+        b = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, w, b)
+
+
+class VisionPatchEmbed(nn.Module):
+
+    def __init__(self, cfg: Dsv41E128Config, dtype: torch.dtype):
+        super().__init__()
+        self.proj = _CastLinear(3 * cfg.vision_patch_size**2, cfg.vision_dim, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x.flatten(1))
+
+
+class VisionAttention(nn.Module):
+    """Full bidirectional attention over one image's patches with 2-D RoPE."""
+
+    def __init__(self, cfg: Dsv41E128Config, dtype: torch.dtype):
+        super().__init__()
+        self.n_heads = cfg.vision_n_heads
+        self.head_dim = cfg.vision_dim // cfg.vision_n_heads
+        self.wqkv = _CastLinear(cfg.vision_dim, 3 * cfg.vision_dim, dtype=dtype)
+        self.wo = _CastLinear(cfg.vision_dim, cfg.vision_dim, dtype=dtype)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        n = x.size(0)
+        q, k, v = (t.view(n, self.n_heads, self.head_dim) for t in self.wqkv(x).chunk(3, dim=-1))
+        q = _vision_apply_rotary(q, cos, sin)
+        k = _vision_apply_rotary(k, cos, sin)
+        o = F.scaled_dot_product_attention(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1))
+        return self.wo(o.transpose(0, 1).reshape(n, -1))
+
+
+class VisionMLP(nn.Module):
+
+    def __init__(self, cfg: Dsv41E128Config, dtype: torch.dtype):
+        super().__init__()
+        self.w1 = _CastLinear(cfg.vision_dim, 2 * cfg.vision_inter_dim, bias=False, dtype=dtype)
+        self.w2 = _CastLinear(cfg.vision_inter_dim, cfg.vision_dim, bias=False, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up = self.w1(x).chunk(2, dim=-1)
+        return self.w2(F.silu(gate) * up)
+
+
+class VisionBlock(nn.Module):
+
+    def __init__(self, cfg: Dsv41E128Config, dtype: torch.dtype):
+        super().__init__()
+        self.norm1 = VisionRMSNorm(cfg.vision_dim, dtype=dtype)
+        self.attn = VisionAttention(cfg, dtype)
+        self.norm2 = VisionRMSNorm(cfg.vision_dim, dtype=dtype)
+        self.mlp = VisionMLP(cfg, dtype)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), cos, sin)
+        return x + self.mlp(self.norm2(x))
+
+
+class VisionTransformer(nn.Module):
+    """DeepSeek ViT (`vision.*` tensors): patch embed -> `vision_n_layers` blocks -> RMSNorm."""
+
+    def __init__(self, cfg: Dsv41E128Config, dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        self.rope_dim = cfg.vision_dim // cfg.vision_n_heads // 2
+        self.rope_theta = cfg.vision_rope_theta
+        self.patch_embed = VisionPatchEmbed(cfg, dtype)
+        self.blocks = nn.ModuleList([VisionBlock(cfg, dtype) for _ in range(cfg.vision_n_layers)])
+        self.norm = VisionRMSNorm(cfg.vision_dim, dtype=dtype)
+        self.gradient_checkpointing = True
+
+    def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+        """`patches: [n_h * n_w, 3, p, p]` -> `[n_h * n_w, vision_dim]`."""
+        any_trainable = patches.requires_grad or any(p.requires_grad for p in self.parameters())
+        if not any_trainable:
+            with torch.no_grad():
+                x = self.patch_embed(patches)
+                cos, sin = _vision_cos_sin_cpu(n_h, n_w, self.rope_dim, self.rope_theta)
+                cos = cos.to(x.device)
+                sin = sin.to(x.device)
+                for block in self.blocks:
+                    x = block(x, cos, sin)
+                return self.norm(x)
+        x = self.patch_embed(patches)
+        cos, sin = _vision_cos_sin_cpu(n_h, n_w, self.rope_dim, self.rope_theta)
+        cos = cos.to(x.device)
+        sin = sin.to(x.device)
+        use_ckpt = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+        for block in self.blocks:
+            if use_ckpt and x.requires_grad:
+                x = torch_ckpt(block, x, cos, sin, use_reentrant=False)
+            else:
+                x = block(x, cos, sin)
+        return self.norm(x)
+
+
+class VisionAligner(nn.Module):
+    """3x3 patch-merge + 2-layer GELU MLP into the LLM width (`aligner.*` tensors)."""
+
+    def __init__(self, cfg: Dsv41E128Config, dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        self.downsample_ratio = cfg.vision_downsample_ratio
+        in_dim = cfg.vision_dim * self.downsample_ratio**2
+        self.w1 = _CastLinear(in_dim, cfg.dim, dtype=dtype)
+        self.w2 = _CastLinear(cfg.dim, cfg.dim, dtype=dtype)
+
+    def forward(self, x: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+        """`x: [n_h * n_w, vision_dim]` -> `[ceil(n_h/r) * ceil(n_w/r), dim]` in reading order."""
+        r = self.downsample_ratio
+        x = x.view(n_h, n_w, -1).permute(2, 0, 1)
+        x = F.pad(x, (0, -n_w % r, 0, -n_h % r))
+        x = F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
+        return self.w2(F.gelu(self.w1(x)))
+
+
+@dataclass
+class ImageInput:
+    """One image for the forward pass: ViT patches (`[n_vit_h * n_vit_w, 3, p, p]`) and its patch grid."""
+
+    patches: torch.Tensor
+    n_vit_h: int
+    n_vit_w: int
+
+
 class Dsv41SftModel(nn.Module):
     """Full-Sequence Differentiable & KV-Cached Pruned DeepSeek-V4.1 (`Tool E128`) Model for QAT SFT & Eval."""
 
@@ -3663,11 +4171,13 @@ class Dsv41SftModel(nn.Module):
         gradient_checkpointing: bool = True,
         grad_ckpt_stride: int = 1,
         ep_replicated_input: bool = False,
+        ep_group: dist.ProcessGroup | None = None,
     ):
         super().__init__()
         self.cfg = cfg
         self.ep_rank = ep_rank
         self.ep_world_size = ep_world_size
+        self.ep_group = ep_group
         self.gradient_checkpointing = gradient_checkpointing
         self.grad_ckpt_stride = max(1, grad_ckpt_stride)
         self.ep_replicated_input = ep_replicated_input
@@ -3684,7 +4194,11 @@ class Dsv41SftModel(nn.Module):
         self.layers = nn.ModuleList(
             [
                 DifferentiableBlock(
-                    i, cfg, ep_rank=ep_rank, ep_world_size=ep_world_size
+                    i,
+                    cfg,
+                    ep_rank=ep_rank,
+                    ep_world_size=ep_world_size,
+                    ep_group=ep_group,
                 )
                 for i in range(cfg.n_layers)
             ]
@@ -3715,6 +4229,22 @@ class Dsv41SftModel(nn.Module):
         self.register_buffer("cos_comp", cos_comp, persistent=False)
         self.register_buffer("sin_comp", sin_comp, persistent=False)
 
+        # Vision tower (names match the released checkpoint keys `vision.*`, `aligner.*`, `image_*`).
+        # FP32 master weights under QAT so `lr ~ 1e-5` updates are not lost to BF16 rounding; the
+        # matmuls run in the activation dtype either way and the export casts back to BF16.
+        self.vision: VisionTransformer | None = None
+        self.aligner: VisionAligner | None = None
+        if cfg.vision_enabled:
+            v_dtype = torch.float32 if cfg.enable_qat else torch.bfloat16
+            self.vision = VisionTransformer(cfg, dtype=v_dtype)
+            self.aligner = VisionAligner(cfg, dtype=v_dtype)
+            self.image_start = nn.Parameter(torch.zeros(cfg.dim, dtype=v_dtype))
+            self.image_end = nn.Parameter(torch.zeros(cfg.dim, dtype=v_dtype))
+            self.image_newline = nn.Parameter(torch.zeros(cfg.dim, dtype=v_dtype))
+        self._vision_teacher_state: dict[str, torch.Tensor] | None = None
+        self._vision_teacher_vis_state: dict[str, torch.Tensor] | None = None
+        self._vision_teacher_al_state: dict[str, torch.Tensor] | None = None
+
     def set_teacher_mode(self, enabled: bool) -> None:
         """Toggles frozen base teacher mode across all submodules (for Nemotron QAD forward-KL)."""
         self.teacher_mode = enabled
@@ -3727,6 +4257,103 @@ class Dsv41SftModel(nn.Module):
         for blk in self.layers:
             if blk.ffn.shared_experts is not None:
                 blk.ffn.shared_experts.snapshot_teacher_weights()
+        if self.vision is not None:
+            # On-device BF16 copy (~110 MB) of the released vision weights; `encode_images` swaps it in under teacher mode.
+            self._vision_teacher_state = {
+                k: v.detach().to(dtype=torch.bfloat16).clone()
+                for k, v in self.named_parameters()
+                if k.startswith(("vision.", "aligner.", "image_"))
+            }
+            self._vision_teacher_vis_state = {
+                k[len("vision."):]: v
+                for k, v in self._vision_teacher_state.items()
+                if k.startswith("vision.")
+            }
+            self._vision_teacher_al_state = {
+                k[len("aligner."):]: v
+                for k, v in self._vision_teacher_state.items()
+                if k.startswith("aligner.")
+            }
+
+    # ---------------------------------------------------------------- images
+
+    def vision_parameter_names(self) -> list[str]:
+        return [n for n, _ in self.named_parameters() if n.startswith(("vision.", "aligner.", "image_"))]
+
+    def encode_images(self, images: Sequence[ImageInput]) -> list[torch.Tensor]:
+        """Runs ViT + aligner per image; returns `[n_llm_h * n_llm_w, dim]` rows per image (reading order)."""
+        assert self.vision is not None and self.aligner is not None, "model has no vision tower"
+        act_dtype = self.embed.weight.dtype
+        if self.teacher_mode and self._vision_teacher_state is not None:
+            dev = self.embed.weight.device
+            if self._vision_teacher_vis_state is not None and self._vision_teacher_al_state is not None:
+                vis_state = self._vision_teacher_vis_state
+                al_state = self._vision_teacher_al_state
+            else:
+                state = {k: v.to(dev, non_blocking=True) for k, v in self._vision_teacher_state.items()}
+                vis_state = {k[len("vision."):]: v for k, v in state.items() if k.startswith("vision.")}
+                al_state = {k[len("aligner."):]: v for k, v in state.items() if k.startswith("aligner.")}
+            outs = []
+            for img in images:
+                feats = torch.func.functional_call(
+                    self.vision, vis_state, (img.patches.to(dev, act_dtype), img.n_vit_h, img.n_vit_w)
+                )
+                outs.append(
+                    torch.func.functional_call(self.aligner, al_state, (feats, img.n_vit_h, img.n_vit_w))
+                )
+            return outs
+        outs = []
+        for img in images:
+            patches = img.patches.to(self.embed.weight.device, act_dtype, non_blocking=True)
+            feats = self.vision(patches, img.n_vit_h, img.n_vit_w)
+            outs.append(self.aligner(feats, img.n_vit_h, img.n_vit_w))
+        return outs
+
+    def _delimiter_embeddings(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.teacher_mode and self._vision_teacher_state is not None:
+            dev = self.embed.weight.device
+            st = self._vision_teacher_state
+            return st["image_start"].to(dev), st["image_end"].to(dev), st["image_newline"].to(dev)
+        return self.image_start, self.image_end, self.image_newline
+
+    def merge_image_embeddings(
+        self,
+        h: torch.Tensor,
+        token_types: torch.Tensor,
+        images: Sequence[Sequence[ImageInput]],
+    ) -> torch.Tensor:
+        """Overwrites image-span positions of `h [B, S, dim]` with ViT/aligner rows and delimiter embeddings.
+
+        `token_types [B, S]`: -1 text, 0 START, 1 IMAGE, 2 NEW_LINE, 3 END (`dsv41_image_tokens`).
+        `images[b]`: the images of sequence `b` in prompt order. IMAGE slots take the aligner rows in
+        reading order (reference `merge_image_embeddings`).
+        """
+        if self.vision is None:
+            raise ValueError("Received image spans but the model has no vision tower.")
+        if token_types.shape != h.shape[:2]:
+            raise ValueError(f"token_types {tuple(token_types.shape)} vs hidden {tuple(h.shape[:2])}")
+        h = h.clone()
+        start_e, end_e, nl_e = self._delimiter_embeddings()
+        for b in range(h.size(0)):
+            types_b = token_types[b]
+            imgs_b = images[b] if b < len(images) else ()
+            is_img = types_b == 1
+            n_slots = int(is_img.sum().item())
+            if n_slots == 0 and not imgs_b:
+                continue
+            embeds = self.encode_images(imgs_b)
+            rows = torch.cat(embeds, dim=0) if embeds else h.new_zeros((0, h.size(-1)))
+            if rows.size(0) != n_slots:
+                raise ValueError(
+                    f"sequence {b}: {n_slots} IMAGE slots but {rows.size(0)} aligner rows from "
+                    f"{len(imgs_b)} images"
+                )
+            h[b, types_b == 0] = start_e.to(h.dtype)
+            h[b, types_b == 3] = end_e.to(h.dtype)
+            h[b, types_b == 2] = nl_e.to(h.dtype)
+            if n_slots:
+                h[b, is_img] = rows.to(h.dtype)
+        return h
 
     def create_kv_cache(self) -> dict[str, Any]:
         """Creates an empty incremental KV cache dict for `forward_hidden_cached`."""
@@ -3762,8 +4389,19 @@ class Dsv41SftModel(nn.Module):
         self.cos_comp = cos_comp
         self.sin_comp = sin_comp
 
-    def forward_hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Runs embed -> 40 mHC blocks -> final RMSNorm and returns `[B, S, dim]` hidden states."""
+    def forward_hidden(
+        self,
+        input_ids: torch.Tensor,
+        token_types: torch.Tensor | None = None,
+        images: Sequence[Sequence[ImageInput]] | None = None,
+    ) -> torch.Tensor:
+        """Runs embed -> 40 mHC blocks -> final RMSNorm and returns `[B, S, dim]` hidden states.
+
+        `token_types [B, S]` (int, -1 = text, >= 0 inside image spans) and `images[b]` (the
+        sequence's `ImageInput`s in prompt order) enable the VL path: image spans get ViT/aligner
+        embeddings, route with `gate.bias_vl`, and take no part in Engram n-grams. Attention stays
+        causal everywhere (DeepSeek's reference; the `is_mm_prefix_lm` bidirectional variant is a bug).
+        """
         bsz, seqlen = input_ids.shape
         self.ensure_rope_capacity(seqlen)
         ep_l_max = bsz * seqlen
@@ -3774,17 +4412,27 @@ class Dsv41SftModel(nn.Module):
             and dist.is_initialized()
         ):
             l_t = torch.tensor([ep_l_max], dtype=torch.int64, device=input_ids.device)
-            dist.all_reduce(l_t, op=dist.ReduceOp.MAX)
+            dist.all_reduce(l_t, op=dist.ReduceOp.MAX, group=self.ep_group)
             ep_l_max = int(l_t.item())
+
+        image_mask: torch.Tensor | None = None
+        if token_types is not None:
+            token_types = token_types.to(input_ids.device)
+            if bool((token_types >= 0).any()):
+                image_mask = token_types >= 0
 
         engram_hashes: torch.Tensor | None = None
         if self.engram_hash is not None and any(
             blk.engram is not None and blk.engram.has_compact_table
             for blk in self.layers
         ):
-            engram_hashes = self.engram_hash(input_ids)
+            engram_hashes = self.engram_hash(
+                input_ids, token_mask=None if image_mask is None else ~image_mask
+            )
 
         h = self.embed(input_ids)
+        if image_mask is not None:
+            h = self.merge_image_embeddings(h, token_types, images or [])
         h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
         if self.training and torch.is_grad_enabled() and not h.requires_grad:
             h = h.requires_grad_(True)
@@ -3832,6 +4480,7 @@ class Dsv41SftModel(nn.Module):
                     eh_ids: torch.Tensor | None = layer_engram_ids,
                     l_max_val: int = ep_l_max,
                     rep_val: bool = ep_rep,
+                    img_mask: torch.Tensor | None = image_mask,
                 ) -> tuple[
                     torch.Tensor,
                     torch.Tensor,
@@ -3846,18 +4495,22 @@ class Dsv41SftModel(nn.Module):
                         "topk_idxs": tk,
                         "candidates": cd,
                     }
-                    x_out, pm_out = blk(
-                        x_in,
-                        pm_in,
-                        local_shared,
-                        cos_s,
-                        sin_s,
-                        cos_c,
-                        sin_c,
-                        eh_ids,
-                        ep_l_max=l_max_val,
-                        ep_replicated_input=rep_val,
-                    )
+                    with torch.autograd.graph.saved_tensors_hooks(
+                        lambda t: t, lambda t: t
+                    ):
+                        x_out, pm_out = blk(
+                            x_in,
+                            pm_in,
+                            local_shared,
+                            cos_s,
+                            sin_s,
+                            cos_c,
+                            sin_c,
+                            eh_ids,
+                            ep_l_max=l_max_val,
+                            ep_replicated_input=rep_val,
+                            image_mask=img_mask,
+                        )
                     return (
                         x_out,
                         pm_out,
@@ -3923,25 +4576,63 @@ class Dsv41SftModel(nn.Module):
                     layer_engram_ids,
                     ep_l_max=ep_l_max,
                     ep_replicated_input=ep_rep,
+                    image_mask=image_mask,
                 )
 
         h_final = self.layers[-1].hc_pre(h, pre_mix)
         return self.norm(h_final)
 
     @torch.no_grad()
+    def embed_with_images(
+        self,
+        input_ids: torch.Tensor,
+        token_types: torch.Tensor | None,
+        images: Sequence[ImageInput] | None,
+    ) -> torch.Tensor:
+        """Token embeddings `[1, S, dim]` with image spans already replaced (eval prefill helper).
+
+        Call once per prompt (the ViT runs once per image) and feed slices of the result to
+        `forward_hidden_cached(..., inputs_embeds=...)` so chunked prefill never splits an image.
+        """
+        h = self.embed(input_ids)
+        if token_types is not None and images:
+            h = self.merge_image_embeddings(h, token_types.to(input_ids.device), [list(images)])
+        return h
+
+    @torch.no_grad()
     def forward_hidden_cached(
         self,
         new_input_ids: torch.Tensor,
         kv_cache: dict[str, Any],
+        token_types: torch.Tensor | None = None,
+        images: Sequence[ImageInput] | None = None,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Runs incremental KV-cached prefill or 1-token decode for fast Candidate B32 evaluation.
 
         `kv_cache` is a mutable dict initialized as `{}` on a new sequence or prefix reuse.
+
+        VL prefill (image checkpoints): `token_types [B, S]` (-1 text, 0..3 image-span types) for
+        this chunk enables `gate.bias_vl` routing on image rows and keeps image tokens out of the
+        Engram n-grams (the cached tail stores them as DEAD, exactly like the reference
+        `NgramHashState`). Image embeddings come either from `images` (the chunk must contain the
+        complete spans) or from `inputs_embeds [B, S, dim]` precomputed with `embed_with_images`
+        (safe for chunked prefill). Decode steps are text-only and need none of these.
         """
         bsz, seqlen = new_input_ids.shape
         start_pos = int(kv_cache.get("seqlen", 0))
         total_len = start_pos + seqlen
         self.ensure_rope_capacity(total_len)
+
+        image_mask: torch.Tensor | None = None
+        if token_types is not None:
+            token_types = token_types.to(new_input_ids.device)
+            if token_types.shape != new_input_ids.shape:
+                raise ValueError(
+                    f"token_types {tuple(token_types.shape)} vs input_ids {tuple(new_input_ids.shape)}"
+                )
+            if bool((token_types >= 0).any()):
+                image_mask = token_types >= 0
 
         engram_hashes: torch.Tensor | None = None
         if self.engram_hash is not None and any(
@@ -3950,10 +4641,16 @@ class Dsv41SftModel(nn.Module):
         ):
             prev_comp_tok = kv_cache.get("engram_tail")
             engram_hashes = self.engram_hash(
-                new_input_ids, prefix_compressed=prev_comp_tok
+                new_input_ids,
+                prefix_compressed=prev_comp_tok,
+                token_mask=None if image_mask is None else ~image_mask,
             )
             safe_ids = new_input_ids.clamp(0, self.engram_hash.token_map.numel() - 1)
             new_comp = self.engram_hash.token_map[safe_ids]
+            if image_mask is not None:
+                new_comp = torch.where(
+                    image_mask, torch.full_like(new_comp, self.engram_hash.DEAD), new_comp
+                )
             full_comp = (
                 torch.cat([prev_comp_tok, new_comp], dim=1)
                 if (prev_comp_tok is not None and start_pos > 0)
@@ -3966,7 +4663,20 @@ class Dsv41SftModel(nn.Module):
             "layers", [{} for _ in range(len(self.layers))]
         )
 
-        h = self.embed(new_input_ids)
+        if inputs_embeds is not None:
+            if tuple(inputs_embeds.shape[:2]) != (bsz, seqlen):
+                raise ValueError(
+                    f"inputs_embeds {tuple(inputs_embeds.shape)} vs input_ids {tuple(new_input_ids.shape)}"
+                )
+            h = inputs_embeds.to(self.embed.weight.dtype)
+        else:
+            h = self.embed(new_input_ids)
+            if image_mask is not None:
+                if not images:
+                    raise ValueError(
+                        "token_types has image spans but neither `images` nor `inputs_embeds` was given"
+                    )
+                h = self.merge_image_embeddings(h, token_types, [list(images)])
         h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
         pre_mix = h.new_zeros(bsz, seqlen, self.cfg.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
@@ -4002,6 +4712,7 @@ class Dsv41SftModel(nn.Module):
                 ep_replicated_input=True,
                 layer_cache=layer_caches[i],
                 start_pos=start_pos,
+                image_mask=image_mask,
             )
 
         kv_cache["seqlen"] = total_len
@@ -4458,6 +5169,41 @@ def _load_compact_engram_from_shards(
 REPAIR_SHARD_PREFIX = "model-repair-"
 
 
+LEGACY_BACKBONE_SHARDS = (
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+)
+
+
+def _list_backbone_shards(model_dir: str) -> list[str]:
+    """Returns the non-Engram, non-gptq backbone shard basenames of a checkpoint, in index order.
+
+    Prefers `model.safetensors.index.json` (`weight_map` values), which covers both the legacy
+    `model-0000N-of-00002.safetensors` layout and the 3-shard `model-0000N.safetensors` layout of
+    the image checkpoints; Engram row chunks (`model-engram-*`) are loaded separately.
+    """
+    idx_path = os.path.join(model_dir, "model.safetensors.index.json")
+    shards: list[str] = []
+    try:
+        if gfile.Exists(idx_path):
+            with gfile.Open(idx_path, "r") as f:
+                weight_map = (json.load(f) or {}).get("weight_map") or {}
+            shards = sorted(
+                {
+                    os.path.basename(v)
+                    for v in weight_map.values()
+                    if v.endswith(".safetensors") and "engram" not in os.path.basename(v)
+                }
+            )
+    except Exception:  # pylint: disable=broad-exception-caught
+        shards = []
+    if not shards:
+        shards = [s for s in LEGACY_BACKBONE_SHARDS if gfile.Exists(os.path.join(model_dir, s))]
+    if not shards:
+        shards = list(LEGACY_BACKBONE_SHARDS)
+    return shards
+
+
 def _list_repair_shards(model_dir: str) -> list[str]:
     """Returns sorted basenames of optional `model-repair-*.safetensors` shards in `model_dir`."""
     try:
@@ -4578,10 +5324,8 @@ def load_dequantized_dsv41_e128(
     rank = dist.get_rank() if is_dist else 0
     world_size = dist.get_world_size() if is_dist else 1
 
-    backbone_rel = [
-        "model-00001-of-00002.safetensors",
-        "model-00002-of-00002.safetensors",
-    ]
+    backbone_rel = _list_backbone_shards(model_dir)
+    stats["backbone_shards"] = list(backbone_rel)
     # Optional repair shards (e.g. re-quantised `layers.9.ffn.shared_experts.*` weight+scale pairs
     # for legacy exports that dropped cross-shard scales). Loaded last so their keys override.
     backbone_rel += _list_repair_shards(model_dir)
@@ -4589,18 +5333,20 @@ def load_dequantized_dsv41_e128(
     all_rel = backbone_rel + gptq_rel
 
     if is_dist and model_dir.startswith("/cns/"):
+        local_rank = model.ep_rank if model.ep_world_size > 1 else (rank % max(1, world_size))
+        local_world_size = model.ep_world_size if model.ep_world_size > 1 else world_size
         staged_root = "/tmp/dsv41_e128_staged"
-        if rank == 0:
+        if local_rank == 0:
             os.makedirs(os.path.join(staged_root, "gptq"), exist_ok=True)
         dist.barrier()
-        my_rel = all_rel[rank::world_size]
+        my_rel = all_rel[local_rank::local_world_size]
 
         def _stage_one(rel: str) -> None:
             cns_src = os.path.join(model_dir, rel)
             if not gfile.Exists(cns_src):
                 raise FileNotFoundError(f"Missing checkpoint shard on CNS: {cns_src}")
             local_dst = os.path.join(staged_root, rel)
-            tmp_dst = f"{local_dst}.tmp.{rank}"
+            tmp_dst = f"{local_dst}.tmp.{local_rank}"
             if not os.path.exists(local_dst):
                 with gfile.Open(cns_src, "rb") as f_in, open(tmp_dst, "wb") as f_out:
                     while True:
@@ -4663,24 +5409,17 @@ def load_dequantized_dsv41_e128(
                     stats["gptq_2bit_experts_unpacked"] += 1
 
         dist.barrier()
-        if rank == 0:
+        if local_rank == 0:
             for rel in all_rel:
                 p = os.path.join(staged_root, rel)
                 if os.path.exists(p):
                     os.remove(p)
         dist.barrier()
 
-        eng_dir = engram_model_dir or model_dir
-        if not gfile.Exists(
-            os.path.join(eng_dir, "model-engram-00001-of-00016.safetensors")
-        ):
-            default_base = "/cns/lu-d/home/arazdai/kaggle/models/dsv41_e128_2bit"
-            if gfile.Exists(
-                os.path.join(default_base, "model-engram-00001-of-00016.safetensors")
-            ):
-                eng_dir = default_base
+        eng_dir = _resolve_engram_dir(engram_model_dir or model_dir)
+        stats["engram_dir"] = eng_dir
         stats["engram_slices_loaded"] = _load_compact_engram_from_shards(
-            eng_dir, model, device, is_dist, rank, world_size
+            eng_dir, model, device, is_dist, local_rank, local_world_size
         )
         return stats
 
@@ -4740,12 +5479,31 @@ def load_dequantized_dsv41_e128(
                     stats["gptq_2bit_experts_unpacked"] += 1
             os.remove(local_layer)
 
-        eng_dir = engram_model_dir or model_dir
+        eng_dir = _resolve_engram_dir(engram_model_dir or model_dir)
+        stats["engram_dir"] = eng_dir
         stats["engram_slices_loaded"] = _load_compact_engram_from_shards(
             eng_dir, model, device, False, 0, 1
         )
 
     return stats
+
+
+def _resolve_engram_dir(preferred_dir: str) -> str:
+    """Returns `preferred_dir` if it holds the compact Engram shards, else the E043 default dir.
+
+    The image checkpoints (`dsv41_img_e128_2bit_causal`) and every export derived from them ship no
+    `model-engram-*.safetensors`; their `config.json` carries the identical `engram_compact_kept`
+    table layout, so the E043 shards are reused when loading from CNS.
+    """
+    marker = "model-engram-00001-of-00016.safetensors"
+    if not preferred_dir.startswith("/cns/"):
+        return preferred_dir
+    if gfile.Exists(os.path.join(preferred_dir, marker)):
+        return preferred_dir
+    default_base = "/cns/lu-d/home/arazdai/kaggle/models/dsv41_e128_2bit"
+    if gfile.Exists(os.path.join(default_base, marker)):
+        return default_base
+    return preferred_dir
 
 
 @torch.no_grad()
@@ -4766,6 +5524,16 @@ def export_dsv41_e128_2bit_checkpoint(
         dist.barrier()
 
     exported_files: list[str] = []
+    # On-disk delta counters (what a byte diff against the base checkpoint would show).
+    delta: dict[str, int] = {
+        "routed_codes_total": 0,
+        "routed_codes_changed": 0,
+        "routed_scales_total": 0,
+        "routed_scales_changed": 0,
+        "backbone_trainable_tensors": 0,
+        "backbone_trainable_elems": 0,
+        "backbone_changed_elems": 0,
+    }
     # 1. Export 2-bit Humming routed experts (`gptq/layer_00..39.safetensors`) FIRST
     routed_experts_trained = (
         model.cfg.trainable_routed_experts_dense
@@ -4788,6 +5556,8 @@ def export_dsv41_e128_2bit_checkpoint(
                         f_out.write(buf)
                 exported_files.append(rel)
     else:
+        ep_ws = max(1, model.ep_world_size)
+        is_primary_ep_replica = rank < ep_ws
         with tempfile.TemporaryDirectory(
             prefix=f"dsv41_export_gptq_r{rank}_"
         ) as tmp_dir:
@@ -4795,25 +5565,31 @@ def export_dsv41_e128_2bit_checkpoint(
             for layer_idx, block in enumerate(model.layers):
                 moe = block.ffn
                 local_expert_dict: dict[str, torch.Tensor] = {}
-                for e_idx in range(moe.experts_start_idx, moe.experts_end_idx):
-                    expert = moe.experts[e_idx]
-                    assert expert is not None
-                    for proj_name, group in (("w1", 128), ("w3", 128), ("w2", 64)):
-                        proj_mod = getattr(expert, proj_name)
-                        if isinstance(proj_mod, LoRALinear):
-                            q, s, z = proj_mod.export_humming_2bit()
-                        else:
-                            w_full = (
-                                proj_mod.merged_weight()
-                                if hasattr(proj_mod, "merged_weight")
-                                else proj_mod.weight
-                            )
-                            q, s, z = quantize_uint2_humming_expert_tensor(
-                                w_full, group=group
-                            )
-                        local_expert_dict[f"e{e_idx}.{proj_name}.q"] = q.cpu()
-                        local_expert_dict[f"e{e_idx}.{proj_name}.s"] = s.cpu()
-                        local_expert_dict[f"e{e_idx}.{proj_name}.z"] = z.cpu()
+                if is_primary_ep_replica:
+                    for e_idx in range(moe.experts_start_idx, moe.experts_end_idx):
+                        expert = moe.experts[e_idx]
+                        assert expert is not None
+                        for proj_name, group in (("w1", 128), ("w3", 128), ("w2", 64)):
+                            proj_mod = getattr(expert, proj_name)
+                            if isinstance(proj_mod, LoRALinear):
+                                q, s, z, p_stats = proj_mod.export_humming_2bit_with_stats()
+                                delta["routed_codes_total"] += p_stats["codes_total"]
+                                delta["routed_scales_total"] += p_stats["scales_total"]
+                                if p_stats["codes_changed"] >= 0:
+                                    delta["routed_codes_changed"] += p_stats["codes_changed"]
+                                    delta["routed_scales_changed"] += p_stats["scales_changed"]
+                            else:
+                                w_full = (
+                                    proj_mod.merged_weight()
+                                    if hasattr(proj_mod, "merged_weight")
+                                    else proj_mod.weight
+                                )
+                                q, s, z = quantize_uint2_humming_expert_tensor(
+                                    w_full, group=group
+                                )
+                            local_expert_dict[f"e{e_idx}.{proj_name}.q"] = q.cpu()
+                            local_expert_dict[f"e{e_idx}.{proj_name}.s"] = s.cpu()
+                            local_expert_dict[f"e{e_idx}.{proj_name}.z"] = z.cpu()
 
                 writer_rank = layer_idx % max(1, world_size)
                 if world_size > 1 and dist.is_available() and dist.is_initialized():
@@ -4855,12 +5631,12 @@ def export_dsv41_e128_2bit_checkpoint(
                         pool.map(_write_layer_shard, pending_writes)
                     )
 
-    # 2. Ranks 0 and 1 export the updated non-routed backbone shards (`model-00001/00002.safetensors`)
-    #    preserving 2D `[out//32, in//32]` vs 1D `[out, in//32]` scale shapes from the original checkpoint.
-    backbone_shards = (
-        "model-00001-of-00002.safetensors",
-        "model-00002-of-00002.safetensors",
-    )
+    # 2. One rank per shard exports the updated non-routed backbone shards (2-shard legacy layout
+    #    or the 3-shard image layout, discovered from the base index), preserving 2D `[out//32, in//32]`
+    #    vs 1D `[out, in//32]` scale shapes from the original checkpoint. Trainable non-FP8 tensors
+    #    (e.g. vision tower / aligner / `image_*` under FP32 masters) are written back in their
+    #    original dtype; frozen tensors are copied byte-for-byte.
+    backbone_shards = tuple(_list_backbone_shards(base_model_dir))
     my_backbone_shards = [
         s
         for idx, s in enumerate(backbone_shards)
@@ -4935,8 +5711,23 @@ def export_dsv41_e128_2bit_checkpoint(
                             )
                             out_tensors[k] = w_fp8.cpu()
                             out_tensors[scale_key] = s_e8m0.cpu()
+                            # Value-level delta vs the base (bit diffs over-count: a halved UE8M0
+                            # scale re-codes a whole block without changing any value).
+                            try:
+                                base_deq = dequantize_fp8_block32_torch(
+                                    f.get_tensor(k), f_scale.get_tensor(scale_key), out_dtype=torch.bfloat16
+                                )
+                                new_deq = dequantize_fp8_block32_torch(
+                                    w_fp8.cpu(), s_e8m0.cpu(), out_dtype=torch.bfloat16
+                                )
+                                delta["backbone_changed_elems"] += int((base_deq != new_deq).sum().item())
+                            except Exception:  # pylint: disable=broad-exception-caught
+                                pass
+                            delta["backbone_trainable_tensors"] += 1
+                            delta["backbone_trainable_elems"] += int(src_param.numel())
                         else:
-                            orig_dtype = f.get_tensor(k).dtype
+                            base_t = f.get_tensor(k)
+                            orig_dtype = base_t.dtype
                             if orig_dtype.is_floating_point and torch.empty(
                                 0, dtype=orig_dtype
                             ).element_size() == 1:
@@ -4944,9 +5735,12 @@ def export_dsv41_e128_2bit_checkpoint(
                                     f"Cannot export FP8 tensor {k!r}: no {scale_key!r} found in any "
                                     "base backbone shard."
                                 )
-                            out_tensors[k] = (
-                                src_param.data.to(orig_dtype).cpu()
-                            )
+                            new_t = src_param.data.to(orig_dtype).cpu()
+                            out_tensors[k] = new_t
+                            delta["backbone_trainable_tensors"] += 1
+                            delta["backbone_trainable_elems"] += int(new_t.numel())
+                            if base_t.shape == new_t.shape:
+                                delta["backbone_changed_elems"] += int((base_t != new_t).sum().item())
                 finally:
                     for h in handles.values():
                         close = getattr(h, "__exit__", None)
@@ -4998,7 +5792,15 @@ def export_dsv41_e128_2bit_checkpoint(
                     exported_files.append(entry)
 
     if world_size > 1 and dist.is_available() and dist.is_initialized():
+        keys = sorted(delta)
+        dev = model.embed.weight.device
+        t = torch.tensor([delta[k] for k in keys], dtype=torch.int64, device=dev)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        delta = dict(zip(keys, (int(v) for v in t.tolist())))
         dist.barrier()
+
+    def _frac(num: int, den: int) -> float:
+        return round(float(num) / float(den), 6) if den > 0 else 0.0
 
     return {
         "export_cns_dir": export_cns_dir,
@@ -5006,5 +5808,9 @@ def export_dsv41_e128_2bit_checkpoint(
         "trainable_routed_experts_dense": model.cfg.trainable_routed_experts_dense,
         "enable_qat": model.cfg.enable_qat,
         "exported_files_count": len(exported_files),
+        **delta,
+        "routed_codes_changed_frac": _frac(delta["routed_codes_changed"], delta["routed_codes_total"]),
+        "routed_scales_changed_frac": _frac(delta["routed_scales_changed"], delta["routed_scales_total"]),
+        "backbone_changed_frac": _frac(delta["backbone_changed_elems"], delta["backbone_trainable_elems"]),
     }
 

@@ -73,13 +73,42 @@ flags.DEFINE_integer(
     "If > 0, rank 0 runs torch.profiler on this (1-based) batched decode chunk and prints op tables.",
 )
 flags.DEFINE_integer("priority", 200, "Borg priority.")
+# E058 image harness passthrough (`eval_dsv41_b32_arc2` flags). Defaults = the old text harness.
+flags.DEFINE_enum(
+    "grid_format",
+    "json",
+    ["json", "text+image"],
+    "B32 prompt format: 'json' (text harness) or 'text+image' (E058: JSON prompt + IMAGE_NOTE + one "
+    "token-aligned PNG per grid; requires an image checkpoint such as "
+    "/cns/lu-d/home/arazdai/kaggle/models/dsv41_img_e128_2bit_causal).",
+)
+flags.DEFINE_integer(
+    "image_cell", 0, "E058 pixels per grid cell; 0 = token-aligned 42*k px (`--image-cell 0`)."
+)
+flags.DEFINE_enum("image_note", "", ["", "strict"], "E058 IMAGE_NOTE variant ('' = default note).")
+flags.DEFINE_integer(
+    "max_images_per_prompt",
+    32,
+    "Serving cap on images per prompt (`--limit-mm-per-prompt {\"image\": 32}`); larger prompts error.",
+)
+flags.DEFINE_integer(
+    "prefill_chunk_tokens", 4096, "Prefill chunk size of the step engine (image spans may be split)."
+)
+flags.DEFINE_string(
+    "attribution_url",
+    "rh/efforts/419617",
+    "Research Hub attribution URL for deepmind-dynamic / XManager launches.",
+)
 
 
 def main(argv: list[str]) -> None:
     if len(argv) > 1:
         raise app.UsageError("Too many command-line arguments.")
 
-    with xm_abc.create_experiment(experiment_title=FLAGS.exp_name) as experiment:
+    attrib = [FLAGS.attribution_url] if FLAGS.attribution_url else None
+    with xm_abc.create_experiment(
+        experiment_title=FLAGS.exp_name, attribution_urls=attrib
+    ) as experiment:
         reqs = xm.JobRequirements(
             b200=FLAGS.num_gpus,
             cpu=64,
@@ -134,32 +163,40 @@ def main(argv: list[str]) -> None:
                     job_suffix: str = job_suffix,
                     **unused_kwargs,
                 ) -> None:
+                    job_args: dict[str, object] = {
+                        "undefok": "cfs_d_cid_enable,cfs_d_resource_user_override,cfs_default_traffic_class,cfs_max_write_bytes_inflight",
+                        "cfs_d_cid_enable": True,
+                        "cfs_d_resource_user_override": "deepmind-resources-colossus",
+                        "cfs_default_traffic_class": "AF1",
+                        "cfs_max_write_bytes_inflight": 33554432,
+                        "checkpoint_2bit_dir": ckpt_2bit,
+                        "base_engram_dir": FLAGS.base_engram_dir,
+                        "dataset_dir": FLAGS.dataset_dir,
+                        "out_dir": out_dir,
+                        "milestone_tag": m_tag,
+                        "num_attempts": FLAGS.num_attempts,
+                        "max_tasks": FLAGS.max_tasks,
+                        "num_gpus": FLAGS.num_gpus,
+                        "shard_index": shard_idx,
+                        "num_shards": FLAGS.num_shards,
+                        "enable_qat": FLAGS.enable_qat,
+                        "load_compact_engram": FLAGS.load_compact_engram,
+                        "poll_for_checkpoint": True,
+                        "poll_timeout_hours": 24,
+                        # E058 image harness (defaults reproduce the text harness exactly).
+                        "grid_format": FLAGS.grid_format,
+                        "image_cell": FLAGS.image_cell,
+                        "max_images_per_prompt": FLAGS.max_images_per_prompt,
+                        "prefill_chunk_tokens": FLAGS.prefill_chunk_tokens,
+                    }
+                    if FLAGS.image_note:
+                        job_args["image_note"] = FLAGS.image_note
                     wu.add(
                         xm.Job(
                             executable=executable,
                             executor=executor,
                             name=f"eval_{job_suffix}",
-                            args={
-                                "undefok": "cfs_d_cid_enable,cfs_d_resource_user_override,cfs_default_traffic_class,cfs_max_write_bytes_inflight",
-                                "cfs_d_cid_enable": True,
-                                "cfs_d_resource_user_override": "deepmind-resources-colossus",
-                                "cfs_default_traffic_class": "AF1",
-                                "cfs_max_write_bytes_inflight": 33554432,
-                                "checkpoint_2bit_dir": ckpt_2bit,
-                                "base_engram_dir": FLAGS.base_engram_dir,
-                                "dataset_dir": FLAGS.dataset_dir,
-                                "out_dir": out_dir,
-                                "milestone_tag": m_tag,
-                                "num_attempts": FLAGS.num_attempts,
-                                "max_tasks": FLAGS.max_tasks,
-                                "num_gpus": FLAGS.num_gpus,
-                                "shard_index": shard_idx,
-                                "num_shards": FLAGS.num_shards,
-                                "enable_qat": FLAGS.enable_qat,
-                                "load_compact_engram": FLAGS.load_compact_engram,
-                                "poll_for_checkpoint": True,
-                                "poll_timeout_hours": 12,
-                            },
+                            args=job_args,
                             env_vars={
                                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
                                 "NCCL_DEBUG": "WARN",

@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import pickle
+import shutil
 import tempfile
 from typing import Sequence
 
 import numpy as np
+from PIL import Image
 import torch
 import transformers
 
 from google3.experimental.users.arazdai.kaggle.sft import data_pipeline
+from google3.experimental.users.arazdai.kaggle.sft import dsv41_image_tokens
 from google3.experimental.users.arazdai.kaggle.sft import dsv41_sft_model
 from google3.experimental.users.arazdai.kaggle.sft import evaluate_difficulty_argon
 from google3.experimental.users.arazdai.kaggle.sft import export_and_quantize
@@ -1049,11 +1054,22 @@ class SftPipelineTest(googletest.TestCase):
             },
         )
         groups, p_stats = train_dsv41_sft.build_dsv41_optimizer_param_groups(
-            model, weight_decay=0.01
+            model, weight_decay=0.01, lr_mults={"lora": 5.0, "scale": 2.5}
         )
-        self.assertEqual(len(groups), 2)
+        # Groups are split by LR tier x decay: every group carries `tier` + `lr_mult`.
+        self.assertGreaterEqual(len(groups), 2)
+        tiers = {g["tier"] for g in groups}
+        self.assertIn("base", tiers)
+        for g in groups:
+            self.assertIn(g["tier"], ("base", "lora", "scale", "vision", "aligner"))
+            expected_mult = {"lora": 5.0, "scale": 2.5}.get(g["tier"], 1.0)
+            self.assertEqual(g["lr_mult"], expected_mult)
+            if g["tier"] == "scale":
+                self.assertEqual(g["weight_decay"], 0.0)  # qat_scale never decays
         self.assertGreater(p_stats["decay_tensors"], 0)
         self.assertGreater(p_stats["no_decay_tensors"], 0)
+        n_all = sum(len(g["params"]) for g in groups)
+        self.assertEqual(n_all, sum(1 for p in model.parameters() if p.requires_grad))
 
         # 5. Verify build_length_bucketed_step_batches on a synthetic PackedTrajectoryDataset
         with tempfile.TemporaryDirectory(prefix="dsv41_bucket_test_") as tmp_dir:
@@ -1288,6 +1304,19 @@ class SftPipelineTest(googletest.TestCase):
             self.assertEqual(info4["step"], 4)
             self.assertAlmostEqual(info4["ema_loss"], losses[-1], places=6)
 
+            # (b2) also works when directory basename is a HuggingFace repo name
+            # (e.g. `ds-qat-image-v02-ep08`) rather than `step-XXXXX`, reading step from COMPLETED.json.
+            hf_style_dir = os.path.join(tmp_dir, "ds-qat-image-v02-ep08")
+            shutil.copytree(ckpt_dir, hf_style_dir)
+            info_hf = train_dsv41_sft.load_dsv41_resumable_checkpoint(
+                ckpt_dir=hf_style_dir, model=fresh, rank=0, world_size=1
+            )
+            self.assertEqual(info_hf["step"], 4)
+            self.assertEqual(info_hf["milestone_tag"], "epoch_0p25")
+
+            from google3.experimental.users.arazdai.kaggle.sft import load_dsv41_2bit_example
+            self.assertIn("round2_v14_16xb200_fast", load_dsv41_2bit_example.CHECKPOINT_2BIT_DIR)
+
             # (c) metrics history is reloaded up to the resume step;
             self.assertEqual(
                 [r["step"] for r in train_dsv41_sft.load_metrics_history(tmp_dir, 6)],
@@ -1427,6 +1456,11 @@ class SftPipelineTest(googletest.TestCase):
         self.assertTrue(torch.equal(q_exp0, q_packed_orig))
         self.assertTrue(torch.equal(s_exp0, s_init))
         self.assertTrue(torch.equal(z_exp0, z_packed_orig))
+        _, _, _, st0 = lora_lin.export_humming_2bit_with_stats()
+        self.assertEqual(st0["codes_changed"], 0)
+        self.assertEqual(st0["scales_changed"], 0)
+        self.assertEqual(st0["codes_total"], n_out * k_in)
+        self.assertEqual(st0["scales_total"], n_out * (k_in // g_size))
 
         # After non-zero LoRA + qat_scale updates, forward QAT weight must match exported 2-bit dequant exactly
         with torch.no_grad():
@@ -1434,6 +1468,10 @@ class SftPipelineTest(googletest.TestCase):
             lora_lin.qat_scale.mul_(1.07)
         q_exp1, s_exp1, z_exp1 = lora_lin.export_humming_2bit()
         self.assertTrue(torch.equal(z_exp1, z_packed_orig))  # z_orig remains locked!
+        _, _, _, st1 = lora_lin.export_humming_2bit_with_stats()
+        self.assertGreater(st1["scales_changed"], 0)  # +7% on s moves every BF16 scale
+        self.assertGreater(st1["codes_changed"], 0)  # LoRA delta of this size crosses s/2 somewhere
+        self.assertEqual(st1["scales_changed"], int((s_exp1 != s_init).sum()))
         w_deq_exp1 = dsv41_sft_model.dequant_gptq_expert_tensor(
             q_exp1, s_exp1, z_exp1, group=g_size, out_dtype=torch.bfloat16
         )
@@ -2070,8 +2108,263 @@ class SftPipelineTest(googletest.TestCase):
                 self.assertTrue(torch.isfinite(h_pre).all())
                 self.assertTrue(torch.isfinite(logits_dec).all())
 
+    def test_dsv41_round2_child_flags_and_vl_dataset_contract(self):
+        # 1. Every round-2 flag must be forwarded to the 8 per-GPU worker subprocesses (round-2 bug:
+        #    workers silently ran with train_vision=none and scale/LoRA LR == base LR).
+        flags_obj = train_dsv41_sft.FLAGS
+        flags_obj.mark_as_parsed()
+        saved = {
+            n: flags_obj[n].value
+            for n in ("train_vision", "scale_learning_rate", "lora_learning_rate", "engram_model_dir")
+        }
+        try:
+            flags_obj.train_vision = "aligner+last_k"
+            flags_obj.scale_learning_rate = 5e-5
+            flags_obj.lora_learning_rate = 1e-4
+            flags_obj.engram_model_dir = "/cns/x/engram"
+            child_args = train_dsv41_sft._serialize_dsv41_flags_for_children()  # pylint: disable=protected-access
+        finally:
+            for n, v in saved.items():
+                setattr(flags_obj, n, v)
+        self.assertIn("--train_vision=aligner+last_k", child_args)
+        self.assertIn("--scale_learning_rate=5e-05", child_args)
+        self.assertIn("--lora_learning_rate=0.0001", child_args)
+        self.assertIn("--engram_model_dir=/cns/x/engram", child_args)
+        for name in (
+            "vision_trainable_blocks",
+            "vision_learning_rate",
+            "aligner_learning_rate",
+            "disable_vision",
+            "allow_non_qat_export",
+            "global_grad_clip",
+        ):
+            self.assertTrue(any(a.startswith(f"--{name}=") for a in child_args), name)
+
+        # 2. VL dataset contract: `token_types` in the npz + `{split}_images.pkl` sidecar.
+        img = Image.new("RGB", (84, 42), (255, 0, 0))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        png = buf.getvalue()
+        base_ids = np.array([5, 6, 7, dsv41_image_tokens.IMAGE_TOKEN_ID, 8, 9], dtype=np.int32)
+        ids, types, (mask,), plans = dsv41_image_tokens.expand_image_placeholders(
+            base_ids, [png], per_token_arrays=[np.array([0, 0, 0, 0, 1, 1], dtype=np.uint8)]
+        )
+        self.assertEqual(len(plans), 1)
+        n_img_slots = int((types == dsv41_image_tokens.IMAGE).sum())
+        self.assertGreater(n_img_slots, 0)
+        text_ids = np.array([11, 12, 13, 14], dtype=np.int32)
+        with tempfile.TemporaryDirectory(prefix="dsv41_vl_ds_") as tmp_dir:
+            npz_path = os.path.join(tmp_dir, "train_tokens.npz")
+            lengths = np.array([len(ids), len(text_ids)], dtype=np.int32)
+            offsets = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
+            np.savez(
+                npz_path,
+                input_ids=np.concatenate([ids, text_ids]).astype(np.int32),
+                loss_mask=np.concatenate([mask, np.ones(4, dtype=np.uint8)]).astype(np.uint8),
+                loss_weights=np.concatenate([mask, np.ones(4, dtype=np.uint8)]).astype(np.uint8),
+                offsets=offsets,
+                lengths=lengths,
+                token_types=np.concatenate(
+                    [types, np.full(4, dsv41_image_tokens.TEXT, dtype=np.int8)]
+                ).astype(np.int8),
+            )
+            with open(os.path.join(tmp_dir, "train_images.pkl"), "wb") as f:
+                pickle.dump([[png], []], f)
+            ds = train_dsv41_sft.VLPackedTrajectoryDataset(npz_path, max_seq_len=4096)
+            self.assertEqual(len(ds), 2)
+            self.assertEqual(ds.n_with_images, 1)
+            s0 = ds[0]
+            s1 = ds[1]
+            self.assertEqual(int(s0["token_types"].numel()), len(ids))
+            self.assertEqual(int((s0["token_types"] == dsv41_image_tokens.IMAGE).sum()), n_img_slots)
+            self.assertEqual(len(s0["images"]), 1)
+            self.assertEqual(s1["images"], [])
+            self.assertTrue(bool((s1["token_types"] < 0).all()))
+            # Image spans are never supervised.
+            self.assertEqual(int(s0["loss_mask"][s0["token_types"] >= 0].sum()) if "loss_mask" in s0 else 0, 0)
+            tt, imgs = train_dsv41_sft.prepare_vl_inputs(s0, torch.device("cpu"))
+            self.assertIsNotNone(tt)
+            self.assertEqual(tuple(tt.shape), (1, len(ids)))
+            self.assertEqual(len(imgs[0]), 1)
+            self.assertEqual(tuple(imgs[0][0].patches.shape[1:]), (3, 14, 14))
+            tt1, imgs1 = train_dsv41_sft.prepare_vl_inputs(s1, torch.device("cpu"))
+            self.assertIsNone(tt1)
+            self.assertIsNone(imgs1)
+
+            # Text-only legacy npz (no token_types key, no sidecar) loads exactly as before.
+            legacy_path = os.path.join(tmp_dir, "legacy_tokens.npz")
+            np.savez(
+                legacy_path,
+                input_ids=text_ids,
+                loss_mask=np.ones(4, dtype=np.uint8),
+                loss_weights=np.ones(4, dtype=np.uint8),
+                offsets=np.array([0, 4], dtype=np.int64),
+                lengths=np.array([4], dtype=np.int32),
+            )
+            ds_legacy = train_dsv41_sft.VLPackedTrajectoryDataset(legacy_path, max_seq_len=4096)
+            self.assertEqual(ds_legacy.n_with_images, 0)
+            self.assertNotIn("token_types", ds_legacy[0])
+            self.assertNotIn("images", ds_legacy[0])
+
+    def test_e065_audit_split_and_gemini38_difficulty_ranking(self):
+        from google3.experimental.users.arazdai.kaggle.sft import audit_and_split_e065_rollouts as split_mod
+        from google3.experimental.users.arazdai.kaggle.sft import rank_e065_difficulty_gemini38_flash as rank_mod
+
+        gt_tasks = {
+            "t_pass": {
+                "task_id": "t_pass",
+                "parent": "t_pass",
+                "batch": "arc2_train",
+                "source": "kaggle_arc2_training",
+                "train": [{"input": [[0, 1]], "output": [[1, 0]]}],
+                "test": [{"input": [[1, 1]], "output": [[0, 0]]}],
+            },
+            "t_fail": {
+                "task_id": "t_fail",
+                "parent": "t_fail",
+                "batch": "arc2_train",
+                "source": "kaggle_arc2_training",
+                "train": [{"input": [[0, 2]], "output": [[2, 0]]}],
+                "test": [
+                    {"input": [[2, 2]], "output": [[0, 0]]},
+                    {"input": [[0, 0]], "output": [[2, 2]]},
+                ],
+            },
+        }
+        msgs_sample = json.dumps(
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "Solve."},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "Let's test a rule.",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "submit_answer",
+                                "arguments": json.dumps({"code": "solve(test_input)"}),
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "Submitted"},
+            ]
+        )
+        rows = [
+            {
+                "task_id": "t_pass",
+                "pair": 0,
+                "attempt": 0,
+                "source": "arc2_train",
+                "parent": "t_pass",
+                "correct": True,
+                "pred": json.dumps([[0, 0]]),
+                "answer_source": "submit",
+                "stop_reason": "submitted",
+                "turns": 2,
+                "tool_calls": 2,
+                "prompt_tokens": 500,
+                "completion_tokens": 1200,
+                "reasoning_tokens": 900,
+                "elapsed_s": 5.0,
+                "messages": msgs_sample,
+                "events": "[]",
+                "error": None,
+                "train_pass": True,
+                "train_frac": 1.0,
+                "train_trace": "expr",
+            },
+            {
+                "task_id": "t_fail",
+                "pair": 0,
+                "attempt": 0,
+                "source": "arc2_train",
+                "parent": "t_fail",
+                "correct": True,
+                "pred": json.dumps([[0, 0]]),
+                "answer_source": "submit",
+                "stop_reason": "submitted",
+                "turns": 8,
+                "tool_calls": 8,
+                "prompt_tokens": 900,
+                "completion_tokens": 18000,
+                "reasoning_tokens": 15000,
+                "elapsed_s": 40.0,
+                "messages": msgs_sample,
+                "events": "[]",
+                "error": None,
+                "train_pass": True,
+                "train_frac": 1.0,
+                "train_trace": "expr",
+            },
+            {
+                "task_id": "t_fail",
+                "pair": 1,
+                "attempt": 0,
+                "source": "arc2_train",
+                "parent": "t_fail",
+                "correct": False,
+                "pred": json.dumps([[9, 9]]),
+                "answer_source": "submit",
+                "stop_reason": "submitted",
+                "turns": 0,
+                "tool_calls": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "reasoning_tokens": 0,
+                "elapsed_s": 0.0,
+                "messages": msgs_sample,
+                "events": "[]",
+                "error": None,
+                "train_pass": True,
+                "train_frac": 1.0,
+                "train_trace": "expr",
+            },
+        ]
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        with tempfile.TemporaryDirectory(prefix="e065_split_") as tmp_dir:
+            pq_file = os.path.join(tmp_dir, "e065_images_arc2_train.parquet")
+            pq.write_table(pa.Table.from_pylist(rows), pq_file)
+            res = split_mod.audit_and_split_modality(
+                rollouts_dir=tmp_dir,
+                file_names=("e065_images_arc2_train.parquet",),
+                gt_tasks=gt_tasks,
+                eval_index={"eval_task_ids": set()},
+            )
+            self.assertEqual(res["total_discrepancies"], 0)
+            st = res["per_file_stats"]["e065_images_arc2_train.parquet"]
+            self.assertEqual(st["test_passing_rollouts"], 1)
+            self.assertEqual(st["non_test_passing_rollouts"], 1)
+            self.assertEqual(st["fail_demo_overfit_train_pass"], 1)
+            self.assertEqual(len(res["non_test_passing_records"]), 1)
+
+            # Verify Gemini 3.8 Flash prompt builder and composite hardness scoring
+            fail_rec = res["non_test_passing_records"][0]
+            pass_rec = res["rollout_status_by_task"]["t_pass"]
+            prompt_str = rank_mod.build_difficulty_prompt(fail_rec)
+            self.assertIn("t_fail", prompt_str)
+            self.assertIn("demo_overfit_train_pass_test_fail", prompt_str)
+
+            hard_score_fail = rank_mod.compute_composite_hardness_score(
+                fail_rec, {"difficulty_score": 8.5}
+            )
+            hard_score_pass = rank_mod.compute_composite_hardness_score(
+                pass_rec, {"difficulty_score": 3.0}
+            )
+            self.assertGreater(hard_score_fail, hard_score_pass)
+            self.assertEqual(
+                data_pipeline.discover_e065_extra_parquet_shards(tmp_dir),
+                [pq_file],
+            )
+
 
 if __name__ == "__main__":
     googletest.main()
+
 
 

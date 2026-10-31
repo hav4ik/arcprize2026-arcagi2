@@ -23,10 +23,13 @@ import io
 import json
 import math
 import os
+import pickle
 import random
 import re
+import socket
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -37,6 +40,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from google3.experimental.users.arazdai.kaggle.sft import dsv41_image_tokens
 from google3.experimental.users.arazdai.kaggle.sft import dsv41_sft_model
 from google3.experimental.users.arazdai.kaggle.sft import export_and_quantize
 from google3.experimental.users.arazdai.kaggle.sft import train_full_sft
@@ -138,6 +142,71 @@ flags.DEFINE_integer(
     4,
     "Linear LR re-warm-up steps right after a resume to soften the first updates of the re-initialized AdamW moments (0 disables).",
 )
+# ---- Round-2 (image checkpoint + QAT) flags ----
+flags.DEFINE_float(
+    "lora_learning_rate",
+    0.0,
+    "Peak LR for the routed-expert LoRA A/B parameters (0 = same as --learning_rate). Follows the same cosine schedule.",
+)
+flags.DEFINE_float(
+    "scale_learning_rate",
+    0.0,
+    "Peak LR for the trainable 2-bit group scales `qat_scale` (0 = same as --learning_rate). At 1e-5 the relative "
+    "step on s~0.028 is only 0.04%/step and many scales never cross a BF16 rounding boundary before export.",
+)
+flags.DEFINE_enum(
+    "train_vision",
+    "none",
+    ["none", "aligner", "aligner+last_k", "all"],
+    "Which vision-tower parameters to train when the checkpoint has one: 'none' (frozen), 'aligner' "
+    "(aligner MLP + image_start/end/newline), 'aligner+last_k' (plus the last --vision_trainable_blocks ViT "
+    "blocks and the final ViT norm), or 'all'.",
+)
+flags.DEFINE_integer("vision_trainable_blocks", 8, "Number of trailing ViT blocks trained under --train_vision=aligner+last_k.")
+flags.DEFINE_float("vision_learning_rate", 0.0, "Peak LR for ViT blocks (0 = same as --learning_rate).")
+flags.DEFINE_float("aligner_learning_rate", 0.0, "Peak LR for the aligner + image delimiter embeddings (0 = same as --learning_rate).")
+flags.DEFINE_bool(
+    "disable_vision",
+    False,
+    "Force the text-only path (no ViT/aligner built or loaded) even when config.json has a vision tower.",
+)
+flags.DEFINE_bool(
+    "allow_non_qat_export",
+    False,
+    "Round-1 lesson: with --enable_qat=false the 2-bit export re-rounds W0+LoRA onto the frozen GPTQ grid and "
+    "drops 100% of routed-expert updates (0 of 181B codes changed). Milestone exports with routed-expert "
+    "adapters therefore require --enable_qat=true unless this flag is set.",
+)
+flags.DEFINE_string(
+    "engram_model_dir",
+    "",
+    "Checkpoint directory holding the 16 compact Engram shards (model-engram-*.safetensors) when "
+    "--dsv41_model_dir ships none (the image checkpoints reuse the E043 tables; identical "
+    "`engram_compact_kept`). Empty = dsv41_model_dir, then the E043 default dir.",
+)
+flags.DEFINE_bool(
+    "global_grad_clip",
+    True,
+    "Clip with the GLOBAL gradient norm (replicated params counted once + expert-parallel params summed "
+    "across ranks) so every rank applies the same clip coefficient. Round 1 clipped on each rank's local "
+    "norm, which scaled the replicated shared-expert weights differently per rank and let the replicas drift.",
+)
+flags.DEFINE_bool(
+    "pilot_longest_batches_first",
+    False,
+    "Smoke/pilot aid: order the epoch's step batches by descending max sequence length so a --max_steps=N "
+    "run exercises peak activation memory first.",
+)
+flags.DEFINE_integer(
+    "num_nodes",
+    1,
+    "Number of 8-GPU nodes for DP x EP training (1 = 8x B200 EP=8; 2 = 16x B200 DP=2 x EP=8).",
+)
+flags.DEFINE_integer(
+    "node_rank",
+    0,
+    "Node index in [0, num_nodes) when num_nodes > 1.",
+)
 
 
 def compute_milestone_steps(
@@ -187,13 +256,52 @@ def build_length_bucketed_step_batches(
     )
 
 
+def _vision_param_trainable(
+    name: str,
+    train_vision: str,
+    vision_trainable_blocks: int,
+    n_vision_blocks: int,
+) -> bool:
+    """Vision-tower training policy for one parameter name (`vision.*`, `aligner.*`, `image_*`)."""
+    if train_vision == "none":
+        return False
+    is_aligner = name.startswith("aligner.") or name.startswith("image_")
+    if is_aligner:
+        return True
+    if not name.startswith("vision."):
+        return False
+    if train_vision == "all":
+        return True
+    if train_vision == "aligner+last_k":
+        if name.startswith("vision.norm."):
+            return vision_trainable_blocks > 0
+        m = re.match(r"^vision\.blocks\.(\d+)\.", name)
+        if m is None:
+            return False  # patch embedding stays frozen
+        return int(m.group(1)) >= n_vision_blocks - vision_trainable_blocks
+    return False
+
+
 def configure_dsv41_trainable_parameters(
     model: dsv41_sft_model.Dsv41SftModel,
     train_moe_only: bool = True,
+    train_vision: str = "none",
+    vision_trainable_blocks: int = 0,
 ) -> dict[str, int]:
-    """Configures `requires_grad` across `model` when `train_moe_only=True` (freezing attention, ngrams/Engram, router gate, mHC, norms, embed, head)."""
+    """Configures `requires_grad` across `model` when `train_moe_only=True` (freezing attention, ngrams/Engram, router gate, mHC, norms, embed, head).
+
+    Vision-tower parameters (`vision.*`, `aligner.*`, `image_*`) follow `train_vision` (see the
+    `--train_vision` flag); `gate.bias_vl` is a buffer and stays frozen.
+    """
+    n_vision_blocks = len(model.vision.blocks) if getattr(model, "vision", None) is not None else 0
     if train_moe_only:
         for name, p in model.named_parameters():
+            is_vision_param = name.startswith(("vision.", "aligner.", "image_"))
+            if is_vision_param:
+                p.requires_grad_(
+                    _vision_param_trainable(name, train_vision, vision_trainable_blocks, n_vision_blocks)
+                )
+                continue
             is_moe_expert_param = (
                 ".ffn.shared_experts." in name
                 or (
@@ -210,6 +318,12 @@ def configure_dsv41_trainable_parameters(
                 )
             )
             p.requires_grad_(is_moe_expert_param)
+    elif n_vision_blocks:
+        for name, p in model.named_parameters():
+            if name.startswith(("vision.", "aligner.", "image_")):
+                p.requires_grad_(
+                    _vision_param_trainable(name, train_vision, vision_trainable_blocks, n_vision_blocks)
+                )
 
     trainable_tensors = sum(1 for p in model.parameters() if p.requires_grad)
     frozen_tensors = sum(1 for p in model.parameters() if not p.requires_grad)
@@ -222,6 +336,13 @@ def configure_dsv41_trainable_parameters(
             if p.requires_grad and "qat_scale" in n
         )
     )
+    vision_params = int(
+        sum(
+            p.numel()
+            for n, p in model.named_parameters()
+            if p.requires_grad and n.startswith(("vision.", "aligner.", "image_"))
+        )
+    )
     return {
         "train_moe_only": int(train_moe_only),
         "trainable_tensors": trainable_tensors,
@@ -229,16 +350,34 @@ def configure_dsv41_trainable_parameters(
         "frozen_tensors": frozen_tensors,
         "frozen_numel": frozen_numel,
         "qat_scale_params": qat_scale_params,
+        "vision_trainable_numel": vision_params,
     }
+
+
+def lr_tier_of(name: str) -> str:
+    """Learning-rate tier of a parameter: `lora`, `scale`, `vision`, `aligner`, or `base`."""
+    if "lora_" in name:
+        return "lora"
+    if "qat_scale" in name:
+        return "scale"
+    if name.startswith("vision."):
+        return "vision"
+    if name.startswith(("aligner.", "image_")):
+        return "aligner"
+    return "base"
 
 
 def build_dsv41_optimizer_param_groups(
     model: dsv41_sft_model.Dsv41SftModel,
     weight_decay: float,
+    lr_mults: dict[str, float] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Splits trainable parameters into decayed 2-D matrices vs non-decayed 1-D/norm/bias/mHC/sink/qat_scale params."""
-    decay_params: list[nn.Parameter] = []
-    no_decay_params: list[nn.Parameter] = []
+    """Splits trainable parameters into decayed 2-D matrices vs non-decayed 1-D/norm/bias/mHC/sink/qat_scale params.
+
+    `lr_mults` maps LR tiers (`lr_tier_of`) to multipliers of the scheduled base LR; each group
+    carries `lr_mult` and the trainer sets `pg["lr"] = lr_now * pg["lr_mult"]` every step.
+    """
+    lr_mults = {k: float(v) for k, v in (lr_mults or {}).items()}
     no_decay_keywords = (
         "norm",
         "bias",
@@ -247,27 +386,111 @@ def build_dsv41_optimizer_param_groups(
         "q_weight",
         "k_weight",
         "qat_scale",
+        "image_start",
+        "image_end",
+        "image_newline",
     )
+    buckets: dict[tuple[str, bool], list[nn.Parameter]] = {}
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if p.ndim < 2 or any(k in name for k in no_decay_keywords):
-            no_decay_params.append(p)
-        else:
-            decay_params.append(p)
+        decay = not (p.ndim < 2 or any(k in name for k in no_decay_keywords))
+        buckets.setdefault((lr_tier_of(name), decay), []).append(p)
 
     groups: list[dict[str, Any]] = []
-    if decay_params:
-        groups.append({"params": decay_params, "weight_decay": weight_decay})
-    if no_decay_params:
-        groups.append({"params": no_decay_params, "weight_decay": 0.0})
-    stats = {
-        "decay_tensors": len(decay_params),
-        "decay_numel": int(sum(p.numel() for p in decay_params)),
-        "no_decay_tensors": len(no_decay_params),
-        "no_decay_numel": int(sum(p.numel() for p in no_decay_params)),
+    stats: dict[str, int] = {
+        "decay_tensors": 0,
+        "decay_numel": 0,
+        "no_decay_tensors": 0,
+        "no_decay_numel": 0,
     }
+    for (tier, decay), params in sorted(buckets.items(), key=lambda kv: (kv[0][0], not kv[0][1])):
+        groups.append(
+            {
+                "params": params,
+                "weight_decay": weight_decay if decay else 0.0,
+                "lr_mult": lr_mults.get(tier, 1.0),
+                "tier": tier,
+            }
+        )
+        key = "decay" if decay else "no_decay"
+        stats[f"{key}_tensors"] += len(params)
+        stats[f"{key}_numel"] += int(sum(p.numel() for p in params))
+        stats[f"tier_{tier}_numel"] = stats.get(f"tier_{tier}_numel", 0) + int(sum(p.numel() for p in params))
     return groups, stats
+
+
+class VLPackedTrajectoryDataset(train_sft.PackedTrajectoryDataset):
+    """`PackedTrajectoryDataset` plus per-token `token_types` and per-trajectory PNG image blobs.
+
+    Reads the optional `token_types` key of `*_tokens.npz` (int8, `-1` text / `0..3` image-span
+    types, see `dsv41_image_tokens`) and the optional `{split}_images.pkl` sidecar (a list aligned
+    with the npz trajectories; each element is the list of encoded images in prompt order).
+    Text-only datasets load exactly as before.
+    """
+
+    def __init__(self, npz_path: str, max_seq_len: int = 65536):
+        super().__init__(npz_path, max_seq_len=max_seq_len)
+        with gfile.Open(npz_path, "rb") as f:
+            raw_bytes = f.read()
+        with np.load(io.BytesIO(raw_bytes)) as data:
+            self.flat_types = data["token_types"] if "token_types" in data else None
+        del raw_bytes
+        self.images: list[list[bytes]] | None = None
+        images_path = re.sub(r"_tokens\.npz$", "_images.pkl", npz_path)
+        if images_path != npz_path and gfile.Exists(images_path):
+            with gfile.Open(images_path, "rb") as f:
+                self.images = pickle.load(f)
+            if len(self.images) != len(self.lengths):
+                raise ValueError(
+                    f"{images_path}: {len(self.images)} image lists for {len(self.lengths)} trajectories"
+                )
+        self.n_with_images = (
+            sum(1 for i in self.valid_indices if self.images[i]) if self.images is not None else 0
+        )
+
+    def __getitem__(self, i: int) -> dict[str, Any]:
+        item = super().__getitem__(i)
+        real_idx = self.valid_indices[i]
+        if self.flat_types is not None:
+            start = int(self.offsets[real_idx])
+            end = int(self.offsets[real_idx + 1])
+            item["token_types"] = torch.from_numpy(self.flat_types[start:end].astype(np.int64))
+        if self.images is not None:
+            item["images"] = list(self.images[real_idx])
+        return item
+
+
+def prepare_vl_inputs(
+    sample: dict[str, Any], device: torch.device
+) -> tuple[torch.Tensor | None, list[list[dsv41_sft_model.ImageInput]] | None]:
+    """Builds `(token_types [1, S], images)` for `model.forward_hidden` from a dataset sample.
+
+    Returns `(None, None)` for text-only samples so the forward is byte-identical to round 1.
+    """
+    token_types = sample.get("token_types")
+    blobs = sample.get("images") or []
+    if token_types is None or not bool((token_types >= 0).any()):
+        return None, None
+    image_inputs: list[dsv41_sft_model.ImageInput] = []
+    for blob in blobs:
+        patches, plan = dsv41_image_tokens.preprocess_image(blob)
+        image_inputs.append(
+            dsv41_sft_model.ImageInput(
+                patches=torch.from_numpy(patches).pin_memory() if device.type == "cuda" else torch.from_numpy(patches),
+                n_vit_h=plan.n_vit_h,
+                n_vit_w=plan.n_vit_w,
+            )
+        )
+    n_slots = int((token_types == dsv41_image_tokens.IMAGE).sum().item())
+    n_rows = sum(
+        math.ceil(img.n_vit_h / dsv41_image_tokens.DOWNSAMPLE_RATIO)
+        * math.ceil(img.n_vit_w / dsv41_image_tokens.DOWNSAMPLE_RATIO)
+        for img in image_inputs
+    )
+    if n_slots != n_rows:
+        raise ValueError(f"token_types has {n_slots} IMAGE slots but the images yield {n_rows} aligner rows")
+    return token_types.unsqueeze(0).to(device, non_blocking=True), [image_inputs]
 
 
 def _qat_qad_chunk_loss(
@@ -412,7 +635,9 @@ def save_dsv41_resumable_checkpoint(
     if world_size > 1 and dist.is_initialized():
         dist.barrier()
 
-    if (
+    ep_ws = max(1, int(getattr(model, "ep_world_size", world_size)))
+    ep_rank = int(getattr(model, "ep_rank", rank % ep_ws))
+    if rank < ep_ws and (
         model.cfg.routed_expert_lora_r > 0
         or model.cfg.trainable_routed_experts_dense
         or (model.cfg.enable_qat and model.cfg.qat_trainable_expert_scales)
@@ -425,7 +650,7 @@ def save_dsv41_resumable_checkpoint(
         buf_e = io.BytesIO()
         torch.save(expert_lora_state, buf_e)
         with gfile.Open(
-            os.path.join(ckpt_dir, f"expert_lora_rank_{rank:02d}.pt"), "wb"
+            os.path.join(ckpt_dir, f"expert_lora_rank_{ep_rank:02d}.pt"), "wb"
         ) as f:
             f.write(buf_e.getvalue())
 
@@ -452,6 +677,7 @@ def save_dsv41_resumable_checkpoint(
             "ema_loss": ema_loss,
             "best_val_loss": best_val_loss,
             "world_size": world_size,
+            "ep_world_size": ep_ws,
             "timestamp": time.time(),
         }
         with gfile.Open(os.path.join(ckpt_dir, "COMPLETED.json"), "w") as f:
@@ -543,7 +769,16 @@ def load_dsv41_resumable_checkpoint(
     """
     parsed = parse_checkpoint_step(ckpt_dir)
     if parsed is None:
-        raise ValueError(f"Not a step-XXXXX checkpoint directory: {ckpt_dir!r}")
+        marker_probe = os.path.join(ckpt_dir, "COMPLETED.json")
+        if gfile.Exists(marker_probe):
+            with gfile.Open(marker_probe, "r") as f:
+                meta_probe = json.load(f)
+            parsed = (
+                int(meta_probe.get("global_step", meta_probe.get("step", 0))),
+                str(meta_probe.get("milestone_tag", "")),
+            )
+        else:
+            raise ValueError(f"Not a step-XXXXX checkpoint directory: {ckpt_dir!r}")
     params = dict(model.named_parameters())
     trainable = {k for k, p in params.items() if p.requires_grad}
     loaded: set[str] = set()
@@ -565,11 +800,13 @@ def load_dsv41_resumable_checkpoint(
 
     _load_state_file(os.path.join(ckpt_dir, "backbone_trainable.pt"))
     if model_has_expert_checkpoint_state(model):
-        expert_path = os.path.join(ckpt_dir, f"expert_lora_rank_{rank:02d}.pt")
+        ep_ws = max(1, int(getattr(model, "ep_world_size", world_size)))
+        ep_rank = int(getattr(model, "ep_rank", rank % ep_ws))
+        expert_path = os.path.join(ckpt_dir, f"expert_lora_rank_{ep_rank:02d}.pt")
         if not gfile.Exists(expert_path):
             raise FileNotFoundError(
-                f"Missing {expert_path}: checkpoint was saved with a different world size "
-                f"(now world_size={world_size})?"
+                f"Missing {expert_path}: checkpoint was saved with a different EP world size "
+                f"(now ep_world_size={ep_ws}, world_size={world_size})?"
             )
         _load_state_file(expert_path)
 
@@ -643,13 +880,15 @@ def evaluate_dsv41_validation_loss(
             input_ids = sample["input_ids"].unsqueeze(0).to(device, non_blocking=True)
             labels = sample["labels"].unsqueeze(0).to(device, non_blocking=True)
             loss_weights = sample.get("loss_weights")
+            tt, imgs = prepare_vl_inputs(sample, device)
         else:
             s0 = val_dataset[0]
             input_ids = s0["input_ids"][:64].unsqueeze(0).to(device, non_blocking=True)
             labels = torch.full_like(input_ids, -100)
             loss_weights = None
+            tt, imgs = None, None
 
-        hidden = model.forward_hidden(input_ids)
+        hidden = model.forward_hidden(input_ids, token_types=tt, images=imgs)
         loss_sum_t, n_valid = train_sft.compute_chunked_causal_lm_loss(
             hidden_states=hidden,
             lm_head=model.head,
@@ -705,9 +944,19 @@ def evaluate_dsv41_validation_loss(
 
 def _worker_main(rank: int, world_size: int) -> None:
     is_distributed = world_size > 1
+    num_nodes = max(1, int(FLAGS.num_nodes))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", max(1, world_size // num_nodes)))
+    local_rank = int(os.environ.get("LOCAL_RANK", rank % local_world_size))
+    ep_rank = local_rank
+    ep_world_size = local_world_size
+
+    os.environ.setdefault("HOME", "/tmp")
+    os.environ["PYTORCH_KERNEL_CACHE_PATH"] = f"/tmp/pytorch_kernel_cache_dsv41_sft_rank_{local_rank}"
+    os.makedirs(os.environ["PYTORCH_KERNEL_CACHE_PATH"], exist_ok=True)
+
     if torch.cuda.is_available():
-        torch.cuda.set_device(rank)
-        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
         backend = "nccl"
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -719,26 +968,46 @@ def _worker_main(rank: int, world_size: int) -> None:
         os.environ.setdefault("MASTER_ADDR", "::1")
         os.environ.setdefault("MASTER_PORT", "29509")
         os.environ.setdefault("NCCL_SOCKET_FAMILY", "AF_INET6")
-        os.environ["TRITON_CACHE_DIR"] = f"/tmp/triton_cache_dsv41_sft_rank_{rank}"
-        os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/inductor_cache_dsv41_sft_rank_{rank}"
-        store_path = os.environ.get(
-            "TORCH_DIST_INIT_FILE", "/tmp/dsv41_sft_c10d_filestore"
-        )
+        os.environ["TRITON_CACHE_DIR"] = f"/tmp/triton_cache_dsv41_sft_rank_{local_rank}"
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"/tmp/inductor_cache_dsv41_sft_rank_{local_rank}"
+        init_method = os.environ.get("TORCH_DIST_INIT_METHOD", "")
+        if not init_method:
+            store_path = os.environ.get(
+                "TORCH_DIST_INIT_FILE", "/tmp/dsv41_sft_c10d_filestore"
+            )
+            init_method = f"file://{store_path}"
         dist.init_process_group(
             backend=backend,
-            init_method=f"file://{store_path}",
+            init_method=init_method,
             rank=rank,
             world_size=world_size,
             timeout=datetime.timedelta(minutes=90),
             device_id=device if device.type == "cuda" else None,
         )
 
+    ep_group: dist.ProcessGroup | None = None
+    dp_group: dist.ProcessGroup | None = None
+    if is_distributed and world_size > ep_world_size:
+        n_dp = world_size // ep_world_size
+        for n_idx in range(n_dp):
+            ep_ranks = list(range(n_idx * ep_world_size, (n_idx + 1) * ep_world_size))
+            grp = dist.new_group(ranks=ep_ranks)
+            if rank in ep_ranks:
+                ep_group = grp
+        for r_idx in range(ep_world_size):
+            dp_ranks = [n_idx * ep_world_size + r_idx for n_idx in range(n_dp)]
+            grp = dist.new_group(ranks=dp_ranks)
+            if rank in dp_ranks:
+                dp_group = grp
+
+    # Seed by ep_rank so data-parallel replicas of the same expert shard (rank r and rank 8+r)
+    # initialize identical LoRA adapters (lora_A) before step 0.
     seed = int(FLAGS.seed)
-    random.seed(seed + rank)
-    np.random.seed(seed + rank)
-    torch.manual_seed(seed + rank)
+    random.seed(seed + ep_rank)
+    np.random.seed(seed + ep_rank)
+    torch.manual_seed(seed + ep_rank)
     if device.type == "cuda":
-        torch.cuda.manual_seed_all(seed + rank)
+        torch.cuda.manual_seed_all(seed + ep_rank)
 
     if rank == 0:
         export_and_quantize.ensure_cns_quota_dir(FLAGS.dsv41_output_dir)
@@ -762,16 +1031,35 @@ def _worker_main(rank: int, world_size: int) -> None:
     cfg.qat_trainable_expert_scales = bool(FLAGS.qat_trainable_expert_scales)
     cfg.qat_lock_gptq_codes = bool(FLAGS.qat_lock_gptq_codes)
     cfg.load_compact_engram = bool(FLAGS.load_compact_engram)
+    if bool(FLAGS.disable_vision):
+        cfg.vision_n_layers = 0
+
+    routed_adapters_trained = cfg.routed_expert_lora_r > 0 or cfg.trainable_routed_experts_dense
+    exports_enabled = bool(str(FLAGS.milestone_epoch_fractions).strip())
+    if (
+        exports_enabled
+        and routed_adapters_trained
+        and not cfg.enable_qat
+        and not bool(FLAGS.allow_non_qat_export)
+    ):
+        raise ValueError(
+            "Refusing to train routed-expert adapters with --enable_qat=false while milestone 2-bit exports "
+            "are on: the non-QAT export re-rounds W0+LoRA onto the frozen GPTQ grid and discards the adapters "
+            "entirely (round 1: 0 of 181,193,932,800 codes changed). Use --enable_qat=true "
+            "--qat_trainable_expert_scales=true, or pass --allow_non_qat_export=true knowingly."
+        )
 
     if rank == 0:
         print(
             f"[Rank 0] Building Dsv41SftModel on {device} (n_layers={cfg.n_layers}, dim={cfg.dim}, "
-            f"n_routed_experts={cfg.n_routed_experts}, ep_world_size={world_size}, "
+            f"n_routed_experts={cfg.n_routed_experts}, world_size={world_size}, ep_world_size={ep_world_size}, "
             f"routed_expert_lora_r={cfg.routed_expert_lora_r}, "
             f"trainable_routed_experts_dense={cfg.trainable_routed_experts_dense}, "
             f"train_moe_only={FLAGS.train_moe_only}, enable_qat={cfg.enable_qat}, "
             f"qat_trainable_expert_scales={cfg.qat_trainable_expert_scales}, "
-            f"qat_kl_weight={FLAGS.qat_kl_weight}, load_compact_engram={cfg.load_compact_engram})...",
+            f"qat_kl_weight={FLAGS.qat_kl_weight}, load_compact_engram={cfg.load_compact_engram}, "
+            f"vision_n_layers={cfg.vision_n_layers}, train_vision={FLAGS.train_vision}/"
+            f"{FLAGS.vision_trainable_blocks})...",
             flush=True,
         )
 
@@ -779,11 +1067,12 @@ def _worker_main(rank: int, world_size: int) -> None:
     with torch.device(device):
         model = dsv41_sft_model.Dsv41SftModel(
             cfg=cfg,
-            ep_rank=rank,
-            ep_world_size=world_size,
+            ep_rank=ep_rank,
+            ep_world_size=ep_world_size,
             gradient_checkpointing=bool(FLAGS.gradient_checkpointing),
             grad_ckpt_stride=int(FLAGS.grad_ckpt_stride),
             ep_replicated_input=False,
+            ep_group=ep_group,
         )
     if rank == 0:
         print(
@@ -796,6 +1085,7 @@ def _worker_main(rank: int, world_size: int) -> None:
         model_dir=FLAGS.dsv41_model_dir,
         model=model,
         device=device,
+        engram_model_dir=(str(FLAGS.engram_model_dir) or None),
     )
     if float(FLAGS.qat_kl_weight) > 0.0:
         model.snapshot_teacher_weights()
@@ -806,10 +1096,29 @@ def _worker_main(rank: int, world_size: int) -> None:
         )
 
     freeze_stats = configure_dsv41_trainable_parameters(
-        model, train_moe_only=bool(FLAGS.train_moe_only)
+        model,
+        train_moe_only=bool(FLAGS.train_moe_only),
+        train_vision=str(FLAGS.train_vision),
+        vision_trainable_blocks=int(FLAGS.vision_trainable_blocks),
     )
+    if dp_group is not None:
+        with torch.no_grad():
+            for p in model.parameters():
+                if p.requires_grad:
+                    dist.broadcast(p.data, src=ep_rank, group=dp_group)
+
+    base_lr = float(FLAGS.learning_rate)
+    lr_mults = {
+        tier: (float(v) / base_lr if float(v) > 0.0 and base_lr > 0.0 else 1.0)
+        for tier, v in (
+            ("lora", FLAGS.lora_learning_rate),
+            ("scale", FLAGS.scale_learning_rate),
+            ("vision", FLAGS.vision_learning_rate),
+            ("aligner", FLAGS.aligner_learning_rate),
+        )
+    }
     param_groups, param_stats = build_dsv41_optimizer_param_groups(
-        model, weight_decay=float(FLAGS.weight_decay)
+        model, weight_decay=float(FLAGS.weight_decay), lr_mults=lr_mults
     )
     optimizer = torch.optim.AdamW(
         param_groups,
@@ -821,7 +1130,8 @@ def _worker_main(rank: int, world_size: int) -> None:
 
     if rank == 0:
         print(
-            f"[Rank 0] Trainable parameter policy: {freeze_stats} | Optimizer groups: {param_stats}",
+            f"[Rank 0] Trainable parameter policy: {freeze_stats} | Optimizer groups: {param_stats} | "
+            f"lr_mults={lr_mults}",
             flush=True,
         )
 
@@ -832,7 +1142,7 @@ def _worker_main(rank: int, world_size: int) -> None:
         resume_dir = (
             find_latest_resumable_checkpoint(
                 output_dir=FLAGS.dsv41_output_dir,
-                world_size=world_size,
+                world_size=ep_world_size,
                 has_expert_state=model_has_expert_checkpoint_state(model),
             )
             or ""
@@ -865,12 +1175,24 @@ def _worker_main(rank: int, world_size: int) -> None:
     # 2. Load tokenized dataset with `loss_weights`
     train_npz = os.path.join(FLAGS.dsv41_data_dir, "train_tokens.npz")
     val_npz = os.path.join(FLAGS.dsv41_data_dir, "val_tokens.npz")
-    train_dataset = train_sft.PackedTrajectoryDataset(
+    train_dataset = VLPackedTrajectoryDataset(
         train_npz, max_seq_len=int(FLAGS.max_seq_len)
     )
-    val_dataset = train_sft.PackedTrajectoryDataset(
+    val_dataset = VLPackedTrajectoryDataset(
         val_npz, max_seq_len=int(FLAGS.max_seq_len)
     )
+    if (train_dataset.n_with_images or val_dataset.n_with_images) and model.vision is None:
+        raise ValueError(
+            f"Dataset {FLAGS.dsv41_data_dir} contains image trajectories "
+            f"(train={train_dataset.n_with_images}, val={val_dataset.n_with_images}) but the model has no "
+            "vision tower (text-only checkpoint or --disable_vision=true)."
+        )
+    if rank == 0 and (train_dataset.n_with_images or val_dataset.n_with_images):
+        print(
+            f"[Rank 0] Image trajectories: train {train_dataset.n_with_images}/{len(train_dataset)}, "
+            f"val {val_dataset.n_with_images}/{len(val_dataset)}",
+            flush=True,
+        )
 
     grad_accum = max(1, int(FLAGS.grad_accum_steps))
     effective_batch = world_size * grad_accum
@@ -890,7 +1212,7 @@ def _worker_main(rank: int, world_size: int) -> None:
     if rank == 0:
         print(
             f"[Rank 0] Dataset: train={len(train_dataset)}, val={len(val_dataset)}, "
-            f"effective_batch={effective_batch} (world_size={world_size} x grad_accum={grad_accum}), "
+            f"effective_batch={effective_batch} (world_size={world_size} [dp={world_size // ep_world_size} x ep={ep_world_size}] x grad_accum={grad_accum}), "
             f"steps_per_epoch={steps_per_epoch}, total_steps={total_steps}, "
             f"milestones={milestones}",
             flush=True,
@@ -941,6 +1263,8 @@ def _worker_main(rank: int, world_size: int) -> None:
             world_size=world_size,
         )
         if rank == 0:
+            delta_keys = [k for k in exp_info if k.startswith(("routed_", "backbone_"))]
+            export_delta = {k: exp_info[k] for k in delta_keys}
             marker_path = os.path.join(export_2bit_dir, "EXPORT_COMPLETED.json")
             with gfile.Open(marker_path, "w") as mf:
                 json.dump(
@@ -952,6 +1276,8 @@ def _worker_main(rank: int, world_size: int) -> None:
                         "val_wic_alnum_loss": row.get("val_wic_alnum_loss"),
                         "export_dir": export_2bit_dir,
                         "elapsed_sec": round(time.time() - t_exp, 2),
+                        "export_delta": export_delta,
+                        "enable_qat": bool(cfg.enable_qat),
                     },
                     mf,
                     indent=2,
@@ -961,6 +1287,26 @@ def _worker_main(rank: int, world_size: int) -> None:
                 f"and exported 2-bit checkpoint to {export_2bit_dir} in {time.time() - t_exp:.1f}s: {exp_info}",
                 flush=True,
             )
+            print(
+                f"[Milestone {m_tag}] EXPORT DELTA vs base: routed scales changed "
+                f"{exp_info.get('routed_scales_changed', 0):,}/{exp_info.get('routed_scales_total', 0):,} "
+                f"({100.0 * exp_info.get('routed_scales_changed_frac', 0.0):.2f}%), routed 2-bit codes flipped "
+                f"{exp_info.get('routed_codes_changed', 0):,}/{exp_info.get('routed_codes_total', 0):,} "
+                f"({100.0 * exp_info.get('routed_codes_changed_frac', 0.0):.4f}%), backbone trainable elems changed "
+                f"{exp_info.get('backbone_changed_elems', 0):,}/{exp_info.get('backbone_trainable_elems', 0):,} "
+                f"({100.0 * exp_info.get('backbone_changed_frac', 0.0):.2f}%)",
+                flush=True,
+            )
+            if (
+                exp_info.get("routed_scales_total", 0) > 0
+                and exp_info.get("routed_scales_changed", 0) == 0
+                and exp_info.get("routed_codes_changed", 0) == 0
+            ):
+                print(
+                    f"[Milestone {m_tag}] WARNING: exported routed experts are byte-identical to the base "
+                    "checkpoint (0 scales / 0 codes changed) -- the SFT did not reach the 2-bit weights.",
+                    flush=True,
+                )
 
     # 3b. A preemption can kill the run between a milestone's checkpoint save and its 2-bit export
     #     (v12 step 57): if we resumed exactly at such a milestone and its export marker is missing,
@@ -1012,6 +1358,16 @@ def _worker_main(rank: int, world_size: int) -> None:
                 perm[i : i + effective_batch]
                 for i in range(0, len(perm), effective_batch)
             ]
+        if bool(FLAGS.pilot_longest_batches_first):
+            # Smoke/pilot runs: put the batches with the longest sequences first so the few
+            # steps executed exercise peak activation memory (the VRAM gate), not a random sample.
+            step_batches = sorted(
+                step_batches,
+                key=lambda b: -max((int(train_dataset.lengths[i]) for i in b if i is not None), default=0),
+            )
+            if rank == 0:
+                top = [max(int(train_dataset.lengths[i]) for i in b if i is not None) for b in step_batches[:3]]
+                print(f"[Rank 0] pilot_longest_batches_first: first step batch max lengths = {top}", flush=True)
 
         for step_in_epoch, batch_indices in enumerate(step_batches):
             if global_step >= total_steps:
@@ -1032,7 +1388,7 @@ def _worker_main(rank: int, world_size: int) -> None:
             if rewarmup_steps > 0 and (global_step - resume_step) < rewarmup_steps:
                 lr_now *= float(global_step - resume_step + 1) / float(rewarmup_steps)
             for pg in optimizer.param_groups:
-                pg["lr"] = lr_now
+                pg["lr"] = lr_now * float(pg.get("lr_mult", 1.0))
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -1076,6 +1432,8 @@ def _worker_main(rank: int, world_size: int) -> None:
                 item_idx = padded_slots[slot]
                 is_real = item_idx is not None
                 sample = train_dataset[item_idx if item_idx is not None else fallback_idx]
+                vl_types: torch.Tensor | None = None
+                vl_images: list[list[dsv41_sft_model.ImageInput]] | None = None
                 if is_real:
                     input_ids = (
                         sample["input_ids"].unsqueeze(0).to(device, non_blocking=True)
@@ -1088,6 +1446,7 @@ def _worker_main(rank: int, world_size: int) -> None:
                         if (FLAGS.use_token_loss_weights and "loss_weights" in sample)
                         else None
                     )
+                    vl_types, vl_images = prepare_vl_inputs(sample, device)
                 else:
                     input_ids = (
                         sample["input_ids"][:64]
@@ -1102,12 +1461,12 @@ def _worker_main(rank: int, world_size: int) -> None:
                 if kl_w > 0.0:
                     with torch.no_grad():
                         model.set_teacher_mode(True)
-                        teacher_hidden = (
-                            model.forward_hidden(input_ids).detach().cpu()
-                        )
+                        teacher_hidden = model.forward_hidden(
+                            input_ids, token_types=vl_types, images=vl_images
+                        ).detach()
                         model.set_teacher_mode(False)
 
-                hidden = model.forward_hidden(input_ids)
+                hidden = model.forward_hidden(input_ids, token_types=vl_types, images=vl_images)
                 loss_sum_t, n_valid, kl_sum_val = compute_chunked_qat_qad_loss(
                     student_hidden=hidden,
                     teacher_hidden=teacher_hidden,
@@ -1133,22 +1492,56 @@ def _worker_main(rank: int, world_size: int) -> None:
 
                 scaled_loss.backward()
 
-            # All-reduce gradients across ranks for replicated parameters; scale local expert grads
+            # All-reduce gradients across ranks for replicated parameters; scale local expert grads.
+            # Replicated params may have no grad on some ranks (vision tower when this rank's
+            # micro-batches were text-only) -- zero-fill so all ranks issue identical collectives.
             if is_distributed:
+                for name, p in model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if ".experts." not in name:
+                        if p.grad is None:
+                            p.grad = torch.zeros_like(p)
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                    else:
+                        if p.grad is None:
+                            p.grad = torch.zeros_like(p)
+                        if dp_group is not None:
+                            dist.all_reduce(
+                                p.grad, op=dist.ReduceOp.SUM, group=dp_group
+                            )
+                        p.grad.div_(float(world_size))
+
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            if is_distributed and bool(FLAGS.global_grad_clip):
+                # Global norm: replicated grads are identical on all ranks after the AVG all-reduce
+                # (count once); expert-parallel grads are shard-local across the 8 EP ranks in ep_group.
+                sq_rep = torch.zeros((), dtype=torch.float32, device=device)
+                sq_exp = torch.zeros((), dtype=torch.float32, device=device)
                 for name, p in model.named_parameters():
                     if not p.requires_grad or p.grad is None:
                         continue
-                    if ".experts." not in name:
-                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                    g_sq = p.grad.detach().float().pow(2).sum()
+                    if ".experts." in name:
+                        sq_exp += g_sq
                     else:
-                        p.grad.div_(float(world_size))
-
-            grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad],
-                    max_norm=float(FLAGS.max_grad_norm),
-                ).item()
-            )
+                        sq_rep += g_sq
+                dist.all_reduce(sq_exp, op=dist.ReduceOp.SUM, group=ep_group)
+                total_norm_t = torch.sqrt(sq_rep + sq_exp)
+                max_norm = float(FLAGS.max_grad_norm)
+                if max_norm > 0.0:
+                    clip_coef = (max_norm / (total_norm_t + 1e-6)).clamp(max=1.0)
+                    for p in trainable_params:
+                        if p.grad is not None:
+                            p.grad.detach().mul_(clip_coef)
+                grad_norm = float(total_norm_t.item())
+            else:
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(
+                        trainable_params,
+                        max_norm=float(FLAGS.max_grad_norm),
+                    ).item()
+                )
             optimizer.step()
             global_step += 1
 
@@ -1161,7 +1554,10 @@ def _worker_main(rank: int, world_size: int) -> None:
                 dist.all_reduce(loss_stat, op=dist.ReduceOp.SUM)
             step_loss = float(loss_stat[0].item()) / global_sup_tokens
             step_kl = float(loss_stat[2].item()) / global_sup_tokens
-            ema_loss = 0.9 * ema_loss + 0.1 * step_loss
+            if global_step == 1 and resume_step == 0:
+                ema_loss = step_loss
+            else:
+                ema_loss = 0.9 * ema_loss + 0.1 * step_loss
             dt_step = time.time() - t_step
             peak_gb = (
                 torch.cuda.max_memory_allocated(device) / (1024.0**3)
@@ -1294,6 +1690,20 @@ def _serialize_dsv41_flags_for_children() -> list[str]:
         "auto_resume",
         "resume_from_checkpoint_dir",
         "resume_lr_rewarmup_steps",
+        # Round-2 flags (must reach every worker subprocess).
+        "lora_learning_rate",
+        "scale_learning_rate",
+        "train_vision",
+        "vision_trainable_blocks",
+        "vision_learning_rate",
+        "aligner_learning_rate",
+        "disable_vision",
+        "allow_non_qat_export",
+        "engram_model_dir",
+        "global_grad_clip",
+        "pilot_longest_batches_first",
+        "num_nodes",
+        "node_rank",
     ]
     args: list[str] = [
         "--undefok=cfs_d_cid_enable,cfs_d_resource_user_override,cfs_default_traffic_class,cfs_max_write_bytes_inflight",
@@ -1313,6 +1723,23 @@ def _serialize_dsv41_flags_for_children() -> list[str]:
     return args
 
 
+def _resolve_local_ipv6_or_host() -> str:
+    try:
+        for res in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET6):
+            cand = str(res[4][0]).split("%")[0]
+            if cand and cand != "::1" and not cand.startswith("fe80"):
+                return cand
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    return socket.getfqdn()
+
+
+def _pick_free_port() -> int:
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return int(s.getsockname()[1])
+
+
 def main(argv: list[str]) -> None:
     if len(argv) > 1:
         raise app.UsageError(f"Unknown command-line arguments: {argv[1:]}")
@@ -1324,28 +1751,104 @@ def main(argv: list[str]) -> None:
         return
 
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    if FLAGS.use_multi_gpu and num_gpus > 1:
+    num_nodes = max(1, int(FLAGS.num_nodes))
+    node_rank = int(FLAGS.node_rank)
+    if FLAGS.use_multi_gpu and (num_gpus > 1 or num_nodes > 1):
         exe_path = sys.argv[0]
         child_args = _serialize_dsv41_flags_for_children()
-        master_port = os.environ.get("MASTER_PORT", "29509")
-        store_file = f"/tmp/dsv41_sft_c10d_filestore_{os.getpid()}_{int(time.time())}"
-        if os.path.exists(store_file):
-            os.remove(store_file)
-        print(
-            f"Launching {num_gpus} DeepSeek-V4.1 E128 SFT worker subprocesses via {exe_path} "
-            f"(init_method=file://{store_file})...",
-            flush=True,
-        )
+        total_world_size = num_nodes * num_gpus
+        hb_stop = threading.Event()
+        hb_thread: threading.Thread | None = None
+
+        if num_nodes > 1:
+            rendezvous_path = os.path.join(
+                FLAGS.dsv41_output_dir, "dist_rendezvous.json"
+            )
+            if node_rank == 0:
+                export_and_quantize.ensure_cns_quota_dir(FLAGS.dsv41_output_dir)
+                master_addr = _resolve_local_ipv6_or_host()
+                master_port = str(_pick_free_port())
+
+                def _write_rendezvous() -> None:
+                    tmp_path = f"{rendezvous_path}.tmp.{os.getpid()}"
+                    payload = {
+                        "master_addr": master_addr,
+                        "master_port": int(master_port),
+                        "num_nodes": num_nodes,
+                        "timestamp": time.time(),
+                    }
+                    with gfile.Open(tmp_path, "w") as f:
+                        json.dump(payload, f)
+                    gfile.Rename(tmp_path, rendezvous_path, overwrite=True)
+
+                _write_rendezvous()
+
+                def _heartbeat_loop() -> None:
+                    while not hb_stop.wait(10.0):
+                        try:
+                            _write_rendezvous()
+                        except Exception:  # pylint: disable=broad-exception-caught
+                            pass
+
+                hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+                hb_thread.start()
+            else:
+                print(
+                    f"[Node {node_rank}/{num_nodes}] Waiting for fresh master rendezvous at {rendezvous_path}...",
+                    flush=True,
+                )
+                master_addr = ""
+                master_port = ""
+                while True:
+                    try:
+                        if gfile.Exists(rendezvous_path):
+                            with gfile.Open(rendezvous_path, "r") as f:
+                                info = json.load(f)
+                            age = time.time() - float(info.get("timestamp", 0.0))
+                            if age < 35.0 and info.get("master_addr") and info.get("master_port"):
+                                master_addr = str(info["master_addr"])
+                                master_port = str(info["master_port"])
+                                break
+                    except Exception:  # pylint: disable=broad-exception-caught
+                        pass
+                    time.sleep(2.0)
+
+            host_fmt = f"[{master_addr}]" if ":" in master_addr else master_addr
+            init_method = f"tcp://{host_fmt}:{master_port}"
+            store_file = ""
+            print(
+                f"[Node {node_rank}/{num_nodes}] Launching {num_gpus} local workers "
+                f"(global ranks {node_rank * num_gpus}..{node_rank * num_gpus + num_gpus - 1} of {total_world_size}, "
+                f"init_method={init_method})...",
+                flush=True,
+            )
+        else:
+            master_addr = "::1"
+            master_port = os.environ.get("MASTER_PORT", "29509")
+            store_file = f"/tmp/dsv41_sft_c10d_filestore_{os.getpid()}_{int(time.time())}"
+            if os.path.exists(store_file):
+                os.remove(store_file)
+            init_method = f"file://{store_file}"
+            print(
+                f"Launching {num_gpus} DeepSeek-V4.1 E128 SFT worker subprocesses via {exe_path} "
+                f"(init_method={init_method})...",
+                flush=True,
+            )
+
         procs: list[subprocess.Popen[bytes]] = []
         for r in range(num_gpus):
+            global_r = node_rank * num_gpus + r
             child_env = os.environ.copy()
-            child_env["RANK"] = str(r)
+            child_env["RANK"] = str(global_r)
             child_env["LOCAL_RANK"] = str(r)
-            child_env["WORLD_SIZE"] = str(num_gpus)
-            child_env["MASTER_ADDR"] = "::1"
+            child_env["LOCAL_WORLD_SIZE"] = str(num_gpus)
+            child_env["WORLD_SIZE"] = str(total_world_size)
+            child_env["MASTER_ADDR"] = master_addr
             child_env["MASTER_PORT"] = master_port
             child_env["NCCL_SOCKET_FAMILY"] = "AF_INET6"
-            child_env["TORCH_DIST_INIT_FILE"] = store_file
+            child_env["TORCH_DIST_INIT_METHOD"] = init_method
+            if store_file:
+                child_env["TORCH_DIST_INIT_FILE"] = store_file
             procs.append(subprocess.Popen([exe_path, *child_args], env=child_env))
 
         exit_codes: list[int | None] = [None] * len(procs)
@@ -1360,8 +1863,8 @@ def main(argv: list[str]) -> None:
                         break
             if failed_rank is not None:
                 print(
-                    f"Worker rank {failed_rank} exited with non-zero code {exit_codes[failed_rank]}; "
-                    "terminating remaining workers.",
+                    f"Worker local_rank {failed_rank} (global rank {node_rank * num_gpus + failed_rank}) "
+                    f"exited with non-zero code {exit_codes[failed_rank]}; terminating remaining workers.",
                     flush=True,
                 )
                 for other in procs:
@@ -1370,6 +1873,7 @@ def main(argv: list[str]) -> None:
                 break
             time.sleep(0.5)
 
+        hb_stop.set()
         for r, p in enumerate(procs):
             exit_codes[r] = p.wait()
 

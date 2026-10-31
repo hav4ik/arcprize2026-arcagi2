@@ -8,17 +8,23 @@ on the full 120-task / 167-pair ARC-AGI-2 evaluation benchmark using Havu's Cand
   - Uninterrupted thinking (`max_tokens=64000`, `80k` hard / `40k` soft `"gentle"`, `max_turns=40`)
   - Isolated child-process Python sandbox (`LocalExecutor`, `style="ipython"`, `A1-A11` session `answer`/`solve()` fallbacks)
   - 4-path zero-token post-attempt `train_check` (`expr` -> `cell` -> `fn` -> `transcript`) + `ranked_answers`
+  - E058 `--grid_format=text+image --image_cell=0` (Havu's image harness): the JSON prompt + IMAGE_NOTE +
+    one token-aligned PNG per grid in the first user message, run through the replicated ViT/aligner of an
+    image checkpoint (`dsv41_img_e128_2bit_causal`) with image-aware prefix caching (`sha256` of the images)
+    and a follower broadcast protocol that leaves the text harness byte-identical to round 1.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Sequence
 
 from absl import app
 from absl import flags
@@ -29,6 +35,7 @@ import torch.distributed as dist
 
 from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import havu_b32_harness
 from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import prompts_and_selector
+from google3.experimental.users.arazdai.kaggle.sft import dsv41_image_tokens
 from google3.experimental.users.arazdai.kaggle.sft import dsv41_sft_model
 from google3.experimental.users.arazdai.kaggle.sft import export_and_quantize
 from google3.pyglib import gfile
@@ -88,6 +95,129 @@ flags.DEFINE_integer(
     12,
     "Maximum hours to poll for EXPORT_COMPLETED.json when poll_for_checkpoint=True.",
 )
+flags.DEFINE_enum(
+    "grid_format",
+    "json",
+    ["json", "text+image"],
+    "B32 prompt format: 'json' (text harness) or 'text+image' (E058: JSON prompt + one PNG per grid; "
+    "requires a checkpoint with a vision tower).",
+)
+flags.DEFINE_integer(
+    "image_cell", 0, "E058 pixels per grid cell; 0 = token-aligned 42*k px (`--image-cell 0`)."
+)
+flags.DEFINE_enum("image_note", "", ["", "strict"], "E058 IMAGE_NOTE variant.")
+flags.DEFINE_integer(
+    "max_images_per_prompt",
+    32,
+    "Refuse prompts with more images than the serving cap (`--limit-mm-per-prompt {\"image\": 32}`).",
+)
+flags.DEFINE_integer(
+    "prefill_chunk_tokens",
+    4096,
+    "Prefill chunk size; image spans are never split across chunks (`--disable-chunked-mm-input`).",
+)
+
+
+# ------------------------------------------------------------------------------------------------
+# Rank-0 -> follower broadcast protocol (`_run_distributed_cached_forward` / `_follower_worker_loop`).
+# Every command is one int64[3] tensor `(op_code, a, b)` followed by op-specific payload tensors.
+# The round-1 text protocol (ops 0..4) is unchanged byte for byte; the E058 VL extension only adds
+# the three prefill ops 11/12/13, which are never emitted for text-only prompts.
+#
+#   OP_STOP      (0, _, _)                  follower exits.
+#   OP_APPEND    (1, slot, L)   + ids[1,L]  text prefill chunk appended to `slot`.
+#   OP_RESET     (2, slot, L)   + ids[1,L]  text prefill chunk into a fresh `slot`.
+#   OP_DECODE    (3, B, steps)  + slots[B] (+ tok[B,1] per step) + valid_steps[B]
+#   OP_EVICT     (4, slot, _)
+#   OP_VL_APPEND (11, slot, L)  VL delta starts on an existing slot. Payload BEFORE the chunk ids:
+#                               hdr int64[2] = (delta_len, n_images), delta_ids[1,delta_len],
+#                               delta_types[1,delta_len], broadcast_object_list([png_bytes, ...]);
+#                               then ids[1,L] of the first chunk. Every rank runs
+#                               `embed_with_images` on the whole delta and slices it per chunk.
+#   OP_VL_RESET  (12, slot, L)  same, into a fresh slot.
+#   OP_VL_CONT   (13, slot, L)  + ids[1,L]  next chunk of the open VL delta (no extra payload).
+# ------------------------------------------------------------------------------------------------
+OP_STOP = 0
+OP_APPEND = 1
+OP_RESET = 2
+OP_DECODE = 3
+OP_EVICT = 4
+VL_OP_OFFSET = 10
+OP_VL_APPEND = OP_APPEND + VL_OP_OFFSET
+OP_VL_RESET = OP_RESET + VL_OP_OFFSET
+OP_VL_CONT = 13
+
+
+def image_digest(blobs: Sequence[bytes]) -> str:
+    """sha256 over an image list (count, order and bytes); `""` for text-only prompts."""
+    if not blobs:
+        return ""
+    h = hashlib.sha256()
+    for blob in blobs:
+        h.update(len(blob).to_bytes(8, "little"))
+        h.update(blob)
+    return h.hexdigest()
+
+
+def build_image_inputs(
+    blobs: Sequence[bytes], device: torch.device
+) -> list[dsv41_sft_model.ImageInput]:
+    """PNG bytes -> `ImageInput`s via `dsv41_image_tokens.preprocess_image` (the training preprocessing)."""
+    out: list[dsv41_sft_model.ImageInput] = []
+    for blob in blobs:
+        patches, plan = dsv41_image_tokens.preprocess_image(blob)
+        out.append(
+            dsv41_sft_model.ImageInput(
+                patches=torch.from_numpy(patches).to(device),
+                n_vit_h=plan.n_vit_h,
+                n_vit_w=plan.n_vit_w,
+            )
+        )
+    return out
+
+
+def check_image_slots(
+    token_types: Any,
+    image_inputs: Sequence[dsv41_sft_model.ImageInput],
+    downsample_ratio: int,
+) -> None:
+    """Asserts `#IMAGE slots in token_types == #aligner rows the images will produce` (clear error otherwise)."""
+    types = np.asarray(
+        token_types.detach().cpu().numpy() if isinstance(token_types, torch.Tensor) else token_types
+    ).reshape(-1)
+    n_slots = int((types == dsv41_image_tokens.IMAGE).sum())
+    rows_per_image = [
+        math.ceil(img.n_vit_h / downsample_ratio) * math.ceil(img.n_vit_w / downsample_ratio)
+        for img in image_inputs
+    ]
+    n_rows = int(sum(rows_per_image))
+    n_spans = len(dsv41_image_tokens.image_spans(types))
+    if n_slots != n_rows or n_spans != len(image_inputs):
+        raise ValueError(
+            f"Image span / image mismatch: token_types has {n_spans} spans with {n_slots} IMAGE slots "
+            f"but {len(image_inputs)} images yield {n_rows} aligner rows (per image: {rows_per_image}; "
+            f"ViT grids: {[(i.n_vit_h, i.n_vit_w) for i in image_inputs]}, downsample={downsample_ratio})."
+        )
+
+
+def vl_prefill_chunk(
+    model: dsv41_sft_model.Dsv41SftModel,
+    tok_t: torch.Tensor,
+    kv_cache: dict[str, Any],
+    types_chunk: torch.Tensor,
+    embeds_chunk: torch.Tensor,
+) -> torch.Tensor:
+    """One prefill chunk of a VL delta; identical on rank 0 and the followers.
+
+    Chunks that contain an image position take the `inputs_embeds` route (slices of the
+    `embed_with_images` result, so an image span may be split across chunks); chunks without
+    image positions use the exact round-1 call.
+    """
+    if bool((types_chunk >= 0).any()):
+        return model.forward_hidden_cached(
+            tok_t, kv_cache, token_types=types_chunk, inputs_embeds=embeds_chunk
+        )
+    return model.forward_hidden_cached(tok_t, kv_cache)
 
 
 class _FastTokenizerAdapter:
@@ -139,6 +269,14 @@ class _ActiveSeq:
     processed_ids: list[int] = field(default_factory=list)
     pending_logits: torch.Tensor | None = None
     cache_overshoot: bool = False
+    # E058 text+image prompts: per-position span types of the prompt prefix (`dsv41_image_tokens`,
+    # -1 = text; positions beyond the list are text) and the PNG bytes in prompt order.
+    token_types: list[int] | None = None
+    image_blobs: list[bytes] = field(default_factory=list)
+    image_digest: str = ""
+    # Set when the request was rejected at `enqueue` (e.g. over `max_images_per_prompt`); `step()`
+    # then reports it as finished with `finish_reason="error"` and never runs the model on it.
+    error: str | None = None
 
 
 @dataclass
@@ -185,16 +323,24 @@ class Dsv41DistributedStepEngine:
         tokenizer: _FastTokenizerAdapter,
         device: torch.device,
         max_model_len: int = 163840,
+        prefill_chunk: int = 4096,
+        max_images_per_prompt: int = 32,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.model_config = type("Cfg", (), {"max_model_len": max_model_len})()
         self.llm_engine = self
+        # Prefill chunk length (`--prefill_chunk_tokens`); tests shrink it to exercise chunking.
+        self.prefill_chunk = max(1, int(prefill_chunk))
+        # Serving cap on images per prompt (`--limit-mm-per-prompt {"image": N}`): prompts above it
+        # are rejected with an error, never truncated.
+        self.max_images_per_prompt = int(max_images_per_prompt)
         self._active: dict[str, _ActiveSeq] = {}
         self._req_counter = 0
         self._cache_slots: dict[int, dict[str, Any]] = {}
-        self._prefix_bank: list[tuple[int, list[int]]] = []
+        # (slot_id, cached token ids, image digest of the images embedded in that slot's KV).
+        self._prefix_bank: list[tuple[int, list[int], str]] = []
         self._next_slot_id = 1
         self._max_bank_size = 36
         # Engine-level throughput accounting (independent of harness turn completion)
@@ -204,6 +350,8 @@ class Dsv41DistributedStepEngine:
         self._prefill_tokens = 0
         self._prefill_time = 0.0
         self._prefill_calls = 0
+        self._vl_prefill_calls = 0
+        self._vl_images = 0
         self._engine_t0 = time.time()
         self._last_engine_log = time.time()
         self._open_chunk: tuple[Any, int, list[_ActiveSeq]] | None = None
@@ -226,7 +374,10 @@ class Dsv41DistributedStepEngine:
             stop_list = list(getattr(sp, "stop", None) or [])
             if havu_b32_harness.DS41_EOS_TOKEN not in stop_list:
                 stop_list.append(havu_b32_harness.DS41_EOS_TOKEN)
-            self._active[rid] = _ActiveSeq(
+            raw_types = p.get("token_types")
+            token_types = [int(t) for t in raw_types] if raw_types is not None else None
+            image_blobs = [bytes(b) for b in (p.get("images") or [])]
+            seq = _ActiveSeq(
                 request_id=rid,
                 prompt_token_ids=list(p["prompt_token_ids"]),
                 max_tokens=int(getattr(sp, "max_tokens", 64000)),
@@ -234,7 +385,35 @@ class Dsv41DistributedStepEngine:
                 top_p=float(getattr(sp, "top_p", 1.0)),
                 top_k=int(getattr(sp, "top_k", -1)),
                 stop_strings=stop_list,
+                token_types=token_types,
+                image_blobs=image_blobs,
+                image_digest=image_digest(image_blobs),
             )
+            # Harness contract: one image span in `token_types` per image, spans inside the prompt.
+            n_spans = (
+                len(dsv41_image_tokens.image_spans(np.asarray(token_types, dtype=np.int8)))
+                if token_types is not None
+                else 0
+            )
+            if n_spans != len(image_blobs):
+                raise ValueError(
+                    f"{rid}: token_types has {n_spans} image spans but {len(image_blobs)} images were given"
+                )
+            if token_types is not None and len(token_types) > len(seq.prompt_token_ids):
+                raise ValueError(
+                    f"{rid}: token_types ({len(token_types)}) longer than prompt ({len(seq.prompt_token_ids)})"
+                )
+            if len(image_blobs) > self.max_images_per_prompt:
+                # Mirrors vLLM's `--limit-mm-per-prompt` rejection: the request fails, the shard goes on.
+                seq.error = (
+                    f"prompt has {len(image_blobs)} images > max_images_per_prompt="
+                    f"{self.max_images_per_prompt}; request rejected (not truncated)"
+                )
+                seq.finished = True
+                seq.finish_reason = "error"
+                seq.prefilled = True
+                print(f"[ENGINE] {rid}: {seq.error}", flush=True)
+            self._active[rid] = seq
             rids.append(rid)
         return rids
 
@@ -246,7 +425,7 @@ class Dsv41DistributedStepEngine:
         is_dist = dist.is_initialized() and dist.get_world_size() > 1
         if is_dist:
             cmd = torch.tensor(
-                [4, slot_id, 0], dtype=torch.int64, device=self.device
+                [OP_EVICT, slot_id, 0], dtype=torch.int64, device=self.device
             )
             dist.broadcast(cmd, src=0)
 
@@ -256,28 +435,66 @@ class Dsv41DistributedStepEngine:
             if seq is not None and seq.slot_id > 0:
                 self._evict_slot(seq.slot_id)
 
+    @staticmethod
+    def _boundary_splits_image_span(token_types: list[int] | None, pos: int) -> bool:
+        """True if prompt position `pos` lies strictly inside an image span (START excluded)."""
+        if token_types is None or not 0 < pos < len(token_types):
+            return False
+        t = token_types[pos]
+        return t >= 0 and t != dsv41_image_tokens.IMAGE_START
+
+    @classmethod
+    def _prefix_images_compatible(
+        cls,
+        cached_digest: str,
+        c_len: int,
+        token_types: list[int] | None,
+        prompt_digest: str,
+    ) -> bool:
+        """Whether a cached prefix of `c_len` tokens may serve a prompt (ids already match).
+
+        Image spans carry the same `IMAGE_TOKEN_ID` everywhere, so identical ids never prove the
+        pixels agree: a cached slot that embedded images is only reused for the identical image list
+        (same sha256 over count/order/bytes); a text-only cached prefix is reused only if the new
+        prompt has no image position inside it; and the cached boundary must not split a span
+        (the delta is embedded with `embed_with_images`, which needs complete spans).
+        """
+        if cls._boundary_splits_image_span(token_types, c_len):
+            return False
+        if cached_digest == prompt_digest:
+            return True
+        if cached_digest:
+            return False  # cached KV holds other images
+        if token_types is None:
+            return True
+        return not any(t >= 0 for t in token_types[:c_len])
+
     def _acquire_slot_for_prompt(
-        self, prompt_ids: list[int]
+        self,
+        prompt_ids: list[int],
+        token_types: list[int] | None = None,
+        prompt_digest: str = "",
     ) -> tuple[int, list[int], list[int], int]:
         """Finds a matching prefix KV-cache slot or allocates a new slot (`op_code`: 1=append, 2=reset+prefill)."""
         best_idx = -1
         best_len = 0
-        for idx, (slot_id, cached_ids) in enumerate(self._prefix_bank):
+        for idx, (slot_id, cached_ids, cached_digest) in enumerate(self._prefix_bank):
             c_len = len(cached_ids)
             if (
                 0 < c_len < len(prompt_ids)
                 and c_len > best_len
                 and prompt_ids[:c_len] == cached_ids
+                and self._prefix_images_compatible(cached_digest, c_len, token_types, prompt_digest)
             ):
                 best_idx = idx
                 best_len = c_len
         if best_idx >= 0:
-            slot_id, cached_ids = self._prefix_bank.pop(best_idx)
-            return slot_id, list(cached_ids), prompt_ids[best_len:], 1
+            slot_id, cached_ids, _ = self._prefix_bank.pop(best_idx)
+            return slot_id, list(cached_ids), prompt_ids[best_len:], OP_APPEND
 
         active_slot_ids = {s.slot_id for s in self._active.values() if s.slot_id > 0}
         if len(self._prefix_bank) >= self._max_bank_size:
-            evicted_slot, _ = self._prefix_bank.pop(0)
+            evicted_slot, _, _ = self._prefix_bank.pop(0)
             if evicted_slot not in active_slot_ids:
                 slot_id = evicted_slot
             else:
@@ -287,24 +504,101 @@ class Dsv41DistributedStepEngine:
             slot_id = self._next_slot_id
             self._next_slot_id += 1
         self._cache_slots[slot_id] = {}
-        return slot_id, [], list(prompt_ids), 2
+        return slot_id, [], list(prompt_ids), OP_RESET
+
+    @staticmethod
+    def _delta_vl_inputs(
+        seq: _ActiveSeq, cached_len: int, delta_len: int
+    ) -> tuple[list[int] | None, list[bytes]]:
+        """`(token_types, images)` of the prompt tokens `[cached_len, cached_len + delta_len)`.
+
+        Returns `(None, [])` when the delta holds no image position (text-only prefill). Positions
+        past the end of `seq.token_types` are text (`-1`); only the images whose spans lie inside
+        the delta are returned (spans inside the reused prefix are already in the KV cache).
+        """
+        if seq.token_types is None or not seq.image_blobs:
+            return None, []
+        end = cached_len + delta_len
+        delta_types = [
+            int(seq.token_types[i]) if i < len(seq.token_types) else dsv41_image_tokens.TEXT
+            for i in range(cached_len, end)
+        ]
+        if not any(t >= 0 for t in delta_types):
+            return None, []
+        spans = dsv41_image_tokens.image_spans(np.asarray(seq.token_types, dtype=np.int8))
+        blobs: list[bytes] = []
+        for k, (s, e) in enumerate(spans):
+            if e <= cached_len:
+                continue  # fully inside the reused prefix
+            if s < cached_len or e > end:
+                raise ValueError(
+                    f"{seq.request_id}: image span {k} [{s}, {e}) is split by the prefill range "
+                    f"[{cached_len}, {end})"
+                )
+            blobs.append(seq.image_blobs[k])
+        return delta_types, blobs
 
     def _run_distributed_cached_forward(
-        self, op_code: int, slot_id: int, token_ids: list[int]
+        self,
+        op_code: int,
+        slot_id: int,
+        token_ids: list[int],
+        token_types: list[int] | None = None,
+        image_blobs: Sequence[bytes] | None = None,
     ) -> torch.Tensor:
-        """Broadcasts `(op_code, slot_id, seq_len)` + `token_ids` to Ranks 1..7 and returns last-token logits."""
+        """Prefills `token_ids` into `slot_id` on every rank and returns the last-token logits.
+
+        Text-only (`token_types` without image positions): per chunk, broadcasts
+        `(op_code, slot_id, seq_len)` + `token_ids` to Ranks 1..7 exactly like round 1.
+        VL deltas: `embed_with_images` runs ONCE over the whole delta on every rank (the ViT and
+        aligner are replicated), the delta ids/types/images are broadcast once with the first
+        chunk (`OP_VL_*`), and each chunk feeds its `inputs_embeds` slice, so chunking may split a
+        span. The chunk computation itself is `vl_prefill_chunk` on all ranks.
+        """
         is_dist = dist.is_initialized() and dist.get_world_size() > 1
-        if op_code == 2:
+        if op_code == OP_RESET:
             self._cache_slots[slot_id] = {}
         kv_cache = self._cache_slots.setdefault(slot_id, {})
+        n_tokens = len(token_ids)
 
-        # Chunk long prefills into 4096-token segments to bound activation memory
-        prefill_chunk = 4096
-        hidden_last: torch.Tensor | None = None
+        types_arr: np.ndarray | None = None
+        if token_types is not None:
+            types_arr = np.full(n_tokens, dsv41_image_tokens.TEXT, dtype=np.int64)
+            m = min(n_tokens, len(token_types))
+            types_arr[:m] = np.asarray(token_types[:m], dtype=np.int64)
+            if not bool((types_arr >= 0).any()):
+                types_arr = None
+        is_vl = types_arr is not None
+
         t_pf0 = time.time()
-        for start in range(0, len(token_ids), prefill_chunk):
-            sub_ids = token_ids[start : start + prefill_chunk]
-            sub_op = op_code if start == 0 else 1
+        h_full: torch.Tensor | None = None
+        types_t: torch.Tensor | None = None
+        ids_full_t: torch.Tensor | None = None
+        blobs: list[bytes] = []
+        if is_vl:
+            if self.model.vision is None:
+                raise ValueError(
+                    "Prompt contains image spans but the loaded checkpoint has no vision tower "
+                    "(text-only config); run with --grid_format=json or an image checkpoint."
+                )
+            blobs = [bytes(b) for b in (image_blobs or [])]
+            image_inputs = build_image_inputs(blobs, self.device)
+            check_image_slots(types_arr, image_inputs, self.model.cfg.vision_downsample_ratio)
+            ids_full_t = torch.tensor([token_ids], dtype=torch.long, device=self.device)
+            types_t = torch.from_numpy(types_arr).unsqueeze(0).to(self.device)
+            h_full = self.model.embed_with_images(ids_full_t, types_t, image_inputs)
+            self._vl_prefill_calls += 1
+            self._vl_images += len(blobs)
+
+        hidden_last: torch.Tensor | None = None
+        prefill_chunk = self.prefill_chunk
+        for start in range(0, n_tokens, prefill_chunk):
+            end = min(n_tokens, start + prefill_chunk)
+            sub_ids = token_ids[start:end]
+            if is_vl:
+                sub_op = (op_code + VL_OP_OFFSET) if start == 0 else OP_VL_CONT
+            else:
+                sub_op = op_code if start == 0 else OP_APPEND
             cmd = torch.tensor(
                 [sub_op, slot_id, len(sub_ids)],
                 dtype=torch.int64,
@@ -312,11 +606,31 @@ class Dsv41DistributedStepEngine:
             )
             if is_dist:
                 dist.broadcast(cmd, src=0)
+                if is_vl and start == 0:
+                    assert ids_full_t is not None and types_t is not None
+                    hdr = torch.tensor(
+                        [n_tokens, len(blobs)], dtype=torch.int64, device=self.device
+                    )
+                    dist.broadcast(hdr, src=0)
+                    dist.broadcast(ids_full_t, src=0)
+                    dist.broadcast(types_t, src=0)
+                    dist.broadcast_object_list([blobs], src=0, device=self.device)
             tok_t = torch.tensor([sub_ids], dtype=torch.long, device=self.device)
             if is_dist:
                 dist.broadcast(tok_t, src=0)
-            hidden = self.model.forward_hidden_cached(tok_t, kv_cache)
+            if is_vl:
+                assert h_full is not None and types_t is not None
+                hidden = vl_prefill_chunk(
+                    self.model,
+                    tok_t,
+                    kv_cache,
+                    types_t[:, start:end],
+                    h_full[:, start:end],
+                )
+            else:
+                hidden = self.model.forward_hidden_cached(tok_t, kv_cache)
             hidden_last = hidden[:, -1, :]
+        del h_full
 
         assert hidden_last is not None
         logits = self.model.head(hidden_last.to(self.model.head.weight.dtype)).float()[0]
@@ -340,7 +654,8 @@ class Dsv41DistributedStepEngine:
             f"[ENGINE] decode: {self._decode_tokens} tok in {self._decode_time:.1f}s "
             f"({dec_tps:.1f} tok/s, {step_ms:.0f} ms/step, {self._decode_steps} steps) | "
             f"prefill: {self._prefill_tokens} tok in {self._prefill_time:.1f}s "
-            f"({pf_tps:.0f} tok/s, {self._prefill_calls} calls) | "
+            f"({pf_tps:.0f} tok/s, {self._prefill_calls} calls, "
+            f"{self._vl_prefill_calls} with images / {self._vl_images} images) | "
             f"active={len(self._active)} slots={len(self._cache_slots)} "
             f"bank={len(self._prefix_bank)} rollbacks={self._rollback_streams} | wall={wall/60:.1f}m",
             flush=True,
@@ -570,17 +885,37 @@ class Dsv41DistributedStepEngine:
         if not self._active:
             return []
         eos_id = self.tokenizer.eos_token_id
+        outputs: list[_MockRequestOutput] = []
+
+        # 0. Requests rejected at `enqueue` (over `max_images_per_prompt`): report them finished with
+        #    `finish_reason="error"` (the harness records an errored attempt) without touching the model.
+        for seq in list(self._active.values()):
+            if seq.error is not None and seq.finished:
+                self._active.pop(seq.request_id, None)
+                outputs.append(
+                    _MockRequestOutput(
+                        request_id=seq.request_id,
+                        prompt_token_ids=seq.prompt_token_ids,
+                        outputs=[_MockCompletionOutput(text="", token_ids=[], finish_reason="error")],
+                        finished=True,
+                    )
+                )
 
         # 1. Prefill any newly enqueued sequences so they join the active decode batch immediately
         for seq in list(self._active.values()):
             if not seq.prefilled:
-                slot_id, cached_ids, delta_ids, op_code = (
-                    self._acquire_slot_for_prompt(seq.prompt_token_ids)
+                slot_id, cached_ids, delta_ids, op_code = self._acquire_slot_for_prompt(
+                    seq.prompt_token_ids, seq.token_types, seq.image_digest
                 )
                 seq.slot_id = slot_id
                 seq.processed_ids = cached_ids
+                # Only the tokens past the reused prefix are embedded/prefilled; their span types
+                # and the images inside that range come from the prompt's `token_types`.
+                delta_types, delta_blobs = self._delta_vl_inputs(
+                    seq, len(cached_ids), len(delta_ids)
+                )
                 seq.pending_logits = self._run_distributed_cached_forward(
-                    op_code, slot_id, delta_ids
+                    op_code, slot_id, delta_ids, delta_types, delta_blobs
                 )
                 seq.processed_ids.extend(delta_ids)
                 seq.prefilled = True
@@ -589,7 +924,7 @@ class Dsv41DistributedStepEngine:
             s for s in self._active.values() if s.prefilled and not s.finished
         ]
         if not active_seqs:
-            return []
+            return outputs
 
         min_rem = min(
             max(1, s.max_tokens - len(s.generated_ids)) for s in active_seqs
@@ -601,7 +936,6 @@ class Dsv41DistributedStepEngine:
 
         fwd_steps = max(0, chunk_steps - 1)
         kept_new: dict[str, int] = {}
-        outputs: list[_MockRequestOutput] = []
         for seq, new_tokens in zip(active_seqs, sampled_batch):
             prev_len = len(seq.generated_ids)
             hit_eos_idx = -1
@@ -701,7 +1035,7 @@ class Dsv41DistributedStepEngine:
                     )
                     if valid_cached_len == len(seq.processed_ids) and not seq.cache_overshoot:
                         self._prefix_bank.append(
-                            (seq.slot_id, list(seq.processed_ids))
+                            (seq.slot_id, list(seq.processed_ids), seq.image_digest)
                         )
                         active_slot_ids = {
                             s.slot_id
@@ -709,7 +1043,7 @@ class Dsv41DistributedStepEngine:
                             if s.slot_id > 0
                         }
                         while len(self._prefix_bank) > self._max_bank_size:
-                            old_slot, _ = self._prefix_bank.pop(0)
+                            old_slot, _, _ = self._prefix_bank.pop(0)
                             if (
                                 old_slot != seq.slot_id
                                 and old_slot not in active_slot_ids
@@ -721,24 +1055,41 @@ class Dsv41DistributedStepEngine:
         return outputs
 
 
+@dataclass
+class _FollowerVlDelta:
+    """Follower-side state of the VL delta currently being prefilled (`OP_VL_*` ops)."""
+
+    slot_id: int
+    delta_len: int
+    types_t: torch.Tensor  # [1, delta_len]
+    h_full: torch.Tensor  # [1, delta_len, dim] from `embed_with_images`
+    offset: int = 0
+
+
 def _follower_worker_loop(
     model: dsv41_sft_model.Dsv41SftModel,
     device: torch.device,
+    cache_slots: dict[int, dict[str, Any]] | None = None,
 ) -> None:
-    """Ranks 1..7 participate in KV-cached expert-parallel all-reduces until Rank 0 broadcasts cmd[0] == 0."""
-    cache_slots: dict[int, dict[str, Any]] = {}
+    """Ranks 1..7 participate in KV-cached expert-parallel all-reduces until Rank 0 broadcasts cmd[0] == 0.
+
+    `cache_slots` may be injected (tests) to inspect the follower's KV caches afterwards.
+    """
+    if cache_slots is None:
+        cache_slots = {}
+    vl_delta: _FollowerVlDelta | None = None
     with torch.no_grad():
         while True:
             cmd = torch.zeros(3, dtype=torch.int64, device=device)
             dist.broadcast(cmd, src=0)
             op_code = int(cmd[0].item())
-            if op_code == 0:
+            if op_code == OP_STOP:
                 break
-            if op_code == 4:
+            if op_code == OP_EVICT:
                 slot_id = int(cmd[1].item())
                 cache_slots.pop(slot_id, None)
                 continue
-            if op_code == 3:
+            if op_code == OP_DECODE:
                 bsz = int(cmd[1].item())
                 fwd_steps = int(cmd[2].item())
                 slots_t = torch.empty(bsz, dtype=torch.int64, device=device)
@@ -770,7 +1121,64 @@ def _follower_worker_loop(
                 continue
             slot_id = int(cmd[1].item())
             seq_len = int(cmd[2].item())
-            if op_code == 2:
+            if op_code in (OP_VL_APPEND, OP_VL_RESET, OP_VL_CONT):
+                # E058 VL prefill: the delta payload arrives once (first chunk); every rank runs the
+                # replicated ViT + aligner itself and then feeds per-chunk `inputs_embeds` slices.
+                if op_code != OP_VL_CONT:
+                    if op_code == OP_VL_RESET:
+                        cache_slots[slot_id] = {}
+                    hdr = torch.zeros(2, dtype=torch.int64, device=device)
+                    dist.broadcast(hdr, src=0)
+                    delta_len, n_images = int(hdr[0].item()), int(hdr[1].item())
+                    delta_ids = torch.empty((1, delta_len), dtype=torch.long, device=device)
+                    dist.broadcast(delta_ids, src=0)
+                    delta_types = torch.empty((1, delta_len), dtype=torch.int64, device=device)
+                    dist.broadcast(delta_types, src=0)
+                    obj: list[Any] = [None]
+                    dist.broadcast_object_list(obj, src=0, device=device)
+                    blobs = [bytes(b) for b in (obj[0] or [])]
+                    if len(blobs) != n_images:
+                        raise RuntimeError(
+                            f"follower received {len(blobs)} images, header announced {n_images}"
+                        )
+                    if model.vision is None:
+                        raise ValueError(
+                            "Prompt contains image spans but the loaded checkpoint has no vision tower."
+                        )
+                    image_inputs = build_image_inputs(blobs, device)
+                    check_image_slots(delta_types, image_inputs, model.cfg.vision_downsample_ratio)
+                    vl_delta = _FollowerVlDelta(
+                        slot_id=slot_id,
+                        delta_len=delta_len,
+                        types_t=delta_types,
+                        h_full=model.embed_with_images(delta_ids, delta_types, image_inputs),
+                    )
+                elif vl_delta is None or vl_delta.slot_id != slot_id:
+                    raise RuntimeError(
+                        f"OP_VL_CONT for slot {slot_id} without an open VL delta "
+                        f"(open: {None if vl_delta is None else vl_delta.slot_id})"
+                    )
+                assert vl_delta is not None
+                kv_cache = cache_slots.setdefault(slot_id, {})
+                tok_t = torch.empty((1, seq_len), dtype=torch.long, device=device)
+                dist.broadcast(tok_t, src=0)
+                off = vl_delta.offset
+                if off + seq_len > vl_delta.delta_len:
+                    raise RuntimeError(
+                        f"VL chunk [{off}, {off + seq_len}) exceeds delta length {vl_delta.delta_len}"
+                    )
+                _ = vl_prefill_chunk(
+                    model,
+                    tok_t,
+                    kv_cache,
+                    vl_delta.types_t[:, off : off + seq_len],
+                    vl_delta.h_full[:, off : off + seq_len],
+                )
+                vl_delta.offset += seq_len
+                if vl_delta.offset >= vl_delta.delta_len:
+                    vl_delta = None  # frees `h_full`
+                continue
+            if op_code == OP_RESET:
                 cache_slots[slot_id] = {}
             kv_cache = cache_slots.setdefault(slot_id, {})
             tok_t = torch.empty((1, seq_len), dtype=torch.long, device=device)
@@ -790,9 +1198,10 @@ def _wait_for_exported_checkpoint(ckpt_dir: str, timeout_hours: int) -> dict[str
     """
     marker = os.path.join(ckpt_dir, "EXPORT_COMPLETED.json")
     is_trainer_export = "/export_2bit/" in (ckpt_dir.rstrip("/") + "/")
-    static_required = [
-        os.path.join(ckpt_dir, "model-00001-of-00002.safetensors"),
-        os.path.join(ckpt_dir, "model-00002-of-00002.safetensors"),
+    # Backbone shards come from `model.safetensors.index.json` (legacy `model-0000N-of-00002` text
+    # checkpoints as well as the 3-shard `model-0000N.safetensors` image checkpoints).
+    backbone_shards = dsv41_sft_model._list_backbone_shards(ckpt_dir)  # pylint: disable=protected-access
+    static_required = [os.path.join(ckpt_dir, s) for s in backbone_shards] + [
         os.path.join(ckpt_dir, "model.safetensors.index.json"),
         os.path.join(ckpt_dir, "config.json"),
         os.path.join(ckpt_dir, "tokenizer.json"),
@@ -870,6 +1279,25 @@ def _worker_main(rank: int, world_size: int) -> None:
         cfg.qat_trainable_expert_scales = False
         cfg.load_compact_engram = FLAGS.load_compact_engram
         cfg.max_seq_len = 163840
+        # E058 text+image needs the vision tower (`vision_config` present and not `e043_pruning.text_only`).
+        # `from_json_dict` keeps it enabled for the image base model and disabled for the text-only E043
+        # export; refuse to start (on every rank, before loading 10+ GB) instead of silently running the
+        # image spans on the placeholder text embedding.
+        if FLAGS.grid_format == "text+image" and not cfg.vision_enabled:
+            raise RuntimeError(
+                f"--grid_format=text+image requires a checkpoint with a vision tower, but {cfg_path} is "
+                "text-only (no `vision_config` or `e043_pruning.text_only=true`). Use the image base model "
+                "(e.g. /cns/lu-d/home/arazdai/kaggle/models/dsv41_img_e128_2bit_causal) or --grid_format=json."
+            )
+        if rank == 0:
+            print(
+                f"[eval_dsv41_b32_arc2] prompt format: grid_format={FLAGS.grid_format} "
+                f"image_cell={FLAGS.image_cell} image_note={FLAGS.image_note!r} "
+                f"max_images_per_prompt={FLAGS.max_images_per_prompt} "
+                f"prefill_chunk_tokens={FLAGS.prefill_chunk_tokens} | vision_enabled={cfg.vision_enabled} "
+                f"(vision_n_layers={cfg.vision_n_layers}) from {cfg_path}",
+                flush=True,
+            )
 
         with torch.device(device):
             model = dsv41_sft_model.Dsv41SftModel(
@@ -902,17 +1330,34 @@ def _worker_main(rank: int, world_size: int) -> None:
                 tokenizer=tok,
                 device=device,
                 max_model_len=cfg.max_seq_len,
+                prefill_chunk=FLAGS.prefill_chunk_tokens,
+                max_images_per_prompt=FLAGS.max_images_per_prompt,
             )
             base_cfg = prompts_and_selector.PILOT2_HYPOTHESES["havu_b32"]
+            is_image_run = FLAGS.grid_format == "text+image"
+            exp_suffix = "_img" if is_image_run else ""
+            title_suffix = (
+                f" + E058 images (cell={FLAGS.image_cell or 'aligned'}, note={FLAGS.image_note or 'default'})"
+                if is_image_run
+                else ""
+            )
             eval_cfg = prompts_and_selector.Pilot2HypothesisConfig(
                 **{
                     **base_cfg.__dict__,
-                    "exp_id": f"dsv41_e128_b32_{FLAGS.milestone_tag}",
-                    "title": f"DeepSeek-V4.1 E128 QAT SFT ({FLAGS.milestone_tag}) + Havu Candidate B32",
+                    "exp_id": f"dsv41_e128_b32_{FLAGS.milestone_tag}{exp_suffix}",
+                    "title": (
+                        f"DeepSeek-V4.1 E128 QAT SFT ({FLAGS.milestone_tag}) + Havu Candidate B32"
+                        + title_suffix
+                    ),
                     "num_attempts": FLAGS.num_attempts,
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": -1,
+                    # E058 prompt format -> `havu_b32_harness._create_attempt_state` (prompt builder)
+                    # and the per-shard config/summary json.
+                    "grid_format": FLAGS.grid_format,
+                    "image_cell": FLAGS.image_cell,
+                    "image_note": FLAGS.image_note,
                 }
             )
             try:
@@ -954,6 +1399,13 @@ def _serialize_eval_flags_for_children() -> list[str]:
         "load_compact_engram",
         "poll_for_checkpoint",
         "poll_timeout_hours",
+        # E058 text+image prompt format + serving caps (every rank needs them: the followers
+        # replicate the vision tower and rank 0 builds the harness cfg from them).
+        "grid_format",
+        "image_cell",
+        "image_note",
+        "max_images_per_prompt",
+        "prefill_chunk_tokens",
     ]
     args: list[str] = [
         "--undefok=cfs_d_cid_enable,cfs_d_resource_user_override,cfs_default_traffic_class,cfs_max_write_bytes_inflight",

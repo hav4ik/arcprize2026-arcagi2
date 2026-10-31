@@ -110,13 +110,47 @@ flags.DEFINE_string(
     "Explicit step-XXXXX[-tag] checkpoint directory to resume from (overrides auto_resume discovery).",
 )
 flags.DEFINE_integer("resume_lr_rewarmup_steps", 4, "Linear LR re-warm-up steps after a resume (0 disables).")
+# ---- Round-2 (image checkpoint + QAT) flags; defaults reproduce round-1 behaviour ----
+flags.DEFINE_float("lora_learning_rate", 0.0, "Peak LR for routed-expert LoRA A/B (0 = learning_rate).")
+flags.DEFINE_float("scale_learning_rate", 0.0, "Peak LR for the trainable 2-bit group scales (0 = learning_rate).")
+flags.DEFINE_enum(
+    "train_vision",
+    "none",
+    ["none", "aligner", "aligner+last_k", "all"],
+    "Vision-tower training tier (image checkpoints only).",
+)
+flags.DEFINE_integer("vision_trainable_blocks", 8, "Trailing ViT blocks trained under --train_vision=aligner+last_k.")
+flags.DEFINE_float("vision_learning_rate", 0.0, "Peak LR for ViT blocks (0 = learning_rate).")
+flags.DEFINE_float("aligner_learning_rate", 0.0, "Peak LR for aligner + image delimiter embeddings (0 = learning_rate).")
+flags.DEFINE_bool("disable_vision", False, "Force the text-only path even if the checkpoint has a vision tower.")
+flags.DEFINE_string(
+    "engram_model_dir",
+    "",
+    "Directory holding the 16 compact Engram shards when dsv41_model_dir ships none (empty = auto fallback).",
+)
+flags.DEFINE_bool("global_grad_clip", True, "Clip on the global (all-rank) gradient norm.")
+flags.DEFINE_bool("allow_non_qat_export", False, "Allow milestone 2-bit exports with --enable_qat=false (not recommended).")
+flags.DEFINE_bool("pilot_longest_batches_first", False, "Pilot aid: run the longest batches first (peak-VRAM gate).")
+flags.DEFINE_integer(
+    "num_nodes",
+    1,
+    "Number of 8x B200 nodes per work unit (1 = 8x B200 EP=8; 2 = 16x B200 DP=2 x EP=8).",
+)
+flags.DEFINE_string(
+    "attribution_url",
+    "rh/efforts/419617",
+    "Research Hub attribution URL for deepmind-dynamic / XManager launches.",
+)
 
 
 def main(argv: list[str]) -> None:
     if len(argv) > 1:
         raise app.UsageError(f"Unknown arguments: {argv[1:]}")
 
-    with xm_abc.create_experiment(experiment_title=FLAGS.exp_name) as experiment:
+    attrib = [FLAGS.attribution_url] if FLAGS.attribution_url else None
+    with xm_abc.create_experiment(
+        experiment_title=FLAGS.exp_name, attribution_urls=attrib
+    ) as experiment:
         reqs = xm.JobRequirements(
             b200=FLAGS.num_b200,
             cpu=FLAGS.cpu_cores,
@@ -184,28 +218,59 @@ def main(argv: list[str]) -> None:
                 "auto_resume": FLAGS.auto_resume,
                 "resume_from_checkpoint_dir": FLAGS.resume_from_checkpoint_dir,
                 "resume_lr_rewarmup_steps": FLAGS.resume_lr_rewarmup_steps,
+                "lora_learning_rate": FLAGS.lora_learning_rate,
+                "scale_learning_rate": FLAGS.scale_learning_rate,
+                "train_vision": FLAGS.train_vision,
+                "vision_trainable_blocks": FLAGS.vision_trainable_blocks,
+                "vision_learning_rate": FLAGS.vision_learning_rate,
+                "aligner_learning_rate": FLAGS.aligner_learning_rate,
+                "disable_vision": FLAGS.disable_vision,
+                "engram_model_dir": FLAGS.engram_model_dir,
+                "global_grad_clip": FLAGS.global_grad_clip,
+                "allow_non_qat_export": FLAGS.allow_non_qat_export,
+                "pilot_longest_batches_first": FLAGS.pilot_longest_batches_first,
             }
-            wu.add(
-                xm.Job(
-                    executable=train_pkg,
-                    executor=executor,
-                    args=job_args,
-                    env_vars={
-                        "PYTHONUNBUFFERED": "1",
-                        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                        "TOKENIZERS_PARALLELISM": "false",
-                        "TORCHINDUCTOR_COMPILE_THREADS": "1",
-                    },
+            env_vars = {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "TOKENIZERS_PARALLELISM": "false",
+                "TORCHINDUCTOR_COMPILE_THREADS": "1",
+            }
+            num_nodes = max(1, int(FLAGS.num_nodes))
+            if num_nodes == 1:
+                wu.add(
+                    xm.Job(
+                        executable=train_pkg,
+                        executor=executor,
+                        args=job_args,
+                        env_vars=env_vars,
+                    )
                 )
-            )
+            else:
+                jobs = {}
+                for n_rank in range(num_nodes):
+                    node_args = dict(job_args)
+                    node_args["num_nodes"] = num_nodes
+                    node_args["node_rank"] = n_rank
+                    jobs[f"node_{n_rank}"] = xm.Job(
+                        executable=train_pkg,
+                        executor=executor,
+                        args=node_args,
+                        env_vars=env_vars,
+                    )
+                wu.add(xm.JobGroup(**jobs))
 
         experiment.add(
             run_dsv41_sft_job,
             args={
                 "lr": FLAGS.learning_rate,
+                "lora_lr": FLAGS.lora_learning_rate,
+                "scale_lr": FLAGS.scale_learning_rate,
+                "train_vision": FLAGS.train_vision,
                 "grad_accum": FLAGS.grad_accum_steps,
                 "max_seq_len": FLAGS.max_seq_len,
                 "num_b200": FLAGS.num_b200,
+                "num_nodes": FLAGS.num_nodes,
                 "expert_lora_r": FLAGS.routed_expert_lora_r,
                 "enable_qat": FLAGS.enable_qat,
                 "qat_kl_weight": FLAGS.qat_kl_weight,

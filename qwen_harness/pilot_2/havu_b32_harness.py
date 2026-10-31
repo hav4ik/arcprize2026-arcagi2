@@ -46,9 +46,11 @@ import time
 import uuid
 from typing import Any, Callable
 
+from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import grid_image
 from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import havu_auto_repair
 from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import havu_sandbox_zygote
 from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import prompts_and_selector
+from google3.experimental.users.arazdai.kaggle.sft import dsv41_image_tokens
 from google3.pyglib import gfile
 
 
@@ -316,8 +318,30 @@ def render_system_dsv41(
   return s
 
 
-def render_user_dsv41(content: str) -> str:
-  return f"{DS41_USER_SP_TOKEN}{content}"
+def user_content_to_dsml_text(content: Any) -> str:
+  """Plain text of a user message for DSML rendering.
+
+  Strings pass through. OpenAI-style content parts (E058 text+image prompts) are rendered exactly
+  like DeepSeek's `encoding.py::process_image_messages`: every `image_url` part becomes the
+  `<｜deepseek_image｜>` placeholder (one token; expanded to its image span at tokenization time)
+  and the text parts are joined with `"\\n\\n"`.
+  """
+  if isinstance(content, str):
+    return content
+  texts: list[str] = []
+  for part in content:
+    ptype = part.get("type")
+    if ptype == "text":
+      texts.append(part.get("text", ""))
+    elif ptype in ("image_url", "image"):
+      texts.append(dsv41_image_tokens.IMAGE_PLACEHOLDER)
+    else:
+      raise ValueError(f"Unsupported user content part type: {ptype!r}")
+  return "\n\n".join(texts)
+
+
+def render_user_dsv41(content: Any) -> str:
+  return f"{DS41_USER_SP_TOKEN}{user_content_to_dsml_text(content)}"
 
 
 def render_tool_responses_dsv41(outputs: list[str]) -> str:
@@ -1914,6 +1938,11 @@ class HavuAttemptState:
           "eos_continues": 0,
       }
   )
+  # E058 text+image prompts: PNG bytes of the first user message's images (prompt order) and
+  # the per-position image-span types of `prompt_token_ids` (`dsv41_image_tokens`; positions past
+  # the end of the list are text). Empty / None for the text harness.
+  image_blobs: list[bytes] = dataclasses.field(default_factory=list)
+  token_types: list[int] | None = None
 
   # Turn & tool tracking
   n_turns: int = 0
@@ -2091,6 +2120,24 @@ def _create_attempt_state(
     )
   del tools_spec
 
+  # E058 `--grid-format text+image --image-cell 0`: same JSON prompt + IMAGE_NOTE, then one
+  # labelled image per grid (train inputs/outputs, then test inputs) as OpenAI content parts.
+  grid_format = getattr(cfg, "grid_format", "json")
+  if grid_format == "text+image":
+    user_content: Any = grid_image.text_image_content(
+        user_prompt,
+        task_spec.train_pairs,
+        all_inputs,
+        cell=int(getattr(cfg, "image_cell", 0)),
+        note=grid_image.IMAGE_NOTES[getattr(cfg, "image_note", "")],
+    )
+    image_blobs = grid_image.content_images(user_content)
+  elif grid_format == "json":
+    user_content = user_prompt
+    image_blobs = []
+  else:
+    raise ValueError(f"Unsupported grid_format: {grid_format!r}")
+
   def prelude_fn(inps: list[Grid]) -> str:
     return inputs_prelude(inps)
 
@@ -2122,11 +2169,12 @@ def _create_attempt_state(
       max_total_output=max_total_output,
       budget_soft=budget_soft,
       system_block=system_block,
-      messages=[{"role": "user", "content": user_prompt}],
+      messages=[{"role": "user", "content": user_content}],
       session=session,
       all_inputs=all_inputs,
       multi=multi,
       prelude_fn=prelude_fn,
+      image_blobs=image_blobs,
   )
 
 
@@ -2590,6 +2638,12 @@ def run_havu_b32_shard(
       vllm.__dict__["SamplingParams"] = _FallbackSamplingParams
 
   fb = prompts_and_selector.FROZEN_BASELINE_CONFIG
+  # E058 prompt format (text harness: json / 0 / ""), written to every per-shard artifact.
+  prompt_format = {
+      "grid_format": getattr(cfg, "grid_format", "json"),
+      "image_cell": int(getattr(cfg, "image_cell", 0)),
+      "image_note": getattr(cfg, "image_note", ""),
+  }
   gfile.MakeDirs(out_dir)
   shard_tag = f"shard_{shard_index:02d}_of_{num_shards:02d}"
   config_path = os.path.join(out_dir, f"config_{shard_tag}.json")
@@ -2612,6 +2666,7 @@ def run_havu_b32_shard(
       {
           "harness": "havu_candidate_b32",
           "hypothesis_config": dataclasses.asdict(cfg),
+          "prompt_format": prompt_format,
           "b32_params": {
               "multi_test": True,
               "multi_budget": 0.5,
@@ -2637,6 +2692,7 @@ def run_havu_b32_shard(
               "loop_window": LOOP_WINDOW,
               "loop_ratio": LOOP_RATIO,
               "loop_confirm": LOOP_CONFIRM,
+              **prompt_format,
           },
           "shard_index": shard_index,
           "num_shards": num_shards,
@@ -2658,7 +2714,8 @@ def run_havu_b32_shard(
   print(
       f"[havu_b32] Starting {cfg.exp_id} ({cfg.title}) | {shard_tag} | "
       f"shard_tasks={len(shard_tasks)} ({total_pairs_in_shard} pairs), "
-      f"todo_tasks={len(todo_tasks_sorted)} | num_attempts={cfg.num_attempts}",
+      f"todo_tasks={len(todo_tasks_sorted)} | num_attempts={cfg.num_attempts} | "
+      f"prompt_format={prompt_format}",
       flush=True,
   )
   if not todo_tasks_sorted:
@@ -2685,6 +2742,11 @@ def run_havu_b32_shard(
       or "dsv41" in cfg.exp_id.lower()
       or (len(dsv41_eos_probe) == 1 and len(qwen_eos_probe) > 1)
   )
+  if prompt_format["grid_format"] == "text+image" and not is_dsv41_model:
+    raise ValueError(
+        "grid_format='text+image' (E058) is only implemented for DeepSeek-V4.1 DSML prompts "
+        "(`<｜deepseek_image｜>` placeholder expansion); the Qwen ChatML path has no image route."
+    )
   stop_str = DS41_EOS_TOKEN if is_dsv41_model else "<|im_end|>"
   tc_open_str = DS41_TC_OPEN if is_dsv41_model else "<tool_call>"
 
@@ -2761,6 +2823,14 @@ def run_havu_b32_shard(
         if st.prompt_token_ids is not None and st.resync:
           st.tok_stats["resyncs"] += 1
         st.prompt_token_ids = encode_fn(full_chatml)
+        st.token_types = None
+        if st.image_blobs:
+          # E058: each `<｜deepseek_image｜>` placeholder -> its image span (`dsv41_image_tokens`).
+          ids_np, types_np, _, _ = dsv41_image_tokens.expand_image_placeholders(
+              st.prompt_token_ids, st.image_blobs
+          )
+          st.prompt_token_ids = ids_np.tolist()
+          st.token_types = types_np.tolist()
         st.resync = False
       st.n_turns += 1
       st.eos_continues_this_turn = 0
@@ -2813,7 +2883,11 @@ def run_havu_b32_shard(
     sp.output_kind = cumulative_kind
     if hasattr(sp, "stream_interval"):
       sp.stream_interval = 250
-    rids = llm.enqueue([{"prompt_token_ids": send_ids}], [sp], use_tqdm=False)
+    prompt_req: dict[str, Any] = {"prompt_token_ids": send_ids}
+    if st.image_blobs and st.token_types is not None:
+      prompt_req["token_types"] = st.token_types
+      prompt_req["images"] = st.image_blobs
+    rids = llm.enqueue([prompt_req], [sp], use_tqdm=False)
     internal = str(rids[0])
     external = internal.rsplit("-", 1)[0] if "-" in internal else internal
     st.active_internal_rid = internal
@@ -2868,6 +2942,7 @@ def run_havu_b32_shard(
             "exp_id": cfg.exp_id,
             "title": cfg.title,
             "harness": "havu_candidate_b32",
+            "prompt_format": prompt_format,
             "shard_index": shard_index,
             "num_shards": num_shards,
             "status": status_str,
@@ -2946,6 +3021,8 @@ def run_havu_b32_shard(
                 "completion": st.cum_completion_tokens,
             },
             "wall_s": st.wall_s,
+            "grid_format": prompt_format["grid_format"],
+            "prompt_images": len(st.image_blobs),
             **st.labels,
         }
         if st.multi:
@@ -2961,6 +3038,8 @@ def run_havu_b32_shard(
               "task_id": t_spec.task_id,
               "attempt_idx": st.attempt_idx,
               "multi_test": st.multi,
+              "prompt_format": prompt_format,
+              "prompt_images": len(st.image_blobs),
               "stop_reason": st.stop_reason,
               "turns": st.n_turns,
               "cum_gen_tokens": st.cum_completion_tokens,

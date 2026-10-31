@@ -6,6 +6,14 @@ Round-2 additions (all opt-in via flags; defaults reproduce the round-1 E031 dat
   * `--max_per_parent_vu` / `--max_per_task_top10k`: cap near-duplicate trajectories, keeping the SHORTEST verified ones.
   * `--upsample_arc2_train`: replicate real ARC-AGI-2 training-task trajectories in the TRAIN split only.
   * `--tier_weights`: stochastic per-tier up/down-sampling of Top-10K rows in the TRAIN split only.
+
+E065 text+image rollouts (`--subset=e065_images|e065_text|e065_all`, DeepSeek-V4.1 only):
+  * rows are de-duplicated per rollout (`pair==0`, `correct_all` over all test pairs), `error` rows dropped, and
+    verified := correct_all & train_pass & answer_source=='submit' & stop_reason=='submitted';
+  * image prompts are rendered with one `<｜deepseek_image｜>` placeholder per image, expanded to the full image
+    span at tokenization time (`--max_seq_len` applies to the EXPANDED length; `--max_images_per_sample` caps images);
+  * `{split}_tokens.npz` gains a flat int8 `token_types` array (-1 text, 0..3 image span types) and a sidecar
+    `{split}_images.pkl` (list aligned with the split's trajectories; each element a list of PNG bytes).
 """
 
 from __future__ import annotations
@@ -14,6 +22,7 @@ from collections import Counter
 import io
 import json
 import os
+import pickle
 import time
 from typing import Any
 
@@ -23,6 +32,7 @@ import numpy as np
 import transformers
 
 from google3.experimental.users.arazdai.kaggle.sft import data_pipeline
+from google3.experimental.users.arazdai.kaggle.sft import dsv41_image_tokens
 from google3.pyglib import gfile
 
 FLAGS = flags.FLAGS
@@ -65,8 +75,26 @@ flags.DEFINE_string(
 flags.DEFINE_enum(
     "subset",
     "e031",
-    ["e031", "all", "top10k_v8", "all_with_top10k_v8"],
-    "Which rollout files to include in the SFT dataset: 'e031', 'all', 'top10k_v8', or 'all_with_top10k_v8'.",
+    ["e031", "all", "top10k_v8", "all_with_top10k_v8", "e065_images", "e065_text", "e065_all"],
+    "Which rollout files to include in the SFT dataset: 'e031', 'all', 'top10k_v8', 'all_with_top10k_v8', "
+    "or the E065 text+image sets 'e065_images', 'e065_text', 'e065_all' (images + text twins).",
+)
+flags.DEFINE_string(
+    "e065_rollouts_dir",
+    "/cns/lu-d/home/arazdai/kaggle/arc_sft_data/livobereshka_e065_rollouts/rollouts",
+    "CNS directory containing the six E065 parquet files (e065_{images,text}_{arc2_train,nvarc_b0,nvarc_b1}.parquet).",
+)
+flags.DEFINE_string(
+    "e065_manifest_path",
+    "/cns/lu-d/home/arazdai/kaggle/arc_sft_data/livobereshka_e065_rollouts/tasks/manifest.jsonl",
+    "E065 tasks/manifest.jsonl (parent fallback, n_train, expected test pairs). Empty or missing = not used.",
+)
+flags.DEFINE_string(
+    "e065_extra_rollouts_dir",
+    "",
+    "Optional CNS directory containing corrected+rewritten E065 rollout parquet shards "
+    "(e.g. /cns/lu-d/home/arazdai/kaggle/arc_sft_data/e065_hardest_rollouts/corrected_rewritten/shards) "
+    "to include alongside e065_rollouts_dir when --subset in ('e065_images', 'e065_all').",
 )
 flags.DEFINE_integer(
     "max_seq_len",
@@ -172,6 +200,16 @@ flags.DEFINE_integer(
     5,
     "Token-level loss weight multiplier for the final submit_answer turn in DeepSeek-V4.1 SFT.",
 )
+flags.DEFINE_integer(
+    "max_images_per_sample",
+    32,
+    "Drop rollouts carrying more than this many images (serving cap of the image harness; 0 = off).",
+)
+flags.DEFINE_integer(
+    "max_records_per_file",
+    0,
+    "Smoke-run aid: only read the first N rows of every rollout file (0 = all rows).",
+)
 
 E031_PARQUETS = (
     "e031_arc2_train.parquet",
@@ -186,6 +224,21 @@ ALL_PARQUETS = (
     "e038_openrouter_deepinfra_b1r.parquet",
 )
 
+# E065: E058 image harness rollouts ("images") and their E046 text-only twins ("text") of the same tasks.
+E065_IMAGE_PARQUETS = (
+    "e065_images_arc2_train.parquet",
+    "e065_images_nvarc_b0.parquet",
+    "e065_images_nvarc_b1.parquet",
+)
+
+E065_TEXT_PARQUETS = (
+    "e065_text_arc2_train.parquet",
+    "e065_text_nvarc_b0.parquet",
+    "e065_text_nvarc_b1.parquet",
+)
+
+E065_SUBSETS = ("e065_images", "e065_text", "e065_all")
+
 TIER_ALIASES = {
     "tier1": "tier1_frontier_1of2",
     "tier2": "tier2_hard_unsolved_0of2",
@@ -195,6 +248,7 @@ TIER_ALIASES = {
 
 audit_parquet_file = data_pipeline.audit_rollout_file
 discover_top10k_rollout_shards = data_pipeline.discover_top10k_rollout_shards
+discover_e065_extra_parquet_shards = data_pipeline.discover_e065_extra_parquet_shards
 
 
 def parse_tier_weights(spec: str) -> dict[str, float]:
@@ -220,6 +274,7 @@ def apply_record_filters(
     max_ident_syntax_error_turns: int = -1,
     max_wasted_post_pass_turns: int = -1,
     max_post_pass_tokens: int = -1,
+    max_images_per_sample: int = 0,
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
     """Applies row-level filters; returns kept records and drop-reason counts."""
     kept: list[dict[str, Any]] = []
@@ -248,6 +303,9 @@ def apply_record_filters(
             continue
         if max_tool_calls > 0 and int(rec.get("tool_calls", 0)) > max_tool_calls:
             drops["tool_calls_over_cap"] += 1
+            continue
+        if max_images_per_sample > 0 and int(rec.get("n_images", 0) or 0) > max_images_per_sample:
+            drops["images_over_cap"] += 1
             continue
         kept.append(rec)
     return kept, drops
@@ -292,6 +350,23 @@ def is_arc2_train(rec: dict[str, Any]) -> bool:
 
 def is_vu_synthetic(rec: dict[str, Any]) -> bool:
     return (not is_top10k(rec)) and not is_arc2_train(rec)
+
+
+def is_e065(rec: dict[str, Any]) -> bool:
+    """E065 records carry a `modality` ('image' | 'text') set by `audit_e065_rollout_file`."""
+    return "modality" in rec
+
+
+def vu_parent_cap_key(rec: dict[str, Any]) -> str:
+    """Group key for `--max_per_parent_vu`: parent puzzle, and for E065 also the modality.
+
+    With `--subset=e065_all` every nvarc task has an image rollout and a text twin; capping per
+    (parent, modality) keeps up to N shortest of EACH instead of letting the (usually shorter) text
+    twins crowd out the image rollouts of the same parent.
+    """
+    if is_e065(rec):
+        return f"{rec['parent_id']}|{rec.get('modality', 'text')}"
+    return str(rec["parent_id"])
 
 
 def main(argv: list[str]) -> None:
@@ -346,12 +421,65 @@ def main(argv: list[str]) -> None:
                 print(f"  ... {s_idx + 1}/{len(shard_paths)} shards, verified so far={len(top10k_verified)} ({time.time() - t_sh:.0f}s)")
         print(f"  -> Top-10K v8 verified clean trajectories: {len(top10k_verified)}")
 
+    e065_verified: list[dict[str, Any]] = []
+    if FLAGS.subset in E065_SUBSETS:
+        if FLAGS.model_family != "deepseek_v41":
+            raise app.UsageError("E065 subsets are DeepSeek-V4.1 only (--model_family=deepseek_v41).")
+        e065_manifest = data_pipeline.load_e065_manifest(FLAGS.e065_manifest_path)
+        print(f"Loaded E065 manifest: {len(e065_manifest)} tasks from {FLAGS.e065_manifest_path or '<none>'}")
+        e065_files: tuple[str, ...] = ()
+        if FLAGS.subset in ("e065_images", "e065_all"):
+            e065_files += E065_IMAGE_PARQUETS
+        if FLAGS.subset in ("e065_text", "e065_all"):
+            e065_files += E065_TEXT_PARQUETS
+        for fname in e065_files:
+            fpath = os.path.join(FLAGS.e065_rollouts_dir, fname)
+            if not gfile.Exists(fpath):
+                print(f"WARNING: {fpath} not found, skipping.")
+                continue
+            print(f"Auditing E065 {fname}...")
+            fstats, recs = data_pipeline.audit_e065_rollout_file(
+                fpath, eval_index, manifest=e065_manifest, max_rows=FLAGS.max_records_per_file
+            )
+            all_file_stats.append(fstats)
+            print(
+                f"  -> rows={fstats['rows']}, rollouts={fstats['rollouts']} (multi-pair {fstats['multi_pair_rollouts']}), "
+                f"unique_tasks={fstats['unique_task_ids']}, unique_parents={fstats['unique_parent_puzzles']}, "
+                f"correct_all={fstats['correct_all_rollouts']}, error_rows={fstats['error_rows']}, "
+                f"verified_clean={fstats['verified_clean_count']} (with images {fstats['verified_with_images']}, "
+                f"images/rollout mean {fstats['images_per_verified_rollout_mean']} max {fstats['images_per_verified_rollout_max']}), "
+                f"drops={fstats['drops']}, {fstats['elapsed_sec']}s"
+            )
+            e065_verified.extend(recs)
+        if FLAGS.e065_extra_rollouts_dir and FLAGS.subset in ("e065_images", "e065_all"):
+            extra_shards = discover_e065_extra_parquet_shards(FLAGS.e065_extra_rollouts_dir)
+            print(f"Auditing {len(extra_shards)} extra corrected+rewritten E065 shards from {FLAGS.e065_extra_rollouts_dir}...")
+            existing_image_tasks = {r["task_id"] for r in e065_verified if r.get("modality") == "image"}
+            added_extra = 0
+            for spath in extra_shards:
+                try:
+                    fstats, recs = data_pipeline.audit_e065_rollout_file(
+                        spath, eval_index, manifest=e065_manifest, max_rows=FLAGS.max_records_per_file
+                    )
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    print(f"  WARNING: skipping extra E065 shard {spath}: {e}")
+                    continue
+                all_file_stats.append(fstats)
+                for r in recs:
+                    if r["task_id"] not in existing_image_tasks:
+                        existing_image_tasks.add(r["task_id"])
+                        e065_verified.append(r)
+                        added_extra += 1
+            print(f"  -> Added {added_extra} corrected+rewritten E065 image rollouts (total e065_verified={len(e065_verified)}).")
+
     if FLAGS.subset == "e031":
         selected_records = e031_verified
     elif FLAGS.subset == "all":
         selected_records = all_verified
     elif FLAGS.subset == "top10k_v8":
         selected_records = top10k_verified
+    elif FLAGS.subset in E065_SUBSETS:
+        selected_records = e065_verified
     else:
         selected_records = all_verified + top10k_verified
 
@@ -384,6 +512,7 @@ def main(argv: list[str]) -> None:
         max_ident_syntax_error_turns=FLAGS.max_ident_syntax_error_turns,
         max_wasted_post_pass_turns=FLAGS.max_wasted_post_pass_turns,
         max_post_pass_tokens=FLAGS.max_post_pass_tokens,
+        max_images_per_sample=FLAGS.max_images_per_sample,
     )
     stage_stats["1_after_row_filters"] = {**_breakdown(selected_records), "drops": dict(filter_drops)}
     print(f"After row filters: {len(selected_records)} (drops={dict(filter_drops)})")
@@ -391,7 +520,7 @@ def main(argv: list[str]) -> None:
     # ---- Per-group caps (shortest first) ----
     selected_records, n_cap_vu = cap_group_keep_shortest(
         selected_records,
-        group_key_fn=lambda r: r["parent_id"],
+        group_key_fn=vu_parent_cap_key,
         max_per_group=FLAGS.max_per_parent_vu,
         applies_fn=is_vu_synthetic,
     )
@@ -492,9 +621,23 @@ def main(argv: list[str]) -> None:
         rec_copy["n_supervised_tokens"] = n_sup
         rec_copy["n_wic_alnum_tokens"] = int(tok_stats.get("n_wic_alnum_tokens", 0))
         rec_copy["supervised_ratio"] = round(n_sup / max(1, n_tok), 4)
+        rec_copy["n_images"] = int(tok_stats.get("n_images", rec.get("n_images", 0)) or 0)
+        rec_copy["n_image_tokens"] = int(tok_stats.get("n_image_tokens", 0) or 0)
         rec_copy["input_ids"] = input_ids
         rec_copy["loss_mask"] = loss_mask
         rec_copy["loss_weights"] = loss_weights
+        token_types = tok_stats.get("token_types")
+        rec_copy["token_types"] = (
+            np.asarray(token_types, dtype=np.int8)
+            if token_types is not None
+            else np.full(n_tok, dsv41_image_tokens.TEXT, dtype=np.int8)
+        )
+        rec_copy["image_blobs"] = list(tok_stats.get("image_blobs") or [])
+        if len(rec_copy["token_types"]) != n_tok:
+            raise AssertionError(
+                f"token_types length {len(rec_copy['token_types'])} != input_ids length {n_tok} "
+                f"for {rec.get('task_id')} ({rec.get('batch')})"
+            )
         tokenized_records.append(rec_copy)
         if (idx + 1) % 250 == 0 or (idx + 1) == len(selected_records):
             print(
@@ -548,9 +691,11 @@ def main(argv: list[str]) -> None:
         flat_ids = np.concatenate([r["input_ids"] for r in split_list]).astype(np.int32)
         flat_mask = np.concatenate([r["loss_mask"] for r in split_list]).astype(np.uint8)
         flat_weights = np.concatenate([r["loss_weights"] for r in split_list]).astype(np.uint8)
+        flat_types = np.concatenate([r["token_types"] for r in split_list]).astype(np.int8)
         lengths = np.asarray([len(r["input_ids"]) for r in split_list], dtype=np.int32)
         offsets = np.zeros(len(split_list) + 1, dtype=np.int64)
         np.cumsum(lengths, out=offsets[1:])
+        assert len(flat_types) == len(flat_ids), (len(flat_types), len(flat_ids))
 
         npz_path = os.path.join(FLAGS.output_cns_dir, f"{split_name}_tokens.npz")
         buf = io.BytesIO()
@@ -561,9 +706,21 @@ def main(argv: list[str]) -> None:
             loss_weights=flat_weights,
             offsets=offsets,
             lengths=lengths,
+            token_types=flat_types,
         )
         with gfile.Open(npz_path, "wb") as f:
             f.write(buf.getvalue())
+
+        # Sidecar: per-trajectory list of PNG bytes (prompt order), aligned with the npz rows.
+        # Written only when the split has at least one image so text-only datasets stay as before.
+        images_list = [list(r.get("image_blobs") or []) for r in split_list]
+        n_with_images = sum(1 for imgs in images_list if imgs)
+        images_path = os.path.join(FLAGS.output_cns_dir, f"{split_name}_images.pkl")
+        if n_with_images:
+            with gfile.Open(images_path, "wb") as f:
+                f.write(pickle.dumps(images_list, protocol=pickle.HIGHEST_PROTOCOL))
+        elif gfile.Exists(images_path):
+            gfile.Remove(images_path)
 
         meta_path = os.path.join(FLAGS.output_cns_dir, f"{split_name}_manifest.jsonl")
         with gfile.Open(meta_path, "w") as f:
@@ -571,10 +728,11 @@ def main(argv: list[str]) -> None:
                 meta_row = {
                     k: v
                     for k, v in r.items()
-                    if k not in ("input_ids", "loss_mask", "loss_weights")
+                    if k not in ("input_ids", "loss_mask", "loss_weights", "token_types", "image_blobs")
                 }
                 meta_row["index"] = i
                 f.write(json.dumps(meta_row) + "\n")
+        n_image_tokens = int((flat_types != dsv41_image_tokens.TEXT).sum())
         split_token_stats[split_name] = {
             "trajectories": len(split_list),
             "total_tokens": int(len(flat_ids)),
@@ -584,11 +742,19 @@ def main(argv: list[str]) -> None:
             "seq_len_p50": int(np.percentile(lengths, 50)) if len(lengths) else 0,
             "seq_len_p90": int(np.percentile(lengths, 90)) if len(lengths) else 0,
             "seq_len_max": int(lengths.max()) if len(lengths) else 0,
+            "trajectories_with_images": n_with_images,
+            "images_total": int(sum(len(imgs) for imgs in images_list)),
+            "image_tokens_total": n_image_tokens,
+            "by_modality": dict(Counter(str(r.get("modality", "text")) for r in split_list)),
+            "by_batch": dict(Counter(str(r.get("batch")) for r in split_list)),
+            "images_sidecar": images_path if n_with_images else "",
         }
         print(
             f"Saved {split_name}: {len(split_list)} trajectories, "
             f"{len(flat_ids):,} total tokens ({ int(flat_mask.sum()):,} supervised, "
-            f"{int((flat_weights == FLAGS.wic_alnum_weight).sum()):,} WIC-alnum) -> {npz_path}"
+            f"{int((flat_weights == FLAGS.wic_alnum_weight).sum()):,} WIC-alnum, "
+            f"{n_image_tokens:,} image-span) -> {npz_path}"
+            + (f" + {n_with_images} image trajectories -> {images_path}" if n_with_images else "")
         )
 
     tot_arr = np.asarray(total_tokens_list)
@@ -616,6 +782,9 @@ def main(argv: list[str]) -> None:
             "wic_alnum_weight": FLAGS.wic_alnum_weight,
             "tool_call_weight": FLAGS.tool_call_weight,
             "final_submit_weight": FLAGS.final_submit_weight,
+            "max_images_per_sample": FLAGS.max_images_per_sample,
+            "e065_rollouts_dir": FLAGS.e065_rollouts_dir if FLAGS.subset in E065_SUBSETS else "",
+            "e065_manifest_path": FLAGS.e065_manifest_path if FLAGS.subset in E065_SUBSETS else "",
             "n_wic_alnum_tokens_total": int(wic_arr.sum()) if len(wic_arr) else 0,
         },
         "eval_tasks_indexed": len(eval_index["eval_task_ids"]),

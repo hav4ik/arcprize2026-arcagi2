@@ -10,8 +10,11 @@ driven by scripted completions.
 
 from __future__ import annotations
 
+import dataclasses
+import io
 import json
 import os
+import struct
 import tempfile
 
 # Mirror production (`pilot2_eval.py`): fork the sandbox zygote before heavier imports.
@@ -19,8 +22,13 @@ from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import havu_san
 
 havu_sandbox_zygote.ensure_started()
 
+import numpy as np  # pylint: disable=g-import-not-at-top,g-bad-import-order
+from PIL import Image  # pylint: disable=g-import-not-at-top,g-bad-import-order
+
+from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import grid_image  # pylint: disable=g-import-not-at-top,g-bad-import-order
 from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import havu_b32_harness as hb  # pylint: disable=g-import-not-at-top,g-bad-import-order
 from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_2 import prompts_and_selector  # pylint: disable=g-import-not-at-top,g-bad-import-order
+from google3.experimental.users.arazdai.kaggle.sft import dsv41_image_tokens  # pylint: disable=g-import-not-at-top,g-bad-import-order
 from google3.testing.pybase import googletest  # pylint: disable=g-import-not-at-top,g-bad-import-order
 
 
@@ -734,6 +742,292 @@ class ProcessCompletedTurnTest(googletest.TestCase):
     self.assertLen(recs, 1)
     self.assertTrue(recs[0]["pass1"])
     self.assertTrue(recs[0]["any_verified"])
+
+
+class TextImageContentTest(googletest.TestCase):
+  """E058 `--grid-format text+image --image-cell 0` content (port of Havu's `text_image_content`)."""
+
+  # Verbatim `run_deepseek_tools.IMAGE_NOTE` / `IMAGE_NOTES["strict"]` (Havu's repo, E058/E064).
+  HAVU_IMAGE_NOTE = (
+      "\n\nThe images below show the SAME training examples and test input(s) as the JSON above, in the same "
+      "order; they are not additional examples. Each image is one grid, drawn as flat coloured squares "
+      "without lines (0 black, 1 blue, 2 red, 3 green, 4 yellow, 5 grey, 6 magenta, 7 orange, 8 light blue, "
+      "9 maroon). Use them to see shapes and layout; the JSON grids specify the exact cells."
+  )
+  HAVU_STRICT_SUFFIX = (
+      " The images give only an overall impression and are easy to misread: before "
+      "you build on anything you see in them (a symmetry, a count, which cells "
+      "connect, sizes or positions), confirm it in code on the JSON grids."
+  )
+
+  @staticmethod
+  def _aligned_cell(g: list[list[int]]) -> int:
+    cells = len(g) * len(g[0])
+    k = 1
+    while cells * k * k < 169:
+      k += 1
+    return 42 * k
+
+  @staticmethod
+  def _png_size(data: bytes) -> tuple[int, int]:
+    return struct.unpack(">II", data[16:24])
+
+  def _encode_with_placeholders(self, text: str) -> list[int]:
+    """Fake tokenizer that maps each `<｜deepseek_image｜>` to its single token id."""
+    ph = dsv41_image_tokens.IMAGE_PLACEHOLDER
+    ids: list[int] = []
+    for i, piece in enumerate(text.split(ph)):
+      if i:
+        ids.append(dsv41_image_tokens.IMAGE_TOKEN_ID)
+      ids.extend(_fake_encode(piece))
+    return ids
+
+  def test_notes_match_havu_wording(self) -> None:
+    self.assertEqual(grid_image.IMAGE_NOTE, self.HAVU_IMAGE_NOTE)
+    self.assertEqual(grid_image.IMAGE_NOTES[""], self.HAVU_IMAGE_NOTE)
+    self.assertEqual(grid_image.IMAGE_NOTES["strict"], self.HAVU_IMAGE_NOTE + self.HAVU_STRICT_SUFFIX)
+    self.assertEqual(sorted(grid_image.IMAGE_NOTES), ["", "strict"])
+
+  def test_parts_order_captions_and_images(self) -> None:
+    prompt = hb.build_prompt_single(TRAIN, TEST_INPUT) + hb.LEAN2SUB_SUFFIX
+    parts = grid_image.text_image_content(prompt, TRAIN, [TEST_INPUT], cell=0)
+    # Part 0: the unchanged JSON prompt + the note, in ONE text part.
+    self.assertEqual(parts[0], {"type": "text", "text": prompt + grid_image.IMAGE_NOTE})
+    # Then (label, image) pairs: train inputs/outputs in order (numbered from 0), then the test input.
+    grids = []
+    for pair in TRAIN:
+      grids += [pair["input"], pair["output"]]
+    grids.append(TEST_INPUT)
+    labels = []
+    for i in range(len(TRAIN)):
+      labels += [f"Example {i} input", f"Example {i} output"]
+    labels.append("Test input")
+    self.assertLen(parts, 1 + 2 * len(grids))
+    images = grid_image.content_images(parts)
+    self.assertLen(images, 2 * len(TRAIN) + 1)
+    for j, (label, g) in enumerate(zip(labels, grids)):
+      text_part, image_part = parts[1 + 2 * j], parts[2 + 2 * j]
+      self.assertEqual(text_part, {"type": "text", "text": f"\n{label} ({len(g)}x{len(g[0])}):"})
+      self.assertEqual(image_part["type"], "image_url")
+      url = image_part["image_url"]["url"]
+      self.assertTrue(url.startswith("data:image/png;base64,"))
+      png = images[j]
+      self.assertEqual(png, dsv41_image_tokens.decode_data_url(url))
+      # `--image-cell 0`: 42*k px cells, k = smallest with cells*k^2 >= 169 (no rescale by the model).
+      cell = self._aligned_cell(g)
+      self.assertEqual(cell, grid_image.deepseek_cell(g))
+      self.assertEqual(cell % 42, 0)
+      self.assertEqual(self._png_size(png), (len(g[0]) * cell, len(g) * cell))
+      self.assertEqual(dsv41_image_tokens.png_size(png), (len(g[0]) * cell, len(g) * cell))
+      # Solid palette squares, no grid lines: every cell centre and corner has the cell's colour.
+      with Image.open(io.BytesIO(png)) as im:
+        im = im.convert("RGB")
+        for r, row in enumerate(g):
+          for c, v in enumerate(row):
+            for dx, dy in ((0, 0), (cell // 2, cell // 2), (cell - 1, cell - 1)):
+              self.assertEqual(im.getpixel((c * cell + dx, r * cell + dy)), grid_image.PALETTE[v])
+      # Token-aligned: the model's planner keeps the image size, one LLM token per 42x42 tile,
+      # and Havu's `deepseek_tokens` charge equals the real span length.
+      plan = dsv41_image_tokens.plan_from_bytes(png)
+      self.assertEqual((plan.best_width, plan.best_height), (len(g[0]) * cell, len(g) * cell))
+      self.assertEqual((plan.n_llm_h, plan.n_llm_w), (len(g) * cell // 42, len(g[0]) * cell // 42))
+      self.assertEqual(plan.num_tokens, grid_image.deepseek_tokens(g))
+
+  def test_multi_test_labels_and_strict_note(self) -> None:
+    prompt = hb.build_prompt_multi(TRAIN, [TEST_INPUT, TEST_INPUT_B]) + hb.LEAN2SUB_SUFFIX + hb.MULTI_NOTE.format(n=2)
+    parts = grid_image.text_image_content(
+        prompt, TRAIN, [TEST_INPUT, TEST_INPUT_B], cell=0, note=grid_image.IMAGE_NOTES["strict"]
+    )
+    self.assertTrue(parts[0]["text"].endswith(self.HAVU_STRICT_SUFFIX))
+    self.assertIn(hb.MULTI_NOTE.format(n=2) + self.HAVU_IMAGE_NOTE, parts[0]["text"])
+    texts = [p["text"] for p in parts if p["type"] == "text"]
+    self.assertEqual(texts[-2], "\nTest input 0 (2x4):")
+    self.assertEqual(texts[-1], "\nTest input 1 (3x2):")
+    self.assertLen(grid_image.content_images(parts), 2 * len(TRAIN) + 2)
+    # Fixed cell size (`--image-cell 32`): no alignment.
+    parts32 = grid_image.text_image_content(prompt, TRAIN, [TEST_INPUT], cell=32)
+    self.assertEqual(self._png_size(grid_image.content_images(parts32)[0]), (3 * 32, 3 * 32))
+
+  def test_dsml_rendering_matches_encoding_py_semantics(self) -> None:
+    prompt = hb.build_prompt_single(TRAIN, TEST_INPUT) + hb.LEAN2SUB_SUFFIX
+    parts = grid_image.text_image_content(prompt, TRAIN, [TEST_INPUT], cell=0)
+    n_images = len(grid_image.content_images(parts))
+    rendered = hb.render_user_dsv41(parts)
+    # encoding.py `process_image_messages`: image blocks -> one `<｜deepseek_image｜>` text block each,
+    # all text blocks joined with "\n\n"; nothing else is inserted.
+    expected_texts = []
+    for p in parts:
+      expected_texts.append(p["text"] if p["type"] == "text" else dsv41_image_tokens.IMAGE_PLACEHOLDER)
+    self.assertEqual(rendered, hb.DS41_USER_SP_TOKEN + "\n\n".join(expected_texts))
+    self.assertEqual(rendered.count(dsv41_image_tokens.IMAGE_PLACEHOLDER), n_images)
+    self.assertTrue(
+        rendered.startswith(hb.DS41_USER_SP_TOKEN + prompt + grid_image.IMAGE_NOTE + "\n\n\nExample 0 input (3x3):\n\n"
+                            + dsv41_image_tokens.IMAGE_PLACEHOLDER + "\n\n\nExample 0 output (3x3):\n\n")
+    )
+    # Plain-string user content is untouched (text harness path).
+    self.assertEqual(hb.render_user_dsv41("hi"), hb.DS41_USER_SP_TOKEN + "hi")
+    with self.assertRaises(ValueError):
+      hb.user_content_to_dsml_text([{"type": "audio"}])
+
+  def test_attempt_state_text_image_and_expansion(self) -> None:
+    cfg = prompts_and_selector.PILOT2_HYPOTHESES["havu_b32"]
+    img_cfg = dataclasses.replace(cfg, grid_format="text+image", image_cell=0, image_note="")
+    tools = hb.tools_spec_b32()
+    system_block = hb.render_system_dsv41(tools=tools, tier_text="", reasoning_effort=50)
+    spec = hb.EvalTaskSpec(
+        task_idx=0,
+        task_id="demo",
+        train_pairs=TRAIN,
+        test_pairs=[{"input": TEST_INPUT, "output": TEST_OUTPUT}],
+        global_pair_indices=[0],
+        prompt_size_bytes=100,
+    )
+    st = hb._create_attempt_state(spec, 0, img_cfg, tools, system_block, start_session=False)  # pylint: disable=protected-access
+    n_images = 2 * len(TRAIN) + 1
+    self.assertLen(st.image_blobs, n_images)
+    self.assertIsInstance(st.messages[0]["content"], list)
+    self.assertEqual(st.messages[0]["role"], "user")
+    self.assertLen(st.messages, 1)  # images only in the first user message
+    # Same JSON prompt as the text harness, followed by the note.
+    txt_st = hb._create_attempt_state(spec, 0, cfg, tools, system_block, start_session=False)  # pylint: disable=protected-access
+    self.assertIsInstance(txt_st.messages[0]["content"], str)
+    self.assertEqual(txt_st.image_blobs, [])
+    self.assertEqual(st.messages[0]["content"][0]["text"], txt_st.messages[0]["content"] + grid_image.IMAGE_NOTE)
+
+    full = hb.render_full_messages_dsv41(system_block, st.messages, add_generation_prompt=True)
+    self.assertEqual(full.count(dsv41_image_tokens.IMAGE_PLACEHOLDER), n_images)
+    self.assertTrue(full.endswith(hb.DS41_GEN_PROMPT))
+    ids = self._encode_with_placeholders(full)
+    self.assertEqual(ids.count(dsv41_image_tokens.IMAGE_TOKEN_ID), n_images)
+    new_ids, types, _, plans = dsv41_image_tokens.expand_image_placeholders(ids, st.image_blobs)
+    span_total = sum(p.num_tokens for p in plans)
+    self.assertLen(plans, n_images)
+    self.assertEqual(len(new_ids), len(ids) - n_images + span_total)
+    self.assertEqual(len(types), len(new_ids))
+    self.assertEqual(int((new_ids == dsv41_image_tokens.IMAGE_TOKEN_ID).sum()), span_total)
+    spans = dsv41_image_tokens.image_spans(types)
+    self.assertLen(spans, n_images)
+    self.assertEqual([e - s for s, e in spans], [p.num_tokens for p in plans])
+    self.assertEqual(int((types == dsv41_image_tokens.IMAGE).sum()), sum(p.n_llm_h * p.n_llm_w for p in plans))
+    self.assertEqual(int((types == dsv41_image_tokens.TEXT).sum()), len(ids) - n_images)
+    # Expected per-grid charges (Havu's `deepseek_tokens`), e.g. 3x3 grid -> 15x15 tiles -> 242 tokens.
+    self.assertEqual([p.num_tokens for p in plans][:2], [grid_image.deepseek_tokens(TRAIN[0]["input"])] * 2)
+    self.assertEqual(plans[0].num_tokens, 242)
+    # A second attempt of the same task renders byte-identical content and images (prefix reuse).
+    st2 = hb._create_attempt_state(spec, 1, img_cfg, tools, system_block, start_session=False)  # pylint: disable=protected-access
+    self.assertEqual(st2.image_blobs, st.image_blobs)
+    self.assertEqual(st2.messages[0]["content"], st.messages[0]["content"])
+    with self.assertRaises(ValueError):
+      hb._create_attempt_state(  # pylint: disable=protected-access
+          spec, 0, dataclasses.replace(cfg, grid_format="image"), tools, system_block, start_session=False
+      )
+
+  def test_prompt_req_carries_token_types_and_images(self) -> None:
+    """`run_havu_b32_shard` sends `token_types` + `images` with the first-turn prompt (DSV41 model)."""
+    d_in = tempfile.mkdtemp(dir=os.environ.get("TEST_TMPDIR"))
+    d_out = tempfile.mkdtemp(dir=os.environ.get("TEST_TMPDIR"))
+    with open(os.path.join(d_in, "task00.json"), "w") as f:
+      json.dump({"train": TRAIN, "test": [{"input": TEST_INPUT, "output": TEST_OUTPUT}]}, f)
+    outer = self
+
+    class _Tok:
+      eos_token_id = 1
+
+      def encode(self, s: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        if s == hb.DS41_EOS_TOKEN:
+          return [1]
+        return outer._encode_with_placeholders(s)  # pylint: disable=protected-access
+
+      def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
+        del skip_special_tokens
+        return "".join(chr((i % 26) + 97) for i in ids)
+
+    seen: list[dict] = []
+
+    class _Comp:
+
+      def __init__(self, text: str) -> None:
+        self.text = text
+        self.token_ids = _fake_encode(text)
+        self.finish_reason = "stop"
+
+    class _Out:
+
+      def __init__(self, rid: str, text: str) -> None:
+        self.request_id = rid
+        self.outputs = [_Comp(text)]
+        self.finished = True
+        self.prompt_token_ids = [1, 2, 3]
+
+    class _Engine:
+
+      def __init__(self) -> None:
+        self.model_config = type("Cfg", (), {"max_model_len": 131072})()
+        self.pending: list[str] = []
+        self.counter = 0
+
+      def has_unfinished_requests(self) -> bool:
+        return bool(self.pending)
+
+      def step(self) -> list[_Out]:
+        rid = self.pending.pop(0)
+        txt = (
+            "Submit.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"submit_answer\">\n"
+            f'<｜DSML｜ parameter name="code" string="true">{json.dumps(TEST_OUTPUT)}</｜DSML｜ parameter>\n'
+            "</｜DSML｜ invoke>\n</｜DSML｜ calls>" + hb.DS41_EOS_TOKEN
+        )
+        return [_Out(rid, txt)]
+
+    class _LLM:
+
+      def __init__(self) -> None:
+        self.llm_engine = _Engine()
+        self._tok = _Tok()
+
+      def get_tokenizer(self) -> _Tok:
+        return self._tok
+
+      def enqueue(self, prompts, sps, use_tqdm: bool = False) -> list[str]:
+        del sps, use_tqdm
+        seen.extend(prompts)
+        self.llm_engine.counter += 1
+        rid = f"req_{self.llm_engine.counter}"
+        self.llm_engine.pending.append(rid)
+        return [rid]
+
+    cfg = dataclasses.replace(
+        prompts_and_selector.PILOT2_HYPOTHESES["havu_b32"],
+        exp_id="dsv41_img_unit_test",
+        num_attempts=1,
+        attempt_prompt_styles=("lean2sub",),
+        attempt_include_task_summary=(False,),
+        grid_format="text+image",
+        image_cell=0,
+        image_note="strict",
+    )
+    recs = hb.run_havu_b32_shard(
+        llm=_LLM(), cfg=cfg, dataset_dir=d_in, out_dir=d_out, shard_index=0, num_shards=1,
+        model_path="/tmp/dsv41_img_e128",
+    )
+    self.assertLen(recs, 1)
+    self.assertLen(seen, 1)
+    req = seen[0]
+    n_images = 2 * len(TRAIN) + 1
+    self.assertLen(req["images"], n_images)
+    self.assertLen(req["token_types"], len(req["prompt_token_ids"]))
+    self.assertLen(dsv41_image_tokens.image_spans(np.asarray(req["token_types"])), n_images)
+    self.assertEqual(req["prompt_token_ids"].count(dsv41_image_tokens.IMAGE_TOKEN_ID), sum(
+        dsv41_image_tokens.plan_from_bytes(b).num_tokens for b in req["images"]))
+    with open(os.path.join(d_out, "config_shard_00_of_01.json")) as f:
+      conf = json.load(f)
+    self.assertEqual(conf["prompt_format"], {"grid_format": "text+image", "image_cell": 0, "image_note": "strict"})
+    self.assertEqual(conf["hypothesis_config"]["grid_format"], "text+image")
+    with open(os.path.join(d_out, "summary_shard_00_of_01.json")) as f:
+      self.assertEqual(json.load(f)["prompt_format"]["grid_format"], "text+image")
+    with open(os.path.join(d_out, "attempts_shard_00_of_01.jsonl")) as f:
+      row = json.loads(f.readline())
+    self.assertEqual((row["grid_format"], row["prompt_images"]), ("text+image", n_images))
 
 
 if __name__ == "__main__":

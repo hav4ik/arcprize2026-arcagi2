@@ -83,6 +83,14 @@ class Pilot2HypothesisConfig:
   think_call_rescue: bool = FROZEN_BASELINE_CONFIG["think_call_rescue"]
   lock_first_verified_pred: bool = FROZEN_BASELINE_CONFIG["lock_first_verified_pred"]
 
+  # E058 image harness (`run_deepseek_tools --grid-format text+image --image-cell 0`): the JSON
+  # prompt is unchanged and one labelled PNG per grid is appended to the first user message.
+  # `grid_format`: "json" (B32 text harness) or "text+image"; `image_cell`: px per cell, 0 =
+  # token-aligned 42*k px; `image_note`: "" (E058 note) or "strict" (E064 variant).
+  grid_format: str = "json"
+  image_cell: int = 0
+  image_note: str = ""
+
   def validate(self) -> None:
     """Assert that all frozen baseline invariants hold and attempt tuples match `num_attempts`."""
     assert self.temperature == FROZEN_BASELINE_CONFIG["temperature"], (

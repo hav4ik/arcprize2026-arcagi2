@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections import Counter
 import copy
 import hashlib
@@ -14,6 +15,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
+from google3.experimental.users.arazdai.kaggle.sft import dsv41_image_tokens
 from google3.pyglib import gfile
 
 
@@ -471,8 +473,8 @@ def split_by_parent_puzzle_id(
     return train_records, val_records, split_stats
 
 
-def _read_rollout_rows_from_file(fpath: str) -> tuple[list[dict[str, Any]], list[str]]:
-    """Reads rollout rows from either a .parquet or .jsonl file on CNS."""
+def _read_rollout_rows_from_file(fpath: str, max_rows: int = 0) -> tuple[list[dict[str, Any]], list[str]]:
+    """Reads rollout rows from either a .parquet or .jsonl file on CNS (optionally only the first `max_rows`)."""
     if fpath.endswith(".jsonl"):
         rows: list[dict[str, Any]] = []
         with gfile.Open(fpath, "r") as f:
@@ -480,6 +482,8 @@ def _read_rollout_rows_from_file(fpath: str) -> tuple[list[dict[str, Any]], list
                 line = line.strip()
                 if line:
                     rows.append(json.loads(line))
+                if max_rows > 0 and len(rows) >= max_rows:
+                    break
         cols = list(rows[0].keys()) if rows else []
         return rows, cols
     import pyarrow as pa
@@ -487,6 +491,8 @@ def _read_rollout_rows_from_file(fpath: str) -> tuple[list[dict[str, Any]], list
     with gfile.Open(fpath, "rb") as f:
         data = f.read()
     table = pq.read_table(pa.BufferReader(data))
+    if max_rows > 0:
+        table = table.slice(0, max_rows)
     df = table.to_pandas()
     return df.to_dict(orient="records"), list(df.columns)
 
@@ -494,12 +500,13 @@ def _read_rollout_rows_from_file(fpath: str) -> tuple[list[dict[str, Any]], list
 def audit_rollout_file(
     fpath: str,
     eval_index: Mapping[str, Any],
+    max_rows: int = 0,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Audits a single parquet or jsonl rollout file and returns summary stats + verified candidate records."""
     import time
 
     t0 = time.time()
-    records, schema_cols = _read_rollout_rows_from_file(fpath)
+    records, schema_cols = _read_rollout_rows_from_file(fpath, max_rows=max_rows)
 
     n_rows = len(records)
     unique_task_ids = {str(r["task_id"]) for r in records}
@@ -636,6 +643,251 @@ def audit_rollout_file(
 def read_rollout_rows_from_file(fpath: str) -> tuple[list[dict[str, Any]], list[str]]:
     """Reads rollout rows from either a .parquet or .jsonl file on CNS."""
     return _read_rollout_rows_from_file(fpath)
+
+
+# ============================================================
+# E065 text+image rollouts (E058 image harness + E046 text twins)
+# ============================================================
+
+E065_VERIFIED_ANSWER_SOURCE = "submit"
+E065_VERIFIED_STOP_REASON = "submitted"
+
+
+def discover_e065_extra_parquet_shards(extra_dir: str) -> list[str]:
+    """Discovers corrected+rewritten E065 rollout parquet shards in `extra_dir`."""
+    if not extra_dir or not gfile.Exists(extra_dir):
+        return []
+    paths: list[str] = []
+    for fname in sorted(gfile.ListDir(extra_dir)):
+        if fname.endswith(".parquet") and not fname.startswith("."):
+            paths.append(os.path.join(extra_dir, fname))
+    return paths
+
+
+def _parquet_scalar_or_none(val: Any) -> Any:
+    """Maps parquet/pandas missing values (None, NaN, 'None'/'nan' strings) to None."""
+    if val is None:
+        return None
+    if isinstance(val, float) and np.isnan(val):
+        return None
+    if isinstance(val, str) and val.strip().lower() in ("", "none", "nan", "null"):
+        return None
+    return val
+
+
+def _as_bool(val: Any) -> bool | None:
+    """Python bool for parquet booleans (numpy bools, object columns holding True/False/None, or strings)."""
+    val = _parquet_scalar_or_none(val)
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes")
+    return bool(val)
+
+
+def _nonempty_str(val: Any) -> bool:
+    return _parquet_scalar_or_none(val) is not None and bool(str(val).strip())
+
+
+def load_e065_manifest(manifest_path: str) -> dict[str, dict[str, Any]]:
+    """Loads E065 `tasks/manifest.jsonl` keyed by task_id (`batch`, `source`, `parent`, `n_train`, `test_pairs`).
+
+    Returns an empty dict when the path is empty or missing so callers can degrade gracefully.
+    """
+    manifest: dict[str, dict[str, Any]] = {}
+    if not manifest_path or not gfile.Exists(manifest_path):
+        return manifest
+    with gfile.Open(manifest_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            tid = str(row.get("task_id") or "")
+            if tid:
+                manifest[tid] = row
+    return manifest
+
+
+def audit_e065_rollout_file(
+    fpath: str,
+    eval_index: Mapping[str, Any],
+    manifest: Mapping[str, Mapping[str, Any]] | None = None,
+    max_rows: int = 0,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Audits one E065 text or image rollout parquet and returns summary stats + verified candidate records.
+
+    E065 row semantics (differ from `audit_rollout_file`):
+      * multi-test tasks share ONE rollout across rows `pair=0,1,...` (identical `messages`, per-pair `correct`);
+        rows are grouped by `(task_id, attempt)`, only the `pair==0` row is kept and
+        `correct_all = all(correct)` over the group (groups missing a manifest test pair are dropped);
+      * rows with a non-empty `error` are dropped (an error on any pair row poisons the whole rollout);
+      * verified := correct_all and train_pass and answer_source == 'submit' and stop_reason == 'submitted';
+      * parent id = `parent` column when present/non-null, else the manifest's `parent`, else `task_id`;
+      * eval de-contamination (`is_task_contaminated`, incl. known derivatives 2753e76c / 81c0276b), the
+        truncation / bad-tool-JSON / markup-leak turn audit and the quality analysis are reused unchanged;
+      * image rollouts carry the images as OpenAI content parts of the first user message; their count is
+        stored as `n_images` (the bytes are decoded later at tokenization time).
+
+    Returned records have the legacy schema (`task_id`, `batch`, `source`, `parent`, `parent_id`, counters,
+    `messages`, ...) plus `n_test_pairs`, `correct_all`, `n_images`, `modality` ('image' | 'text'),
+    `harness`, `train_frac`, and `rollout_file`.
+    """
+    import time
+
+    t0 = time.time()
+    manifest = manifest or {}
+    records, schema_cols = _read_rollout_rows_from_file(fpath, max_rows=max_rows)
+    n_rows = len(records)
+
+    # Group the rows of one rollout (multi-test tasks repeat the rollout once per test pair).
+    groups: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for row in records:
+        key = (str(row["task_id"]), int(_parquet_scalar_or_none(row.get("attempt")) or 0))
+        groups.setdefault(key, []).append(row)
+
+    pair0_rows = [r for r in records if int(_parquet_scalar_or_none(r.get("pair")) or 0) == 0]
+    n_error_rows = sum(1 for r in records if _nonempty_str(r.get("error")))
+    n_correct_pair0 = sum(1 for r in pair0_rows if _as_bool(r.get("correct")) is True)
+    n_train_pass_pair0 = sum(1 for r in pair0_rows if _as_bool(r.get("train_pass")) is True)
+    answer_sources = Counter(str(_parquet_scalar_or_none(r.get("answer_source")) or "none") for r in pair0_rows)
+    stop_reasons = Counter(str(_parquet_scalar_or_none(r.get("stop_reason")) or "none") for r in pair0_rows)
+
+    drops: Counter[str] = Counter()
+    bad_reason_counts: Counter[str] = Counter()
+    contaminated_tasks: dict[str, str] = {}
+    verified_records: list[dict[str, Any]] = []
+    n_correct_all = 0
+    n_multi_pair = 0
+    unique_parents: set[str] = set()
+
+    for (tid, attempt), group in groups.items():
+        group = sorted(group, key=lambda r: int(_parquet_scalar_or_none(r.get("pair")) or 0))
+        if len(group) > 1:
+            n_multi_pair += 1
+        pair0 = next((r for r in group if int(_parquet_scalar_or_none(r.get("pair")) or 0) == 0), None)
+        man = manifest.get(tid) or {}
+        par = str(_parquet_scalar_or_none(pair0.get("parent") if pair0 is not None else None) or man.get("parent") or "")
+        unique_parents.add(get_parent_puzzle_id(tid, par))
+        if pair0 is None:
+            drops["no_pair0_row"] += 1
+            continue
+        if any(_nonempty_str(r.get("error")) for r in group):
+            drops["error"] += 1
+            continue
+        expected_pairs = len(man.get("test_pairs") or []) if man else 0
+        if expected_pairs and len(group) < expected_pairs:
+            drops["missing_test_pair_rows"] += 1
+            continue
+        correct_all = all(_as_bool(r.get("correct")) is True for r in group)
+        if correct_all:
+            n_correct_all += 1
+
+        is_contam, reason = is_task_contaminated(tid, par, eval_index)
+        if is_contam:
+            contaminated_tasks[tid] = reason
+
+        if not correct_all:
+            drops["not_correct_all"] += 1
+            continue
+        if _as_bool(pair0.get("train_pass")) is not True:
+            drops["not_train_pass"] += 1
+            continue
+        if str(_parquet_scalar_or_none(pair0.get("answer_source")) or "") != E065_VERIFIED_ANSWER_SOURCE:
+            drops["answer_source_not_submit"] += 1
+            continue
+        if str(_parquet_scalar_or_none(pair0.get("stop_reason")) or "") != E065_VERIFIED_STOP_REASON:
+            drops["stop_reason_not_submitted"] += 1
+            continue
+        if is_contam:
+            drops["contaminated"] += 1
+            continue
+
+        messages = json.loads(pair0["messages"]) if isinstance(pair0["messages"], str) else pair0["messages"]
+        raw_events = pair0.get("events")
+        events = (
+            json.loads(raw_events)
+            if isinstance(raw_events, str) and raw_events
+            else (raw_events if isinstance(raw_events, list) else [])
+        )
+        bad_reasons = audit_rollout_messages(messages, events)
+        if bad_reasons:
+            drops["bad_turn"] += 1
+            for r in set(bad_reasons):
+                bad_reason_counts[r] += 1
+            continue
+
+        n_images = count_message_images(messages)
+        qual = analyze_trajectory_quality(messages, events, n_train=man.get("n_train"))
+        train_frac = _parquet_scalar_or_none(pair0.get("train_frac"))
+        rec: dict[str, Any] = {
+            "task_id": tid,
+            "pair": 0,
+            "attempt": int(attempt),
+            "batch": str(_parquet_scalar_or_none(pair0.get("batch")) or man.get("batch") or ""),
+            "source": str(_parquet_scalar_or_none(pair0.get("source")) or man.get("source") or ""),
+            "parent": par,
+            "parent_id": get_parent_puzzle_id(tid, par),
+            "turns": int(_parquet_scalar_or_none(pair0.get("turns")) or 0),
+            "tool_calls": int(_parquet_scalar_or_none(pair0.get("tool_calls")) or 0),
+            "prompt_tokens": int(_parquet_scalar_or_none(pair0.get("prompt_tokens")) or 0),
+            "completion_tokens": int(_parquet_scalar_or_none(pair0.get("completion_tokens")) or 0),
+            "py_error_turns": qual["py_error_turns"],
+            "ident_syntax_error_turns": qual["ident_syntax_error_turns"],
+            "wasted_post_pass_turns": qual["wasted_post_pass_turns"],
+            "post_pass_completion_tokens": qual["post_pass_completion_tokens"],
+            "doubt_markers_count": qual["doubt_markers_count"],
+            "n_test_pairs": len(group),
+            "correct_all": True,
+            "n_images": int(n_images),
+            "modality": "image" if n_images > 0 else "text",
+            "harness": str(_parquet_scalar_or_none(pair0.get("harness")) or ""),
+            "answer_source": E065_VERIFIED_ANSWER_SOURCE,
+            "stop_reason": E065_VERIFIED_STOP_REASON,
+            "train_frac": float(train_frac) if train_frac is not None else None,
+            "rollout_file": os.path.basename(fpath),
+            "messages": messages,
+        }
+        verified_records.append(rec)
+
+    n_img_verified = [r["n_images"] for r in verified_records]
+    stats = {
+        "file": os.path.basename(fpath),
+        "path": fpath,
+        "rows": n_rows,
+        "rollouts": len(groups),
+        "multi_pair_rollouts": n_multi_pair,
+        "pair0_rows": len(pair0_rows),
+        "error_rows": n_error_rows,
+        "unique_task_ids": len({str(r["task_id"]) for r in records}),
+        "unique_parent_puzzles": len(unique_parents),
+        "schema_columns": schema_cols,
+        "correct_count": n_correct_pair0,
+        "correct_rate": round(n_correct_pair0 / max(1, len(pair0_rows)), 4),
+        "train_pass_count": n_train_pass_pair0,
+        "train_pass_rate": round(n_train_pass_pair0 / max(1, len(pair0_rows)), 4),
+        "correct_all_rollouts": n_correct_all,
+        "answer_sources": dict(answer_sources),
+        "stop_reasons": dict(stop_reasons),
+        "contaminated_rows": len(contaminated_tasks),
+        "contaminated_tasks": contaminated_tasks,
+        "bad_turn_rows_among_verified": int(drops["bad_turn"]),
+        "bad_reason_counts": dict(bad_reason_counts),
+        "drops": dict(drops),
+        "verified_clean_count": len(verified_records),
+        "verified_with_images": sum(1 for n in n_img_verified if n > 0),
+        "images_per_verified_rollout_mean": round(float(np.mean(n_img_verified)), 2) if n_img_verified else 0.0,
+        "images_per_verified_rollout_max": int(max(n_img_verified)) if n_img_verified else 0,
+        "zero_py_error_among_verified": sum(1 for r in verified_records if r["py_error_turns"] == 0),
+        "zero_ident_syntax_error_among_verified": sum(
+            1 for r in verified_records if r["ident_syntax_error_turns"] == 0
+        ),
+        "zero_wasted_post_pass_turns_among_verified": sum(
+            1 for r in verified_records if r["wasted_post_pass_turns"] == 0
+        ),
+        "elapsed_sec": round(time.time() - t0, 2),
+    }
+    return stats, verified_records
 
 
 def discover_top10k_rollout_shards(top10k_dir: str) -> list[str]:
@@ -783,13 +1035,72 @@ def _detect_all_train_pass(code: str, out: str, n_train: int) -> bool:
     return False
 
 
+# ---- OpenAI content-part helpers (E065 text+image rollouts) ----
+IMAGE_BLOCK_TYPES = ("image_url", "image")
+
+
+def is_image_block(block: Any) -> bool:
+    """True for OpenAI (`image_url`) / Anthropic-style (`image`) content parts."""
+    return isinstance(block, Mapping) and block.get("type") in IMAGE_BLOCK_TYPES
+
+
+def image_block_bytes(block: Mapping[str, Any]) -> bytes:
+    """Decodes the raw (PNG) bytes of an image content part (inline `data:` URLs or base64 payloads only)."""
+    if block.get("type") == "image_url":
+        image_url = block.get("image_url")
+        url = image_url if isinstance(image_url, str) else (image_url or {}).get("url", "")
+        return dsv41_image_tokens.decode_data_url(str(url))
+    source = block.get("source")
+    if isinstance(source, Mapping) and source.get("data"):
+        return base64.b64decode(source["data"])
+    if block.get("data"):
+        return base64.b64decode(block["data"])
+    if block.get("url"):
+        return dsv41_image_tokens.decode_data_url(str(block["url"]))
+    raise ValueError("Image block does not contain an inline base64 image")
+
+
+def message_content_text(content: Any) -> str:
+    """Text of an OpenAI message `content` (plain string, or list of parts whose text parts are joined by '\\n\\n')."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        return "\n\n".join(
+            str(p.get("text") or "") for p in content if isinstance(p, Mapping) and p.get("type") == "text"
+        )
+    return str(content)
+
+
+def count_message_images(messages: Sequence[Mapping[str, Any]]) -> int:
+    """Number of image content parts across all messages (list-valued `content` or `content_blocks`)."""
+    n = 0
+    for m in messages:
+        for key in ("content", "content_blocks"):
+            parts = m.get(key)
+            if isinstance(parts, (list, tuple)):
+                n += sum(1 for p in parts if is_image_block(p))
+    return n
+
+
 def analyze_trajectory_quality(
     messages: Sequence[Mapping[str, Any]],
     events: Sequence[Mapping[str, Any]],
+    n_train: int | None = None,
 ) -> dict[str, int]:
-    """Extracts per-trajectory Python error counts, identifier/syntax typo counts, and post-pass tail stats."""
-    user_text = next((str(m.get("content") or "") for m in messages if m.get("role") == "user"), "")
-    n_train = max(1, len(re.findall(r"--Example \d+--", user_text)))
+    """Extracts per-trajectory Python error counts, identifier/syntax typo counts, and post-pass tail stats.
+
+    `n_train` (number of training pairs) is inferred from the first user prompt unless given explicitly
+    (E065 callers pass the manifest's `n_train`); image parts of list-valued user content are ignored.
+    """
+    user_text = next((message_content_text(m.get("content")) for m in messages if m.get("role") == "user"), "")
+    if n_train is None:
+        n_train = max(
+            len(re.findall(r"--Example \d+--", user_text)),
+            len(re.findall(r"\bExample \d+ input\b", user_text)),
+        )
+    n_train = max(1, int(n_train))
     usage_events = [e for e in events if isinstance(e, Mapping) and e.get("usage")]
 
     py_error_turns = 0
@@ -944,11 +1255,15 @@ def render_deepseek_v41_with_spans(
     """Renders messages into DeepSeek-V4.1 DSML format and returns char spans for loss masking & weighting.
 
     Matches `tokenize_rollouts.py:render_with_roles` + `encoding/encoding.py` byte-for-byte.
+    User `content` given as a list of OpenAI parts (E065 image rollouts) is rendered like
+    `encoding.process_image_messages`: every image part becomes one `<｜deepseek_image｜>` placeholder
+    text block and all parts are joined with "\\n\\n"; the images' bytes are collected in prompt order.
     Returns dict with:
       - `text`: full rendered string starting with `<｜begin▁of▁sentence｜>`
       - `asst_spans`: list of `(start_char, end_char)` for every assistant message's generated suffix
       - `tc_spans`: list of `(start_char, end_char)` for every DSML tool-call block (`<｜DSML｜ calls>...`)
       - `final_submit_span`: `(start_char, end_char)` of the final assistant message
+      - `image_blobs`: list of decoded image bytes (PNG), one per placeholder, in prompt order (empty for text)
     """
     msgs = [copy.deepcopy(dict(m)) for m in messages]
     last_asst = max(i for i, m in enumerate(msgs) if m.get("role") == "assistant")
@@ -1012,6 +1327,7 @@ def render_deepseek_v41_with_spans(
     text = DS41_BOS_TOKEN
     asst_spans: list[tuple[int, int]] = []
     tc_spans: list[tuple[int, int]] = []
+    image_blobs: list[bytes] = []
 
     for idx, msg in enumerate(merged):
         role = msg.get("role")
@@ -1047,6 +1363,11 @@ def render_deepseek_v41_with_spans(
                 for b in c_blocks:
                     if b.get("type") == "text":
                         parts.append(b.get("text", ""))
+                    elif is_image_block(b):
+                        # encoding.py: image blocks become `<｜deepseek_image｜>` text blocks (one placeholder
+                        # per image, expanded to the full span at tokenization time).
+                        parts.append(dsv41_image_tokens.IMAGE_PLACEHOLDER)
+                        image_blobs.append(image_block_bytes(b))
                     elif b.get("type") == "tool_result":
                         parts.append(f"<tool_result>{b.get('content', '')}</tool_result>")
                 piece += "\n\n".join(parts)
@@ -1090,6 +1411,7 @@ def render_deepseek_v41_with_spans(
         "asst_spans": asst_spans,
         "tc_spans": tc_spans,
         "final_submit_span": asst_spans[-1] if asst_spans else None,
+        "image_blobs": image_blobs,
     }
 
 
@@ -1100,7 +1422,7 @@ def tokenize_deepseek_v41_and_build_weights(
     wic_alnum_weight: int = 10,
     tool_call_weight: int = 2,
     final_submit_weight: int = 5,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     """Tokenizes a rollout in DeepSeek-V4.1 DSML format and builds `input_ids`, `loss_mask`, and `loss_weights`.
 
     `loss_weights` (`uint8`) assigns:
@@ -1110,12 +1432,25 @@ def tokenize_deepseek_v41_and_build_weights(
       - `final_submit_weight` (default 5) on the final `submit_answer` turn
       - `wic_alnum_weight` (default 10) on word-internal alphanumeric continuation tokens (`WIC-alnum`)
         inside assistant spans, targeting the 75% BPE split-mixing typo concentration in pruned E128.
+
+    Image rollouts (E065): the rendered text carries one `<｜deepseek_image｜>` placeholder (a single token,
+    id 129264) per image. After the text-level ids/mask/weights above are computed, every placeholder is
+    expanded in place to its full span `[IMAGE_START] + ([IMAGE] * n_llm_w + [IMAGE_NEW_LINE]) * n_llm_h +
+    [IMAGE_END]` (all positions carry id 129264; `loss_mask`/`loss_weights` are 0 there), so the returned
+    arrays have the final sequence length. Text-only input is returned unchanged (no placeholder, no expansion).
+
+    Returns `(input_ids int32, loss_mask uint8, loss_weights uint8, tok_stats)` where `tok_stats` holds:
+      - `n_asst_turns`, `n_wic_alnum_tokens`, `n_tool_call_tokens` (as before)
+      - `token_types`: `np.int8` array aligned with `input_ids` (`-1` text, `0..3` image span types)
+      - `image_blobs`: list of PNG bytes in prompt order (empty for text rollouts)
+      - `n_images`: number of images; `n_image_tokens`: total image-span positions
     """
     rendered = render_deepseek_v41_with_spans(messages, reasoning_effort=reasoning_effort, tools=True)
     text = rendered["text"]
     asst_spans = rendered["asst_spans"]
     tc_spans = rendered["tc_spans"]
     final_span = rendered["final_submit_span"]
+    image_blobs: list[bytes] = list(rendered.get("image_blobs") or [])
 
     # Support both `tokenizers.Tokenizer` and `transformers.PreTrainedTokenizerFast`
     if hasattr(tokenizer, "encode") and not hasattr(tokenizer, "vocab_size"):
@@ -1161,10 +1496,30 @@ def tokenize_deepseek_v41_and_build_weights(
                 loss_weights[k] = max(int(loss_weights[k]), wic_alnum_weight)
                 wic_alnum_count += 1
 
-    tok_stats = {
+    # Expand `<｜deepseek_image｜>` placeholders into full image spans (ids stay 129264, loss arrays get 0).
+    # Text-only rollouts (no images, no placeholder token) skip this entirely so their ids are unchanged.
+    n_placeholders = int((ids == dsv41_image_tokens.IMAGE_TOKEN_ID).sum())
+    if image_blobs or n_placeholders:
+        # Raises ValueError on a placeholder/image count mismatch (e.g. placeholder text leaked into a turn).
+        ids, token_types, (loss_mask, loss_weights), _ = dsv41_image_tokens.expand_image_placeholders(
+            ids,
+            image_blobs,
+            image_token_id=dsv41_image_tokens.IMAGE_TOKEN_ID,
+            per_token_arrays=[loss_mask, loss_weights],
+        )
+        loss_mask = loss_mask.astype(np.uint8)
+        loss_weights = loss_weights.astype(np.uint8)
+    else:
+        token_types = np.full(len(ids), dsv41_image_tokens.TEXT, dtype=np.int8)
+
+    tok_stats: dict[str, Any] = {
         "n_asst_turns": len(asst_spans),
         "n_wic_alnum_tokens": wic_alnum_count,
         "n_tool_call_tokens": int(((loss_weights == tool_call_weight) | (loss_weights == wic_alnum_weight)).sum()),
+        "token_types": token_types,
+        "image_blobs": image_blobs,
+        "n_images": len(image_blobs),
+        "n_image_tokens": int((token_types != dsv41_image_tokens.TEXT).sum()),
     }
     return ids, loss_mask, loss_weights, tok_stats
 

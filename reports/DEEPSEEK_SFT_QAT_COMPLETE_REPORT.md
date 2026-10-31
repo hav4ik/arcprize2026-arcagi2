@@ -1,50 +1,43 @@
 # Pruned DeepSeek-V4.1 (`Tool E128` 2-Bit) SFT & QAT: Architecture, Quantization, Training & Evaluation Reference
 
-**Last Updated:** 2026-10-30  
-**Scope:** End-to-end technical guide and experimental reference for loading, evaluating (Havu's Candidate B32 harness), and fine-tuning (MoE-only SFT & Quantization-Aware Training / QAT) the pruned + 2-bit quantized **DeepSeek-V4.1-Flash-1017 (`Tool E128` 2-bit)** model on **ARC-AGI-2**.
+**Last Updated:** 2026-10-31  
+**Scope:** End-to-end technical guide and experimental reference for loading, evaluating (Havu's Candidate B32 harness, both `json` text and E058 `text+image`), and fine-tuning (MoE-only SFT & Multimodal Quantization-Aware Training / QAT) the pruned + 2-bit quantized **DeepSeek-V4.1-Flash-1017 (`Tool E128` 2-bit & Image `E128` 2-bit)** models on **ARC-AGI-2**.
+- **For the full Round-2 Multimodal (`Text + Image`) QAT SFT (`v14`) & Candidate B32 Evaluation report**, see **[`dsv41_qat_image_v14_experiment_report.md`](dsv41_qat_image_v14_experiment_report.md)**.
 
 ---
 
 ## 1. Executive Summary & Latest ARC-AGI-2 Evaluation Results
 
-We built a complete, dependency-clean PyTorch 8×B200 Expert-Parallel (`EP=8`) training, 2-bit/FP8 export, and multi-shard Candidate B32 evaluation pipeline for collaborator Havu's (`chankhavu`) pruned **DeepSeek-V4.1-Flash-1017 (`Tool E128` 2-bit)** model (`131.1 GB` on disk; `40` layers, `128` kept routed experts/layer in 2-bit Humming `uint2` GPTQ + `FP8` block-32 backbone + `64 GiB` Compact Engram on layers 1 & 14).
+We built a complete, dependency-clean PyTorch `8×B200` / `16×B200` (`DP=2 × EP=8`) training, 2-bit/FP8 export, and multi-shard Candidate B32 evaluation pipeline for collaborator Havu's (`chankhavu`) pruned **DeepSeek-V4.1-Flash-1017 (`Tool E128` 2-bit & Image `E128` 2-bit)** models (`40` layers, `128` kept routed experts/layer in 2-bit Humming `uint2` GPTQ + `FP8` block-32 backbone + `64 GiB` Compact Engram on layers 1 & 14 + ViT/aligner vision tower).
 
-### 1.1 SFT v12 Loss Progression (`114` Steps = `1.00` Epoch on `8×B200`)
+### 1.1 Round-2 Multimodal (`Text + Image`) QAT SFT (`round2_v14_16xb200_fast` on `16×B200`)
+- **Base Model:** `/cns/lu-d/home/arazdai/kaggle/models/dsv41_img_e128_2bit_causal` (`vision_enabled=True`).
+- **Dataset (`e065_img_text_v1`):** `6,149` verified E065 trajectories (`3,050` multimodal `text+image` + `3,099` `json` text; `79.69M` tokens, `22,778` PNG images, `0` identifier/syntax errors, `WIC-alnum = 10.0×` loss weight).
+- **True QAT Breakthrough:** By training all **`1,887,436,800` per-group 2-bit scales (`qat_scale`)** in `FP32` alongside `r=32` LoRA and the vision aligner (`--train_vision=aligner`) under STE fake-quantization, **`80.21% -> 86.33%` (`1.63B / 1.89B`) of all routed-expert group scales updated in the exported 2-bit checkpoints** (solving `v12`'s `0.00%` 2-bit dead-zone).
+- **Uploaded HuggingFace Checkpoints:**
+  - **[`chankhavu/ds-qat-image-v02-ep08`](https://huggingface.co/chankhavu/ds-qat-image-v02-ep08)** (`step-00154-epoch_0p80` resumable QAT delta; standalone 2-bit export at `.../round2_v14_16xb200_fast/wu_1/export_2bit/epoch_0p80`).
+  - **[`chankhavu/ds-qat-image-v02-ep1-2bit`](https://huggingface.co/chankhavu/ds-qat-image-v02-ep1-2bit)** (`export_2bit/epoch_1p00` standalone 2-bit Humming + FP8 block-32 + Vision checkpoint).
+
+| Milestone (`v14` QAT Image) | Step (`Epoch`) | Held-Out `val_loss` (`val_ppl`) | Held-Out `val_wic_alnum_loss` | Routed Scales Changed (`1.887B`) | **Apples-to-Apples E058 `text+image` Score vs. Base Image Model** | Tool-Call Error Rate (`Auto-Repairs`) | Mean (Median) Tokens / Attempt |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Base Image (`dsv41_img_e128_2bit_causal`)** | `0` (`0.00`) | `0.71123` (`2.0365`) | `0.22521` | `0.00%` | `76.11%` (`86.00/113` Attempt-0 tasks) | `15.8%` (**`101` repairs**) | `32,126` (`28,392`) |
+| **`epoch_0p20`** | `39` (`0.20`) | `0.68380` (`1.9814`) | `0.12589` (`-44.1%`) | `80.21%` | `65.06%` Pass@1 / **`74.71%` Pass@2** (`114` tasks, `N=2`) | `10.1%` (`6` repairs) | `26,336` (`22,520`) |
+| **`epoch_0p40`** | `77` (`0.40`) | `0.67712` (`1.9682`) | `0.12378` (`-45.0%`) | `84.38%` | `68.91%` Pass@1 / **`79.27%` Pass@2** (`119` tasks, `N=2`) | `8.8%` (`15` repairs) | `27,828` (`24,992`) |
+| **`epoch_0p60`** | `116` (`0.60`) | `0.67388` (`1.9618`) | `0.11992` (`-46.8%`) | `85.80%` | **`79.00%` vs Base `75.97%` (`+3.03 pp`, `77` common tasks)** *(Shard 3 Pass@2: **`80.86%`**)* | **`7.4%` (`4` repairs)** | **`28,737` (`-15.4%`)** |
+| **`epoch_0p80` ★ (`ds-qat-image-v02-ep08`)** | `154` (`0.80`) | `0.67257` (`1.9593`) | `0.12105` (`-46.3%`) | **`86.22%`** | **`87.76%` vs Base `80.61%` (`+7.14 pp`, `49` common tasks)** | **`9.0%` (`2` repairs)** | **`21,469` (`17,385`, `-21.5%`)** |
+| **`epoch_1p00` ★ (`ds-qat-image-v02-ep1-2bit`)** | `193` (`1.00`) | **`0.67152` (`1.9572`)** | **`0.11979` (`-46.8%`)** | **`86.33%`** | **`86.54%` vs Base `82.69%` (`+3.85 pp`, `52` common tasks)** | **`6.4%` (`1` repair)** | **`18,975` (`16,910`, `-27.6%`)** |
+
+---
+
+### 1.2 Round-1 Text-Only MoE SFT (`v12`) — Completed 120-Task Results (`8×B200`)
 - **Run XIDs:** [`http://xid/305920165`](http://xid/305920165) (steps 1–57) $\to$ auto-resumed in [`http://xid/306004894`](http://xid/306004894) (steps 49–114, `COMPLETED / SUCCESS`).
-- **Peak GPU Memory:** `108.5 GiB / 180 GiB` per B200 GPU (after fixing the 22.6 GiB/rank `d_orig` int8 cache OOM).
 
-| Step | Epoch | Held-Out Val Loss (All Assistant Tokens) | Held-Out Val `WIC-Alnum` Loss (Split-Word Tokens) | Weighted Train Loss (EMA) | Exported 2-Bit Checkpoint |
-| :---: | :---: | :---: | :---: | :---: | :--- |
-| **0 (Base)** | `0.00` | `0.6768` | `0.2155` | — | `/cns/lu-d/home/arazdai/kaggle/models/dsv41_e128_2bit` |
-| **16** | `0.14` | `0.6718` (`-0.0050`) | `0.1538` (`-28.6%`) | `0.418` | — |
-| **28 ★** | **`0.25`** | **`0.6655` (`-0.0113`)** | **`0.1486` (`-31.0%`)** | `0.406` | `.../export_2bit/epoch_0p25` |
-| **32** | `0.28` | `0.6640` (`-0.0128`) | `0.1479` (`-31.4%`) | `0.381` | — |
-| **48** | `0.42` | `0.6618` (`-0.0150`) | `0.1443` (`-33.0%`) | `0.392` | — |
-| **57 ★** | **`0.50`** | **`0.6611` (`-0.0157`)** | **`0.1421` (`-34.1%`)** | `0.399` | `.../export_2bit/epoch_0p50` |
-| **64** | `0.56` | `0.6606` (`-0.0162`) | `0.1404` (`-34.8%`) | `0.377` | — |
-| **80** | `0.70` | `0.6602` (`-0.0166`) | `0.1395` (`-35.3%`) | `0.386` | — |
-| **86 ★** | **`0.75`** | **`0.6599` (`-0.0169`)** | **`0.1394` (`-35.3%`)** | `0.379` | `.../export_2bit/epoch_0p75` |
-| **96** | `0.84` | `0.6600` (`-0.0168`) | `0.1392` (`-35.4%`) | `0.403` | — |
-| **112** | `0.98` | `0.6599` (`-0.0169`) | `0.1389` (`-35.5%`) | `0.363` | — |
-| **114 ★** | **`1.00`** | **`0.6599` (`-0.0169`)** | **`0.1389` (`-35.5%`)** | `0.363` | `.../export_2bit/epoch_1p00` |
-
-### 1.2 Official Kaggle ARC-AGI-2 Evaluation (`120` Tasks, `N=2` Attempts, Havu Candidate B32 Harness)
-
-All evaluations use Havu's **Candidate B32** multi-test single-rollout harness (`80k` hard / `40k` gentle token budget, `×(1 + 0.5(n_test - 1))` multi-test scaling, token-exact continuation, AST/OSA ≤ 2 identifier auto-repair, 4-path `train_check`, `ranked_answers`). Only **official Kaggle task-level Pass@1 and Pass@2** are reported below:
-
-| Checkpoint | Tasks Done | Official Kaggle Pass@1 (on Done Tasks) | Official Kaggle Pass@2 (on Done Tasks) | Official Pass@1 / 120 (Lower Bound So Far) | Official Pass@2 / 120 (Lower Bound So Far) | Output Tokens (Median / Mean / P90) |
+| Checkpoint (`v12` Text-Only B32) | Tasks Done | Held-Out `val_loss` (`WIC-Alnum`) | **Official Kaggle Pass@1 (`120` Tasks)** | **Official Kaggle Pass@2 (`120` Tasks)** | Demo-Verified Pairs (`train_pass`) | Output Tokens (Median / Mean) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Base (`dsv41_e128_2bit`)** | **`120 / 120`** | **`71.9%`** (`86.33/120`) | **`80.3%`** (`96.33/120`) | **`71.9%`** (`86.33/120`) | **`80.3%`** (`96.33/120`) | `36,506` / `46,932` / `101,691` |
-| **SFT `epoch_0p25` (Step 28)** | **`116 / 120`** | **`81.3%`** (`94.33/116`) | **`85.1%`** (`98.67/116`) | **`78.6%`** (`94.33/120`) | **`82.2%`** (`98.67/120`) | `33,439` / `42,164` / `80,218` |
-| **SFT `epoch_0p50` (Step 57)** | `99 / 120` | `83.7%` (`82.83/99`) | `86.7%` (`85.83/99`) | `69.0%` (`82.83/120`) | `71.5%` (`85.83/120`) | `29,128` / `36,207` / `78,715` |
-| **SFT `epoch_0p75` (Step 86)** | `93 / 120` | `80.6%` (`75.00/93`) | `87.6%` (`81.50/93`) | `62.5%` (`75.00/120`) | `67.9%` (`81.50/120`) | `29,227` / `36,229` / `76,967` |
-| **SFT `epoch_1p00` (Step 114)** | `3 / 120` *(running)* | — | — | — | — | `27,193` / `26,919` / `46,456` |
-
-> [!IMPORTANT]
-> **Key Takeaway on `epoch_0p25` vs. `epoch_0p50`:**
-> - With `116/120` tasks completed, **`epoch_0p25` has already reached `98.67 / 120 = 82.2%` Official Pass@2 and `94.33 / 120 = 78.6%` Official Pass@1**, beating the Base model's final 120-task totals (`86.33` Pass@1 / `96.33` Pass@2) with 4 tasks still in flight.
-> - On the exact same finished tasks (`115` common tasks), `epoch_0p25` beats Base by **`+5.5` tasks on Pass@1** (`89.3` vs `83.8`) and **`+3.3` tasks on Pass@2** (`98.7` vs `95.3`, 7 task wins vs 2 losses) while reducing P90 output tokens from `101.7k` to `80.2k`.
-> - Between `0.25` and `0.50`, held-out validation loss drops by `74%` of its total 1-epoch decrease by step 28 (`0.25` epoch) and `93%` by step 57 (`0.50` epoch). On the 100 tasks finished by both `0.25` and `0.50`, `0.50` is `+3.0` tasks higher on Pass@1 while `0.25` is `+1.3` tasks higher on Pass@2 (within single-seed sampling noise of `±2–3` tasks at `T=1.0`).
+| **Base (`dsv41_e128_2bit`)** | **`120 / 120`** | `0.6768` (`0.2155`) | **`71.94%`** (`86.33/120`) | **`80.28%`** (`96.33/120`) | `146 / 167` (`87.4%`) | `36,506` / `39,410` |
+| **SFT `epoch_0p25` (Step 28) ★** | **`120 / 120`** | `0.6656` (`0.1456`, `-32.4%`) | **`80.69%` (`96.83/120`, `+8.75 pp`)** | **`84.31%` (`101.17/120`, `+4.03 pp`)** | **`153 / 167` (`91.6%`)** | **`33,212` / `35,840`** |
+| **SFT `epoch_0p50` (Step 57)** | **`120 / 120`** | `0.6649` (`0.1407`, `-34.7%`) | `75.69%` (`90.83/120`, `+3.75 pp`) | `81.53%` (`97.83/120`, `+1.25 pp`) | `149 / 167` (`89.2%`) | `34,649` / `37,104` |
+| **SFT `epoch_0p75` (Step 85) ★** | **`120 / 120`** | **`0.6606` (`0.1389`, `-35.5%`)** | `77.36%` (`92.83/120`, `+5.42 pp`) | **`85.28%` (`102.33/120`, `+5.00 pp`)** | **`153 / 167` (`91.6%`)** | `34,071` / `36,712` |
 
 ---
 

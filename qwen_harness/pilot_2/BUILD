@@ -51,13 +51,24 @@ py_library(
     srcs = ["havu_sandbox_zygote.py"],
 )
 
+# E058 "text+image" grid rendering (exact port of Havu's evals/arc_harness/grid_image.py).
+py_library(
+    name = "grid_image",
+    srcs = ["grid_image.py"],
+    deps = [
+        "//third_party/py/PIL:pil",
+    ],
+)
+
 py_library(
     name = "havu_b32_harness",
     srcs = ["havu_b32_harness.py"],
     deps = [
+        ":grid_image",
         ":havu_auto_repair",
         ":havu_sandbox_zygote",
         ":prompts_and_selector",
+        "//experimental/users/arazdai/kaggle/sft:dsv41_image_tokens",
         "//pyglib:gfile",
         "//third_party/py/IPython:ipython-libs",
         "//third_party/py/numpy",
@@ -105,10 +116,14 @@ py_test(
     size = "medium",
     srcs = ["havu_b32_harness_test.py"],
     deps = [
+        ":grid_image",
         ":havu_b32_harness",
         ":havu_sandbox_zygote",
         ":prompts_and_selector",
+        "//experimental/users/arazdai/kaggle/sft:dsv41_image_tokens",
         "//testing/pybase",
+        "//third_party/py/PIL:pil",
+        "//third_party/py/numpy",
     ],
 )
 

@@ -1,6 +1,21 @@
-# Qwen3.8-27B ARC-AGI-2 Full SFT & LoRA SFT (`sft/`)
+# DeepSeek-V4.1 (`Image E128` & `Tool E128` 2-Bit) QAT / SFT & Qwen3.8-27B SFT (`sft/`)
 
-This directory implements the end-to-end **Qwen3.8-27B** supervised fine-tuning (SFT) codebase for **ARC-AGI-2**:
+This directory implements the end-to-end **Pruned DeepSeek-V4.1 (`Image E128` & `Tool E128` 2-Bit) Multimodal QAT & MoE SFT** and **Qwen3.8-27B Full/LoRA SFT** pipelines for **ARC-AGI-2**:
+
+### A. Pruned DeepSeek-V4.1 (`Image E128` & `Tool E128` 2-Bit) Multimodal QAT & SFT (`v14` & `v12`)
+- **Full Experiment Report**: [`../arc_agi_2/reports/dsv41_qat_image_v14_experiment_report.md`](../arc_agi_2/reports/dsv41_qat_image_v14_experiment_report.md) & [`../arc_agi_2/reports/DEEPSEEK_SFT_QAT_COMPLETE_REPORT.md`](../arc_agi_2/reports/DEEPSEEK_SFT_QAT_COMPLETE_REPORT.md)
+- **Uploaded Checkpoints**: [`chankhavu/ds-qat-image-v02-ep08`](https://huggingface.co/chankhavu/ds-qat-image-v02-ep08) (`epoch_0p80`, **`+7.14 pp` over Base Image Model** on E058 `text+image` B32) and [`chankhavu/ds-qat-image-v02-ep1-2bit`](https://huggingface.co/chankhavu/ds-qat-image-v02-ep1-2bit) (`epoch_1p00`, **`+3.85 pp` over Base Image Model**, **`-57%` tool-call errors**, **`-27.6%` tokens/attempt**).
+- **Core Scripts**:
+  - [`dsv41_sft_model.py`](dsv41_sft_model.py): 40-layer `EP=8` PyTorch model, 2-bit Humming `uint2` GPTQ routed experts with trainable `FP32` group scales (`qat_scale`) + `r=32` LoRA, `FP8` block-32 STE shared experts, `64 GiB` Compact Engram, and causal ViT + `3×3` aligner vision tower (`ffn.gate.bias_vl`).
+  - [`dsv41_image_tokens.py`](dsv41_image_tokens.py): Exact E058 image-span planner, PNG patch tiler, and `<｜deepseek_image｜>` token expander.
+  - [`train_dsv41_sft.py`](train_dsv41_sft.py) & [`launch_dsv41_sft_b200_xm.py`](launch_dsv41_sft_b200_xm.py): `8×B200` / `16×B200` (`DP=2 × EP=8`) QAT & SFT trainer with global gradient clipping, tiered LRs, resumable delta checkpoints, and standalone 2-bit milestone exports.
+  - [`eval_dsv41_b32_arc2.py`](eval_dsv41_b32_arc2.py) & [`launch_dsv41_b32_eval_xm.py`](launch_dsv41_b32_eval_xm.py): Distributed `EP=8` KV-cached Candidate B32 evaluation driver (`--grid_format=text+image` or `json`).
+  - [`load_dsv41_2bit_example.py`](load_dsv41_2bit_example.py): Reference script for loading standalone 2-bit exports (`export_2bit/epoch_0p80`, `chankhavu/ds-qat-image-v02-ep1-2bit`) or overlaying resumable QAT deltas (`chankhavu/ds-qat-image-v02-ep08`) onto `dsv41_img_e128_2bit_causal`, with text and multimodal greedy decoding.
+  - [`audit_and_split_e065_rollouts.py`](audit_and_split_e065_rollouts.py) & [`rank_e065_difficulty_gemini38_flash.py`](rank_e065_difficulty_gemini38_flash.py): E065 multimodal/text rollout audit, ground-truth verification, and difficulty ranking.
+
+---
+
+### B. Qwen3.8-27B ARC-AGI-2 Full SFT & LoRA SFT
 1. **3-Gate Data Audit & $D_8$+Color Eval De-Contamination** (`audit_and_prepare_data.py`)
 2. **ChatML Tool Rendering & Token-Exact Assistant Loss-Mask Verification** (`data_pipeline.py`)
 3. **Custom `@triton.jit` Gated DeltaNet Forward/Backward Kernels (`BT=64`)** (`fast_deltanet.py`)
