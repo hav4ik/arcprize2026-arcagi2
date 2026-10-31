@@ -1,4 +1,4 @@
-## Per run (19 probes)
+## Per run (23 probes)
 
 | run | machine (GPU uuid tails) | H2D/D2H min GB/s | slow GPUs | NCCL ag 516 KB µs: best / worst pair | model mount MB/s single / 8-par | wheels 8-par | debs 8-par | /kaggle/working write | power |
 |---|---|---|---|---|---|---|---|---|---|
@@ -21,18 +21,22 @@
 | probe-17 | 54ed78,787a97,a2b5bc | 11.5 / 12.2 | - | 150 (0-2) / 228 (0-1) | 169.0 / 1034.1 | 694.2 | 570.5 | 342.0 | 72.00 W |
 | probe-18 | 3c371e,d31bbf,e55abc | 11.5 / 12.3 | - | 147 (0-2) / 228 (2-3) | 141.5 / 960.7 | 242.0 | 173.2 | 312.5 | 72.00 W |
 | probe-19 | 382811,695db3,776898 | 11.5 / 12.3 | - | 148 (0-2) / 227 (0-1) | 196.3 / 821.0 | 833.5 | 654.4 | 312.3 | 72.00 W |
+| probeb-01 | 0cbd99,3f9ef7,a969fe | 11.5 / 12.3 | - | 150 (0-3) / 229 (2-3) | 248.7 / 767.3 | 235.0 | 179.9 | 313.1 | 72.00 W |
+| probeb-02 | 018a8b,3329be,b27242 | 11.5 / 12.3 | - | 150 (0-2) / 227 (2-3) | 171.4 / 746.8 | 227.5 | 173.7 | 312.4 | 72.00 W |
+| probeb-03 | 3d73f8,a60c8b,adb380 | 11.5 / 12.3 | - | 150 (0-2) / 227 (0-1) | 245.6 / 717.0 | 239.1 | 175.1 | 313.2 | 72.00 W |
+| probeb-04 | 0cbd99,3f9ef7,a969fe | 11.5 / 12.3 | - | 150 (0-2) / 228 (0-1) | 150.3 / 956.8 | 235.6 | 175.3 | 312.6 | 72.00 W |
 
 ## Summary
 
-- runs: 19; distinct machines (by GPU UUIDs): 17; distinct hosts: 19
+- runs: 23; distinct machines (by GPU UUIDs): 20; distinct hosts: 23
 - runs with a slow host link (any GPU H2D or D2H < 6 GB/s): 0 []
-- NCCL all-gather 516 KB, best pair µs: min 147, p25 147, median 148, p75 150, max 151 (n=19)
-- NCCL all-gather 516 KB, worst pair µs: min 225, p25 227, median 228, p75 228, max 230 (n=19)
-- model mount cold single-stream MB/s: min 102, p25 142, median 169, p75 196, max 285 (n=19)
-- model mount cold 8-parallel MB/s: min 537, p25 771, median 884, p75 1000, max 1034 (n=19)
-- vllm-wheels cold 8-parallel MB/s: min 56, p25 444, median 550, p75 740, max 959 (n=19)
-- cu13-install cold 8-parallel MB/s: min 150, p25 313, median 540, p75 654, max 834 (n=19)
-- /kaggle/working write MB/s: min 311, p25 312, median 312, p75 313, max 342 (n=19)
-- /dev/shm write MB/s: min 2464, p25 2500, median 2509, p75 2528, max 2541 (n=19)
-- implied minutes to read the whole 131 GB model at the 8-parallel rate: min 2, p25 2, median 2, p75 3, max 4 (n=19)
+- NCCL all-gather 516 KB, best pair µs: min 147, p25 148, median 149, p75 150, max 151 (n=23)
+- NCCL all-gather 516 KB, worst pair µs: min 225, p25 227, median 228, p75 228, max 230 (n=23)
+- model mount cold single-stream MB/s: min 102, p25 150, median 171, p75 202, max 285 (n=23)
+- model mount cold 8-parallel MB/s: min 537, p25 756, median 867, p75 989, max 1034 (n=23)
+- vllm-wheels cold 8-parallel MB/s: min 56, p25 245, median 445, p75 694, max 959 (n=23)
+- cu13-install cold 8-parallel MB/s: min 150, p25 180, median 321, p75 624, max 834 (n=23)
+- /kaggle/working write MB/s: min 311, p25 312, median 312, p75 313, max 342 (n=23)
+- /dev/shm write MB/s: min 2464, p25 2501, median 2511, p75 2530, max 2541 (n=23)
+- implied minutes to read the whole 131 GB model at the 8-parallel rate: min 2, p25 2, median 3, p75 3, max 4 (n=23)
 - probe errors: []

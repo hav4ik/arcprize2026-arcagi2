@@ -9,7 +9,7 @@ MODEL = "/kaggle/input/models/chankhavu/dsv41-flash-1017-arc-tool-e128-2bit/pyto
 WHEELS = "/kaggle/input/datasets/nguyennguyen599/vllm-wheels"
 DEBS = "/kaggle/input/datasets/nguyennguyen599/cu13-install"
 rows = []
-for f in sorted(glob.glob(os.path.join(HERE, "runs/probe-*/probe.json"))):
+for f in sorted(glob.glob(os.path.join(HERE, "runs/probe-*/probe.json")) + glob.glob(os.path.join(HERE, "runs/probeb-*/probe.json"))):
     r = json.load(open(f))
     idn, g = r.get("identity", {}), r.get("gpucheck", {})
     copy = g.get("copy", {})

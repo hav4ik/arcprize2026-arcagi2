@@ -4,6 +4,17 @@ User request 2026-10-31. Manh Nguyen found a Kaggle 4×L4 machine where GPUs 2 a
 (H2D 2.6 GB/s, D2H 0.7 GB/s vs 11 GB/s) and every NCCL pair that touches them is 4–8× slower. Question: how common
 are such machines, and how fast do our submission's mounted inputs read? Budget: 2 h of GPU (user-authorized).
 
+## Bottom line (23 batch probes, 20 distinct machines, ~118 GPU-min, 2026-10-31)
+- **No machine like Manh's:** every GPU of every probe had full host bandwidth (H2D 11.5, D2H 12.1–12.3 GB/s). With 0/23,
+  such machines are probably under ~13% of the batch pool (rule of three, 95%), though they clearly exist.
+- **NCCL has one fixed shape on every machine:** pairs 0-1 and 2-3 ~228 µs, cross pairs ~148 µs (all-gather, 516 KB per
+  rank); no P2P, 72 W power limit everywhere.
+- **Model mounts:** 537–1,034 MB/s with 8 parallel readers (median 867, ~2.5 min for the 131 GB model) but only
+  102–285 MB/s single-stream, so staging must read in parallel. Small-file datasets vary more (vllm-wheels 56–959 MB/s).
+- **The causal image E128 (`arazzd/...-img-e128-causal`) mounts as fast as V12's text E128 on the same machine** (E081b);
+  nothing supports a dataset-region effect, and the zone is not observable from inside a notebook.
+- **Not covered:** interactive sessions, which may come from a different pool. Full per-run table: `summary.md`.
+
 ## Method
 - 19 short commit notebooks `chankhavu/e081-l4-probe-01..19` (private), `machine_shape` NvidiaL4, competition attached
   (otherwise the run silently gets 2×T4), internet off, and **exactly the inputs Manh's V12 (LB 76.25) mounts**:
@@ -18,8 +29,8 @@ are such machines, and how fast do our submission's mounted inputs read? Budget:
      over the next ≤16 untouched files (≤1 GiB each, ≤45 s), then a warm re-read (page cache);
   4. `/kaggle/working`, `/tmp`, `/dev/shm` write speed (2 GiB `dd` with fsync). Their read numbers are page cache
      (the container cannot drop caches) and are not meaningful.
-- `build.py N OUTDIR` builds notebook N; `launch.py` pushes them with at most 2 running (Kaggle's batch GPU limit)
-  and a GPU-minute budget stop; `aggregate.py` writes `summary.md`. Raw results: `runs/probe-NN/probe.json`.
+- `build.py N OUTDIR [b]` builds notebook N (`b`: the E081b dual-model variant); `launch.py` pushes them with at most 2 running (Kaggle's batch GPU limit)
+  and a GPU-minute budget stop; `aggregate.py` writes `summary.md` (all 23 runs). Raw results: `runs/probe-NN/` and `runs/probeb-NN/` (`probe.json`).
 - Cost: ~92 GPU-minutes (each run 2.6–4 min wall, probe ~170 s); probe-20 was skipped to free a batch slot for the
   dsv4-infer session's smoke run. Plus one earlier single check (`chankhavu/arc2-l4-gpucheck`) and ~1 min of an
   interactive session.
