@@ -153,16 +153,10 @@
         <div class="arc-chart" data-draw="scorechart" data-source="acc outages runs"></div>
       </div>
       <div class="arc-card">
-        <h2>Tasks with an answer (of 240)</h2>
-        <p class="arc-note">A task counts once any attempt (or a kept session answer) has a prediction.</p>
+        <h2>Tasks with an answer (solid) and with both attempts (dotted), of 240</h2>
+        <p class="arc-note">Solid: a task counts once any attempt (or a kept session answer) has a prediction. Dotted: a task counts once attempt 0 and attempt 1 both have a finished record (a multi-test task: at least one finished pair each).</p>
         <p class="arc-empty" data-empty-for="answered">No finished attempts yet.</p>
         <div class="arc-chart" data-draw="answeredchart" data-source="acc outages runs"></div>
-      </div>
-      <div class="arc-card">
-        <h2>Tasks with both attempts (of 240)</h2>
-        <p class="arc-note">A task counts once attempt 0 and attempt 1 both have a finished record (a multi-test task: at least one finished pair each).</p>
-        <p class="arc-empty" data-empty-for="two">No finished attempts yet.</p>
-        <div class="arc-chart" data-draw="twochart" data-source="acc outages"></div>
       </div>
     </div>
   </section>
@@ -346,9 +340,10 @@
     const empties = document.querySelectorAll(`[data-empty-for="${opts.key}"]`);
     if (d.status !== 'ok') { empties.forEach((e) => { e.hidden = true; }); return; }
     const rows = d.data.filter((r) => isNum(r[field]) && isNum(r.t_h) && isShown(r.run)).map((r) => ({run: r.run, t: +r.t_h, v: +r[field]}));
+    const rows2 = opts.field2 ? d.data.filter((r) => isNum(r[opts.field2]) && isNum(r.t_h) && isShown(r.run)).map((r) => ({run: r.run, t: +r.t_h, v: +r[opts.field2]})) : [];
     empties.forEach((e) => { e.hidden = rows.length > 0; });
     if (!rows.length) return;
-    const series = d3.groups(rows, (r) => r.run).map(([run, pts]) => ({run, pts: pts.sort((a, b) => a.t - b.t)}))
+    const series = d3.groups(rows, (r) => r.run).map(([run, pts]) => ({run, pts: pts.sort((a, b) => a.t - b.t), pts2: rows2.filter((r) => r.run === run).sort((a, b) => a.t - b.t)}))
       .sort((a, b) => RUN_ORDER.indexOf(a.run) - RUN_ORDER.indexOf(b.run));
     const legend = document.createElement('div');
     legend.className = 'arc-legend';
@@ -356,7 +351,7 @@
     el.append(legend);
     const W = Math.max(280, el.clientWidth || 600), H = 220, m = {t: 10, r: 14, b: 26, l: 40};
     const x = d3.scaleLinear([0, Math.max(12, d3.max(rows, (r) => r.t))], [m.l, W - m.r]);
-    const vals = rows.map((r) => r.v).concat(opts.limits.map((l) => l.v));
+    const vals = rows.concat(rows2).map((r) => r.v).concat(opts.limits.map((l) => l.v));
     const y = d3.scaleLinear([opts.yMin(d3.min(vals)), opts.yMax(d3.max(vals))], [H - m.b, m.t]).nice();
     const svg = d3.select(el).append('svg').attr('width', '100%').attr('viewBox', `0 0 ${W} ${H}`).attr('role', 'img');
     svg.append('g').attr('transform', `translate(0,${H - m.b})`).call(d3.axisBottom(x).ticks(6).tickFormat((v) => v + ' h'))
@@ -393,10 +388,15 @@
       svg.append('path').attr('d', line(s.pts)).attr('fill', 'none').attr('stroke', c).attr('stroke-width', 2)
         .attr('stroke-linecap', 'round').attr('stroke-linejoin', 'round');
       svg.append('g').selectAll('circle').data(s.pts).join('circle').attr('cx', (p) => x(p.t)).attr('cy', (p) => y(p.v)).attr('r', 2.5).attr('fill', c);
+      if (s.pts2.length) {
+        svg.append('path').attr('d', line(s.pts2)).attr('fill', 'none').attr('stroke', c).attr('stroke-width', 2)
+          .attr('stroke-dasharray', '2 4').attr('stroke-linecap', 'round').attr('stroke-linejoin', 'round');
+        svg.append('g').selectAll('circle').data(s.pts2).join('circle').attr('cx', (p) => x(p.t)).attr('cy', (p) => y(p.v)).attr('r', 2).attr('fill', 'var(--color-bg, #fff)').attr('stroke', c).attr('stroke-width', 1.5);
+      }
     });
     const tip = document.createElement('div');
     tip.className = 'arc-tip'; tip.hidden = true; el.append(tip);
-    const flat = series.flatMap((s, i) => s.pts.map((p) => ({...p, i})));
+    const flat = series.flatMap((s, i) => s.pts.map((p) => ({...p, i, lab: opts.label1})).concat(s.pts2.map((p) => ({...p, i, lab: opts.label2}))));
     const dl = d3.Delaunay.from(flat, (p) => x(p.t), (p) => y(p.v));
     svg.on('pointermove', (ev) => {
       const [mx, my] = d3.pointer(ev);
@@ -406,7 +406,7 @@
       const t = document.createElement('div'); t.className = 't'; t.textContent = `${f1(p.t)} h`;
       const v = document.createElement('div'); const sw = document.createElement('i');
       sw.style.cssText = `display:inline-block;width:.6rem;height:.6rem;border-radius:2px;margin-right:.35rem;background:${runColor(p.run)}`;
-      v.append(sw, document.createTextNode(`${p.run}: ${opts.fmt(p.v)} ${opts.unit || 'GiB'}`));
+      v.append(sw, document.createTextNode(`${p.run}${p.lab ? ' (' + p.lab + ')' : ''}: ${opts.fmt(p.v)} ${opts.unit || 'GiB'}`));
       tip.append(t, v); tip.hidden = false;
       const box = el.getBoundingClientRect(), sx = box.width / W;
       const left = Math.min(Math.max(0, x(p.t) * sx + 8), box.width - tip.offsetWidth - 4);
@@ -487,11 +487,7 @@
     limits: [{v: V12_GOLD, label: 'V12 replica 80.83 (gold standard)'}, {v: 68.89, label: 'B32 LB 68.89'}, {v: 46.5, label: 'B32-M LB 46.5', critical: true}],
   }));
   dash.draw('answeredchart', (el) => lineChart(el, 'tasks_answered', {
-    key: 'answered', src: 'acc', unit: 'tasks', fmt: (v) => d3.format(',.0f')(v), yMin: () => 0, yMax: (v) => Math.max(v, 240),
-    limits: [{v: 240, label: 'all 240'}],
-  }));
-  dash.draw('twochart', (el) => lineChart(el, 'tasks_two_attempts', {
-    key: 'two', src: 'acc', unit: 'tasks', fmt: (v) => d3.format(',.0f')(v), yMin: () => 0, yMax: (v) => Math.max(v, 240),
+    key: 'answered', field2: 'tasks_two_attempts', label1: 'with an answer', label2: 'both attempts', src: 'acc', unit: 'tasks', fmt: (v) => d3.format(',.0f')(v), yMin: () => 0, yMax: (v) => Math.max(v, 240),
     limits: [{v: 240, label: 'all 240'}],
   }));
 </script>

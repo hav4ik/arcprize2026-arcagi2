@@ -200,4 +200,5 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
   In `kaggle/`, the emergency writer, the notebook guard cell and `kill_server` use name patterns **only on Kaggle**
   (`/kaggle/input` exists and no `ARC_EXTERNAL_SERVER`); everywhere else they kill only the solver's own descendants
   (`solver.descendants`). `kaggle/tests/fake_v3_test.py` checks this with a decoy process.
+- **All-evals report:** `reports/eval_report.md` + `reports/eval_runs.csv` (every eval run: version-aware pass@1/pass@2, tokens, harness and HF links), regenerate with `.venv/bin/python data_tools/eval_report.py [--hf]`.
 - `data_tools/contamination_check.py`: checks training data against ARC-AGI-2 eval grids, invariant to rotation, flip and colour relabelling. Reports go to `data_tools/contamination_report.json`.

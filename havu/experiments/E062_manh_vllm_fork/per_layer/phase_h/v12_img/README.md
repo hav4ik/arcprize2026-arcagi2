@@ -63,15 +63,88 @@ Hourly (`scripts/replica_wait.sh`):
   - cap − reserved;
   - score and tasks answered.
 
-## The final run (this directory's `data/`)
-- **Notebook:** `kaggle/dsv41_tools/out/nb_v12_img_ab/dsv41-tools-v12-img.ipynb`, sha256 **5f4cfe5d1694**. Relative to 790b1bd9d7b1 (r0) it adds two things:
+## Result: "V12 + images FINAL" (d5e545d4e05c), stopped as planned at Kaggle 7.5 h
+**Verdict: images tie V12 text on accuracy at 7.3 h, cost ~9% throughput, and run stably. The image candidate was not submitted today (coordinator decision).**
+- The run was stopped by PGID at 03:31 UTC (Kaggle 7.55 h; 46 groups, GPUs to 0 MiB). The 1 "server died" line is the stop itself.
+- **Stability over 7.5 h:** 0 deaths, restarts, allocator retries, OOMs or errored attempts.
+- **Alerts:** the only critical alert was the cap − reserved slope rule at 1.5 h (−0.35 GiB/h during the ramp).
+  - No absolute threshold fired: cap − reserved stayed ≥ 0.75 GiB, nvidia-smi free ≥ 0.5 GiB and Kaggle-eq RAM ≤ 150 GiB.
+- **Score at 7.3 h:**
+  - Score so far 74.7, V12 76.0.
+  - Tasks answered 236 vs 234; tasks with both attempts finished 57 vs 73.
+  - First-attempt accuracy 162/233 = 69.5% vs 166/222 = 74.8%.
+  - `submission.json` at the stop (7.55 h): Kaggle-style 75.69 (attempt_1 only 71.67).
+- **Paired per task at 7.3 h** (`../scripts/paired_at_hour.py`), on the 232 tasks both runs answered: images 76.8% vs text 78.0%. 24 gained, 23 lost; paired −1.2 pp, 95% CI −6.0 to +3.6. **A tie.**
+- **Throughput:** mean gen tok/s over 0.17-7.3 h is 525 vs V12's 577, a **ratio of 0.909**.
+  - Uncached prompt tokens per turn ran at 2.0-2.4k vs 0.8-1.3k. Image re-prefills cost more, and image turns cannot use --token-exact.
+  - Preemptions were 11-24 per hour from 4 h (V12: 0).
+  - The GPU prefix-hit rate fell to 0.03-0.19 at 6-7.3 h, while host-KV restores ran at 7.2-9.5k tok/s (V12: 0.54-0.71 and 2.9-4.3k).
+- **cap − reserved trajectory:** it fell in steps and flattened.
+  - Steps: 2.01 at load → 1.17 (1.0 h) → 1.03 (1.5 h) → 0.95 (1.77 h) → **0.93 at 2.32 h**.
+  - Flat at **0.93-0.98 GiB per rank** (TP3 worst) from 2.32 h to the stop, 5.2 h with no further step.
+  - V12 text flattened at 1.08 from 2.83 h. The ~0.15 lower plateau matches the replay graphs (+0.14 GiB graph memory) and the slightly lower cap.
+  - cap − peak 1.66 at the end. Retries 0.
+- **Host RAM:** Kaggle-eq peaked at ~141.7 GiB at ~6 h (V12 ~134.4), 31 GiB under Kaggle's 173.
+  - API-server + EngineCore RSS grew 6.1 → 8.7 GiB as the MM processor caches filled (2 × 4 GiB default). It leveled off at 8.6-8.7 GiB from 6 h.
+  - MM-cache hit rate 93-100% per hour.
+- **KV pool:** 1,531,221 tokens (−4.2% vs the image run without replay graphs; V12 text 1,608,578).
+
+### Hour by hour vs V12 text (`../scripts/hourly_vs_v12.py`)
+| Kaggle h | score (new / V12) | 1st-att acc so far (new / V12) | 2nd-att acc so far (new / V12) | gen tok/s in hour (new / V12) | running (new / V12) | worst cap-reserved GiB (new / V12) | Kaggle-eq GiB (new / V12) |
+|---|---|---|---|---|---|---|---|
+| 1 | 16.0 / 18.1 | 38/47 = 80.9% / 43/50 = 86.0% | - / - | 647 / 729 | 55.4 / 58.7 | 1.21 / 1.37 | 136.6 / - |
+| 2 | 28.5 / 29.8 | 67/90 = 74.4% / 70/87 = 80.5% | - / - | 503 / 559 | 32.9 / 36.3 | 0.95 / 1.19 | 137.7 / - |
+| 3 | 39.6 / 40.4 | 92/125 = 73.6% / 92/126 = 73.0% | - / - | 517 / 536 | 34.7 / 33.0 | 0.93 / 1.08 | 138.4 / 134.2 |
+| 4 | 52.5 / 53.3 | 120/172 = 69.8% / 121/164 = 73.8% | - / - | 491 / 554 | 35.0 / 36.4 | 0.93 / 1.08 | 139.0 / 134.0 |
+| 5 | 65.8 / 68.3 | 151/214 = 70.6% / 156/206 = 75.7% | - / 3/4 = 75.0% | 477 / 555 | 32.9 / 38.0 | 0.93 / 1.08 | 139.7 / 134.3 |
+| 6 | 71.2 / 74.0 | 161/230 = 70.0% / 166/222 = 74.8% | 7/10 = 70.0% / 9/18 = 50.0% | 544 / 552 | 35.8 / 33.2 | 0.93 / 1.08 | 141.7 / 134.1 |
+| 7 | 72.5 / 75.6 | 162/233 = 69.5% / 166/222 = 74.8% | 14/35 = 40.0% / 23/51 = 45.1% | 491 / 549 | 32.0 / 34.4 | 0.93 / - | 139.8 / 134.7 |
+| 7.3 | 74.7 / 76.0 | 162/233 = 69.5% / 166/222 = 74.8% | 27/52 = 51.9% / 34/68 = 50.0% | 515 / 568 | 34.9 / 38.4 | 0.93 / 1.08 | 139.4 / 134.4 |
+
+### Serving metrics vs V12 text (`../scripts/hourly_extra_vs_v12.py`)
+| Kaggle h | score (new / V12) | tasks answered | gen tok/s | prefix hit | uncached tok/s | uncached prompt tok/turn | prompt tok/turn | preemptions | server running | solver in-flight | host-KV restore tok/s | MM cache hit (new) | API+Engine RSS GiB | worst cap-reserved |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 16.0 / 18.1 | 47 / 50 | 671 / 748 | 0.890 / 0.889 | 551 / 254 | 1792 / 1021 | 21098 / 18572 | 0 / 0 | 55.7 / 58.5 | 56.3 / 60.1 | 247 / 572 | 0.980 (6808 q) | 6.13 / 2.83 | 1.21 / 1.37 |
+| 2 | 28.5 / 29.8 | 90 / 87 | 501 / 559 | 0.944 / 0.558 | 499 / 276 | 2264 / 831 | 36300 / 35800 | 0 / 0 | 33.3 / 37.6 | 33.3 / 43.0 | 0 / 3872 | 0.942 (5344 q) | 7.30 / 2.88 | 0.95 / 1.19 |
+| 3 | 39.6 / 40.4 | 125 / 126 | 519 / 537 | 0.832 / 0.499 | 441 / 246 | 2015 / 1084 | 46235 / 44837 | 0 / 0 | 35.0 / 33.9 | 36.1 / 39.3 | 1469 / 5170 | 0.977 (6400 q) | 7.93 / 2.90 | 0.93 / 1.08 |
+| 4 | 52.5 / 53.3 | 172 / 164 | 484 / 566 | 0.821 / 0.973 | 629 / 260 | 2210 / 1185 | 48160 / 42307 | 11 / 0 | 35.5 / 36.3 | 36.7 / 37.6 | 1163 / 0 | 0.933 (6105 q) | 8.18 / 2.90 | 0.93 / 1.08 |
+| 5 | 65.8 / 68.3 | 214 / 206 | 483 / 564 | 0.950 / 0.937 | 570 / 331 | 2322 / 1297 | 45646 / 42273 | 24 / 0 | 32.5 / 38.7 | 33.3 / 40.6 | 7 / 320 | 0.950 (6632 q) | 8.59 / 2.90 | 0.93 / 1.08 |
+| 6 | 71.2 / 74.0 | 231 / 224 | 553 / 553 | 0.026 / 0.705 | 357 / 145 | 2364 / 1050 | 49948 / 49416 | 22 / 0 | 36.3 / 32.7 | 47.0 / 36.2 | 9504 / 2894 | 1.000 (5567 q) | 8.61 / 2.90 | 0.93 / 1.08 |
+| 7 | 72.5 / 75.6 | 236 / 233 | 486 / 545 | 0.166 / 0.601 | 461 / 191 | 2117 / 853 | 48264 / 47586 | 24 / 0 | 32.4 / 34.3 | 43.6 / 37.3 | 7165 / 3733 | 0.965 (5511 q) | 8.71 / 2.92 | 0.93 / - |
+| 7.3 | 74.7 / 76.0 | 236 / 234 | 514 / 579 | 0.186 / 0.543 | 465 / 198 | 2396 / 899 | 46558 / 45056 | 22 / 0 | 35.4 / 38.0 | 47.2 / 41.7 | 7495 / 4348 | 0.962 (5885 q) | 8.71 / 2.92 | 0.93 / 1.08 |
+
+### Runs on the way to this one
+- **r0** (790b1bd9d7b1, no watermark flag): `../v12_img_r0/`.
+- **r1** (5f4cfe5d1694: watermark-reload-only and solver 0c2f81e8, no replay graphs; stopped at 0.98 h): `../v12_img_ab_r1/`.
+- **e5385b5994fe** (replay graphs via a dotted flag, which replaced the compilation config; stopped at load): `../v12_img_rg_bad/`.
+
+### Raw data
+The files over 1 MB are on HF `livobereshka/arc-agi2-vllm-serving-lab` under `replicas/v12_img_final/` (commit bf6018d9c25d; private check and secret scan, 374 files, 0 hits):
+- `dsv41_traces.tar.gz` (690 traces);
+- `server.log`;
+- `gpumem.log`;
+- `samp.jsonl`.
+
+Everything else is in `data/`.
+
+## The final run: setup and load
+
+- **Notebook (final, d5e545d4e05c):** `kaggle/dsv41_tools/out/nb_v12_img_final/dsv41-tools-v12-img.ipynb`. It is 5f4cfe5d1694 plus one full-JSON `--compilation-config` arg (FULL, max capture 64, decoder replay graphs 32-256). Launched 19:58:24 UTC; server up 20:02:59.
+- **Earlier notebook in this line:** `kaggle/dsv41_tools/out/nb_v12_img_ab/dsv41-tools-v12-img.ipynb`, sha256 **5f4cfe5d1694**. Relative to 790b1bd9d7b1 (r0) it adds two things:
   - Manh's `--vllm-arg=--watermark-reload-only` in cell 2m;
   - solver **0c2f81e8**: held free re-queues and 500/timeout classification, active only on failures.
   - The harness is unchanged (ed668f98).
 - **Same as r0:** the staged causal model and mount, the wheels (g22df163d2d) and the runner (`launch_v12img.sh v12img2_rerun <notebook>`).
 - **Launched** 18:49:43 UTC.
 
-### Load (18:54 UTC)
+### Load of the final run (20:03 UTC)
+- Non-default and engine config agree: cudagraph_mode FULL, max_cudagraph_capture_size 64, decoder replay sizes 32-256.
+- Replay graphs were captured; graph memory 0.24 GiB.
+- KV pool 1,531,221 tokens. Caps 21.08-21.13 GiB with 19.12 reserved, so cap − reserved started at 1.96-2.01.
+- watermark_reload_only True, watermark 0.1, disable_chunked_mm_input True, image limit 32.
+- Vision loaded, 0 bidirectional lines, solver 0c2f81e8.
+
+### Load of r1 (5f4cfe5d1694, 18:54 UTC)
 - Server up at +262 s; solver from 18:54:06 (240 tasks, 344 pairs, the usual deadlines).
 - **Non-default args:** `watermark_reload_only: True`, `watermark: 0.1`, `disable_chunked_mm_input: True`, `limit_mm_per_prompt: {image: 32}`, `max_num_seqs: 64`, util 0.91, max_model_len 163840.
 - **Vision tower loaded:** MMEncoderAttention initialised; the encoder cache "profiled with 2 image items". 0 "bidirectional" lines.
