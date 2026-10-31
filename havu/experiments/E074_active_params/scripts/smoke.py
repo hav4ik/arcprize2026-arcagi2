@@ -132,6 +132,11 @@ def main():
                 'max_tokens':128,'temperature':0,'cache_salt':'e074-'+a.schedule},timeout=min(remaining(),90))
             response.raise_for_status()
             (out/'generation_smoke.json').write_text(json.dumps(response.json(),indent=2)+'\n')
+            # Reuse the loaded verification engine for a fixed short ARC check.
+            # This does not enter batch.py's NLL-based candidate selection.
+            from short_eval import TAGS, run_on_server
+            if tag in TAGS:
+                run_on_server(ROOT, EXP, out, tag, env, remaining)
             metrics=requests.get('http://127.0.0.1:18074/metrics',timeout=10)
             (out/'metrics.txt').write_text(metrics.text)
             (out/'complete.json').write_text(json.dumps({'schedule':a.schedule,'elapsed_s':time.monotonic()-started,

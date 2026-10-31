@@ -646,7 +646,12 @@ def main():
             if segs[-1].startswith("attempts") and len(segs) > 1:
                 segs = segs[:-1]
             run_id = "/".join(segs[0:1] + segs[-2:]) if len(segs) > 2 else "/".join(segs)
-        hf = hf_url(rel, info["aliases"]) or "local only (nothing to upload: no trace folder or records file on disk): " + rel
+        E072COPY = "experiments/E072_harness_loop/data_in/v12_m12_attempts.jsonl"
+        v12rep = rel == E072COPY or any(a.endswith("replicas/manh_v12/attempts.jsonl") for a in info["aliases"])
+        if v12rep:  # E072's file is a copy of the E062 phase_h/manh_v12 replica: report it once, as the E062 run
+            run_id = "Manh V12 replica (E062)"
+            eid, ename = "E062", ename or "Manh vLLM fork"
+        hf = hf_url(rel, info["aliases"] + ["hf:arc-agi2-vllm-serving-lab/replicas/manh_v12"] * v12rep) or "local only (nothing to upload: no trace folder or records file on disk): " + rel
         hfile = harness_file(rel, info)
         m = info["m_all"]; mi = info["m_ident"]
         wl = info["workload"]
@@ -658,6 +663,7 @@ def main():
             model_experiment_tsv=mtsv, stack=stack_of(rel, info), stack_detail=pm.get("detail", ""),
             harness_file=hfile, harness_link=REPO + hfile, harness_version=info["harness_version"] or "n/a",
             key_flags=flags(cfg) if cfg else "n/a (records carry no config)",
+            run_type="",
             harness_similarity=harness_similarity(rel, run_id, flags(info["cfg"]) if info.get("cfg") else ""),
             hf_traces=hf, version=info["version"], version_basis=info["version_basis"], workload=wl or "",
             full_partial="full" if info["full"] else "partial", tasks=info["tasks"], tasks_total=info["tot_tasks"],
@@ -683,6 +689,10 @@ def main():
         else:
             sec = ("full_" if info["full"] else "partial_") + info["version"]
         row["section"] = sec
+        if v12rep:
+            row["hf_traces"] = LAB + "manh_v12"
+            row["path"] = "hf:arc-agi2-vllm-serving-lab/replicas/manh_v12/attempts.jsonl (E062 phase_h/manh_v12; E072 data_in copy skipped)"
+        row["run_type"] = ("smoke" if sec == "smoke" else "Kaggle-replica" if (sec == "replica" or "E072_harness_loop/runs" in rel or row["run_id"] == "Manh V12 replica (E062)") else "benchmark")
         rows.append(row)
     for d in derived:
         noneval.append(dict(path=d, n_records=sum(1 for _ in open(P(d))), n_task_ids=0, note="derived analysis file, not a run"))
@@ -834,10 +844,10 @@ def write_md(rows, noneval):
          v12_section(rows),
          DEFS,
          "## Counts\n"]
-    names = [("full_github", "1. Full runs, GitHub task version"), ("full_kaggle", "2. Full runs, Kaggle task version"),
-             ("partial_github", "3. Partial runs, GitHub task version"), ("partial_kaggle", "4. Partial runs, Kaggle task version"),
-             ("replica", "5. Replica workloads (pod replicas on 240-task workloads: 120 Kaggle originals + copies)"),
-             ("smoke", "A. Appendix: smoke runs (<= 10 tasks)")]
+    names = [("full_github", "1. Full runs, GitHub task version (run type: benchmark)"), ("full_kaggle", "2. Full runs, Kaggle task version (run type: benchmark)"),
+             ("partial_github", "3. Partial runs, GitHub task version (run type: benchmark)"), ("partial_kaggle", "4. Partial runs, Kaggle task version (run type: benchmark; E072 loop jobs are Kaggle-replica, see run_type)"),
+             ("replica", "5. Replica workloads (run type: Kaggle-replica; pod replicas on 240-task workloads: 120 Kaggle originals + copies)"),
+             ("smoke", "A. Appendix: smoke runs (run type: smoke, <= 10 tasks)")]
     L.append("| section | runs |\n|---|---|\n" + "".join("| %s | %d |\n" % (n, len(by[k])) for k, n in names) +
              "| B. Appendix: non-eval record files (training pools, NVARC, probes) | %d |\n\n" % len(noneval))
     for k, n in names:
@@ -882,6 +892,10 @@ CAVEATS = """
 - **HF traces**: every run with records or trace files has a deep link into the private `arc-agi2-eval-traces-private` (`runs/<run_id>`;
   `runs/pub_<run_id>` for runs copied from the former public dataset, index in `reports/hf_private_index.csv`) or into the serving-lab
   `replicas/<run>` / the candb32 replica repo. "local only" would mean nothing was uploaded.
+- **run_type**: **Kaggle-replica** = the exact Kaggle notebook run end-to-end on a 4xL4 pod in scored-rerun mode with Kaggle's deadlines
+  (E055/E062/E072 jobs; E072 is the harness-improvement loop, pod job queues on the 120 Kaggle-version tasks, b1_noise_v12_pod2 in progress);
+  **benchmark** = a harness eval run untimed through `evals/run_*.py` against the API or a self-hosted server; **smoke** = a run on <= 10 tasks.
+  Sections 1-4 are benchmark runs (a few E072/E052 pod rows carry their own `run_type` in the CSV), section 5 is Kaggle-replica, appendix A is smoke.
 - **harness_similarity**: rule-based label for closeness to V12 (see the V12 section): "exact V12", "V12 + images", "B32-family", "other". Serving-lab `replicas/<run>` entries without `attempts.jsonl` (traces and submission only) could not
   be scored from the files here.
 - **Server-cut attempts** (pod records with `usage.completion_reported_cut`, completion = 1e9 sentinel) have no usable token count and are left out of the token statistics (`tokens_records` < records).

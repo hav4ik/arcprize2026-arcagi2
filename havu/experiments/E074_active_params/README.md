@@ -112,14 +112,42 @@ The batch reports a stopped state if insufficient time remains for a complete ar
 The 4 screening families are a subset of the 32 verification families; 28 are fresh.
 No new instance is rented; the rental is never stopped or destroyed automatically.
 
-Status: baseline and uniform k=5 full-model screens passed; the 40-layer k=4
-sensitivity sweep is running under supervisor service `e074`. No ARC result yet.
+Status: the 40-layer sweep and all three 32-family verification arms are complete.
+The profiled mean-k5 schedule was selected by training NLL. The short 12-task
+Kaggle image/tool check scored pass@1 58.3% / 66.7% / 75.0% for k6 / uniform k5 /
+profiled mean-k5 (one draw, 24k base budget; diagnostic only). The 120-task x2
+image/tool baseline and candidate both completed. Full results are below;
+the 2pp noninferiority target remains inconclusive.
 The local `scripts/monitor.py` synchronizes results each minute, scores completed
 ARC arms, and updates the registry; it has a 16-hour bound. Actual cgroup memory limit is 512.79 GiB
 (the host-wide `free` display reports 755 GiB). Uniform k=5 Humming/model compatibility has passed. Process cleanup uses captured identities and polling because this
 Vast host rejects psutil's pidfd-based wait with EINVAL.
 
 Research sources and method comparison: [prior-work review](../../prior_works/moe_active_parameter_pruning.md).
+
+### Harness and modality audit (2026-10-31)
+
+`analysis/harness_audit.json` records the checked scope. All 41 frozen harness
+files still match the current local `evals/` files; main harness SHA256
+`914c849b20715fc57c2e10a9161685654ad2e350e2479efefdcb859c680addd1`.
+Live ARC uses sub80s40 + minimal header, multi-test 0.5, train checks, fallback,
+rescue and auto-repair, images, causal attention, context 163840 and local tools.
+This is the E043 vision11 serving fork and chat image path, **not** Manh's newer
+V12/PR3 token-exact image path. Current local harness and latest serving stack
+are separate claims.
+
+Pruning calibration/NLL replays use **both** image+tools and text+tools E065
+traces (32 paired families; all 64 traces contain tool responses). They were
+collected with E046-best/E058 settings on 2026-10-28 and reused, not freshly
+generated with the latest self-hosted harness changes. Both modalities contribute
+equally to schedule selection. Fresh generated-answer checks in E074 so far,
+including the full 120-task comparison, are **image+tools only**. Text-only
+task-accuracy retention has not yet been measured for the active-k candidate.
+
+Prior E128 ARC runs are retained as historical references. The new k6 control
+holds checkpoint, server fork, hardware, harness, modality and Kaggle task
+versions fixed with the active-k candidate; historical cross-setup differences
+are too large to substitute directly for this experiment's 2pp comparison.
 
 ## Initial smoke results (4 training families, paired image/text)
 
@@ -138,3 +166,115 @@ autorestart. Main log `/workspace/dsv4/logs/batch.log`; remote artifacts
 `results/` are synchronized by the monitor. `results/batch_status.json` records
 the current phase or failure. `scripts/score_arc.py` writes the final
 `results/arc_report.json` locally using the Kaggle answer key.
+
+## Layer statistics
+
+The reproducible collector is `scripts/layer_stats.py`. Run with system `python3`
+(NumPy and Matplotlib installed) and `MPLCONFIGDIR=/tmp/e074-matplotlib`; the
+project venv supports `--no-plot`. `--watch-hours 16` refreshes local artifacts
+when the existing result monitor downloads another completed arm. It neither
+changes nor sends requests to the inference server.
+
+- [Chart](analysis/layer_stats/layer_stats.png) and [PDF](analysis/layer_stats/layer_stats.pdf):
+  all 40 historical layer distributions plus the current active-k loss curve.
+- [Layer CSV](analysis/layer_stats/layer_stats.csv): historical distribution metrics,
+  old stored-expert sensitivity, and current k6→4 sensitivity in separate columns.
+- [Per-class CSV](analysis/layer_stats/routing_by_class.csv): separate image/text
+  traffic and prompt/reasoning/tool-block/image positions, plus the E066 weighting.
+- [Paired-family CSV](analysis/layer_stats/paired_family_deltas.csv): image/text
+  generated and tool-block NLL changes for each training family.
+- [JSON with provenance and limitations](analysis/layer_stats/layer_stats.json).
+
+Historical input is E066's **causal full-384 model** census: 24,043,161 scored
+positions, before E128 selection and GPTQ. For the pruning recipe, class weights
+are `[1,1,10,1]` in layers 0–19 and `[0,1,10,1]` in layers 20–39. Expert IDs refer
+to that original model. Do not present these distributions as current E128 routing.
+
+The census confirms substantial layer heterogeneity. For example, the effective
+expert count (exp entropy) under amplitude weighting is 164.7 in layer 1 and 43.9
+in layer 25. Layers 36–39 need special care: their largest-amplitude experts hold
+57–80% of the sum of weighted expert-output norms, but are selected at only
+0.56–1.87% of weighted positions. These rare massive activations distort norm
+concentration; the frequency-based effective counts there remain 141–184. Neither
+aggregate count tells us how many of the six experts matter on an individual
+token, and individual output norms do not account for vector cancellation.
+
+The **current** measurement instead tests each layer at k=4 while keeping all
+other layers at k=6 in quantized causal E128. Its plotted intervals resample paired
+image/text training families together, preserving the image/text-average,
+token-weighted NLL statistic. Four families provide an initial ranking only:
+intervals exclude neither numerical variation between server runs nor unknown
+task families, and are not corrected for testing 40 layers. Tiny negative changes
+are not grounds to claim an improvement. The combined schedule gets the planned
+32-family check and matched Kaggle task-weighted pass@1 comparison.
+
+## Short generated-answer checks
+
+User requested short evals during the experiment. Each of the three 32-family
+verification arms now reuses its loaded engine for the **same 12 Kaggle evaluation
+tasks, one attempt per task**, before the full 120-task runs. This adds no engine
+restarts. `scripts/short_eval.py prepare` fixes the task IDs by a seeded hash,
+stratified by maximum grid area and single/multiple test inputs, using challenges
+only. The exact subset is in `data/short_eval_manifest.json`; no answer key is sent
+to the GPU instance.
+
+The short diagnostic uses the image/tool harness with a **24k base output budget**,
+12k soft budget, 20 turns, multi-budget 0.5, context 65,536, 12 workers and one
+attempt. Baseline k6, uniform k5 and the profiled mean-k5 schedule get identical
+settings and task IDs, separate cache salts, and prefix/cache metrics. These are
+short-budget pass@1 results, not estimates at the full 80k budget or evidence for
+a 2pp noninferiority margin. Candidate selection remains training-NLL-based.
+The existing 35-minute verification-arm timeout and 14-hour batch bound still
+apply; worst-case requested output is recorded by the task manifest and budgets.
+
+Preflight passed on Vast: exact frozen-harness CLI dry run and an actual
+LocalExecutor session importing NumPy/SciPy/SymPy/scikit-image and transforming a
+test grid. The frozen prompt asset and missing client/tool dependencies were added
+before ARC execution. Exact versions are saved in `results/tool_environment.freeze`,
+and the receipt is `results/short_preflight.json`. The selected subset's nominal
+output budgets sum to 360k tokens per arm including multi-test scaling.
+
+The local `scripts/short_eval.py watch --hours 16` scores each arm as the result
+monitor downloads it. `results/short_arc_report.json` records task-weighted
+pass@1, paired task uncertainty, better/worse tasks, missing predictions, errors,
+stop reasons, output tokens and elapsed time. Full results also report the 108
+tasks outside this early diagnostic separately. All current `layer*_k4` screens
+finish as planned before these generated-answer checks run.
+
+## First full ARC result (2026-10-31)
+
+Both arms finished on the **120 Kaggle-version evaluation tasks, two attempts
+per task**, images + tools, full 80k base output budget. Each file contains 344
+test-input records (172 pairs x2), corresponding to all 240 task attempts, with
+zero evaluation error records. Missing answers count as incorrect. All tasks
+have equal weight; pass@1 averages the two draws and each task's test inputs.
+
+| Metric | E128 k6 baseline | Profiled mean-k5 |
+|---|---:|---:|
+| Task-weighted pass@1 | 72.43% | 70.83% |
+| Task-weighted pass@2 | 83.47% | 81.81% |
+| Output tokens / task attempt | 38,905 | 39,483 |
+| Evaluation wall time | 2h 47m 35s | 2h 39m 58s |
+| End-to-end output tokens / second | 928.6 | 987.3 |
+
+Pass@1 difference is **−1.60 percentage points**, with paired task-bootstrap 95%
+interval **[−7.01, +3.54]** (5,000 draws). The point estimate is inside the agreed
+2pp margin, but the interval does not establish noninferiority. The 108 tasks
+outside the short diagnostic give −2.47pp [−8.10, +3.47]. Candidate selection was
+based on training NLL, not the short ARC scores.
+
+Observed token throughput rose **6.3%**, total wall time fell **4.5%**, and output
+tokens increased **1.5%**. This is one sequential same-box pair of real tool runs;
+token counts, sequence lengths and tool trajectories differ, so it is not an
+isolated kernel speed measurement. Active parameters fell by approximately 8.8%
+using the rounded 16B anchor. The gain is modest, and text-only ARC retention
+remains unmeasured.
+
+The full remote batch finished at about 12:37 UTC after 7.65 box-hours (~$43.22
+at the quoted rate), with the rental left running. Local sync had stopped
+updating at 07:09 UTC; both completed remote result sets were retrieved and scored
+locally at 13:38–13:42 UTC. A Luna monitoring sub-agent independently checked
+completeness and score arithmetic. No rental was stopped or deleted.
+
+Machine-readable results: [full report](results/arc_report.json),
+[baseline](results/baseline_arc/arc.jsonl), [candidate](results/candidate_arc/arc.jsonl).

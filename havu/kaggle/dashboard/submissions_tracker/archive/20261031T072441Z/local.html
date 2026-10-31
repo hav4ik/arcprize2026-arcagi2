@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ARC tracker (local)</title>
+<style>
+  :root { --font-anthropic-sans: system-ui, sans-serif; --font-anthropic-serif: Georgia, serif;
+    --color-fg: #1f1e1d; --color-fg-muted: #6b6a68; --color-panel: #fff; --color-border-line: #dcdad4; --color-ok: #2a7d4f; --color-warn: #b7791f; --color-bad: #c0392b;
+    --cds-border: #dcdad4; --cds-chart-axis: #8a8985; --cds-chart-grid: #e6e4de; --cds-chart-reference: #8a8985; --cds-chart-status-critical: #c0392b;
+    --cds-dur-slow: .3s; --cds-font-size-caption: 12.5px; --cds-font-size-heading: 18px; --cds-font-size-title: 28px; --cds-font-weight-medium: 600;
+    --cds-gap-xs: 4px; --cds-gap-sm: 8px; --cds-gap-md: 12px; --cds-gap-lg: 24px; --cds-pad-xs: 4px; --cds-pad-sm: 8px; --cds-pad-lg: 16px; --cds-radius: 8px;
+    --cds-shadow-popover: 0 2px 8px rgba(0,0,0,.15); --cds-surface-popover: #fff; --cds-text-secondary: #6b6a68; }
+  @media (prefers-color-scheme: dark) { :root { --color-fg: #ece9e2; --color-fg-muted: #a09e98; --color-panel: #262624; --color-border-line: #3d3c39; --cds-border: #3d3c39;
+    --cds-chart-grid: #373633; --cds-surface-popover: #30302e; --color-ok: #5fbf8a; --color-warn: #e0a84a; --color-bad: #ef6b5b; } }
+  body { margin: 0; padding: 16px; background: light-dark(#faf9f5, #1c1c1a); color: var(--color-fg); }
+  .dash-skeleton { opacity: .5; }
+  #stamp { font: 12px system-ui; color: var(--color-fg-muted); margin: 0 0 8px; }
+</style></head>
+<body><p id="stamp">loading…</p><div id="mount"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script>
+// Standalone shim: renders index.html's style, markup and script on a tiny `dash` runtime, reading the JSON files next to this page.
+const SOURCES = ['runs', 'mem', 'tps', 'acc', 'outages', 'events', 'findings', 'submissions'];
+const store = {}, calcs = {}, draws = [];
+let params = {};
+const dash = {
+  colors: ['#c96442', '#2f6fb5', '#2a9d8f', '#b08900', '#8e5ab5', '#d1558a', '#5b8c3a', '#6b7280', '#0e8aa8', '#a0522d'],
+  params: () => params,
+  setParams: (p) => { params = Object.assign({}, params, p); redraw(); },
+  data: (name) => {
+    if (store[name]) return {status: 'ok', data: store[name]};
+    const c = calcs[name];
+    if (c) {
+      const ins = c.inputs.map((i) => dash.data(i));
+      if (ins.every((i) => i.status === 'ok')) { try { return {status: 'ok', data: c.fn(...ins.map((i) => i.data))}; } catch (e) { return {status: 'error', data: []}; } }
+    }
+    return {status: 'loading', data: []};
+  },
+  calc: (name, spec) => { calcs[name] = spec; },
+  draw: (name, fn) => { draws.push({name, fn}); },
+};
+function redraw() {
+  for (const d of draws) document.querySelectorAll(`[data-draw="${d.name}"]`).forEach((el) => { try { d.fn(el); } catch (e) { console.error(d.name, e); } });
+}
+async function load() {
+  await Promise.all(SOURCES.map(async (s) => {
+    try { const r = await fetch(`${s}.json?t=${Date.now()}`, {cache: 'no-store'}); if (r.ok) store[s] = await r.json(); } catch (e) { console.error(s, e); }
+  }));
+  document.getElementById('stamp').textContent = 'local view, data loaded ' + new Date().toISOString().slice(0, 19).replace('T', ' ') + ' UTC (refreshes every 60 s)';
+  redraw();
+}
+(async () => {
+  const html = await (await fetch('index.html', {cache: 'no-store'})).text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  doc.querySelectorAll('style').forEach((s) => document.head.append(s.cloneNode(true)));
+  const mount = document.getElementById('mount');
+  doc.body.querySelectorAll(':scope > :not(script)').forEach((n) => mount.append(document.importNode(n, true)));
+  const code = Array.from(doc.querySelectorAll('script')).map((s) => s.textContent).join('\n');
+  new Function('dash', code)(dash);
+  await load();
+  setInterval(load, 60000);
+  window.__ready = true;
+})().catch((e) => { document.getElementById('stamp').textContent = 'error: ' + e; window.__err = String(e); });
+</script></body></html>

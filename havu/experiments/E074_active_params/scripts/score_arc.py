@@ -39,6 +39,18 @@ def main():
         seconds=stats['eval_seconds']
         if seconds:
             stats['end_to_end_output_tokens_per_second']=stats['output_tokens']/seconds
+    short_manifest=EXP/'data/short_eval_manifest.json'
+    if short_manifest.exists():
+        early=set(json.loads(short_manifest.read_text())['task_ids'])
+        remaining=sorted(set(scoring.TASKS)-early)
+        d,lo,hi,b,w=scoring.paired(arms['candidate_arc'],arms['baseline_arc'],remaining)
+        report['outside_short_diagnostic']={
+            'task_count':len(remaining), 'task_ids':remaining,
+            'arms':{name:dict(zip(('pass_at_1','pass_at_2'),scoring.score(data,remaining)))
+                    for name,data in arms.items()},
+            'pass_at_1_difference_pp':d,'paired_task_bootstrap_95ci_pp':[lo,hi],
+            'tasks_better':b,'tasks_worse':w,
+            'note':'Secondary full-budget comparison on tasks excluded from the early 12-task diagnostic'}
     (EXP/'results/arc_report.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report,indent=2))
 
