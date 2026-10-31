@@ -123,6 +123,53 @@ def readme_exp(stem):
     return None
 
 
+PRIV = "https://huggingface.co/datasets/livobereshka/arc-agi2-eval-traces-private/tree/main/"
+LAB = "https://huggingface.co/datasets/livobereshka/arc-agi2-vllm-serving-lab/tree/main/replicas/"
+PRIV_BY_PATH = {}
+if os.path.exists(P("reports/hf_private_index.csv")):
+    for _r in csv.DictReader(open(P("reports/hf_private_index.csv"))):
+        if _r["source_record_file"]:
+            PRIV_BY_PATH[_r["source_record_file"]] = _r["path"]
+
+
+def safe_id(s):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")
+
+
+def hf_url(rel, aliases=()):
+    """Deep link for a run: private traces repo, or the serving-lab replica directory; None if nothing was uploaded."""
+    for x in [rel] + list(aliases):
+        r = HF_RUNS.get(x)
+        if r:
+            return PRIV + "runs/pub_" + safe_id(r["run_id"])
+    for x in [rel] + list(aliases):
+        parts = x.split("/")
+        for p in parts:
+            if p in SERVING_LAB and ("phase_h" in parts or x.startswith("hf:")):
+                return LAB + p
+        if "candBf_x2t" in parts and "E055_kaggle_replica" in parts:
+            return "https://huggingface.co/datasets/livobereshka/arc-agi2-dsv41-e128-candb32-replica/tree/main"
+        if x in PRIV_BY_PATH:
+            return PRIV + PRIV_BY_PATH[x]
+    return None
+
+
+def harness_similarity(rel, run_id, flags):
+    """Closeness to the current best harness (Manh's V12 = B32 pinned harness 882c817f + auto-repair + multi-test 0.5 +
+    token-exact + context 163840 + lean2sub + effort-header minimal, old tool E128). Rule-based, see DEFS."""
+    t = (rel + " " + run_id).lower()
+    fl = flags or ""
+    img = "img" in t.replace("image_pruning", "") or "text+image" in fl
+    v12_flags = all(x in fl for x in ("lean2sub", "effort_header=minimal", "multi_budget=0.5", "context_limit=163840"))
+    if any(x in t for x in ("v12img", "v12_img")) or (v12_flags and "text+image" in fl):
+        return "V12 + images"
+    if any(x in t for x in ("manh_v12", "v12_m12", "sft_025ep_v12", "v12_fast", "b1_noise_v12", "s025_rerun")) or v12_flags:
+        return "exact V12"
+    if any(x in t for x in ("b32", "candb", "e052_next_code", "e055_kaggle_replica", "e057b", "e059_restart")):
+        return "B32-family"
+    return "other"
+
+
 def hf_link(rel, recs_have_trace):
     r = HF_RUNS.get(rel)
     if r:
@@ -599,7 +646,7 @@ def main():
             if segs[-1].startswith("attempts") and len(segs) > 1:
                 segs = segs[:-1]
             run_id = "/".join(segs[0:1] + segs[-2:]) if len(segs) > 2 else "/".join(segs)
-        hf = next((h for h in (hf_link(x, True) for x in [rel] + info["aliases"]) if not h.startswith("local only")), "local only: " + rel)
+        hf = hf_url(rel, info["aliases"]) or "local only (nothing to upload: no trace folder or records file on disk): " + rel
         hfile = harness_file(rel, info)
         m = info["m_all"]; mi = info["m_ident"]
         wl = info["workload"]
@@ -611,6 +658,7 @@ def main():
             model_experiment_tsv=mtsv, stack=stack_of(rel, info), stack_detail=pm.get("detail", ""),
             harness_file=hfile, harness_link=REPO + hfile, harness_version=info["harness_version"] or "n/a",
             key_flags=flags(cfg) if cfg else "n/a (records carry no config)",
+            harness_similarity=harness_similarity(rel, run_id, flags(info["cfg"]) if info.get("cfg") else ""),
             hf_traces=hf, version=info["version"], version_basis=info["version_basis"], workload=wl or "",
             full_partial="full" if info["full"] else "partial", tasks=info["tasks"], tasks_total=info["tot_tasks"],
             attempts_per_task=round(info["att_per_task"], 2), attempt_ranks=info["attempts_idx"], pairs=info["n_pairs"],
@@ -683,6 +731,46 @@ def link(r):
     return "[%s](%s)" % (r["harness_file"].split("/")[-1], r["harness_link"])
 
 
+def star(r):
+    return ("★ " if r["harness_similarity"] != "other" else "") + r["run_id"]
+
+
+HOWTO = """## How to study the reasoning traces
+
+Every run below links to its traces in the private HF dataset `livobereshka/arc-agi2-eval-traces-private`
+(or, for pod replicas, to `livobereshka/arc-agi2-vllm-serving-lab` `replicas/<run>`).
+
+- **Access**: membership of the `livobereshka` HF org plus your own read token (`huggingface-cli login`, or `HF_TOKEN`). Never share tokens.
+- **One run** (the directory name is the `traces` link; `data_tools/show_trace.py` resolves it from the run_id):
+
+  ```bash
+  huggingface-cli download livobereshka/arc-agi2-eval-traces-private --repo-type dataset --include "runs/<run_dir>/*" --local-dir traces
+  ```
+
+  ```python
+  from huggingface_hub import snapshot_download
+  snapshot_download("livobereshka/arc-agi2-eval-traces-private", repo_type="dataset",
+                    allow_patterns=["runs/<run_dir>/*"], local_dir="traces")
+  ```
+
+  One task of a run: use `--include "runs/<run_dir>/*<task_id>_p0_a0*"` (the records file `runs/<run_dir>/<run>.jsonl` is small; fetch it too).
+  `runs/pub_<run_id>/traces.parquet` holds the runs that used to be in the public `arc-agi2-eval-traces` (same columns:
+  `task_id, pair, attempt, correct, predicted_output, messages, trace_text, ...`). `index.csv` maps run_id to directory, files and bytes.
+- **Files**: `<task>_p<pair>_a<attempt>[_<hash>].reasoning.txt.gz` is the model's thinking for a no-tool call (text);
+  `<task>_p<pair>_a<attempt>_<hash>.messages.json.gz` is `{"messages": [...], "events": [...]}` for a tool run (system/user/assistant
+  turns with `reasoning_content`, `tool_calls`, tool results, and per-turn usage events). The records file `<run>.jsonl` has one JSON
+  object per attempt: `task_id, pair, attempt, pred` (final grid), `content` (final text), `usage` (prompt, cache_hit, completion),
+  `turns, tool_calls, tool_errors, stop_reason, train_pass, train_frac, seconds, config, correct` (as recorded by the harness at the time).
+- **Correct or wrong**: compare `pred` with the right answer key for the run's `version` column in `eval_runs.csv`: GitHub key
+  `data/arc-agi-2-github/data/evaluation/<task>.json` (`test[pair].output`) for G, `data/arc-agi_evaluation_solutions.json[task][pair]` for K.
+  The recorded `correct` can be stale for the 6 tasks whose answers differ between the two versions.
+- **Viewer**: `.venv/bin/python data_tools/show_trace.py <run_id> --task <task_id> --attempt 0` prints reasoning, tool calls and results and
+  the final answer marked CORRECT/WRONG against the right key; `--wrong-only` lists the failed attempts of a run; `--download` fetches the
+  files from the private repo first.
+
+"""
+
+
 def table(rows, replica=False):
     if replica:
         h = ("| run | exp | date | model / stack | harness | traces | wl tasks | att/task | a1% | p1 all (240) | p1 a0 | p2 | "
@@ -698,22 +786,39 @@ def table(rows, replica=False):
         a1 = "n/a" if r["a1_task_frac"] in (None, "") else "%d" % round(100 * r["a1_task_frac"])
         ms = "%s %s" % (r["model_record"] or r["model_experiment_tsv"] or "n/a", r["stack"])
         hs = "%s `%s` (%s)" % (link(r), r["key_flags"][:140], r["harness_version"])
-        tr = r["hf_traces"].replace("HF livobereshka/", "HF ")
+        tr = "[traces](%s)" % r["hf_traces"] if r["hf_traces"].startswith("http") else "local only"
         d = r["date_launched"] or r["date_file_mtime"]
         if replica:
             tri = lambda p: "%s/%s/%s" % (f1(r["wl_%s_pass1_all" % p] or None), f1(r["wl_%s_pass1_a0" % p] or None), f1(r["wl_%s_pass2" % p] or None))
             out += "| %s | %s | %s | %s | %s | %s | %s/%s | %s | %s | %s | %s | %s | %s | %s | %s/%s | %s | %s | %s/%s |\n" % (
-                r["run_id"], r["experiment"], d, ms[:120], link(r), tr[:60], r["tasks"], r["tasks_total"], r["attempts_per_task"], a1,
+                star(r), r["experiment"], d, ms[:120], link(r), tr, r["tasks"], r["tasks_total"], r["attempts_per_task"], a1,
                 f1(r["pass1_all"]), f1(r["pass1_a0"]), f1(r["pass2"]), tri("orig"), tri("copy"),
                 f1(r["wl_orig114_pass1_all"] or None), f1(r["wl_orig114_pass2"] or None),
                 tk("comp_mean", "comp_p50", "comp_p90"), tk("total_mean", "total_p50", "total_p90"), r["no_answer"], r["errors"])
         else:
             out += "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s/%s | %s | %s | %s/%s | %s |\n" % (
-                r["run_id"], r["experiment"], d, ms[:120], hs, tr[:60], r["tasks"] if r["full_partial"] == "partial" else "120 (full)",
+                star(r), r["experiment"], d, ms[:120], hs, tr, r["tasks"] if r["full_partial"] == "partial" else "120 (full)",
                 r["attempts_per_task"], a1, f1(r["pass1_all"]), f1(r["pass1_a0"]), f1(r["pass2"]), f1(r["pass1_all_114"]),
                 f1(r["pass2_114"]), tk("comp_mean", "comp_p50", "comp_p90"), tk("total_mean", "total_p50", "total_p90"),
                 r["no_answer"], r["errors"], r["version"][0].upper() + ("?" if "default" in r["version_basis"] or "no evidence" in r["version_basis"] else ""))
     return out
+
+
+def v12_section(rows):
+    sel = [r for r in rows if r["harness_similarity"] != "other" and r["section"] != "smoke"]
+    sel.sort(key=lambda r: (["exact V12", "V12 + images", "B32-family"].index(r["harness_similarity"]), -(r["pass2"] if r["pass2"] is not None else -1)))
+    out = ("## Closest to the current best (V12) harness\n\n"
+           "V12 = Manh's run of B32's pinned harness 882c817f + auto-repair + multi-test (budget 0.5) + token-exact + context 163840 + "
+           "lean2sub + effort-header minimal, on the old tool E128. Runs marked ★ in the tables below. `harness_similarity` (CSV) is "
+           "rule-based (path names and recorded flags; see Definitions): **exact V12** = the V12 replicas (manh_v12, v12_fast, SFT 025ep, "
+           "E072 V12 runs) and records whose flags match V12 (E066 b32_fp8/fp4, E069); **V12 + images** = the same with images "
+           "(`grid_format=text+image`, v12img runs); **B32-family** = B32 harness replicas, E052 and E055/E057/E059. Smoke runs are left out here. "
+           "Click the traces link for the reasoning.\n\n"
+           "| run | similarity | section | tasks | p1 all | p1 a0 | p2 | traces |\n|---|---|---|---|---|---|---|---|\n")
+    for r in sel:
+        tr = "[traces](%s)" % r["hf_traces"] if r["hf_traces"].startswith("http") else "local only"
+        out += "| %s | %s | %s | %s | %s | %s | %s | %s |\n" % (r["run_id"], r["harness_similarity"], r["section"], r["tasks"], f1(r["pass1_all"]), f1(r["pass1_a0"]), f1(r["pass2"]), tr)
+    return out + "\n"
 
 
 def write_md(rows, noneval):
@@ -725,6 +830,8 @@ def write_md(rows, noneval):
          "`reports/eval_runs.csv`; non-eval files are listed in `reports/eval_nonEval_files.csv`. All scores are percentages. "
          "Rows within a table are sorted by pass@2 (n/a last). In the `ver` column K = Kaggle, G = GitHub, `?` = assumed from a default "
          "(basis in the CSV).\n" % datetime.date.today().isoformat(),
+         HOWTO,
+         v12_section(rows),
          DEFS,
          "## Counts\n"]
     names = [("full_github", "1. Full runs, GitHub task version"), ("full_kaggle", "2. Full runs, Kaggle task version"),
@@ -772,8 +879,10 @@ CAVEATS = """
   and E043 e128 `2345e933` in `arc-agi2-tool-traces-dsv41-full-vs-e128`, solver/harness hashes in replica READMEs).
   Pod-replica `attempts.jsonl` records carry no config; flags come from the replica's `replica.json` where one exists.
 - **Dates** are the result file's modification time unless `date_launched` (replica.json) exists; the experiment start date is in the TSV.
-- **HF traces**: runs in `reports/hf_trace_runs.csv` map to `arc-agi2-eval-traces`; replica and serving-lab links are by directory name.
-  Anything else is "local only". Serving-lab `replicas/<run>` entries without `attempts.jsonl` (traces and submission only) could not
+- **HF traces**: every run with records or trace files has a deep link into the private `arc-agi2-eval-traces-private` (`runs/<run_id>`;
+  `runs/pub_<run_id>` for runs copied from the former public dataset, index in `reports/hf_private_index.csv`) or into the serving-lab
+  `replicas/<run>` / the candb32 replica repo. "local only" would mean nothing was uploaded.
+- **harness_similarity**: rule-based label for closeness to V12 (see the V12 section): "exact V12", "V12 + images", "B32-family", "other". Serving-lab `replicas/<run>` entries without `attempts.jsonl` (traces and submission only) could not
   be scored from the files here.
 - **Server-cut attempts** (pod records with `usage.completion_reported_cut`, completion = 1e9 sentinel) have no usable token count and are left out of the token statistics (`tokens_records` < records).
 - **Tokens**: totals count prompt tokens as billed per turn (so cached prefixes are counted every turn). `n/a` where the harness did not log a summed prompt count.
