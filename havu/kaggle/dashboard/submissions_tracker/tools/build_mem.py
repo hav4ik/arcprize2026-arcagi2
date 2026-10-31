@@ -2,7 +2,7 @@
 GPU: from the server log's per-rank 'GPU memory:' lines (lowest vLLM-reported free and cap minus peak over ranks, 10-min
 bins). RAM: Kaggle-eq from the pods' samplers (container view), thinned to 10 min."""
 import json, os, subprocess, sys
-D = os.environ.get("DASH_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the dashboard folder (live copy: the session scratchpad)
+D = "/tmp/claude-1000/-home-vu-Workspace-ARC-AGI-2/81e68821-e1f4-4b05-bad6-9a606f77ad54/scratchpad/dashboard"
 R = "/home/vu/Workspace/ARC-AGI-2/experiments/E062_manh_vllm_fork/per_layer"
 LIVE = {
     "Manh V12 replica": {"t0": "01:56:00", "logs": [f"{R}/phase_h/manh_v12/data/gpumem.log", f"{R}/phase_h/manh_v12/data/dsv41_logs/server/server.log"],
@@ -12,9 +12,10 @@ LIVE = {
 }
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pod4
-P4 = pod4.info()
-if P4:
-    LIVE[pod4.NAME] = {"t0": P4["t0"], "logs": [f"{P4['dir']}/gpumem.log"], "ram": ("tsv", f"{P4['dir']}/ram.tsv", 0.0)}
+for _n, _c in pod4.active().items():
+    LIVE[_n] = {"t0": _c["t0"], "logs": _c["logs"], "ram": ("tsv", f"{_c['dir']}/ram.tsv", _c["ram_adj"])}
+import frozen
+for _n in frozen.load(): LIVE.pop(_n, None)  # finished runs are not rebuilt
 old = json.load(open(f"{D}/mem.json"))
 out = [r for r in old if r["run"] not in LIVE]
 extra = json.load(open(f"{D}/mem_live_points.json")) if os.path.exists(f"{D}/mem_live_points.json") else []

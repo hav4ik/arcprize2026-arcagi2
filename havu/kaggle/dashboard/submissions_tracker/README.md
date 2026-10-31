@@ -39,3 +39,10 @@ The live dashboard for Kaggle submissions and their 12 h pod replicas: https://c
 - **B32-M (LB 46.5):** with Kaggle-matched GPU headroom, the replica hit 4 CUDA OOMs, ran out of restarts at 7.26 h and finished at **50.4**. See `notes/2026-10-30_b32m_oom_modes.md`.
 - **Manh's V12:** 0 events, a flat 1.08 GiB margin, and 80.6 so far at 9 h.
 - **The 10-27 B32 replica** finished at 79.1.
+
+## Automatic refresh (no agent)
+
+- `tools/auto_dash.sh`: every 5 min (`INTERVAL` s) runs `update_dash.py` into `DASH_DIR` (the live scratchpad copy), copies the JSONs here, and refreshes `publish_queue.json` (datasets whose sha256 differs from the last publish). Start: `setsid nohup kaggle/dashboard/submissions_tracker/tools/auto_dash.sh >/dev/null 2>&1 &`. PID in `auto_dash.pid`; stop with `touch auto_dash.stop`; log in `auto_dash.log`.
+- New live runs: `tools/pod4.py:discover()` picks up any `phase_h/<dir>/data/status.json` newer than 3 h that is not a known/frozen dir. Label = status.json `run`/`label`/`name`, else the dir name (pod = status `pod`). To pin a label, add the dir to `CANDS`.
+- Publishing (needs Claude's Artifact tools): `python3 tools/publish_list.py` lists changed dataset ids and files; after publishing, `python3 tools/publish_list.py --mark`.
+- `local.html`: screenshot page. `cd kaggle/dashboard/submissions_tracker && python3 -m http.server 8765`, open http://localhost:8765/local.html. It loads `index.html` at runtime (style, markup, script) and runs it on a small `dash` shim, so it stays in sync; refreshes every 60 s.

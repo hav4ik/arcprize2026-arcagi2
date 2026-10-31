@@ -17,18 +17,19 @@ def pairs_ok(a):
     preds = p if (n > 1 and depth(p) == 3) else [p]
     return [i < len(preds) and preds[i] == sol[t][i] for i in range(n)]
 att = sorted((json.loads(l) for l in open(path) if l.strip()), key=lambda a: float(a.get("t_end_h") or 0))
-best, first_n, first_ok, out, last_bin = {}, 0, 0, [], None
+best, first_n, first_ok, out, last_bin, seen = {}, 0, 0, [], None, {}
 for a in att:
     ok = pairs_ok(a)
     if ok is None or a["task_id"] not in sol:
         continue
     t = a["task_id"]
+    seen.setdefault(t, set()).add(int(a.get("attempt", 0)))
     best[t] = [x or y for x, y in zip(best.get(t, [False] * len(ok)), ok)]
     if int(a.get("attempt", 0)) == 0:
         first_n += 1; first_ok += all(ok)
     th = float(a["t_end_h"])
     point = {"run": run, "t_h": round(th, 2), "score_so_far": round(100 * sum(sum(v) / len(v) for v in best.values()) / len(sol), 2),
-             "tasks_answered": len(best), "first_attempt_acc": round(100 * first_ok / first_n, 1) if first_n else None}
+             "tasks_answered": len(best), "tasks_two_attempts": sum(1 for v in seen.values() if 0 in v and 1 in v), "first_attempt_acc": round(100 * first_ok / first_n, 1) if first_n else None}
     b = int(th * 6)
     if out and b == last_bin:
         out[-1] = point

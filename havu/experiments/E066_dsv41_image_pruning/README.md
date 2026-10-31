@@ -215,6 +215,15 @@ attempts each) measure the wrong model. Do not use them.
 
 ## Final ARC-AGI-2 results (2026-10-29, 120 eval tasks x 2, ARC Prize scoring, `scripts/compare_evals.py`)
 
+> **Answer key / task versions:** the table below is scored with the GitHub copy (the harness `correct` field), and
+> these runs were also *given* the GitHub task versions (`--challenges data/arc-agi-2-github/data/evaluation`). Five
+> tasks differ between that copy and Kaggle's `arc-agi_evaluation_{challenges,solutions}.json` as whole task versions
+> (Kaggle adds a test input; faa9f03d's training pairs differ too): 4a21e3da, abc82100, b6f77b65, f560132c, faa9f03d.
+> So a GitHub-version run cannot be scored with Kaggle's key on those 5. Compare across versions on the 115 tasks that
+> are identical in both (both keys agree there): pass@1 / pass@2 = full API image 81.8 / 91.2, API text 78.4 / 89.9,
+> candidate 1 text 76.2 / 87.0, E046 run 7 74.3 / 85.7, causal image model (run 1) 74.9 / 84.8, V12 text on node 5
+> 71.2 / 82.9, candidate 1 image (buggy path) 70.4 / 80.9.
+
 > **2026-10-30: every image result in E066 ran with a serving bug (E068).** The fork sets `is_mm_prefix_lm =
 > vision_n_layers > 0`, so the language model attended bidirectionally over image spans; DeepSeek's reference is
 > causal. Fixed with `--hf-overrides '{"is_mm_prefix_lm": false}' --disable-chunked-mm-input`; on the full model the
@@ -303,6 +312,42 @@ User's question: does MXFP4 Engram cost ARC accuracy on the model and harness we
 - Node 5 handed to model-serving for the image-harness research (user, 2026-10-30 08:10 UTC); results and logs in
   `results/b32_engram/`.
 
+## Fixed image path: re-prune and evals (2026-10-30, node 5 = Vast 58332344, destroyed 20:18 UTC)
+
+E068 found the fork attending bidirectionally over image spans; `--hf-overrides '{"is_mm_prefix_lm": false}'
+--disable-chunked-mm-input` makes it causal (on this fork that is the only gate: equal to upstream vLLM PR #57152,
+checked in code and at runtime). Everything below ran on the fixed path.
+
+**Re-prune (user: "go straight to re-calibration + new model eval"):**
+- Calibration replays repeated exactly (image 374 rollouts / 12,005,133 tokens, seed 1, minus the 7 preflight rollouts:
+  `scripts/rebuild_e066_selection.py`; text 451 rollouts / 12.0M). `scripts/fix_c1_chain.sh`, `scripts/recal_chain.sh`.
+- Keep set moved 1.58 of 128 experts per layer vs candidate 1 (63 of 5,120; layer 0: 6). B32's E128 vs C1 is 3.2.
+  Routing coverage barely changed (image tokens 79.15 vs 79.44%, generated 85.51 vs 85.62%). The bug corrupted
+  perception, not expert choice. `scripts/keep_shift.py`, `results/node5_fix/data/keep_shift.json`.
+- GPTQ on the fixed path (same seeds/sizes): output error 2.56% / 5.52% (gate-up / down) vs C1's 2.54% / 5.51%;
+  ~42 s per layer (the earlier 2 h 15 estimate was wrong).
+- Dev NLL (paired vs C1's export): text +0.0027 [+0.0012, +0.0043] (slightly worse); image -0.0064 per rollout (but C1's
+  number was measured on the buggy path).
+- Uploads: HF `chankhavu/DeepSeek-V4.1-Flash-1017-arc-tool-img-E128-2bit-causal` (no Engram; verified 122 files) and
+  Kaggle Model `arazzd/deepseek-v41-flash-1017-arc-tool-img-e128-causal/pyTorch/default/1` (private, 137 files,
+  132.06 GB with the 64 GiB tool Engram, verified; manifest `results/c1f_gptq_sha256_manifest.json`; the 16 Engram
+  files are byte-identical to C1's).
+
+**ARC evals (Kaggle key; same-box V12 text baseline = today's B32 runs, V12's harness 882c817f + auto-repair):**
+
+| run (120 x 2) | tasks | pass@1 vs V12 text | pass@2 vs V12 text |
+|---|---|---|---|
+| run 1: causal model + images, E066 image harness, no auto-repair | 115 | 74.9 vs 71.1 (+3.8 [-1.1, +8.9]) | 84.8 vs 82.9 (+1.9 [-3.9, +8.0]) |
+| run 2: + V12's harness (pinned image harness 1d1a281e) + auto-repair; stopped by the user at 165/240 | 77 | 89.3 vs 85.6 (+3.7 [-1.1, +8.9]) | 92.9 vs 94.2 (-1.3 [-5.2, +2.6]) |
+
+- Run 1 vs other text runs on the same 115 tasks: E046 run 7 +0.2, C1 text -1.8; full model API image -7.2, API text -3.7.
+  Text runs of comparable models differ by up to ~5.6 pass@1 between setups, as large as the image effect.
+- Tokens per attempt (run 1 vs V12 text): output 39.2K vs 41.4K; prompt summed over turns 837K vs 773K (+8%).
+- Engram 64 -> 56 GiB (`scripts/engram_subset.py`, training census; user dropped it, RAM is not binding): dev NLL
+  change < 0.001/token on all four sets (CIs include 0); eval traces lose 1.2% of lookups, spread evenly over all
+  120 tasks (max 1.9%, `scripts/engram_task_miss.py`). Its ARC run was stopped at the start.
+- Image harness: one image per grid after the JSON prompt (E058); E070 layouts were worse or tied.
+
 ## Status
 - 2026-10-28: CPU prep done (data, tokens, census, scripts, tests). No box yet; no API spend.
 - 2026-10-29: box up, replays done, candidate 1 picked; candidate 1 GPTQ capture and the layer sweep running.
@@ -310,3 +355,4 @@ User's question: does MXFP4 Engram cost ARC accuracy on the model and harness we
   re-planned; the box 1 chain and the local evals are running.
 - 2026-10-29/30 night: all four evals finished; both boxes destroyed (logs in `results/box1`, `results/box4`).
 - 2026-10-30: Engram A/B on B32's model done: MXFP4 = FP8 on ARC (pass@1 -0.1, pass@2 -2.5, CIs include zero); node 5 handed to model-serving.
+- 2026-10-30 evening: fixed-path re-prune uploaded (HF + Kaggle arazzd, private); image evals ~+3.7 pass@1 over V12 text on the same box; node 5 destroyed. Candidate for today's submission: V12 + images (dsv4-infer, 4xL4 replica).

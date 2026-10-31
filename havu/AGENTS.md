@@ -56,6 +56,12 @@ Guidance for coding agents working in this repository (ARC-AGI-2 / ARC Prize 202
 
 ## Research and evals
 
+- **Start here for the DSv4.1 Kaggle track:** `notes/2026-10-30_dsv4_infer_handoff.md`. It covers the leaderboard, candidate notebooks, running pods, findings with evidence, rules and next steps.
+- **Score ARC-AGI-2 eval on the Kaggle versions** (`data/arc-agi_evaluation_{challenges,solutions}.json`).
+  - The GitHub copy (`data/arc-agi-2-github/`, the harness default `--challenges`) differs on 6 tasks.
+  - Compare across versions only on the 114 identical tasks.
+  - With every score, state the version, the task count and pass@k.
+
 - `experiments/`: experiment registry `experiments.tsv` (id, path, status, results, cost, notes) and one `E###_name/README.md` per experiment. Update the TSV row when status or results change.
 - `prior_works/`: links and summaries of public ARC methods and datasets. `README.md` is the index. Add a summary file per method and keep the index tables up to date.
 - `notes/`: dated research notes; `notes/prompts/` holds ARC Prize's official eval prompt and DeepSeek's reasoning-effort prefixes.

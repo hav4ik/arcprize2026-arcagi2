@@ -1,6 +1,6 @@
 """Rebuild the dashboard's live data: mem.json (via build_mem.py), tps.json, and runs.json's latest GPU/throughput fields."""
 import json, os, re, subprocess, sys
-D = os.environ.get("DASH_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the dashboard folder (live copy: the session scratchpad)
+D = "/tmp/claude-1000/-home-vu-Workspace-ARC-AGI-2/81e68821-e1f4-4b05-bad6-9a606f77ad54/scratchpad/dashboard"
 R = "/home/vu/Workspace/ARC-AGI-2/experiments/E062_manh_vllm_fork/per_layer"
 LIVE = {"Manh V12 replica": ("01:56:00", [f"{R}/phase_h/manh_v12/data/gpumem.log", f"{R}/phase_h/manh_v12/data/dsv41_logs/server/server.log"]),
         "B32-M V3 replica": ("03:30:40", [f"{R}/pod3_runs/b32m_v3/data/gpumem.log"])}
@@ -10,10 +10,19 @@ old_tps = json.load(open(f"{D}/tps.json")) if os.path.exists(f"{D}/tps.json") el
 tps = []
 OUT = []
 # runs whose tps.tsv is trusted (Manh V12 since pod 2 fixed it, checked against server.log: 241 minute rows, one isolated zero blip)
-TSV_TRUST = {"B32-M V3 replica", "Manh V12 replica", "Ours V1 qualification"}
-def kind_of(run):
+TSV_TRUST = {"Ours V1 qualification", "SFT 025ep on V12", "V12 + images FINAL", "V12 + images (causal) r0"}
+def kind_of(run, sod=None):
     try:
         st = json.load(open(STATUS[run]))
+        faults = st.get("faults") or []
+        if faults:  # deliberate fault injection: the fault nearest before the outage's first down minute
+            def fs(f):
+                m = re.search(r"(\d\d):(\d\d):(\d\d)", str(f.get("utc", "")))
+                return int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3]) if m else None
+            cand = [f for f in faults if sod is None or (fs(f) is not None and -120 <= sod - fs(f) <= 600)]
+            if cand:
+                f = cand[-1]
+                return f"fault injection: {f.get('action', 'fault')} ({f.get('signal', '')} {str(f.get('target', '')).replace('VLLM::', '')})".replace("( ", "(").replace(" )", ")")
         if "fault injection" in str(st.get("verdict", "")).lower(): return "fault injection"
         return "OOM hang + restart" if (st.get("ooms") or 0) > 0 or (st.get("deaths") or 0) > 0 else False
     except Exception:
@@ -21,10 +30,14 @@ def kind_of(run):
 STATUS = {"Manh V12 replica": f"{R}/phase_h/manh_v12/data/status.json", "B32-M V3 replica": f"{R}/pod3_runs/b32m_v3/data/status.json"}
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pod4
-P4 = pod4.info()
-if P4:  # a third live run appears once its status.json exists
-    LIVE[pod4.NAME] = (P4["t0"], [f"{P4['dir']}/gpumem.log"])
-    STATUS[pod4.NAME] = f"{P4['dir']}/status.json"
+import frozen
+FROZEN = frozen.load()  # finished runs: taken from their frozen files, never rebuilt
+CAND = pod4.active()
+for _n, _c in CAND.items():  # further live runs appear once their status.json exists
+    LIVE[_n] = (_c["t0"], _c["logs"])
+    STATUS[_n] = f"{_c['dir']}/status.json"
+for _n in FROZEN:
+    LIVE.pop(_n, None); STATUS.pop(_n, None)
 FIN_PATH = f"{D}/finished.json"
 try:
     FIN = json.load(open(FIN_PATH))  # runs whose solver has exited: {run: {"h": kaggle hours at exit, ...}}; kept once seen
@@ -50,6 +63,20 @@ for _run, _p in STATUS.items():
                 FIN[_run] = {"h": float(_st["kaggle_h"]), "utc": str(_st.get("utc")), "verdict": str(_st.get("verdict", ""))[:200]}
         except Exception:
             pass
+def solver_done(run):
+    """(kaggle_h, line) if the run's solver.log ends with the solver's 'done' line, else None."""
+    d = os.path.dirname(STATUS[run])
+    for lp in (f"{d}/solver.log", f"{d}/dsv41_logs/solver.log"):
+        if os.path.exists(lp):
+            lines = [l for l in open(lp, errors="replace").read().splitlines() if l.strip()]
+            if lines:
+                m = re.match(r"\[[\d:]+ \+([\d.]+)h\] done\s*$", lines[-1])
+                if m: return float(m[1]), lines[-1]
+    return None
+for _run in STATUS:  # the solver log ends with "done" once the solver has exited
+    if _run not in FIN and os.path.exists(STATUS[_run]):
+        _d = solver_done(_run)
+        if _d: FIN[_run] = {"h": _d[0], "utc": "", "verdict": "solver log: " + _d[1]}
 for _run, _f in FIN.items():  # the verdict may name the exact exit time: "... finished at Kaggle 7.26 h"
     _m = re.search(r"(?:finished|exited|ended) at Kaggle (\d+(?:\.\d+)?) ?h", _f.get("verdict", ""))
     if _m: _f["h"] = float(_m[1])
@@ -138,6 +165,7 @@ for run, (t0, logs) in LIVE.items():
     if os.path.exists(tsv) and run in TSV_TRUST:
         pts = bins_from_tsv(tsv)
         rows = read_tsv(tsv)
+        if run in FIN: rows = [x for x in rows if x["t"] <= FIN[run]["h"] + 0.02]  # nothing after the solver exit counts
         slog = os.path.join(os.path.dirname(logs[0]), "solver.log")
         ups = []  # the solver's "server up after" lines, as kaggle hours
         if os.path.exists(slog):
@@ -149,7 +177,7 @@ for run, (t0, logs) in LIVE.items():
                 en_h = next((u for u in ups if u > st_h), None)
             en = en_h if en_h is not None else rows[-1]["t"]
             OUT.append({"run": run, "start_h": round(st_h, 2), "end_h": round(en_h, 2) if en_h is not None else None,
-                        "kind": FINAL_LABEL if (en_h is None and (run in FIN or run in FINALS or FINAL_RE.search(verdict_of(run)))) else (kind_of(run) or "no generation"),
+                        "kind": FINAL_LABEL if (en_h is None and (run in FIN or run in FINALS or FINAL_RE.search(verdict_of(run)))) else (kind_of(run, sod(down[0]["utc"])) or "no generation"),
                         "utc": f"{down[0]['utc'][11:16]}-{(endrow or rows[-1])['utc'][11:16]}",
                         "ongoing": en_h is None, "down_t": sorted({round(st_h, 3)} | {x["t"] for x in down})})
             if en_h is None and status_h(run):  # an open outage reads 0 on the GPU charts up to the latest status
@@ -199,6 +227,8 @@ for run, (t0, logs) in LIVE.items():
         for k in ("t_h", "gen_tok_s", "running", "waiting", "kv_pct"):
             if p.get(k) is not None: p[k] = round(p[k], 2 if k == "t_h" else 1)
     tps += pts
+# an outage that starts at the solver's own exit is the normal shutdown, not a failure
+OUT = [o for o in OUT if not (o["run"] in FIN and o["end_h"] is None and o["start_h"] >= FIN[o["run"]]["h"] - 0.03)]
 REF = json.load(open(f"{D}/ref_b32.json")) if os.path.exists(f"{D}/ref_b32.json") else {"tps": [], "mem": []}
 tps += REF["tps"]
 json.dump(tps, open(f"{D}/tps.json", "w"), indent=1)
@@ -215,11 +245,12 @@ mem = [m for m in mem if any(m.get(k) is not None for k in ("vram_free_min_gib",
 json.dump([{k: v for k, v in o.items() if k not in ("down_t", "ongoing")} for o in OUT], open(f"{D}/outages.json", "w"), indent=1)
 json.dump(mem, open(f"{D}/mem.json", "w"), indent=1)
 runs = json.load(open(f"{D}/runs.json"))
-if P4 and not any(r["run"] == pod4.NAME for r in runs):
-    row = {"run": pod4.NAME, "pod": "pod 4", "started_utc": P4["start"], "elapsed_h": None, "first_done": None, "first_correct": None,
-           "deaths": 0, "restarts": 0, "errored": 0, "ram_kaggle_eq_gib": None, "vram_free_min_gib": None, "updated_utc": None}
-    k = max((i for i, r in enumerate(runs) if r["run"] in LIVE), default=-1)
-    runs.insert(k + 1, row)
+for _n, _c in CAND.items():
+    if not any(r["run"] == _n for r in runs):
+        row = {"run": _n, "pod": _c["pod"], "started_utc": _c["start"], "elapsed_h": None, "first_done": None, "first_correct": None,
+               "deaths": 0, "restarts": 0, "errored": 0, "ram_kaggle_eq_gib": None, "vram_free_min_gib": None, "updated_utc": None}
+        k = max((i for i, r in enumerate(runs) if r["run"] in LIVE), default=-1)
+        runs.insert(k + 1, row)
 for r in runs:
     if r["run"] not in LIVE:
         continue
@@ -269,6 +300,8 @@ ATT = {"Manh V12 replica": f"{R}/phase_h/manh_v12/data/dsv41_logs/attempts.jsonl
        "Ours V1 qualification": f"{R}/pod4_runs/v1_qual/data/attempts.jsonl",
        # reference: the 68.89 submission's full pod replica (10-27), same workload
        "B32 replica (LB 68.89), 10-27": "/home/vu/Workspace/ARC-AGI-2/experiments/E055_kaggle_replica/runs/candBf_x2t/out/dsv41_logs/attempts.jsonl"}
+for _n, _c in CAND.items(): ATT[_n] = _c["att"]
+for _n in FROZEN: ATT.pop(_n, None)
 acc = []
 for run, path in ATT.items():
     if os.path.exists(path):
@@ -292,3 +325,23 @@ for r in runs:
         r["status"] = f"finished; final {f.get('final') or 'score ' + str(sc)}"
     r["elapsed_h"] = round(f["h"], 2)
 json.dump(runs, open(f"{D}/runs.json", "w"), indent=1)
+# frozen runs: their stored series and rows replace whatever the live files gave
+for _n, _f in FROZEN.items():
+    FIN.pop(_n, None)
+mem = json.load(open(f"{D}/mem.json")); tps = json.load(open(f"{D}/tps.json")); acc = json.load(open(f"{D}/acc.json"))
+runs = json.load(open(f"{D}/runs.json")); outs = json.load(open(f"{D}/outages.json"))
+for _n, _f in FROZEN.items():
+    mem = [m for m in mem if m["run"] != _n] + _f.get("mem", [])
+    tps = [m for m in tps if m["run"] != _n] + _f.get("tps", [])
+    acc = [m for m in acc if m["run"] != _n] + _f.get("acc", [])
+    outs = [o for o in outs if o["run"] != _n] + _f.get("outages", [])
+    i = next((k for k, r in enumerate(runs) if r["run"] == _n), None)
+    row = _f["runs_row"][0]
+    if i is None: runs.insert(0, row)
+    else: runs[i] = row
+mem.sort(key=lambda m: (m["run"], m["t_h"])); tps.sort(key=lambda m: (m["run"], m["t_h"]))
+order = {n: k for k, n in enumerate(list(ATT) + list(FROZEN))}
+acc.sort(key=lambda m: (m["run"], m["t_h"]))
+json.dump(mem, open(f"{D}/mem.json", "w"), indent=1); json.dump(tps, open(f"{D}/tps.json", "w"), indent=1)
+json.dump(acc, open(f"{D}/acc.json", "w"), indent=1); json.dump(runs, open(f"{D}/runs.json", "w"), indent=1)
+json.dump(outs, open(f"{D}/outages.json", "w"), indent=1)
