@@ -283,6 +283,21 @@ py_binary(
     ],
 )
 
+py_binary(
+    name = "analyze_e065_rescued_rollouts",
+    srcs = ["analyze_e065_rescued_rollouts.py"],
+    deps = [
+        "//file/cns2",
+        "//file/liball",
+        "//pyglib:gfile",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/numpy",
+        "//third_party/py/pyarrow",
+        "//third_party/py/scipy",
+    ],
+)
+
 py_library(
     name = "audit_and_split_e065_rollouts_lib",
     srcs = ["audit_and_split_e065_rollouts.py"],

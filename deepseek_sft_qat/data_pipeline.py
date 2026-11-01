@@ -407,9 +407,18 @@ def split_by_parent_puzzle_id(
     records: Sequence[Mapping[str, Any]],
     val_fraction: float = 0.10,
     seed: int = 20260405,
+    forced_train_parents: set[str] | None = None,
+    forced_val_parents: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    """Splits trajectories ~90/10 by parent puzzle ID (`task_id.split('_')[0]`), stratified by source."""
+    """Splits trajectories ~90/10 by parent puzzle ID (`task_id.split('_')[0]`), stratified by source.
+
+    `forced_train_parents` / `forced_val_parents` pin parents to a split (e.g. the parents of a previous
+    round's train/val manifests) so only genuinely new parents are shuffled; a parent listed in both sets
+    goes to val (the safer side).
+    """
     rng = np.random.default_rng(seed)
+    forced_train_parents = set(forced_train_parents or ())
+    forced_val_parents = set(forced_val_parents or ())
 
     # Group records by parent_id
     by_parent: dict[str, list[dict[str, Any]]] = {}
@@ -429,8 +438,19 @@ def split_by_parent_puzzle_id(
 
     val_parents: set[str] = set()
     train_parents: set[str] = set()
+    n_pinned_train = n_pinned_val = 0
     for src, pids in sorted(parents_by_source.items()):
-        pids_arr = list(pids)
+        free: list[str] = []
+        for p in pids:
+            if p in forced_val_parents:
+                val_parents.add(p)
+                n_pinned_val += 1
+            elif p in forced_train_parents:
+                train_parents.add(p)
+                n_pinned_train += 1
+            else:
+                free.append(p)
+        pids_arr = list(free)
         rng.shuffle(pids_arr)
         n_val = max(1, int(round(len(pids_arr) * val_fraction))) if len(pids_arr) > 1 else 0
         for p in pids_arr[:n_val]:
@@ -469,6 +489,8 @@ def split_by_parent_puzzle_id(
         "parent_overlap_count": len(train_pids & val_pids),
         "train_unique_task_ids": len({r["task_id"] for r in train_records}),
         "val_unique_task_ids": len({r["task_id"] for r in val_records}),
+        "pinned_train_parents": n_pinned_train,
+        "pinned_val_parents": n_pinned_val,
     }
     return train_records, val_records, split_stats
 
@@ -848,6 +870,24 @@ def audit_e065_rollout_file(
             "rollout_file": os.path.basename(fpath),
             "messages": messages,
         }
+        # E082 ("Manh V12" text harness) adds JSON counters for harness interventions (`--rescue-code`,
+        # `--auto-repair`). Expose them as ints so `--drop_rescued_or_nudged` can drop such rows.
+        for src_col, dst_col in (("rescues", "code_rescues"), ("auto_repairs", "auto_repairs")):
+            raw_ctr = _parquet_scalar_or_none(pair0.get(src_col))
+            if raw_ctr is None:
+                continue
+            n_ctr = 0
+            try:
+                parsed_ctr = json.loads(raw_ctr) if isinstance(raw_ctr, str) else raw_ctr
+                if isinstance(parsed_ctr, dict):
+                    n_ctr = int(sum(int(v or 0) for v in parsed_ctr.values()))
+                elif isinstance(parsed_ctr, (int, float)):
+                    n_ctr = int(parsed_ctr)
+                elif isinstance(parsed_ctr, list):
+                    n_ctr = len(parsed_ctr)
+            except (ValueError, TypeError):
+                n_ctr = 1  # unparseable but non-empty counter: treat as an intervention
+            rec[dst_col] = n_ctr
         verified_records.append(rec)
 
     n_img_verified = [r["n_images"] for r in verified_records]

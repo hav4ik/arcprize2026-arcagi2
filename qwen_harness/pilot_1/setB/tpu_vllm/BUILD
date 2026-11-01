@@ -189,11 +189,56 @@ py_binary(
     ],
 )
 
+py_binary(
+    name = "deepseek_v41_e065_correct_and_rewrite",
+    srcs = [
+        "deepseek_v41_arc2_eval.py",
+        "deepseek_v41_e065_correct_and_rewrite.py",
+        "deepseek_v41_top10k_rollouts.py",
+        "deepseek_v41_tpu_vllm_traces.py",
+        "qwen_tpu_vllm_eval.py",
+    ],
+    deps = [
+        ":ds4_full_precision_lib",
+        ":prompts_and_voting",
+        ":sandbox",
+        "//experimental/users/arazdai/kaggle/sft:export_and_quantize_lib",
+        "//file/cns2",
+        "//file/liball",
+        "//pyglib:gfile",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/jax",
+        "//third_party/py/numpy",
+        "//third_party/py/pyarrow",
+        "//third_party/py/scipy",
+        "//third_party/py/tensorstore",
+        "//third_party/py/tokenizers",
+        "//third_party/py/tpu_inference",
+        "//third_party/py/tqdm",
+        "//third_party/py/vllm",
+    ],
+)
+
+py_binary(
+    name = "launch_deepseek_v41_e065_correct_rewrite_xm",
+    srcs = ["launch_deepseek_v41_e065_correct_rewrite_xm.py"],
+    deps = [
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags",
+        "//third_party/py/xmanager:xm_flags",
+        "//third_party/py/xmanager/contrib/internal:requirements_flag",
+        "//third_party/py/xmanager/xm",
+        "//third_party/py/xmanager/xm_abc",
+    ],
+)
+
 py_test(
     name = "top10k_rollouts_test",
     size = "medium",
     srcs = [
         "deepseek_v41_arc2_eval.py",
+        "deepseek_v41_e065_correct_and_rewrite.py",
         "deepseek_v41_top10k_rollouts.py",
         "deepseek_v41_tpu_vllm_traces.py",
         "qwen_tpu_vllm_eval.py",
@@ -204,8 +249,10 @@ py_test(
         ":prompts_and_voting",
         ":sandbox",
         "//experimental/users/arazdai/kaggle/sft:data_pipeline",
+        "//experimental/users/arazdai/kaggle/sft:export_and_quantize_lib",
         "//pyglib:gfile",
         "//testing/pybase",
+        "//third_party/py/absl:app",
         "//third_party/py/absl/flags",
         "//third_party/py/jax",
         "//third_party/py/numpy",

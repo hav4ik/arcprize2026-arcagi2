@@ -23,6 +23,7 @@ import io
 import json
 import os
 import pickle
+import re
 import time
 from typing import Any
 
@@ -75,9 +76,10 @@ flags.DEFINE_string(
 flags.DEFINE_enum(
     "subset",
     "e031",
-    ["e031", "all", "top10k_v8", "all_with_top10k_v8", "e065_images", "e065_text", "e065_all"],
+    ["e031", "all", "top10k_v8", "all_with_top10k_v8", "e065_images", "e065_text", "e065_all", "e065_all_with_top10k_v8"],
     "Which rollout files to include in the SFT dataset: 'e031', 'all', 'top10k_v8', 'all_with_top10k_v8', "
-    "or the E065 text+image sets 'e065_images', 'e065_text', 'e065_all' (images + text twins).",
+    "the E065 text+image sets 'e065_images', 'e065_text', 'e065_all' (images + text twins), or "
+    "'e065_all_with_top10k_v8' (E065 images + text twins + E082 text parts + Top-10K v8 + optional extra shards).",
 )
 flags.DEFINE_string(
     "e065_rollouts_dir",
@@ -94,7 +96,43 @@ flags.DEFINE_string(
     "",
     "Optional CNS directory containing corrected+rewritten E065 rollout parquet shards "
     "(e.g. /cns/lu-d/home/arazdai/kaggle/arc_sft_data/e065_hardest_rollouts/corrected_rewritten/shards) "
-    "to include alongside e065_rollouts_dir when --subset in ('e065_images', 'e065_all').",
+    "to include alongside e065_rollouts_dir when --subset in ('e065_images', 'e065_all', 'e065_all_with_top10k_v8').",
+)
+flags.DEFINE_list(
+    "e065_text_part_dirs",
+    [],
+    "Extra directories of E065-schema TEXT parquet parts (e.g. .../rollouts/e082_text_nvarc_b2) audited like "
+    "the e065_text_* files when --subset includes E065 text.",
+)
+flags.DEFINE_enum(
+    "e065_extra_modality",
+    "both",
+    ["both", "text", "image"],
+    "Which modality of the corrected+rewritten extra shards to keep (each rescued task has an image row and a text twin).",
+)
+flags.DEFINE_bool(
+    "e065_extra_skip_existing_modality_tasks",
+    True,
+    "Skip an extra (rescued) row when E065 already has a verified rollout of the same task AND modality "
+    "(the rescue was run on image failures; 30% of those tasks have a passing text twin).",
+)
+flags.DEFINE_bool(
+    "e065_extra_drop_meta_leaks",
+    True,
+    "Drop rescued rows whose assistant reasoning refers to the hidden rewrite instructions / verified solution "
+    "('verified implementation', 'instructions say', ...) or to a previous attempt ('prev', 'previous failed', "
+    "'diagnostic', ...), and the canned sandbox-synthesis 2-turn rows.",
+)
+flags.DEFINE_integer(
+    "e065_extra_upsample",
+    1,
+    "Number of copies of each kept rescued (corrected+rewritten) trajectory in the TRAIN split (1 = no upsampling).",
+)
+flags.DEFINE_string(
+    "pin_split_from_data_dir",
+    "",
+    "Optional previous-round dataset dir (with train_manifest.jsonl / val_manifest.jsonl): its train parents are "
+    "forced to train and its val parents to val so only NEW parents are shuffled (no train/val leakage across rounds).",
 )
 flags.DEFINE_integer(
     "max_seq_len",
@@ -237,7 +275,7 @@ E065_TEXT_PARQUETS = (
     "e065_text_nvarc_b1.parquet",
 )
 
-E065_SUBSETS = ("e065_images", "e065_text", "e065_all")
+# E065_SUBSETS & friends are defined below next to the rescued-row helpers.
 
 TIER_ALIASES = {
     "tier1": "tier1_frontier_1of2",
@@ -264,6 +302,81 @@ def parse_tier_weights(spec: str) -> dict[str, float]:
     return weights
 
 
+E065_SUBSETS = ("e065_images", "e065_text", "e065_all", "e065_all_with_top10k_v8")
+E065_SUBSETS_WITH_IMAGES = ("e065_images", "e065_all", "e065_all_with_top10k_v8")
+E065_SUBSETS_WITH_TEXT = ("e065_text", "e065_all", "e065_all_with_top10k_v8")
+TOP10K_SUBSETS = ("top10k_v8", "all_with_top10k_v8", "e065_all_with_top10k_v8")
+
+# Rescued (corrected+rewritten) rows: phrases that reveal the hidden rewrite instructions / verified solution.
+RESCUE_META_LEAK_PHRASES = (
+    "previous attempt", "prior attempt", "earlier attempt", "failed attempt", "previous rollout",
+    "reference solution", "reference insight", "reference solve", "reference code", "reference implementation",
+    "provided solution", "given solution", "teacher hint", "rewrite", "verified implementation", "verified python",
+    "verified solution", "verified code", "solution trajectory", "instructions from user", "instructions say",
+    "user instructions", "as if solving", "already discovered", "key reasoning insight", "do not mention",
+    "the given code", "provided code", "given implementation",
+)
+# Sandbox-synthesis fallback rows carry the correction-stage thought and this canned turn-2 sentence.
+RESCUE_SYNTHESIS_SENTENCE = "The transformation function `solve` passes all training pairs cleanly."
+_RESCUE_PRIOR_REF_RE = re.compile(
+    r"\b(prev|previous(ly)? (failed|rule|code|attempt|approach)|old rule|diagnos\w*|why (the )?previous|earlier rule)\b"
+)
+
+
+def rescued_row_leak_reasons(messages: list[dict[str, Any]]) -> list[str]:
+    """Returns why a rescued (corrected+rewritten) trajectory should be dropped (empty = clean)."""
+    texts: list[str] = []
+    for m in messages[2:]:
+        if m.get("role") == "assistant":
+            texts.append(str(m.get("reasoning_content") or ""))
+            texts.append(str(m.get("content") or ""))
+    joined = "\n".join(texts)
+    low = joined.lower()
+    reasons: list[str] = []
+    if RESCUE_SYNTHESIS_SENTENCE in joined:
+        reasons.append("sandbox_synthesis")
+    for ph in RESCUE_META_LEAK_PHRASES:
+        if ph in low:
+            reasons.append(f"meta:{ph}")
+            break
+    if _RESCUE_PRIOR_REF_RE.search(low):
+        reasons.append("prior_attempt_reference")
+    return reasons
+
+
+def is_rescued_extra(rec: dict[str, Any]) -> bool:
+    return "corrected_rewritten" in str(rec.get("rollout_file", ""))
+
+
+def discover_text_part_parquets(part_dir: str) -> list[str]:
+    """Lists `*.parquet` parts of an E065-schema text batch directory (e.g. e082_text_nvarc_b2/part-*.parquet)."""
+    if not part_dir or not gfile.Exists(part_dir):
+        return []
+    return [
+        os.path.join(part_dir, f)
+        for f in sorted(gfile.ListDir(part_dir))
+        if f.endswith(".parquet") and not f.startswith(".")
+    ]
+
+
+def load_pinned_parents(data_dir: str) -> tuple[set[str], set[str]]:
+    """Reads parent_ids of a previous round's train/val manifests (empty sets when absent)."""
+    out: list[set[str]] = []
+    for split in ("train", "val"):
+        path = os.path.join(data_dir, f"{split}_manifest.jsonl") if data_dir else ""
+        parents: set[str] = set()
+        if path and gfile.Exists(path):
+            with gfile.Open(path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    parents.add(str(row.get("parent_id") or data_pipeline.get_parent_puzzle_id(str(row["task_id"]), row.get("parent"))))
+        out.append(parents)
+    return out[0], out[1]
+
+
 def apply_record_filters(
     records: list[dict[str, Any]],
     max_completion_tokens: int,
@@ -283,7 +396,11 @@ def apply_record_filters(
         if require_verified_clean_sft and "verified_clean_sft" in rec and not bool(rec["verified_clean_sft"]):
             drops["not_verified_clean_sft"] += 1
             continue
-        if drop_rescued_or_nudged and (int(rec.get("code_rescues", 0) or 0) > 0 or int(rec.get("cap_nudges", 0) or 0) > 0):
+        if drop_rescued_or_nudged and (
+            int(rec.get("code_rescues", 0) or 0) > 0
+            or int(rec.get("cap_nudges", 0) or 0) > 0
+            or int(rec.get("auto_repairs", 0) or 0) > 0
+        ):
             drops["rescued_or_nudged"] += 1
             continue
         if max_ident_syntax_error_turns >= 0 and int(rec.get("ident_syntax_error_turns", 0)) > max_ident_syntax_error_turns:
@@ -405,7 +522,7 @@ def main(argv: list[str]) -> None:
             if fname != "e037_openrouter_deepinfra.parquet":
                 all_verified.extend(recs)
 
-    if FLAGS.subset in ("top10k_v8", "all_with_top10k_v8"):
+    if FLAGS.subset in TOP10K_SUBSETS:
         shard_paths = discover_top10k_rollout_shards(FLAGS.top10k_rollouts_dir)
         print(f"Auditing {len(shard_paths)} Top-10K v8 rollout shards from {FLAGS.top10k_rollouts_dir}...")
         t_sh = time.time()
@@ -422,18 +539,23 @@ def main(argv: list[str]) -> None:
         print(f"  -> Top-10K v8 verified clean trajectories: {len(top10k_verified)}")
 
     e065_verified: list[dict[str, Any]] = []
+    extra_drop_reasons: Counter[str] = Counter()
     if FLAGS.subset in E065_SUBSETS:
         if FLAGS.model_family != "deepseek_v41":
             raise app.UsageError("E065 subsets are DeepSeek-V4.1 only (--model_family=deepseek_v41).")
         e065_manifest = data_pipeline.load_e065_manifest(FLAGS.e065_manifest_path)
         print(f"Loaded E065 manifest: {len(e065_manifest)} tasks from {FLAGS.e065_manifest_path or '<none>'}")
-        e065_files: tuple[str, ...] = ()
-        if FLAGS.subset in ("e065_images", "e065_all"):
-            e065_files += E065_IMAGE_PARQUETS
-        if FLAGS.subset in ("e065_text", "e065_all"):
-            e065_files += E065_TEXT_PARQUETS
-        for fname in e065_files:
-            fpath = os.path.join(FLAGS.e065_rollouts_dir, fname)
+        e065_paths: list[str] = []
+        if FLAGS.subset in E065_SUBSETS_WITH_IMAGES:
+            e065_paths += [os.path.join(FLAGS.e065_rollouts_dir, f) for f in E065_IMAGE_PARQUETS]
+        if FLAGS.subset in E065_SUBSETS_WITH_TEXT:
+            e065_paths += [os.path.join(FLAGS.e065_rollouts_dir, f) for f in E065_TEXT_PARQUETS]
+            for part_dir in FLAGS.e065_text_part_dirs:
+                parts = discover_text_part_parquets(part_dir)
+                print(f"E065-schema text parts in {part_dir}: {len(parts)}")
+                e065_paths += parts
+        for fpath in e065_paths:
+            fname = os.path.basename(fpath)
             if not gfile.Exists(fpath):
                 print(f"WARNING: {fpath} not found, skipping.")
                 continue
@@ -441,6 +563,12 @@ def main(argv: list[str]) -> None:
             fstats, recs = data_pipeline.audit_e065_rollout_file(
                 fpath, eval_index, manifest=e065_manifest, max_rows=FLAGS.max_records_per_file
             )
+            if fname.startswith("part-"):
+                # Disambiguate E082-style part files in the per-file stats / rollout_file field.
+                tag = os.path.basename(os.path.dirname(fpath))
+                fstats["file"] = f"{tag}/{fname}"
+                for r in recs:
+                    r["rollout_file"] = f"{tag}/{fname}"
             all_file_stats.append(fstats)
             print(
                 f"  -> rows={fstats['rows']}, rollouts={fstats['rollouts']} (multi-pair {fstats['multi_pair_rollouts']}), "
@@ -451,10 +579,11 @@ def main(argv: list[str]) -> None:
                 f"drops={fstats['drops']}, {fstats['elapsed_sec']}s"
             )
             e065_verified.extend(recs)
-        if FLAGS.e065_extra_rollouts_dir and FLAGS.subset in ("e065_images", "e065_all"):
+        if FLAGS.e065_extra_rollouts_dir and FLAGS.subset in E065_SUBSETS_WITH_IMAGES:
             extra_shards = discover_e065_extra_parquet_shards(FLAGS.e065_extra_rollouts_dir)
             print(f"Auditing {len(extra_shards)} extra corrected+rewritten E065 shards from {FLAGS.e065_extra_rollouts_dir}...")
-            existing_image_tasks = {r["task_id"] for r in e065_verified if r.get("modality") == "image"}
+            existing_by_modality = {(r["task_id"], r.get("modality", "text")) for r in e065_verified}
+            seen_extra: set[tuple[str, str]] = set()
             added_extra = 0
             for spath in extra_shards:
                 try:
@@ -466,11 +595,31 @@ def main(argv: list[str]) -> None:
                     continue
                 all_file_stats.append(fstats)
                 for r in recs:
-                    if r["task_id"] not in existing_image_tasks:
-                        existing_image_tasks.add(r["task_id"])
-                        e065_verified.append(r)
-                        added_extra += 1
-            print(f"  -> Added {added_extra} corrected+rewritten E065 image rollouts (total e065_verified={len(e065_verified)}).")
+                    mod = str(r.get("modality", "text"))
+                    key = (str(r["task_id"]), mod)
+                    if FLAGS.e065_extra_modality != "both" and mod != FLAGS.e065_extra_modality:
+                        extra_drop_reasons["modality_filtered"] += 1
+                        continue
+                    if key in seen_extra:
+                        extra_drop_reasons["duplicate_extra_row"] += 1
+                        continue
+                    if FLAGS.e065_extra_skip_existing_modality_tasks and key in existing_by_modality:
+                        extra_drop_reasons["task_already_verified_in_e065_same_modality"] += 1
+                        continue
+                    if FLAGS.e065_extra_drop_meta_leaks:
+                        reasons = rescued_row_leak_reasons(r["messages"])
+                        if reasons:
+                            for rs in reasons:
+                                extra_drop_reasons[rs] += 1
+                            extra_drop_reasons["_dropped_for_leaks_total"] += 1
+                            continue
+                    seen_extra.add(key)
+                    e065_verified.append(r)
+                    added_extra += 1
+            print(
+                f"  -> Added {added_extra} corrected+rewritten E065 rollouts (modality={FLAGS.e065_extra_modality}); "
+                f"extra drop reasons={dict(extra_drop_reasons)}; total e065_verified={len(e065_verified)}."
+            )
 
     if FLAGS.subset == "e031":
         selected_records = e031_verified
@@ -478,6 +627,8 @@ def main(argv: list[str]) -> None:
         selected_records = all_verified
     elif FLAGS.subset == "top10k_v8":
         selected_records = top10k_verified
+    elif FLAGS.subset == "e065_all_with_top10k_v8":
+        selected_records = e065_verified + top10k_verified
     elif FLAGS.subset in E065_SUBSETS:
         selected_records = e065_verified
     else:
@@ -646,23 +797,34 @@ def main(argv: list[str]) -> None:
                 f"render_failed={render_failed}, {time.time() - t_tok:.1f}s)"
             )
 
-    # Perform 90/10 split by parent puzzle ID
+    # Perform 90/10 split by parent puzzle ID (optionally pinning a previous round's parents)
+    pinned_train, pinned_val = load_pinned_parents(FLAGS.pin_split_from_data_dir)
+    if FLAGS.pin_split_from_data_dir:
+        print(
+            f"Pinning split from {FLAGS.pin_split_from_data_dir}: {len(pinned_train)} train parents, "
+            f"{len(pinned_val)} val parents (overlap {len(pinned_train & pinned_val)} -> val)."
+        )
     train_recs, val_recs, split_stats = data_pipeline.split_by_parent_puzzle_id(
         tokenized_records,
         val_fraction=FLAGS.val_fraction,
         seed=FLAGS.seed,
+        forced_train_parents=pinned_train,
+        forced_val_parents=pinned_val,
     )
     print("\n90/10 Parent-Grouped Split Summary:")
     print(json.dumps(split_stats, indent=2))
 
-    # ---- TRAIN-only resampling: arc2_train upsampling + Top-10K tier weights ----
+    # ---- TRAIN-only resampling: arc2_train upsampling + rescued upsampling + Top-10K tier weights ----
     rng = np.random.default_rng(FLAGS.seed + 7)
     tier_weights = parse_tier_weights(FLAGS.tier_weights)
     resampled_train: list[dict[str, Any]] = []
     resample_stats: Counter[str] = Counter()
     for rec in train_recs:
         copies = 1
-        if is_arc2_train(rec) and FLAGS.upsample_arc2_train > 1:
+        if is_rescued_extra(rec) and FLAGS.e065_extra_upsample > 1:
+            copies = int(FLAGS.e065_extra_upsample)
+            resample_stats["rescued_upsampled_records"] += 1
+        elif is_arc2_train(rec) and FLAGS.upsample_arc2_train > 1:
             copies = int(FLAGS.upsample_arc2_train)
             resample_stats["arc2_train_upsampled_records"] += 1
         elif is_top10k(rec) and tier_weights:
@@ -785,6 +947,14 @@ def main(argv: list[str]) -> None:
             "max_images_per_sample": FLAGS.max_images_per_sample,
             "e065_rollouts_dir": FLAGS.e065_rollouts_dir if FLAGS.subset in E065_SUBSETS else "",
             "e065_manifest_path": FLAGS.e065_manifest_path if FLAGS.subset in E065_SUBSETS else "",
+            "e065_text_part_dirs": list(FLAGS.e065_text_part_dirs),
+            "e065_extra_rollouts_dir": FLAGS.e065_extra_rollouts_dir,
+            "e065_extra_modality": FLAGS.e065_extra_modality,
+            "e065_extra_skip_existing_modality_tasks": FLAGS.e065_extra_skip_existing_modality_tasks,
+            "e065_extra_drop_meta_leaks": FLAGS.e065_extra_drop_meta_leaks,
+            "e065_extra_upsample": FLAGS.e065_extra_upsample,
+            "e065_extra_drop_reasons": dict(extra_drop_reasons),
+            "pin_split_from_data_dir": FLAGS.pin_split_from_data_dir,
             "n_wic_alnum_tokens_total": int(wic_arr.sum()) if len(wic_arr) else 0,
         },
         "eval_tasks_indexed": len(eval_index["eval_task_ids"]),

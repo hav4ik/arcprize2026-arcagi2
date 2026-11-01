@@ -110,6 +110,12 @@ flags.DEFINE_string(
     "Explicit step-XXXXX[-tag] checkpoint directory to resume from (overrides auto_resume discovery).",
 )
 flags.DEFINE_integer("resume_lr_rewarmup_steps", 4, "Linear LR re-warm-up steps after a resume (0 disables).")
+flags.DEFINE_string(
+    "init_from_checkpoint_dir",
+    "",
+    "Warm start a NEW round from this step-XXXXX[-tag] resumable checkpoint (weights only; fresh step counter, "
+    "LR schedule and AdamW; no batch fast-forward). A complete checkpoint in the output dir still takes precedence.",
+)
 # ---- Round-2 (image checkpoint + QAT) flags; defaults reproduce round-1 behaviour ----
 flags.DEFINE_float("lora_learning_rate", 0.0, "Peak LR for routed-expert LoRA A/B (0 = learning_rate).")
 flags.DEFINE_float("scale_learning_rate", 0.0, "Peak LR for the trainable 2-bit group scales (0 = learning_rate).")
@@ -218,6 +224,7 @@ def main(argv: list[str]) -> None:
                 "auto_resume": FLAGS.auto_resume,
                 "resume_from_checkpoint_dir": FLAGS.resume_from_checkpoint_dir,
                 "resume_lr_rewarmup_steps": FLAGS.resume_lr_rewarmup_steps,
+                "init_from_checkpoint_dir": FLAGS.init_from_checkpoint_dir,
                 "lora_learning_rate": FLAGS.lora_learning_rate,
                 "scale_learning_rate": FLAGS.scale_learning_rate,
                 "train_vision": FLAGS.train_vision,

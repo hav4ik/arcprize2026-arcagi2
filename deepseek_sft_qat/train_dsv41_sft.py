@@ -142,6 +142,15 @@ flags.DEFINE_integer(
     4,
     "Linear LR re-warm-up steps right after a resume to soften the first updates of the re-initialized AdamW moments (0 disables).",
 )
+flags.DEFINE_string(
+    "init_from_checkpoint_dir",
+    "",
+    "Warm start for a NEW round (e.g. epoch 2 on a new dataset): restore the trainable weights from this "
+    "`step-XXXXX[-tag]` resumable checkpoint but start at global_step=0 with a fresh LR schedule, fresh AdamW "
+    "moments and NO batch fast-forwarding (unlike --resume_from_checkpoint_dir, which continues the same run). "
+    "Ignored when a complete checkpoint already exists in dsv41_output_dir (preemption resume takes precedence). "
+    "Checkpoint tensors without a model parameter (e.g. LoRA tensors when --routed_expert_lora_r=0) are skipped.",
+)
 # ---- Round-2 (image checkpoint + QAT) flags ----
 flags.DEFINE_float(
     "lora_learning_rate",
@@ -761,11 +770,14 @@ def load_dsv41_resumable_checkpoint(
     model: dsv41_sft_model.Dsv41SftModel,
     rank: int,
     world_size: int,
+    skip_unknown_tensors: bool = False,
 ) -> dict[str, Any]:
     """Restores all trainable parameters of `model` in place from `ckpt_dir` (backbone + this rank's routed-expert state).
 
-    Returns `{"step", "milestone_tag", "loaded_tensors", ["ema_loss", "best_val_loss"]}`; raises if any
-    trainable parameter is missing from the checkpoint or has a mismatched shape.
+    Returns `{"step", "milestone_tag", "loaded_tensors", "skipped_tensors", ["ema_loss", "best_val_loss"]}`; raises if
+    any trainable parameter is missing from the checkpoint or has a mismatched shape. With `skip_unknown_tensors=True`,
+    checkpoint tensors that have no parameter in the model (e.g. `lora_*` when the new run uses
+    `--routed_expert_lora_r=0`) are skipped instead of raising.
     """
     parsed = parse_checkpoint_step(ckpt_dir)
     if parsed is None:
@@ -782,6 +794,7 @@ def load_dsv41_resumable_checkpoint(
     params = dict(model.named_parameters())
     trainable = {k for k, p in params.items() if p.requires_grad}
     loaded: set[str] = set()
+    skipped: list[str] = []
 
     def _load_state_file(path: str) -> None:
         with gfile.Open(path, "rb") as f:
@@ -790,6 +803,9 @@ def load_dsv41_resumable_checkpoint(
             for k, v in state.items():
                 p = params.get(k)
                 if p is None:
+                    if skip_unknown_tensors:
+                        skipped.append(k)
+                        continue
                     raise KeyError(f"Checkpoint tensor {k!r} from {path} has no parameter in the model.")
                 if tuple(p.shape) != tuple(v.shape):
                     raise ValueError(
@@ -1153,6 +1169,7 @@ def _worker_main(rank: int, world_size: int) -> None:
         resume_dir = str(resume_obj[0] or "")
     resume_step = 0
     resume_info: dict[str, Any] = {}
+    warm_start_info: dict[str, Any] = {}
     if resume_dir:
         t_res = time.time()
         resume_info = load_dsv41_resumable_checkpoint(
@@ -1164,6 +1181,31 @@ def _worker_main(rank: int, world_size: int) -> None:
                 f"[Rank 0] Resumed trainable weights from {resume_dir} (step {resume_step}) "
                 f"in {time.time() - t_res:.1f}s: {resume_info}. AdamW moments are re-initialized; "
                 f"LR re-warm-up over {int(FLAGS.resume_lr_rewarmup_steps)} step(s).",
+                flush=True,
+            )
+    elif str(FLAGS.init_from_checkpoint_dir or ""):
+        # Warm start of a NEW round: weights only; global_step stays 0 (fresh cosine schedule, fresh AdamW,
+        # no batch fast-forwarding), so the new dataset is consumed from its first batch.
+        t_res = time.time()
+        warm_start_info = load_dsv41_resumable_checkpoint(
+            ckpt_dir=str(FLAGS.init_from_checkpoint_dir),
+            model=model,
+            rank=rank,
+            world_size=world_size,
+            skip_unknown_tensors=True,
+        )
+        warm_start_info["init_from_checkpoint_dir"] = str(FLAGS.init_from_checkpoint_dir)
+        if dp_group is not None:
+            with torch.no_grad():
+                for p in model.parameters():
+                    if p.requires_grad:
+                        dist.broadcast(p.data, src=ep_rank, group=dp_group)
+        if rank == 0:
+            print(
+                f"[Rank 0] WARM START: loaded trainable weights from {FLAGS.init_from_checkpoint_dir} "
+                f"(source step {warm_start_info.get('step')}, {warm_start_info.get('loaded_tensors')} tensors, "
+                f"{len(warm_start_info.get('skipped_tensors') or [])} skipped) in {time.time() - t_res:.1f}s; "
+                "training starts at global_step=0 with a fresh LR schedule and fresh AdamW moments.",
                 flush=True,
             )
     elif bool(FLAGS.auto_resume) and rank == 0:
@@ -1690,6 +1732,7 @@ def _serialize_dsv41_flags_for_children() -> list[str]:
         "auto_resume",
         "resume_from_checkpoint_dir",
         "resume_lr_rewarmup_steps",
+        "init_from_checkpoint_dir",
         # Round-2 flags (must reach every worker subprocess).
         "lora_learning_rate",
         "scale_learning_rate",

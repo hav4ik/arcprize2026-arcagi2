@@ -23,7 +23,8 @@ This repository contains the end-to-end training (Multimodal QAT & MoE SFT), 2-b
 
 ## 📊 Technical Reports (`reports/`)
 
-* **[`reports/dsv41_qat_image_v14_experiment_report.md`](reports/dsv41_qat_image_v14_experiment_report.md)** — **NEW: Round-2 Multimodal (`Text + Image`) QAT SFT (`v14`) & Candidate B32 Evaluation Report**:
+* **[`reports/dsv41_qat_epoch2_plan_report.md`](reports/dsv41_qat_epoch2_plan_report.md)** & **[`reports/dsv41_e065_rescue_analysis.md`](reports/dsv41_e065_rescue_analysis.md)** — **NEW: Epoch-2 QAT Plan (`--init_from_checkpoint_dir`, `e065_all_with_top10k_v8`, pinned val parents) & E065 Overnight Rescue Job Analysis (`533` rescued trajectories)**.
+* **[`reports/dsv41_qat_image_v14_experiment_report.md`](reports/dsv41_qat_image_v14_experiment_report.md)** — **Round-2 Multimodal (`Text + Image`) QAT SFT (`v14`) & Candidate B32 Evaluation Report**:
   - Complete breakdown of `round2_v14_16xb200_fast` (`chankhavu/ds-qat-image-v02-ep08` & `chankhavu/ds-qat-image-v02-ep1-2bit`), `e065_img_text_v1` dataset curation (`6,149` trajectories), trainable 2-bit group scales (`qat_scale`, `86.3%` updated), vision aligner adaptation, 193-step loss progression, E058 `text+image` evaluation tables, scientific conclusions, and model loading/evaluation commands.
 * **[`reports/DEEPSEEK_SFT_QAT_COMPLETE_REPORT.md`](reports/DEEPSEEK_SFT_QAT_COMPLETE_REPORT.md)** — **Complete Reference for Pruned DeepSeek-V4.1 (`Tool E128` & `Image E128` 2-Bit) SFT & QAT**:
   - Full model architecture (`40` layers, `MLA+SWA+Compressor+Indexer`, `mHC` 20-iter Sinkhorn, `128` routed experts + `1` shared expert, `64 GiB` Compact Engram on layers 1 & 14, ViT + `3×3` aligner vision tower).
@@ -40,7 +41,7 @@ This repository contains the end-to-end training (Multimodal QAT & MoE SFT), 2-b
 
 | GitHub Folder (`arazd` branch) | Google3 Package Path | Contents |
 | :--- | :--- | :--- |
-| **[`deepseek_sft_qat/`](deepseek_sft_qat/)** | `//experimental/users/arazdai/kaggle/sft` | `dsv41_sft_model.py`, `dsv41_image_tokens.py`, `train_dsv41_sft.py`, `eval_dsv41_b32_arc2.py`, `launch_dsv41_sft_b200_xm.py`, `launch_dsv41_b32_eval_xm.py`, `load_dsv41_2bit_example.py`, `audit_and_split_e065_rollouts.py`, `rank_e065_difficulty_gemini38_flash.py`, `inspect_e065_rollouts.py`, `download_hf_to_cns.py`, `inspect_and_download_chankhavu_e128.py`, `data_pipeline.py`, `audit_and_prepare_data.py`, `sft_test.py` |
+| **[`deepseek_sft_qat/`](deepseek_sft_qat/)** | `//experimental/users/arazdai/kaggle/sft` | `dsv41_sft_model.py`, `dsv41_image_tokens.py`, `train_dsv41_sft.py`, `eval_dsv41_b32_arc2.py`, `launch_dsv41_sft_b200_xm.py`, `launch_dsv41_b32_eval_xm.py`, `load_dsv41_2bit_example.py`, `analyze_e065_rescued_rollouts.py`, `audit_and_split_e065_rollouts.py`, `rank_e065_difficulty_gemini38_flash.py`, `inspect_e065_rollouts.py`, `download_hf_to_cns.py`, `inspect_and_download_chankhavu_e128.py`, `data_pipeline.py`, `audit_and_prepare_data.py`, `sft_test.py` |
 | **[`qwen_sft/`](qwen_sft/)** | `//experimental/users/arazdai/kaggle/sft` | `train_full_sft.py`, `train_sft.py`, `fast_deltanet.py`, `export_and_quantize.py`, `launch_full_sft_b200_xm.py`, `launch_sft_b200_xm.py`, `evaluate_difficulty_argon.py`, `e031_audit_summary.json` |
 | **[`qwen_harness/`](qwen_harness/)** | `//experimental/users/arazdai/kaggle/arc_agi_2` | `pilot_2/` (`havu_b32_harness.py`, `havu_auto_repair.py`, `havu_sandbox_zygote.py`, `prompts_and_selector.py`, `pilot2_eval.py`, `sandbox_verifier.py`), `pilot_1/` (`setB/`), `notebooks/`, `vllm_cuda_shim.py`, `vllm_fla_triton_ops.py` |
 | **[`inspect_tools/`](inspect_tools/)** | `//experimental/users/arazdai/inspect_tools` | `safetensors_param_census.py` (Safetensors parameter census & byte-size inspector) |

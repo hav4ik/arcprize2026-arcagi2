@@ -273,5 +273,182 @@ class Top10kRolloutsTest(googletest.TestCase):
       self.assertGreater(int(loss_mask.sum()), 0)
 
 
+from google3.experimental.users.arazdai.kaggle.arc_agi_2.pilot_1.setB.tpu_vllm import deepseek_v41_e065_correct_and_rewrite as e065_cr
+
+
+class E065CorrectAndRewriteTest(googletest.TestCase):
+
+  def test_e065_iterative_correction_and_prefix_free_clean_rewrite(self):
+    train_pairs = [
+        {"input": [[0, 2], [2, 0]], "output": [[2, 0], [0, 2]]},
+        {"input": [[0, 0], [2, 2]], "output": [[2, 2], [0, 0]]},
+    ]
+    test_pairs = [
+        {"input": [[2, 2], [0, 2]], "output": [[0, 0], [2, 0]]},
+        {"input": [[0, 2], [0, 0]], "output": [[2, 0], [2, 2]]},
+    ]
+    failure_rec = {
+        "task_id": "syn_swap2_01",
+        "parent": "syn_swap2",
+        "source": "nvarc_b1",
+        "train_pass": True,
+        "train_frac": 1.0,
+        "failure_category": "demo_overfit_train_pass_test_fail",
+        "turns": 4,
+        "stop_reason": "submitted",
+        "last_reasoning_excerpt": "I assumed the grid was always rotated 180 degrees.",
+        "last_submit_code": "def solve(g): return [r[::-1] for r in g[::-1]]",
+        "pair_checks": [
+            {
+                "pair": 0,
+                "diff_summary": {
+                    "status": "cell_mismatch",
+                    "gt_shape": [2, 2],
+                    "pred_shape": [2, 2],
+                    "cell_accuracy": 0.5,
+                    "mismatched_cells": 2,
+                },
+            }
+        ],
+        "train": train_pairs,
+        "test": test_pairs,
+    }
+    prior_attempts = [
+        {
+            "attempt_round": 1,
+            "train_pass": False,
+            "train_frac": 0.5,
+            "correct_all": False,
+            "stop_reason": "submitted",
+            "test_diag": "pair0_cell_mismatch_2_cells",
+            "code": "def solve(g): return g[::-1]",
+        }
+    ]
+    corr_msgs, _ = e065_cr.build_correction_initial_messages(
+        task={"task_id": "syn_swap2_01", "train": train_pairs, "test": test_pairs},
+        test_input=test_pairs[0]["input"],
+        failure_rec=failure_rec,
+        prior_attempts=prior_attempts,
+        attempt_round=2,
+        difficulty_info={"reasoning_bottleneck": "Confused 180-deg rotation with 0<->2 color inversion."},
+    )
+    self.assertEqual(len(corr_msgs), 2)
+    self.assertIn("Prior Correction Retry #1", corr_msgs[1]["content"])
+    self.assertIn("Confused 180-deg rotation", corr_msgs[1]["content"])
+
+    # Verify multi-pair evaluation in live session
+    session = ds_eval.HavuSubprocessSession(
+        train=train_pairs,
+        test_input=test_pairs[0]["input"],
+        timeout_s=10.0,
+        style="ipython",
+    )
+    try:
+      good_code = "def solve(g):\n    return [[2 - x for x in r] for r in g]\n"
+      session.run_python(good_code)
+      _, pred0 = session.submit_answer("solve(test_input)")
+      multi_res = e065_cr.evaluate_all_test_pairs_in_session(
+          session=session,
+          pair0_pred=pred0,
+          submit_code="solve(test_input)",
+          test_pairs=test_pairs,
+      )
+      self.assertTrue(multi_res["correct_all"])
+      self.assertEqual(multi_res["preds_by_pair"], [test_pairs[0]["output"], test_pairs[1]["output"]])
+    finally:
+      session.close()
+
+    # Now test clean rewrite synthesis + E065 parquet row assembly (preserving inline base64 PNG images)
+    asst_msgs, evs, _, tr_labels = e065_cr.synthesize_verified_clean_trajectory_in_sandbox(
+        train_pairs=train_pairs,
+        test_input=test_pairs[0]["input"],
+        verified_solve_code="def solve(g):\n    return [[2 - x for x in r] for r in g]",
+        submit_code="solve(test_input)",
+        reasoning_summary=(
+            "Previous attempt failed because of rotation.\n"
+            "Inspecting the training grids shows every 0 becomes 2 and every 2 becomes 0."
+        ),
+    )
+    self.assertFalse(e065_cr.has_forbidden_meta_language(asst_msgs))
+    self.assertIs(tr_labels["train_pass"], True)
+
+    orig_e065_messages = [
+        {"role": "system", "content": "sys"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Solve puzzle syn_swap2_01."},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                    },
+                },
+            ],
+        },
+        {"role": "assistant", "content": "bad old attempt", "reasoning_content": "old wrong thought"},
+    ]
+    orig_group_rows = [
+        {
+            "task_id": "syn_swap2_01",
+            "pair": p_idx,
+            "attempt": 0,
+            "source": "nvarc_b1",
+            "parent": "syn_swap2",
+            "correct": False,
+            "pred": None,
+            "answer_source": "none",
+            "stop_reason": "max_turns",
+            "turns": 25 if p_idx == 0 else 0,
+            "tool_calls": 25 if p_idx == 0 else 0,
+            "prompt_tokens": 1200 if p_idx == 0 else 0,
+            "completion_tokens": 30000 if p_idx == 0 else 0,
+            "reasoning_tokens": 25000 if p_idx == 0 else 0,
+            "tool_use_tokens": 5000 if p_idx == 0 else 0,
+            "answer_tokens": 0,
+            "elapsed_s": 120.0 if p_idx == 0 else 0.0,
+            "messages": json.dumps(orig_e065_messages),
+            "events": "[]",
+            "error": None,
+            "train_pass": False,
+            "train_frac": 0.0,
+            "train_trace": "untraceable",
+            "train_paths": "[]",
+            "verified_code": "",
+            "train_check_s": 0.01,
+        }
+        for p_idx in range(2)
+    ]
+
+    img_rows, txt_rows = e065_cr.assemble_e065_rewritten_parquet_rows(
+        orig_group_rows=orig_group_rows,
+        clean_asst_and_tool_messages=asst_msgs,
+        clean_events=evs,
+        preds_by_pair=multi_res["preds_by_pair"],
+        train_labels=tr_labels,
+        solved_on_attempt=2,
+        rewrite_source="sandbox_verified_clean_synthesis",
+        elapsed_s=4.5,
+    )
+    self.assertEqual(len(img_rows), 2)
+    self.assertEqual(len(txt_rows), 2)
+    parsed_img_msgs = json.loads(img_rows[0]["messages"])
+    # First user message must still have the inline base64 PNG image part and NO old assistant turns
+    self.assertIsInstance(parsed_img_msgs[1]["content"], list)
+    self.assertEqual(parsed_img_msgs[1]["content"][1]["type"], "image_url")
+    self.assertEqual(len(parsed_img_msgs), 2 + len(asst_msgs))
+
+    with tempfile.TemporaryDirectory(prefix="e065_rw_") as tmp_dir:
+      pq_path = os.path.join(tmp_dir, "e065_images_corrected_rewritten_shard_000of001.parquet")
+      self.assertTrue(e065_cr._write_parquet_rows_to_cns(img_rows, pq_path))
+      stats, recs = data_pipeline.audit_e065_rollout_file(
+          pq_path, {"eval_task_ids": {"89565ca0"}}
+      )
+      self.assertEqual(stats["verified_clean_count"], 1)
+      self.assertEqual(len(recs), 1)
+      self.assertEqual(recs[0]["n_images"], 1)
+
+
 if __name__ == "__main__":
   googletest.main()
+
