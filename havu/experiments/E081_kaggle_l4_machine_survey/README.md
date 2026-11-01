@@ -97,9 +97,11 @@ All pods were busy with measured runs, so no `gpucheck` load was added. The hard
 pods 2, 3 and 6 (with its OK) and pod 4 "beige", another agent's E078 run (inventory only, at the user's request).
 Speed is decode throughput at matched load:
 - pods 2, 3 and 6: dsv4-infer's V12 replica data;
-- beige: read from its running server's own log (`kwork_v12_text_manh3_240/dsv41_logs/server/server.log`, 1,674
-  stats lines). Same model and V12 family, but E078's settings, and the server prefilled ~400 tok/s at the same time,
-  so that ratio is less certain.
+- beige: first from its E078 server log (`kwork_v12_text_manh3_240/dsv41_logs/server/server.log`, different
+  settings, so confounded: 0.69-0.80 of pod 2), **then a clean same-notebook comparison by dsv4-infer** (submitted
+  `chankhavu/dsv41-tools-v12-text` v2 ba6ac136, same model files, wheels v17 g1896dc4179, src v26, 240-task workload,
+  first hour; data `experiments/E072_harness_loop/runs/manh_recovery_speedcal_beige/samp.tps.tsv`). The table uses the
+  clean numbers.
 
 | | Kaggle (E081, 23 probes) | pod 2 `5z3srm3108wcwl` | pod 6 `04oo5rrhs6id3r` | pod 3 `ccn5ns0b8emb3o` (yawning) | pod 4 `4pxdycl42pn4sm` (beige) |
 |---|---|---|---|---|---|
@@ -111,24 +113,29 @@ Speed is decode throughput at matched load:
 | GPU↔GPU P2P | **none** (all `PHB`) | OK | OK | OK | OK |
 | topology | all PHB | 0-1 PHB, 2-3 PHB, rest NODE | 1-2 PHB, rest NODE | 1-2-3 PHB, GPU0 NODE | GPUs 1-3 NODE on socket 1, **GPU0 on the other socket (SYS)** |
 | SM clock under load (power-capped) | – | 1,290-1,335 MHz | 1,335-1,470 MHz | 1,530-1,635 MHz | **1,890-1,965 MHz** |
-| host link bench (H2D / D2H GB/s) | 11.5 / 12.1-12.3 | – | – | GPU0 17.0 / 21.7, GPUs 1-3 ~12.0 / 12.3 | – |
-| decode tok/s at 30-39 / 40-49 / 50-64 running | – | 548 / 635 / 730 | 548 / 606 / 693 | 499 / 561 / 623 | 437 / 485 / 503 (E078) |
-| relative to pod 2 | ~0.67 (8 h pod 2 ≈ 12 h Kaggle) | 1.00 | 0.95-1.00 | 0.85-0.91 | 0.69-0.80 |
+| host link bench (H2D / D2H GB/s) | 11.5 / 12.1-12.3 | 12.4 / 12.3 | – | GPU0 17.0 / 21.7, GPUs 1-3 ~12.0 / 12.3 | 18.6-20.2 / 19.2-23.4 |
+| decode tok/s at 30-39 / 40-49 / 50-64 running | – | 548 / 635 / 730 (V12 replica); 760 at 50-64 (same notebook as beige) | 548 / 606 / 693 | 499 / 561 / 623 | – / – / 645 (same notebook; 659 vs 768 at steady 60+) |
+| relative to pod 2 | ~0.67 (8 h pod 2 ≈ 12 h Kaggle) | 1.00 | 0.95-1.00 | 0.85-0.91 | **0.85** (same notebook) |
 
-- **Fastest:** pods 2 and 6 (tie). **Then** pod 3, 9-15% behind. **Slowest:** pod 4 (beige), 20-31% behind pod 2, and
-  further behind at higher load. That is despite beige having the best GPUs on paper: gen4 x16 everywhere and the
-  highest clocks (cool, 52-55 °C). Throughput tracks the host side, not the GPUs:
+- **Fastest:** pods 2 and 6 (tie). **Slower:** pod 3 (yawning, 0.85-0.91) and beige (0.85 in the same-notebook
+  comparison), about 15% behind. Beige is slow despite having the best GPUs on paper: gen4 x16 everywhere, the fastest
+  host copies (H2D ~19-20, D2H ~19-23 GB/s) and the highest clocks (cool, 52-55 °C). So throughput tracks the host CPU
+  and topology, not PCIe or the GPUs:
   - pod 2: newest CPU (Zen 4, the only one with AVX-512, which matters for the fork's host all-reduce);
   - pod 3: Zen 2, and GPU0 on its own root port;
-  - beige: Zen 2 on two sockets, with every collective crossing the socket link for GPU0.
-- **Closest to Kaggle in speed: beige** (0.69-0.80 of pod 2, vs Kaggle's ~0.67, with the E078-config caveat above).
-  **Closest in topology: pod 3** (three GPUs on one host bridge). **No pod is a faithful Kaggle replica:**
+  - beige: Zen 2 on two sockets, with GPU0 on the other socket.
+  On both Zen 2 pods the solver's GPU auto-bench NCCL step failed and fell back to the order 0,2,1,3.
+  (An earlier estimate from E078's log, 0.69-0.80, was confounded by E078's settings and concurrent prefill.)
+- **No pod matches Kaggle's pace:** even the slowest pods (pod 3, beige) run ~1.27× Kaggle (0.85 vs ~0.67 of pod 2).
+  **Closest in topology: pod 3** (three GPUs on one host bridge). **Closest in pace: pod 3 and beige** (tie). Every pod
+  also differs from Kaggle in ways that favour it:
   - **P2P works on every pod and on no Kaggle machine.** NCCL uses PCIe P2P by default on the pods, while Kaggle falls
     back to host-memory transfers; E027 found forcing P2P on Kaggle ~12× slower.
   - Pods have different, mostly newer AMD CPUs and 2-4× the RAM.
   - PCIe gen4 x8 equals Kaggle's gen3 x16 in raw bandwidth; x16 gen4 links (pod GPU0s, all of beige) are twice that.
   - All pods and Kaggle share the 72 W power cap, so GPU compute is matched and the differences are host and
     interconnect.
-- **For Kaggle-like timing:** beige is the best pacing proxy as is. On any pod, `NCCL_P2P_DISABLE=1` and ~46 CPU threads
+- **For Kaggle-like timing:** pod 3 or beige come closest as they are, but every pod still needs the clock
+  calibration (8 h on pod 2 ≈ 12 h on Kaggle; ~9.4 h on pod 3 or beige by the same ratio). On any pod, `NCCL_P2P_DISABLE=1` and ~46 CPU threads
   move it closer to Kaggle. A `gpucheck` on pod 6 when E080 ends (~02:00-02:30 UTC; dsv4-infer offered the window) would
   add measured per-pair NCCL numbers with and without P2P.
