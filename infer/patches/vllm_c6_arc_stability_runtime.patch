@@ -1,0 +1,341 @@
+diff --git a/vllm/lora/model_manager.py b/vllm/lora/model_manager.py
+index 2c4be5678630fe4478e2775bb7f6eab23aa3a457..35e9df559652224b71853282033660f7bae6d4ab 100644
+--- a/vllm/lora/model_manager.py
++++ b/vllm/lora/model_manager.py
+@@ -724,6 +724,13 @@ class LoRAModelManager:
+
+         return None
+
++    def get_lm_punica_wrapper(self) -> PunicaWrapperBase:
++        """Return the punica wrapper for the language model component."""
++        if not self.supports_mm:
++            return self.punica_wrapper_mapping[DEFAULT_LANGUAGE_WRAPPER_KEY]
++        lm_prefix = self.mm_mapping.language_model[0]
++        return self.punica_wrapper_mapping[lm_prefix]
++
+     def _register_packed_modules(self, module_full_name: str) -> None:
+         parts = module_full_name.split(".")
+         module_name = parts[-1]
+diff --git a/vllm/lora/ops/triton_ops/utils.py b/vllm/lora/ops/triton_ops/utils.py
+index dd4c0d2097cfa22c953fba53af2f7333fbd0adc1..f028d23cf08a047070304c4b76876cdfbfe5931a 100644
+--- a/vllm/lora/ops/triton_ops/utils.py
++++ b/vllm/lora/ops/triton_ops/utils.py
+@@ -19,7 +19,7 @@ logger = init_logger(__name__)
+ is_batch_invariant = envs.VLLM_BATCH_INVARIANT
+
+ _LORA_A_PTR_DICT: dict[tuple[int, ...], tuple[torch.tensor, ...]] = {}
+-_LORA_B_PTR_DICT: dict[tuple[int, ...], tuple[torch.tensor, ...]] = {}
++_LORA_B_PTR_DICT: dict[tuple[tuple[int, ...], int], tuple[torch.tensor, ...]] = {}
+
+
+ def _get_lora_a_ptr(lora_a_weights: list[torch.Tensor], device: torch.device):
+@@ -86,2 +85,3 @@ def _get_lora_b_ptr(
+-    key = tuple(lora_weight.data_ptr() for lora_weight in lora_weights)
++    weight_ptrs = tuple(lora_weight.data_ptr() for lora_weight in lora_weights)
++    key = (weight_ptrs, offset_start)
+     if values := _LORA_B_PTR_DICT.get(key):
+diff --git a/vllm/lora/worker_manager.py b/vllm/lora/worker_manager.py
+index 7082b7287d8ef2fa9d2fa4971502a9543a7e8ab7..e8465c7e4777d9d8602bf674210b6ef67d6d61a4 100644
+--- a/vllm/lora/worker_manager.py
++++ b/vllm/lora/worker_manager.py
+@@ -201,6 +201,9 @@ class WorkerLoRAManager:
+             and self._adapter_manager.supports_tower_connector_lora
+         )
+
++    def get_lm_punica_wrapper(self):
++        return self._adapter_manager.get_lm_punica_wrapper()
++
+     def _apply_adapters(self, adapter_requests: set[Any]) -> None:
+         existing_adapters = self.list_adapters()
+         models_map = {
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 64c1096dfbecbfb28dddedbd86179ca898347380..f0ef94b593c3d8626fbc07321b0dfbd68873baf5 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -470,6 +470,9 @@ def _post_update_kernel(
+     all_token_ids_ptr,
+     all_token_ids_stride,
+     total_len_ptr,
++    VOCAB_SIZE: tl.constexpr,
++    MAX_NUM_SAMPLED: tl.constexpr,
++    MAX_MODEL_LEN: tl.constexpr,
+ ):
+     req_id = tl.program_id(0)
+     req_state_idx = tl.load(idx_mapping_ptr + req_id)
+@@ -479,28 +482,48 @@ def _post_update_kernel(
+
+     total_len = tl.load(total_len_ptr + req_state_idx)
+     num_sampled = tl.load(num_sampled_ptr + req_id)
+-    if num_sampled > 0:
++    sample_shape_valid = (
++        (num_sampled >= 0)
++        & (num_sampled <= MAX_NUM_SAMPLED)
++        & (total_len >= 0)
++        & (total_len + num_sampled <= MAX_MODEL_LEN)
++    )
++    all_token_ids_valid = sample_shape_valid
++    if sample_shape_valid:
++        for i in range(num_sampled):
++            token_id = tl.load(
++                sampled_tokens_ptr + req_id * sampled_tokens_stride + i
++            )
++            all_token_ids_valid &= (token_id >= 0) & (token_id < VOCAB_SIZE)
++
++    if num_sampled > 0 and all_token_ids_valid:
+         token_id = tl.load(
+             sampled_tokens_ptr + req_id * sampled_tokens_stride + num_sampled - 1
+         )
+         tl.store(last_sampled_tokens_ptr + req_state_idx, token_id)
+         tl.store(total_len_ptr + req_state_idx, total_len + num_sampled)
+
+-    for i in range(num_sampled):
+-        token_id = tl.load(sampled_tokens_ptr + req_id * sampled_tokens_stride + i)
+-        tl.store(
+-            all_token_ids_ptr + req_state_idx * all_token_ids_stride + total_len + i,
+-            token_id,
+-        )
+-
+-        if output_bin_counts_ptr is not None:
+-            token_ptr = (
+-                output_bin_counts_ptr
+-                + req_state_idx * output_bin_counts_stride
+-                + token_id
++    if all_token_ids_valid:
++        for i in range(num_sampled):
++            token_id = tl.load(
++                sampled_tokens_ptr + req_id * sampled_tokens_stride + i
+             )
+-            count = tl.load(token_ptr)
+-            tl.store(token_ptr, count + 1)
++            tl.store(
++                all_token_ids_ptr
++                + req_state_idx * all_token_ids_stride
++                + total_len
++                + i,
++                token_id,
++            )
++
++            if output_bin_counts_ptr is not None:
++                token_ptr = (
++                    output_bin_counts_ptr
++                    + req_state_idx * output_bin_counts_stride
++                    + token_id
++                )
++                count = tl.load(token_ptr)
++                tl.store(token_ptr, count + 1)
+
+     if query_start_loc_ptr is None:
+         query_len = 0
+@@ -511,7 +534,7 @@ def _post_update_kernel(
+     num_rejected = tl.load(num_rejected_ptr + req_id)
+
+     computed_delta = query_len - num_rejected
+-    if computed_delta != 0:
++    if computed_delta != 0 and all_token_ids_valid:
+         num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
+         tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + computed_delta)
+
+@@ -537,6 +560,7 @@ def post_update(
+     all_token_ids: torch.Tensor,
+     # [max_num_reqs]
+     total_len: torch.Tensor,
++    vocab_size: int,
+ ) -> None:
+     num_reqs = idx_mapping.shape[0]
+     _post_update_kernel[(num_reqs,)](
+@@ -553,6 +577,9 @@ def post_update(
+         all_token_ids,
+         all_token_ids.stride(0),
+         total_len,
++        VOCAB_SIZE=vocab_size,
++        MAX_NUM_SAMPLED=sampled_tokens.shape[1],
++        MAX_MODEL_LEN=all_token_ids.shape[1],
+         num_warps=1,
+     )
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 3f86b5595cb921618d791dacc05c3008fabb29b4..e3293c9957b7f4e6e78b0daa610516d9dc523648 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1160,6 +1160,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             query_start_loc,
+             self.req_states.all_token_ids.gpu,
+             self.req_states.total_len.gpu,
++            self.vocab_size,
+         )
+
+         self.model_state.postprocess_state(
+@@ -1193,6 +1194,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         num_toks = scheduler_output.total_num_scheduled_tokens
+         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
++        if not dummy_run and uniform_tok_count is not None:
++            # A prefill chunk can coincidentally have the same one-token shape
++            # as a uniform decode batch. Replaying the FULL decode CUDA graph
++            # for that mixed batch corrupts request state. This is the minimal
++            # no-spec backport of upstream vLLM #51865 for the c6fe94b4d ARC
++            # runtime; speculative runners need the complete upstream patch.
++            req_indices = np.fromiter(
++                map(
++                    self.req_states.req_id_to_index.__getitem__,
++                    scheduler_output.num_scheduled_tokens,
++                ),
++                dtype=np.intp,
++                count=num_reqs,
++            )
++            has_prefill = np.any(
++                self.req_states.num_computed_prefill_tokens[req_indices]
++                < self.req_states.prefill_len.np[req_indices]
++            )
++            if has_prefill:
++                uniform_tok_count = None
+
+         num_active_loras = 0
+         if self.lora_config:
+@@ -1463,8 +1484,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+
+         assert self.prompt_logprobs_worker is not None
++        prompt_logits_fn = self.model.compute_logits
++        if self.lora_config:
++            lm_wrapper = self.lora_manager.get_lm_punica_wrapper()
++            if hasattr(lm_wrapper, "prompt_mapping_meta"):
++                token_lora_indices = lm_wrapper.token_lora_indices[
++                    : input_batch.num_tokens
++                ]
++                prompt_logits_offset = 0
++
++                def prompt_logits_fn(
++                    prompt_hidden_states: torch.Tensor,
++                ) -> torch.Tensor:
++                    nonlocal prompt_logits_offset
++                    end_offset = prompt_logits_offset + prompt_hidden_states.shape[0]
++                    token_slice = token_lora_indices[
++                        prompt_logits_offset:end_offset
++                    ]
++                    lm_wrapper.prompt_mapping_meta.prepare_tensors(token_slice)
++                    try:
++                        return self.model.compute_logits(prompt_hidden_states)
++                    finally:
++                        prompt_logits_offset = end_offset
++                        lm_wrapper.prompt_mapping_meta.prepare_tensors(
++                            lm_wrapper.sampler_indices
++                        )
++
+         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
+-            self.model.compute_logits,
++            prompt_logits_fn,
+             hidden_states,
+             input_batch,
+             self.req_states.all_token_ids.gpu,
+diff --git a/vllm/v1/worker/gpu/sample/logprob.py b/vllm/v1/worker/gpu/sample/logprob.py
+index c0f31cdf9f0eb2190873229c0f64dea9193ea3b0..0b4d6bda101998802a5b93b437e0b38354e4285c 100644
+--- a/vllm/v1/worker/gpu/sample/logprob.py
++++ b/vllm/v1/worker/gpu/sample/logprob.py
+@@ -51,9 +51,16 @@ def _topk_log_softmax_kernel(
+         topk_ids = tl.load(
+             topk_ids_ptr + req_idx * topk + k_offset, mask=k_mask, other=0
+         )
+-        logits = tl.load(row_ptr + topk_ids, mask=k_mask)
++        # Treat token IDs as untrusted at this boundary. A failed or stale
++        # upstream sampler must not turn response validation into an
++        # out-of-bounds logits read and a sticky CUDA illegal-address error.
++        # Valid IDs follow the exact original path.
++        valid_id = k_mask & (topk_ids >= 0) & (topk_ids < vocab_size)
++        safe_topk_ids = tl.where(valid_id, topk_ids, 0)
++        logits = tl.load(row_ptr + safe_topk_ids, mask=k_mask)
+         logits = logits.to(tl.float32)
+         o = logits - max_val - lse
++        o = tl.where(valid_id, o, float("-inf"))
+         tl.store(output_ptr + req_idx * topk + k_offset, o, mask=k_mask)
+
+
+@@ -70,13 +77,17 @@ def _ranks_kernel(
+     row_ptr = logits_ptr + req_idx * logits_stride
+
+     token_id = tl.load(token_ids_ptr + req_idx)
+-    x = tl.load(row_ptr + token_id)
++    valid_id = (token_id >= 0) & (token_id < vocab_size)
++    safe_token_id = tl.where(valid_id, token_id, 0)
++    x = tl.load(row_ptr + safe_token_id)
+
+     n = 0
+     for i in range(0, vocab_size, BLOCK_SIZE):
+         block = i + tl.arange(0, BLOCK_SIZE)
+         logits = tl.load(row_ptr + block, mask=block < vocab_size, other=float("-inf"))
+         n += tl.sum((logits >= x).to(tl.int32))
++    # Return an invalid rank sentinel without ever indexing outside logits.
++    n = tl.where(valid_id, n, vocab_size + 1)
+     tl.store(output_ptr + req_idx, n)
+
+
+@@ -126,7 +137,12 @@ def compute_topk_scores(
+             topk_indices = torch.topk(logits, num_logprobs, dim=-1).indices
+             logprob_token_ids = torch.cat((logprob_token_ids, topk_indices), dim=1)
+         if logits_mode:
+-            scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
++            valid_token_ids = (logprob_token_ids >= 0) & (
++                logprob_token_ids < vocab_size
++            )
++            safe_token_ids = logprob_token_ids.clamp(0, vocab_size - 1)
++            scores = logits.gather(-1, safe_token_ids).to(torch.float32)
++            scores = scores.masked_fill(~valid_token_ids, float("-inf"))
+         else:
+             scores = compute_token_logprobs(logits, logprob_token_ids)
+     else:
+@@ -163,7 +179,12 @@ def compute_topk_scores(
+             PADDED_COLS=triton.next_power_of_2(num_cols),
+         )
+         if logits_mode:
+-            scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
++            valid_token_ids = (logprob_token_ids >= 0) & (
++                logprob_token_ids < vocab_size
++            )
++            safe_token_ids = logprob_token_ids.clamp(0, vocab_size - 1)
++            scores = logits.gather(-1, safe_token_ids).to(torch.float32)
++            scores = scores.masked_fill(~valid_token_ids, float("-inf"))
+         else:
+             scores = compute_token_logprobs(logits, logprob_token_ids)
+         scores = scores.masked_fill(~valid_mask, float("-inf"))
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index f7646682e7b0dc9d83d0ee0ed30be40bca613a5f..31484fccc98dd040def24191a6db4ed5295fb11b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -5568,6 +5568,17 @@ class GPUModelRunner(
+
+         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
+
++        # When LoRA targets lm_head, add_lora_logits uses prompt_mapping_meta
++        # (one entry per sequence). For prompt_logprobs we have one hidden-state
++        # row per prompt token, so the per-sequence mapping is wrong and the
++        # lm_head delta is silently dropped. Cache the wrapper here and swap the
++        # metadata to per-token indices around each compute_logits call.
++        lm_wrapper = None
++        if self.lora_config:
++            lm_wrapper = self.lora_manager.get_lm_punica_wrapper()
++            if not hasattr(lm_wrapper, "prompt_mapping_meta"):
++                lm_wrapper = None
++
+         # Since prompt logprobs are a rare feature, prioritize simple,
+         # maintainable loop over optimal performance.
+         completed_prefill_reqs = []
+@@ -5626,7 +5637,18 @@ class GPUModelRunner(
+             req_idx = self.input_batch.req_id_to_index[req_id]
+             offset = self.query_start_loc.np[req_idx].item()
+             prompt_hidden_states = hidden_states[offset : offset + num_logits]
+-            logits = self.model.compute_logits(prompt_hidden_states)
++            if lm_wrapper is not None:
++                token_slice = lm_wrapper.token_lora_indices[
++                    offset : offset + num_logits
++                ]
++                lm_wrapper.prompt_mapping_meta.prepare_tensors(token_slice)
++            try:
++                logits = self.model.compute_logits(prompt_hidden_states)
++            finally:
++                if lm_wrapper is not None:
++                    lm_wrapper.prompt_mapping_meta.prepare_tensors(
++                        lm_wrapper.sampler_indices
++                    )
+
+             # Get the "target" tokens for each index. For prompt at index i,
+             # the token at prompt index i+1 is the "sampled" token we want

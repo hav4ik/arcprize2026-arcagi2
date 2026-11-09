@@ -1,0 +1,131 @@
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -282,10 +282,82 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+         self._logprobs_tensors = logprobs_tensors
+         self._routed_experts = routed_experts
+         self._has_fault: torch.Tensor | None = None
++        self._arc_output_guard_cpu: torch.Tensor | None = None
++        self._arc_output_guard_metadata: dict[str, object] | None = None
++
++        # Preserve engine overlap while determining whether malformed IDs are
++        # already present at the sampler boundary. The comparisons execute on
++        # the producer stream; only their three boolean results are copied on
++        # the existing asynchronous output stream. This distinguishes
++        # producer/kernel corruption from a later D2H/storage lifetime race
++        # without inserting a per-step host synchronization.
++        guard_async_output = os.environ.get(
++            "ARC_VLLM_ASYNC_OUTPUT_GUARD", "0"
++        ).strip().lower() in {"1", "true", "yes", "on"}
++        guard_flags: torch.Tensor | None = None
++        if guard_async_output:
++            if self._sampled_token_ids.dtype != torch.int32:
++                raise RuntimeError(
++                    "ARC async output guard expected sampled token IDs to be "
++                    f"int32, got {self._sampled_token_ids.dtype} with shape "
++                    f"{tuple(self._sampled_token_ids.shape)}"
++                )
++            sampled_invalid = (
++                (self._sampled_token_ids < -1)
++                | (self._sampled_token_ids >= self.vocab_size)
++            ).any()
++            if self._logprobs_tensors is None:
++                logprob_id_invalid = torch.zeros_like(sampled_invalid)
++                logprob_nonfinite = torch.zeros_like(sampled_invalid)
++                logprob_ids = None
++                logprob_values = None
++            else:
++                logprob_ids = self._logprobs_tensors.logprob_token_ids
++                logprob_values = self._logprobs_tensors.logprobs
++                if logprob_ids.dtype != torch.int32:
++                    raise RuntimeError(
++                        "ARC async output guard expected logprob token IDs to "
++                        f"be int32, got {logprob_ids.dtype} with shape "
++                        f"{tuple(logprob_ids.shape)}"
++                    )
++                logprob_id_invalid = (
++                    (logprob_ids < -1) | (logprob_ids >= self.vocab_size)
++                ).any()
++                # ``compute_topk_scores`` deliberately fills padded logprob
++                # columns with -inf. Only NaN and +inf are invalid here;
++                # treating the documented -inf sentinel as corruption causes
++                # false engine deaths in mixed prompt-logprob/decode batches.
++                logprob_nonfinite = (
++                    torch.isnan(logprob_values) | torch.isposinf(logprob_values)
++                ).any()
++            guard_flags = torch.stack(
++                (sampled_invalid, logprob_id_invalid, logprob_nonfinite)
++            )
++            self._arc_output_guard_metadata = {
++                "sampled_shape": tuple(self._sampled_token_ids.shape),
++                "sampled_dtype": str(self._sampled_token_ids.dtype),
++                "logprob_id_shape": (
++                    None if logprob_ids is None else tuple(logprob_ids.shape)
++                ),
++                "logprob_id_dtype": (
++                    None if logprob_ids is None else str(logprob_ids.dtype)
++                ),
++                "logprob_value_shape": (
++                    None
++                    if logprob_values is None
++                    else tuple(logprob_values.shape)
++                ),
++                "logprob_value_dtype": (
++                    None if logprob_values is None else str(logprob_values.dtype)
++                ),
++                "vocab_size": int(self.vocab_size),
++            }
+ 
+-        # ARC forensic controls. These are opt-in, diagnostic-only controls:
+-        # snapshot on the producing stream to distinguish producer corruption
+-        # from reuse while the async device-to-host copy is in flight.
++        # ARC forensic controls. These are deliberately opt-in and are not a
++        # production policy: they let us distinguish a producer-side corrupt
++        # sampler tensor from a lifetime race while the async D2H copy is in
++        # flight. Snapshotting happens on the producing (default) stream,
++        # before the copy stream is allowed to overlap the next engine step.
+         snapshot_async_output = os.environ.get(
+             "ARC_VLLM_ASYNC_OUTPUT_SNAPSHOT", "0"
+         ).strip().lower() in {"1", "true", "yes", "on"}
+@@ -317,6 +391,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+                 if self._logprobs_tensors
+                 else None
+             )
++            if guard_flags is not None:
++                self._arc_output_guard_cpu = guard_flags.to(
++                    "cpu", non_blocking=True
++                )
+             self._routed_experts_cpu = (
+                 self._routed_experts.to_cpu_nonblocking()
+                 if self._routed_experts is not None
+@@ -335,6 +413,30 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
+         self.async_copy_ready_event.synchronize()
+ 
++        if self._arc_output_guard_cpu is not None:
++            sampled_invalid, logprob_id_invalid, logprob_nonfinite = map(
++                bool, self._arc_output_guard_cpu.tolist()
++            )
++            if sampled_invalid or logprob_id_invalid or logprob_nonfinite:
++                sampled_preview = (
++                    self.sampled_token_ids_cpu.flatten()[:64].tolist()
++                )
++                logprob_id_preview = (
++                    None
++                    if self._logprobs_tensors_cpu is None
++                    else self._logprobs_tensors_cpu.logprob_token_ids.flatten()[
++                        :64
++                    ].tolist()
++                )
++                raise RuntimeError(
++                    "ARC async output guard detected producer-side sampler "
++                    "corruption before response serialization: "
++                    f"flags={(sampled_invalid, logprob_id_invalid, logprob_nonfinite)}, "
++                    f"metadata={self._arc_output_guard_metadata}, "
++                    f"sampled_preview={sampled_preview}, "
++                    f"logprob_id_preview={logprob_id_preview}"
++                )
++
+         # Release the device tensors once the copy has completed.
+         del self._logprobs_tensors
+         del self._sampled_token_ids

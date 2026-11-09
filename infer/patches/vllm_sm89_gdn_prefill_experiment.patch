@@ -1,0 +1,493 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+index a3ef86d1b6..5c415f582c 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -129,6 +129,9 @@ if TYPE_CHECKING:
+     VLLM_USE_HW_AGNOSTIC: bool = False
+     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
+     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
++    VLLM_GDN_FUSED_CONV_PREFILL: bool = False
++    VLLM_GDN_FUSED_CONV_PREFILL_MIN_TOKENS: int = 2048
++    VLLM_GDN_DIRECT_PREFILL_OUTPUT: bool = False
+     VLLM_DISABLE_PYNCCL: bool = False
+     VLLM_USE_OINK_OPS: bool = False
+     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
+@@ -1234,6 +1237,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         ["cuda", "triton"],
+         case_sensitive=False,
+     ),
++    # Opt-in SM89 GDN prefill experiments. Short/mixed/speculative batches keep
++    # the incumbent convolution + post-convolution preparation path.
++    "VLLM_GDN_FUSED_CONV_PREFILL": lambda: bool(
++        int(os.getenv("VLLM_GDN_FUSED_CONV_PREFILL", "0"))
++    ),
++    "VLLM_GDN_FUSED_CONV_PREFILL_MIN_TOKENS": lambda: max(
++        1, int(os.getenv("VLLM_GDN_FUSED_CONV_PREFILL_MIN_TOKENS", "2048"))
++    ),
++    "VLLM_GDN_DIRECT_PREFILL_OUTPUT": lambda: bool(
++        int(os.getenv("VLLM_GDN_DIRECT_PREFILL_OUTPUT", "0"))
++    ),
+     # Disable pynccl (using torch.distributed instead)
+     "VLLM_DISABLE_PYNCCL": lambda: (
+         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index b7bd5b7b0b..2bf4f32133 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -1362,12 +1362,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             )
+ 
+         # 1.2: Process the remaining part
++        prefill_prep = None
+         if attn_metadata.num_prefills > 0:
+             assert mixed_qkv_non_spec is not None
+             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
+             # - "cache_indices" updates the conv_state cache in positions
+             #   pointed to by "state_indices_tensor"
+-            mixed_qkv_non_spec = causal_conv1d_fn(
++            fuse_prefill = (
++                envs.VLLM_GDN_FUSED_CONV_PREFILL
++                and current_platform.is_device_capability(89)
++                and spec_sequence_masks is None
++                and attn_metadata.num_decodes == 0
++                and num_actual_tokens >= envs.VLLM_GDN_FUSED_CONV_PREFILL_MIN_TOKENS
++                and self.activation in ("silu", "swish")
++                and self.head_k_dim == self.head_v_dim == 128
++                and (self.num_k_heads // self.tp_size) % 2 == 0
++                and (self.num_v_heads // self.tp_size) % 2 == 0
++                and mixed_qkv_non_spec.dtype == conv_state.dtype == torch.bfloat16
++            )
++            conv_output = causal_conv1d_fn(
+                 mixed_qkv_non_spec_T,
+                 conv_weights,
+                 self.conv1d.bias,
+@@ -1377,7 +1390,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 cache_indices=non_spec_state_indices_tensor,
+                 query_start_loc=non_spec_query_start_loc,
+                 metadata=attn_metadata,
+-            ).transpose(0, 1)
++                gdn_prefill_params=(
++                    a,
++                    b,
++                    self.A_log,
++                    self.dt_bias,
++                    self.num_k_heads // self.tp_size,
++                    self.head_k_dim,
++                    self.head_v_dim,
++                )
++                if fuse_prefill
++                else None,
++            )
++            if fuse_prefill:
++                prefill_prep = conv_output
++            else:
++                mixed_qkv_non_spec = conv_output.transpose(0, 1)
+         elif attn_metadata.num_decodes > 0:
+             assert mixed_qkv_non_spec is not None
+             mixed_qkv_non_spec = causal_conv1d_update(
+@@ -1430,17 +1458,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 value_non_spec,
+                 g_non_spec,
+                 beta_non_spec,
+-            ) = fused_post_conv_prep(
+-                conv_output=conv_output_prefill,
+-                a=a_prefill,
+-                b=b_prefill,
+-                A_log=self.A_log,
+-                dt_bias=self.dt_bias,
+-                num_k_heads=self.num_k_heads // self.tp_size,
+-                head_k_dim=self.head_k_dim,
+-                head_v_dim=self.head_v_dim,
+-                apply_l2norm=True,
+-                output_g_exp=False,
++            ) = (
++                prefill_prep
++                if prefill_prep is not None
++                else fused_post_conv_prep(
++                    conv_output=conv_output_prefill,
++                    a=a_prefill,
++                    b=b_prefill,
++                    A_log=self.A_log,
++                    dt_bias=self.dt_bias,
++                    num_k_heads=self.num_k_heads // self.tp_size,
++                    head_k_dim=self.head_k_dim,
++                    head_v_dim=self.head_v_dim,
++                    apply_l2norm=True,
++                    output_g_exp=False,
++                )
+             )
+             query_non_spec = query_non_spec.unsqueeze(0)
+             key_non_spec = key_non_spec.unsqueeze(0)
+@@ -1506,7 +1538,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             core_attn_out_decode = None
+ 
+         # 2.3: Process the remaining part (prefill chunk, or non-spec decode-only)
++        direct_prefill_output = None
+         if attn_metadata.num_prefills > 0:
++            if (
++                envs.VLLM_GDN_DIRECT_PREFILL_OUTPUT
++                and spec_sequence_masks is None
++                and not split_non_spec
++            ):
++                direct_prefill_output = core_attn_out[:num_actual_tokens]
+             # State indices, initial-state mask and cu_seqlens for the chunk
+             # kernel are precomputed by the metadata builder (the prefill tail
+             # when decodes are peeled off, else the full non-spec batch), so they
+@@ -1532,6 +1571,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 chunk_indices=attn_metadata.chunk_indices,
+                 chunk_offsets=attn_metadata.chunk_offsets,
+                 use_qk_l2norm_in_kernel=False,
++                core_attn_out=direct_prefill_output,
+             )
+             # Init cache
+             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+@@ -1577,7 +1617,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
+         elif spec_sequence_masks is not None:
+             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+-        else:
++        elif direct_prefill_output is None:
+             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+ 
+     def _forward_core_decode_aiter(
+diff --git a/vllm/model_executor/layers/mamba/ops/causal_conv1d.py b/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+index 8335c84966..f0e376d47f 100644
+--- a/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
++++ b/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+@@ -3,6 +3,8 @@
+ 
+ # Copyright (c) 2024, Tri Dao.
+ # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
++# Optional GDN prefill fusion adapted from Intelligent-Internet's
++# Qwen3.8-Inference-MetaZenith, commits a10dd979 and 3bc13898 (Apache-2.0).
+ 
+ 
+ import numpy as np
+@@ -32,6 +34,17 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
+     initial_state_idx,  # (batch,)
+     num_computed_tokens,  # (batch,)
+     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
++    # Optional GDN-prefill inputs and direct outputs. These are compile-time
++    # dead in the generic causal-conv path.
++    gdn_a_ptr,
++    gdn_b_ptr,
++    gdn_A_log_ptr,
++    gdn_dt_bias_ptr,
++    gdn_q_ptr,
++    gdn_k_ptr,
++    gdn_v_ptr,
++    gdn_g_ptr,
++    gdn_beta_ptr,
+     # Matrix dimensions
+     dim: tl.constexpr,
+     num_cache_lines,  # added to support vLLM larger cache lines
+@@ -46,6 +59,11 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
+     stride_cache_indices: tl.constexpr,
+     stride_o_dim: tl.constexpr,
+     stride_o_token: tl.int64,
++    stride_gdn_a_token: tl.constexpr,
++    stride_gdn_b_token: tl.constexpr,
++    stride_gdn_q_token: tl.constexpr,
++    stride_gdn_k_token: tl.constexpr,
++    stride_gdn_v_token: tl.constexpr,
+     stride_block_m: tl.constexpr,  # Stride block to align divided by BLOCK_M
+     # others
+     pad_slot_id: tl.constexpr,
+@@ -59,6 +77,11 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
+     NP2_STATELEN: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
++    FUSE_GDN_PREFILL: tl.constexpr,
++    GDN_QK_DIM: tl.constexpr,
++    GDN_V_DIM: tl.constexpr,
++    GDN_NUM_V_HEADS: tl.constexpr,
++    GDN_HEAD_DIM: tl.constexpr,
+     launch_pdl: tl.constexpr,
+ ):
+     conv_states_ptr = initial_states_ptr
+@@ -421,6 +444,16 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
+     if launch_pdl:
+         tl.extra.cuda.gdc_launch_dependents()
+ 
++    if FUSE_GDN_PREFILL:
++        feature_block = tl.program_id(1)
++        QK_BLOCKS: tl.constexpr = GDN_QK_DIM // BLOCK_N
++        HEADS_PER_BLOCK: tl.constexpr = BLOCK_N // GDN_HEAD_DIM
++        # One conv program owns 8 tokens x 2 Q/K heads. Keeping this tile in
++        # BF16 preserves the incumbent materialized-conv rounding point. It is
++        # reloaded below with the exact 16x128 reduction layout of the removed
++        # post-conv normalization kernel.
++        qk_tile = tl.zeros((BLOCK_M, BLOCK_N), dtype=gdn_q_ptr.dtype.element_ty)
++
+     for idx_token in range(segment_len):
+         acc = acc_preload
+ 
+@@ -469,13 +502,138 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
+         mask_1d = (idx_token < segment_len) & (
+             idx_feats < dim
+         )  # token-index  # feature-index
+-        o_ptrs = (
+-            o_ptr
+-            + (sequence_start_index + token_offset + idx_token) * stride_o_token
+-            + (idx_feats * stride_o_dim)
+-        )
+-
+-        tl.store(o_ptrs, acc, mask=mask_1d)
++        output_token = sequence_start_index + token_offset + idx_token
++        if FUSE_GDN_PREFILL:
++            # Preserve the incumbent materialized-conv rounding point while
++            # writing directly to the post-conv layouts.
++            rounded = acc.to(gdn_q_ptr.dtype.element_ty)
++
++            if feature_block < QK_BLOCKS:  # noqa: SIM114 - retain tested Triton layout
++                qk_tile = tl.where(
++                    (tl.arange(0, BLOCK_M) == idx_token)[:, None],
++                    rounded[None, :],
++                    qk_tile,
++                )
++            elif feature_block < 2 * QK_BLOCKS:
++                qk_tile = tl.where(
++                    (tl.arange(0, BLOCK_M) == idx_token)[:, None],
++                    rounded[None, :],
++                    qk_tile,
++                )
++            else:
++                v_feature = idx_feats - 2 * GDN_QK_DIM
++                v_ptrs = gdn_v_ptr + output_token * stride_gdn_v_token + v_feature
++                tl.store(v_ptrs, rounded, mask=mask_1d)
++
++                head_base = (feature_block - 2 * QK_BLOCKS) * HEADS_PER_BLOCK
++                for local_head in tl.static_range(HEADS_PER_BLOCK):
++                    head = head_base + local_head
++                    head_mask = head < GDN_NUM_V_HEADS
++                    a_value = tl.load(
++                        gdn_a_ptr + output_token * stride_gdn_a_token + head,
++                        mask=head_mask,
++                        other=0.0,
++                    ).to(tl.float32)
++                    b_value = tl.load(
++                        gdn_b_ptr + output_token * stride_gdn_b_token + head,
++                        mask=head_mask,
++                        other=0.0,
++                    ).to(tl.float32)
++                    A_log_value = tl.load(
++                        gdn_A_log_ptr + head, mask=head_mask, other=0.0
++                    ).to(tl.float32)
++                    dt_bias_value = tl.load(
++                        gdn_dt_bias_ptr + head, mask=head_mask, other=0.0
++                    ).to(tl.float32)
++                    z = a_value + dt_bias_value
++                    softplus = tl.where(
++                        z > 0,
++                        z + tl.log(1.0 + tl.exp(-z)),
++                        tl.log(1.0 + tl.exp(z)),
++                    )
++                    softplus = tl.where(z <= 20.0, softplus, z)
++                    gate = -tl.exp(A_log_value) * softplus
++                    gb_offset = output_token * GDN_NUM_V_HEADS + head
++                    tl.store(gdn_g_ptr + gb_offset, gate, mask=head_mask)
++                    tl.store(
++                        gdn_beta_ptr + gb_offset,
++                        tl.sigmoid(b_value),
++                        mask=head_mask,
++                    )
++        else:
++            o_ptrs = o_ptr + output_token * stride_o_token + (idx_feats * stride_o_dim)
++            tl.store(o_ptrs, acc, mask=mask_1d)
++
++    if FUSE_GDN_PREFILL:  # noqa: SIM102 - inner names only exist in fused mode
++        if feature_block < 2 * QK_BLOCKS:
++            tile_tokens = sequence_start_index + token_offset + tl.arange(0, BLOCK_M)
++            tile_mask = (tl.arange(0, BLOCK_M) < segment_len)[:, None] & (
++                idx_feats < dim
++            )[None, :]
++            norm_rows = tl.arange(0, BLOCK_M * HEADS_PER_BLOCK)
++            norm_dims = tl.arange(0, GDN_HEAD_DIM)
++            norm_mask = (norm_rows // HEADS_PER_BLOCK < segment_len)[:, None] & (
++                norm_dims < GDN_HEAD_DIM
++            )[None, :]
++            if feature_block < QK_BLOCKS:
++                q_raw_ptrs = (
++                    gdn_q_ptr
++                    + tile_tokens[:, None] * stride_gdn_q_token
++                    + idx_feats[None, :]
++                )
++                tl.store(q_raw_ptrs, qk_tile, mask=tile_mask)
++                tl.debug_barrier()
++                q_head_base = feature_block * HEADS_PER_BLOCK
++                q_norm_ptrs = (
++                    gdn_q_ptr
++                    + (
++                        sequence_start_index
++                        + token_offset
++                        + norm_rows // HEADS_PER_BLOCK
++                    )[:, None]
++                    * stride_gdn_q_token
++                    + (q_head_base + norm_rows % HEADS_PER_BLOCK)[:, None]
++                    * GDN_HEAD_DIM
++                    + norm_dims[None, :]
++                )
++                q_f32 = tl.load(q_norm_ptrs, mask=norm_mask, other=0.0).to(tl.float32)
++                q_sq_sum = tl.sum(q_f32 * q_f32, axis=1)
++                q_inv = 1.0 / tl.sqrt(q_sq_sum + 1e-6)
++                tl.store(
++                    q_norm_ptrs,
++                    (q_f32 * q_inv[:, None]).to(gdn_q_ptr.dtype.element_ty),
++                    mask=norm_mask,
++                )
++            else:
++                k_feature = idx_feats - GDN_QK_DIM
++                k_raw_ptrs = (
++                    gdn_k_ptr
++                    + tile_tokens[:, None] * stride_gdn_k_token
++                    + k_feature[None, :]
++                )
++                tl.store(k_raw_ptrs, qk_tile, mask=tile_mask)
++                tl.debug_barrier()
++                k_head_base = (feature_block - QK_BLOCKS) * HEADS_PER_BLOCK
++                k_norm_ptrs = (
++                    gdn_k_ptr
++                    + (
++                        sequence_start_index
++                        + token_offset
++                        + norm_rows // HEADS_PER_BLOCK
++                    )[:, None]
++                    * stride_gdn_k_token
++                    + (k_head_base + norm_rows % HEADS_PER_BLOCK)[:, None]
++                    * GDN_HEAD_DIM
++                    + norm_dims[None, :]
++                )
++                k_f32 = tl.load(k_norm_ptrs, mask=norm_mask, other=0.0).to(tl.float32)
++                k_sq_sum = tl.sum(k_f32 * k_f32, axis=1)
++                k_inv = 1.0 / tl.sqrt(k_sq_sum + 1e-6)
++                tl.store(
++                    k_norm_ptrs,
++                    (k_f32 * k_inv[:, None]).to(gdn_k_ptr.dtype.element_ty),
++                    mask=norm_mask,
++                )
+ 
+ 
+ def causal_conv1d_fn(
+@@ -496,6 +654,16 @@ def causal_conv1d_fn(
+     block_size_to_align=0,
+     metadata=None,
+     validate_data=False,
++    gdn_prefill_params: tuple[
++        torch.Tensor,
++        torch.Tensor,
++        torch.Tensor,
++        torch.Tensor,
++        int,
++        int,
++        int,
++    ]
++    | None = None,
+ ):
+     """support varlen + continuous batching when x is 2D tensor
+ 
+@@ -555,7 +723,39 @@ def causal_conv1d_fn(
+     # Store original dtype to cast back at the end
+     original_x_dtype = x.dtype
+     x = x.to(conv_states.dtype)
+-    out = torch.empty_like(x)
++    dim, cu_seqlen = x.shape
++    fuse_gdn_prefill = gdn_prefill_params is not None
++    if fuse_gdn_prefill:
++        assert gdn_prefill_params is not None
++        gdn_a, gdn_b, gdn_A_log, gdn_dt_bias, gdn_h, gdn_k, gdn_v = gdn_prefill_params
++        gdn_hv = gdn_A_log.shape[0]
++        gdn_qk_dim = gdn_h * gdn_k
++        gdn_v_dim = gdn_hv * gdn_v
++        assert original_x_dtype == x.dtype
++        assert gdn_k == 128 and gdn_v == 128
++        assert dim == 2 * gdn_qk_dim + gdn_v_dim
++        assert gdn_a.shape == (cu_seqlen, gdn_hv)
++        assert gdn_b.shape == (cu_seqlen, gdn_hv)
++        gdn_q_out = torch.empty(
++            (cu_seqlen, gdn_h, gdn_k), dtype=x.dtype, device=x.device
++        )
++        gdn_k_out = torch.empty_like(gdn_q_out)
++        gdn_v_out = torch.empty(
++            (cu_seqlen, gdn_hv, gdn_v), dtype=x.dtype, device=x.device
++        )
++        gdn_g_out = torch.empty(
++            (cu_seqlen, gdn_hv), dtype=torch.float32, device=x.device
++        )
++        gdn_beta_out = torch.empty_like(gdn_g_out)
++        # o_ptr is compile-time dead in fused mode; retain a valid channel-last
++        # placeholder so the generic launch geometry and state logic stay shared.
++        out = gdn_q_out.view(cu_seqlen, -1).transpose(0, 1)
++    else:
++        out = torch.empty_like(x)
++        # Valid dummy pointers for arguments eliminated by FUSE_GDN_PREFILL=False.
++        gdn_a = gdn_b = gdn_A_log = gdn_dt_bias = x
++        gdn_q_out = gdn_k_out = gdn_v_out = gdn_g_out = gdn_beta_out = out
++        gdn_h = gdn_hv = gdn_k = gdn_v = gdn_qk_dim = gdn_v_dim = 0
+     if metadata is not None:
+         nums_dict = metadata.nums_dict
+         args = nums_dict
+@@ -574,7 +774,6 @@ def causal_conv1d_fn(
+         )  # tracking BLOCK_M-based index in the sequence the Triton program is handling
+ 
+     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
+-    dim, cu_seqlen = x.shape
+     _, width = weight.shape
+     state_len = width - 1
+     np2_statelen = triton.next_power_of_2(state_len)
+@@ -611,6 +810,11 @@ def causal_conv1d_fn(
+         stride_o_dim = out.stride(1)
+         stride_o_token = out.stride(2)
+     stride_cache_indices = cache_indices.stride(0) if cache_indices is not None else 0
++    stride_gdn_a_token = gdn_a.stride(0) if fuse_gdn_prefill else 0
++    stride_gdn_b_token = gdn_b.stride(0) if fuse_gdn_prefill else 0
++    stride_gdn_q_token = gdn_q_out.stride(0) if fuse_gdn_prefill else 0
++    stride_gdn_k_token = gdn_k_out.stride(0) if fuse_gdn_prefill else 0
++    stride_gdn_v_token = gdn_v_out.stride(0) if fuse_gdn_prefill else 0
+ 
+     if validate_data:
+         assert x.dim() == 2
+@@ -725,6 +929,15 @@ def causal_conv1d_fn(
+         initial_state_idx,
+         num_computed_tokens,
+         out,
++        gdn_a,
++        gdn_b,
++        gdn_A_log,
++        gdn_dt_bias,
++        gdn_q_out,
++        gdn_k_out,
++        gdn_v_out,
++        gdn_g_out,
++        gdn_beta_out,
+         # Matrix dimensions
+         dim,
+         num_cache_lines,
+@@ -739,6 +952,11 @@ def causal_conv1d_fn(
+         stride_cache_indices,
+         stride_o_dim,
+         stride_o_token,
++        stride_gdn_a_token,
++        stride_gdn_b_token,
++        stride_gdn_q_token,
++        stride_gdn_k_token,
++        stride_gdn_v_token,
+         block_size_to_align // BLOCK_M,
+         # others
+         pad_slot_id,
+@@ -753,9 +971,16 @@ def causal_conv1d_fn(
+         # launch_cooperative_grid=True
+         BLOCK_M=BLOCK_M,
+         BLOCK_N=256,
++        FUSE_GDN_PREFILL=fuse_gdn_prefill,
++        GDN_QK_DIM=gdn_qk_dim,
++        GDN_V_DIM=gdn_v_dim,
++        GDN_NUM_V_HEADS=gdn_hv,
++        GDN_HEAD_DIM=gdn_v,
+         num_stages=2,
+         launch_pdl=current_platform.is_arch_support_pdl(),
+     )
++    if fuse_gdn_prefill:
++        return gdn_q_out, gdn_k_out, gdn_v_out, gdn_g_out, gdn_beta_out
+     return out.to(original_x_dtype)
+ 
+ 
